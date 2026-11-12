@@ -1,0 +1,45 @@
+git status
+git log --oneline -n 5 | Select-Object -First 3
+Get-ChildItem -Path . -Recurse -Filter *.rs | Where-Object { $_.Length -gt 1000 }
+Get-ChildItem | ForEach-Object { $_.Name }
+ls | % { $_.FullName } | sort
+cd C:\Projects\nucleos; cargo test -p nucleos-base --lib
+cargo build --release 2>&1 | Select-Object -Last 20
+$env:RUST_LOG = 'debug'; cargo run -p nucleos-core
+$x = Get-Content 'a b.txt' -Raw; Write-Output $x
+if (Test-Path .\build) { Remove-Item .\build -Recurse -Force } else { New-Item -ItemType Directory build }
+foreach ($f in Get-ChildItem *.log) { Get-Content $f | Select-String 'error' }
+for ($i = 0; $i -lt 5; $i++) { Write-Host "i=$i" }
+while ($true) { Start-Sleep 1; if ($n++ -gt 3) { break } }
+do { $n++ } while ($n -lt 10)
+try { Get-Item nope -ErrorAction Stop } catch { Write-Error $_ } finally { Write-Host done }
+function Get-Thing { param([string]$Name) Get-Item $Name }
+switch ($x) { 1 { 'one' } 2 { 'two' } default { 'many' } }
+git commit -m "fix: $(Get-Date -Format s)" && git push
+npm install || Write-Error 'failed'
+$a = $null; $b = $a ?? 'default'; $c = $a?.Length
+$r = ($x -gt 3) ? 'big' : 'small'
+1..5 | ForEach-Object { $_ * 2 }
+[int]'3' + 4
+'{0} and {1}' -f 'a', 'b'
+'hello world' -replace 'o', '0'
+& 'C:\Program Files\Tool\tool.exe' --flag value
+. .\profile.ps1
+Get-Process | Where-Object CPU -gt 10 | Sort-Object CPU -Descending | Select-Object -First 5
+Write-Output "x$(hostname)y" > out.txt 2>&1
+echo hi >> log.txt
+$h = @{ a = 1; b = 2 }; $h.Keys | ForEach-Object { "$_=$($h[$_])" }
+@(1,2,3) | Measure-Object -Sum
+# just a comment
+Get-Item . <# inline #> | Out-Null
+git diff --stat # trailing comment
+$s = @'raw $text'@; Write-Output $s
+if ($a) { 'a' } elseif ($b) { 'b' } else { 'c' }
+Invoke-Expression "Get-Date"
+docker run --rm -it -v "${PWD}:/w" img sh -c 'ls | wc -l'
+python -c "print('hi')"
+Get-Content x.txt | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Out-File y.txt
+$files = (Get-ChildItem -File).Name; $files.Count
+[System.IO.Path]::Combine('a', 'b')
+$list = [System.Collections.Generic.List[string]]::new(); $list.Add('x')
+Start-Process notepad -ArgumentList 'a.txt' -Wait

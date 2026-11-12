@@ -1,0 +1,72 @@
+// @vitest-environment node
+import { describe, expect, it } from "vitest";
+
+import { readState, statesOf } from "./state-map";
+
+describe("state tones", () => {
+  it("a feed line is a record, so the feed domain spends no Acting Green", () => {
+    const kinds = statesOf("feed");
+    expect(kinds).toHaveLength(118);
+    for (const kind of kinds) expect(readState("feed", kind)?.tone, kind).not.toBe("active");
+    for (const kind of ["job_started", "job_finished", "council_started"] as const) expect(readState("feed", kind)?.tone, kind).toBe("info");
+    for (const [domain, state, tone, label] of [["feed", "team_run_finished", "info", "team run settled"], ["feed", "team_action", "info", "team action settled"], ["feed", "team_trigger_armed", "info", "team trigger armed"], ["feed", "team_trigger_skipped", "paused", "team trigger did not fire"], ["feed", "team_item_dropped", "off", "team item dropped"], ["feed", "shadow_run_completed", "shadow", "shadow run completed"], ["feed", "worktree_run_completed", "info", "worktree run completed"], ["feed", "resume_did_not_act", "info", "approved action never attempted"], ["feed", "vcs_resolution_started", "info", "conflict resolution started"], ["feed", "vcs_resolution_cancelled", "off", "conflict resolution stopped"], ["feed", "vcs_resolution_discarded", "danger", "resolution discarded changes"], ["feed", "land_resolution_failed", "danger", "resolution could not be landed"], ["feed", "job_item_conflicted", "paused", "job item did not merge"], ["feed", "job_item_orphaned", "off", "job item never attempted"], ["feed", "command_finished", "info", "project command finished"], ["feed", "config_written", "info", "setting written"], ["feed", "project_onboarded", "info", "project onboarded"], ["feed", "workflow_changed", "info", "workflow changed"], ["feed", "postgate_held", "info", "post-merge gate held"], ["feed", "direct_write_violation", "danger", "target moved outside the queue"], ["feed", "direct_write_bypass", "paused", "target moved through the direct-git escape"], ["feed", "integration_step", "info", "an integration step changed files"], ["feed", "work_tree_parked", "pending", "node tree parked"], ["feed", "work_tree_finished", "info", "node tree finished"], ["rule", "armed", "info", "armed"], ["rule", "never-fires", "danger", "never fires"], ["rule", "capped", "paused", "capped today"], ["rule", "unseen", "info", "no commit seen yet"], ["folder", "missing", "danger", "gone"], ["folder", "unset", "off", "not named"], ["knowledge", "prompt", "info", "instruction"], ["knowledge", "subagent", "info", "delegation"]] as const) {
+      const reading = readState(domain, state); expect(reading?.tone, `${domain}.${state}`).toBe(tone); expect(reading?.label, `${domain}.${state}`).toBe(label);
+    }
+    expect(new Set(statesOf("knowledge").map((kind) => readState("knowledge", kind)?.tone)).size).toBe(1);
+  });
+  it("every finished-without-verdict state reads as a fact, not as work in flight", () => {
+    for (const [domain, state] of [
+      ["run", "completed"],
+      ["job", "completed"],
+      ["vcs", "succeeded"],
+      ["council", "done"],
+      ["team_run", "done"],
+      ["team_item", "done"],
+      ["team_action", "done"],
+    ] as const) {
+      expect(readState(domain, state)?.tone).toBe("info");
+    }
+  });
+
+  it("acting green is left to live work and to a measurement's verdict", () => {
+    for (const [domain, state] of [
+      ["run", "running"],
+      ["job", "running"],
+      ["team_run", "working"],
+      ["team_item", "running"],
+      ["gate", "passed"],
+      ["collision", "clean"],
+      ["web_extract", "article"],
+    ] as const) {
+      expect(readState(domain, state)?.tone).toBe("active");
+    }
+  });
+
+  it("a brake, a setting and a department read as facts, never as work in flight", () => {
+    for (const [domain, state, tone, label] of [
+      ["brake", "held", "paused", "held"], ["brake", "released", "off", "released"], ["brake", "not_read", "off", "not read"],
+      ["setting", "enabled", "info", "enabled"], ["setting", "disabled", "off", "disabled"], ["setting", "armed", "info", "armed"],
+      ["setting", "unarmed", "off", "unarmed"], ["setting", "disarmed", "off", "disarmed"],
+      ["department", "working", "active", "at work"], ["department", "waiting", "pending", "waiting"], ["department", "idle", "off", "idle"],
+    ] as const) {
+      const reading = readState(domain, state);
+      expect(reading?.tone, `${domain}.${state}`).toBe(tone);
+      expect(reading?.label, `${domain}.${state}`).toBe(label);
+    }
+    expect(readState("department", "waiting")?.label).not.toContain("on you");
+  });
+
+  it("the voice phases are shell derivations: every phase the reducers can hold has a reading", () => {
+    for (const [domain, state, tone, label] of [
+      ["voice_conversation", "off", "off", "off"], ["voice_conversation", "listening", "active", "listening"],
+      ["voice_conversation", "hearing", "pending", "hearing you"], ["voice_conversation", "thinking", "info", "thinking"],
+      ["voice_conversation", "speaking", "info", "answering"],
+      ["voice_phase", "idle", "off", "idle"], ["voice_phase", "recording", "pending", "recording"],
+      ["voice_phase", "transcribing", "info", "transcribing"], ["voice_phase", "hotkeys_failed", "danger", "hotkeys failed"],
+    ] as const) {
+      const reading = readState(domain, state);
+      expect(reading?.tone, `${domain}.${state}`).toBe(tone);
+      expect(reading?.label, `${domain}.${state}`).toBe(label);
+    }
+  });
+});

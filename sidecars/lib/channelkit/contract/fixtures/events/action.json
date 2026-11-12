@@ -1,0 +1,6 @@
+{ "event_id": "cbq-551",
+  "at": "2026-10-19T10:32:00Z",
+  "conversation": {"ref": "-100123:5", "kind": "thread", "parent": "-100123"},
+  "sender": {"ref": "4242", "name": "Duarte"},
+  "type": "action",
+  "action": { "ref": "551", "message_ref": "990", "token": "tk_9f2c" } }

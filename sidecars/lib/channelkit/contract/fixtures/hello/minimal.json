@@ -1,0 +1,1 @@
+{ "kind": "signal", "version": "1.0.0", "capabilities": { "max_text": 2000 } }

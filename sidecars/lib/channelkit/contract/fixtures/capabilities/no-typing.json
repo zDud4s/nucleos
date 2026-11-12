@@ -1,0 +1,14 @@
+{ "missing": "typing",
+  "hello": { "kind": "fake", "version": "1.0.0",
+             "capabilities": { "buttons": true, "edit": true, "threads": true, "reply_to": true,
+                               "max_text": 4096, "media_in": ["audio", "image", "file"],
+                               "media_out": ["image", "file", "audio"] } },
+  "setup": { "identities": [ {"sender_ref": "4242", "conversation_ref": "4242", "home": true} ] },
+  "forbid": { "ephemeral_types": ["typing"] },
+  "steps": [
+    { "event": { "event_id": "nt-1", "conversation": {"ref": "4242", "kind": "private"},
+                 "sender": {"ref": "4242", "name": "Duarte"}, "type": "message",
+                 "message": {"ref": "100", "parts": [ {"type": "text", "text": "Summarise the inbox"} ]} },
+      "expect": { "response": {"accepted": true},
+                  "actions": [ {"type": "send", "conversation": "4242"} ],
+                  "ephemeral": [] } } ] }

@@ -1,0 +1,1928 @@
+//! §spec agenticos-foundation-and-autopilot
+
+use serde::Serialize;
+use serde_json::Value;
+use sqlx::{FromRow, SqlitePool};
+
+use crate::governance::classifier::{self, Classification};
+
+pub mod rollup;
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct ShadowDecision {
+    pub id: i64,
+    pub run_id: i64,
+    pub tool_name: String,
+    pub tool_input: Option<String>,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub action_class: String,
+    pub classifier_version: i64,
+    /// The configuration the decision was taken under, beside the code version above.
+    ///
+    /// `Option` because every row written before migration 0089 has none, and because that gap is
+    /// harmless by the choice of reader — `shadow_readiness` COUNTS distinct digests and does not
+    /// group by them, so a null-digest row goes on counting toward review and agreement exactly as
+    /// it always did.
+    pub policy_digest: Option<String>,
+    pub human_verdict: Option<String>,
+    pub reviewed_at: Option<String>,
+    pub created_at: String,
+    /// The raw `tool_response` JSON a `PostToolUse`/`PostToolUseFailure` report carried back, or
+    /// `None` until `record_outcome` fills it in — which, for a `real`-mode run with no row to
+    /// fill, is forever.
+    pub outcome: Option<String>,
+    /// When the outcome above landed, mirroring `reviewed_at` beside `human_verdict`.
+    pub outcome_at: Option<String>,
+    /// Which of the two hooks reported it: `PostToolUse` for a success, `PostToolUseFailure` for
+    /// a failure. The CLI never fires the first for a call that failed (measured against the
+    /// installed CLI, 2.1.260), so this is what tells the two apart in the ledger.
+    pub outcome_event: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, FromRow)]
+pub struct ClassTally {
+    pub mode: String,
+    pub action_class: String,
+    pub total: i64,
+    pub would_allow: i64,
+    pub would_pend: i64,
+    pub would_deny: i64,
+    pub reviewed: i64,
+    pub agree: i64,
+    pub disagree: i64,
+    /// Disagreements where the human was stricter than the classifier (rejected an `allow`).
+    pub stricter: i64,
+    /// Disagreements where the human was looser (approved a `deny` or `pending_approval`).
+    pub looser: i64,
+    /// Decisions still waiting for a human verdict.
+    pub unreviewed: i64,
+    /// Oldest `created_at` among the unreviewed decisions, `None` when nothing is waiting.
+    pub oldest_unreviewed_at: Option<String>,
+    /// Reviewed decisions split by what the classifier decided.
+    pub reviewed_allow: i64,
+    pub reviewed_pend: i64,
+    pub reviewed_deny: i64,
+}
+
+/// How much of one stored text a `shadow_decisions` row keeps: each string inside `tool_input`, and
+/// the whole `tool_response`. The same 8 KiB as a git transport's `OUTPUT_TAIL_BYTES`, counted in
+/// characters so a cut never splits one. A `Read` of a large file or a `Write` of one used to land in
+/// this table whole, and every row is served to the review screen.
+pub const STORED_TEXT_CHARS: usize = 8 * 1024;
+
+/// The `tool_input` as a row stores it: every string inside it through the judge's redaction and
+/// cut to `STORED_TEXT_CHARS` (`[...]` marks a cut), the JSON shape kept.
+///
+/// String by string rather than over the serialized JSON, because `judge::state_with_note` parses
+/// this column back as JSON to show the judge a run's recent actions: a cut through the middle of
+/// the serialized text, or a redaction that swallowed a closing quote, would turn the column into
+/// `[unparseable]`. Deterministic, so `record_outcome` finds the row `record_decision` wrote by
+/// computing the same value.
+pub fn stored_tool_input(tool_input: &Value) -> String {
+    fn scrub(value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(crate::judge::trim_two_thirds(
+                &crate::judge::redact_for_judge(text),
+                STORED_TEXT_CHARS,
+            )),
+            Value::Array(items) => Value::Array(items.iter().map(scrub).collect()),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), scrub(value)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    scrub(tool_input).to_string()
+}
+
+/// The `tool_response` as a row stores it: redacted, then cut to `STORED_TEXT_CHARS` with `[...]`
+/// where the middle went. Nothing parses the `outcome` column back, so the cut is over the text.
+pub fn stored_tool_response(tool_response: &Value) -> String {
+    crate::judge::trim_two_thirds(
+        &crate::judge::redact_for_judge(&tool_response.to_string()),
+        STORED_TEXT_CHARS,
+    )
+}
+
+/// Records what the classifier WOULD have done, and under which code and which configuration.
+///
+/// **Two identifiers and not one, and they mean different things.** `classifier_version` is the
+/// CODE — bumped by hand once per policy change, and stamped here so two differently-classified
+/// decisions can be told apart after the fact. `policy_digest` is the CONFIGURATION, and it exists
+/// because from version 10 the code stopped being the whole answer: part of the policy is
+/// `~/.nucleos/github.yaml`, which lives in one person's home and travels with nobody, so two machines on the same
+/// version can decide one `gh` line differently. Since `Policy::for_project`, part of it is also
+/// `project_github_ops` — so two PROJECTS on one machine can too, and the digest is what tells those
+/// two rows apart.
+///
+/// The digest is passed in rather than read here, because this function does no I/O beyond its own
+/// INSERT and the caller holds the EFFECTIVE policy — the same value `classify` was handed for this
+/// very decision, which is what keeps the row describing the answer it actually recorded. It used to
+/// say "`AppState`'s", and that stopped being the whole of it when the policy became per-project:
+/// what the row needs is the one that decided, not the one the daemon started with.
+pub async fn record_decision(
+    pool: &SqlitePool,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &Value,
+    classification: &Classification,
+    policy_digest: &str,
+) -> sqlx::Result<i64> {
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO shadow_decisions
+         (run_id, tool_name, tool_input, decision, reason, action_class,
+          classifier_version, policy_digest, human_verdict, reviewed_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+    )
+    .bind(run_id)
+    .bind(tool_name)
+    .bind(stored_tool_input(tool_input))
+    .bind(&classification.decision.decision)
+    .bind(&classification.reason)
+    .bind(classification.action_class)
+    .bind(classifier::CLASSIFIER_VERSION as i64)
+    .bind(policy_digest)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+
+    Ok(result.last_insert_rowid())
+}
+
+/// Records what a tool call actually DID, against the decision already taken about it.
+///
+/// **UPDATE-only, and this is the whole of the design.** `record_decision` above is called only
+/// for `shadow` and `worktree` modes (`hooks.rs`), so a `real`-mode run has no `shadow_decisions`
+/// row at all for this tool call. INSERTing one here — the natural instinct for a function named
+/// "record" — would put a decision nobody took into `list_unreviewed` and into `scoreboard`: a
+/// row with an outcome and no decision would look exactly like a shadow decision that was never
+/// reviewed. Matching zero rows is therefore success, not failure — it means this run was never
+/// being shadowed, and there is nothing here for this call to complete. Callers that want to know
+/// whether anything was actually recorded read `rows_affected` off the `Ok(())` — none of the
+/// current ones need to, so it is swallowed rather than returned.
+///
+/// Matched on `(run_id, tool_name, tool_input)` — the same identity `PreToolUse` classified under
+/// — AND `outcome IS NULL`, so a second, later `PostToolUse` for the identical command updates
+/// its OWN row instead of overwriting whichever matching row happens to sort first. Ordered by
+/// `id ASC` and limited to one: outcomes arrive in the same order their decisions were taken, so
+/// the OLDEST still-unfilled row sharing the identity is always the one this outcome belongs to.
+/// `DESC` used to sit here instead, and read as correct only because `auth.rs` and `hooks.rs` both
+/// hold a run to at most one tool call in flight — an invariant this function does not own and,
+/// with `ASC`, no longer needs: ordering by age is right whether that call happens to be the only
+/// one pending or one of several.
+pub async fn record_outcome(
+    pool: &SqlitePool,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &Value,
+    tool_response: &Value,
+    outcome_event: &str,
+) -> sqlx::Result<()> {
+    let outcome_at = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE shadow_decisions SET outcome = ?, outcome_at = ?, outcome_event = ?
+         WHERE id = (
+             SELECT id FROM shadow_decisions
+             WHERE run_id = ? AND tool_name = ? AND tool_input = ? AND outcome IS NULL
+             ORDER BY id ASC LIMIT 1
+         )",
+    )
+    .bind(stored_tool_response(tool_response))
+    .bind(outcome_at)
+    .bind(outcome_event)
+    .bind(run_id)
+    .bind(tool_name)
+    .bind(stored_tool_input(tool_input))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// The review queue a human actually works from: unreviewed decisions from `shadow`-mode runs
+/// only, so this list shows exactly what `shadow_readiness` counts toward promotion and nothing
+/// else. A `worktree`-mode decision was already enforced — there is no verdict left to collect —
+/// so it must not appear here for someone to be asked about it.
+pub async fn list_unreviewed(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<Vec<ShadowDecision>> {
+    sqlx::query_as(
+        "SELECT shadow_decisions.*
+         FROM shadow_decisions
+         JOIN runs ON runs.id = shadow_decisions.run_id
+         WHERE runs.project_id = ? AND shadow_decisions.human_verdict IS NULL
+           AND runs.mode = 'shadow'
+         ORDER BY shadow_decisions.id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// The only two verdicts the agreement arithmetic understands. Anything else was stored happily
+/// and then counted as reviewed-and-disagreeing, which silently pushed the readiness ratio down
+/// and could hold promotion back forever with no way to see why.
+pub const VALID_VERDICTS: &[&str] = &["approve", "reject"];
+
+/// Records a human verdict, exactly once, and only if it is one this can count. `Ok(false)` when the
+/// verdict is not recognised, when the id is unknown, or when the decision was already judged —
+/// `http::post_shadow_verdict` answers 404 to all three.
+///
+/// The `human_verdict IS NULL` guard is the load-bearing half, and mirrors `proposals::transition`,
+/// which has always carried `AND status = 'pending'`. Without it the UPDATE matched on the id alone:
+/// a replay rewrote `reviewed_at` and still answered 204, contradicting the promise written at that
+/// handler ("a verdict is recorded once — replaying it answers 404") and silently moving the only
+/// record of WHEN a decision was judged.
+pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Result<bool> {
+    if !VALID_VERDICTS.contains(&verdict) {
+        return Ok(false);
+    }
+    let reviewed_at = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE shadow_decisions SET human_verdict = ?, reviewed_at = ?
+         WHERE id = ? AND human_verdict IS NULL",
+    )
+    .bind(verdict)
+    .bind(reviewed_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+/// The asymmetric agreement rule, as a SQL expression yielding 1 when the human's verdict matched
+/// the classifier. `approve` agrees only with `allow`; `reject` agrees with both `deny` and
+/// `pending_approval` (rejecting an action the classifier already withheld IS agreement).
+///
+/// Used by `scoreboard`, which reports ACTIVITY: how many decisions were taken and how the human
+/// judged each one. `shadow_readiness` deliberately does not share it — the gate counts distinct
+/// ACTIONS (see `action_hash`), because ten reviews of one command are ten data points about
+/// the same thing. Same rule for what counts as agreement, applied to different units, and the
+/// scoreboard's column headings are what tell the two apart on screen.
+///
+/// Also read by `analytics_pipeline::autopilot`, which aggregates it across projects.
+pub const AGREE_CASE: &str = "CASE
+    WHEN shadow_decisions.human_verdict = 'approve'
+         AND shadow_decisions.decision = 'allow' THEN 1
+    WHEN shadow_decisions.human_verdict = 'reject'
+         AND shadow_decisions.decision IN ('deny', 'pending_approval') THEN 1
+    ELSE 0
+END";
+
+/// The key of one distinct ACTION, the unit readiness counts in: the hex SHA-256 of the tool name,
+/// the unit separator (`0x1f`) and the tool input.
+///
+/// Ten reviews of the same `ls` are one piece of evidence about the classifier, not ten. Counting
+/// rows meant a single shadow run looping one harmless command, bulk-approved, cleared its class
+/// and unlocked active mode having proved nothing about anything risky. The tool name joins the
+/// key because a `Read` of a path and a `Bash` touching it are different actions, and the
+/// separator keeps the two fields from running together into a colliding string.
+///
+/// A hash and not the text: `rollup::prune` keeps this key in `shadow_reviewed_actions` forever,
+/// and the raw `tool_input` (commands, paths, file contents) must not outlive the retention
+/// window. SQLite has no SHA-256, so every reader hashes in Rust.
+pub(crate) fn action_hash(tool_name: &str, tool_input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(tool_input.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// One reviewed action as the SQL hands it over, before [`action_hash`]: project, action class,
+/// tool name, tool input, and whether a person disagreed about it (0 or 1).
+pub(crate) type ReviewedActionRow = (String, String, String, String, i64);
+
+/// The scoreboard's counters, in [`ClassTally`] order after `mode` and `action_class`. Named by
+/// [`tally_select`], and the column list `rollup::prune` inserts them into.
+pub(crate) const TALLY_NAMES: &str = "total, would_allow, would_pend, would_deny, reviewed, agree, \
+     disagree, stricter, looser, unreviewed, oldest_unreviewed_at, reviewed_allow, reviewed_pend, \
+     reviewed_deny";
+
+/// The scoreboard's counters over raw `shadow_decisions` rows, aliased as [`TALLY_NAMES`].
+///
+/// One list for `scoreboard`, which reads the rows still in the table, and for `rollup::prune`,
+/// which folds the rows it deletes into `shadow_decision_days`: a day folded and a day still raw
+/// are counted by the same rule, or the totals would change the moment a day aged out.
+pub(crate) fn tally_select() -> String {
+    format!(
+        "COUNT(*) AS total,
+             SUM(CASE WHEN shadow_decisions.decision = 'allow' THEN 1 ELSE 0 END) AS would_allow,
+             SUM(CASE WHEN shadow_decisions.decision = 'pending_approval' THEN 1 ELSE 0 END) AS would_pend,
+             SUM(CASE WHEN shadow_decisions.decision = 'deny' THEN 1 ELSE 0 END) AS would_deny,
+             SUM(CASE WHEN shadow_decisions.human_verdict IS NOT NULL THEN 1 ELSE 0 END) AS reviewed,
+             SUM({AGREE_CASE}) AS agree,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL AND ({AGREE_CASE}) = 0 THEN 1
+                 ELSE 0
+             END) AS disagree,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict = 'reject'
+                      AND shadow_decisions.decision = 'allow' THEN 1
+                 ELSE 0
+             END) AS stricter,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict = 'approve'
+                      AND shadow_decisions.decision IN ('deny', 'pending_approval') THEN 1
+                 ELSE 0
+             END) AS looser,
+             SUM(CASE WHEN shadow_decisions.human_verdict IS NULL THEN 1 ELSE 0 END) AS unreviewed,
+             MIN(CASE
+                 WHEN shadow_decisions.human_verdict IS NULL THEN shadow_decisions.created_at
+             END) AS oldest_unreviewed_at,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'allow' THEN 1
+                 ELSE 0
+             END) AS reviewed_allow,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'pending_approval' THEN 1
+                 ELSE 0
+             END) AS reviewed_pend,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'deny' THEN 1
+                 ELSE 0
+             END) AS reviewed_deny"
+    )
+}
+
+/// Per run mode and action class, the whole history of one project: the rows still in
+/// `shadow_decisions` plus the days `rollup::prune` folded into `shadow_decision_days`. The two
+/// never hold the same decision (a row is deleted in the transaction that folds it), so adding
+/// them is the total the table alone would have given had nothing been pruned.
+pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<ClassTally>> {
+    let tally = tally_select();
+    let sql = format!(
+        "SELECT mode, action_class,
+             SUM(total) AS total,
+             SUM(would_allow) AS would_allow,
+             SUM(would_pend) AS would_pend,
+             SUM(would_deny) AS would_deny,
+             SUM(reviewed) AS reviewed,
+             SUM(agree) AS agree,
+             SUM(disagree) AS disagree,
+             SUM(stricter) AS stricter,
+             SUM(looser) AS looser,
+             SUM(unreviewed) AS unreviewed,
+             MIN(oldest_unreviewed_at) AS oldest_unreviewed_at,
+             SUM(reviewed_allow) AS reviewed_allow,
+             SUM(reviewed_pend) AS reviewed_pend,
+             SUM(reviewed_deny) AS reviewed_deny
+         FROM (
+             SELECT runs.mode AS mode, shadow_decisions.action_class AS action_class, {tally}
+             FROM shadow_decisions
+             JOIN runs ON runs.id = shadow_decisions.run_id
+             WHERE runs.project_id = ?1
+             GROUP BY runs.mode, shadow_decisions.action_class
+             UNION ALL
+             SELECT mode, action_class,
+                    SUM(total), SUM(would_allow), SUM(would_pend), SUM(would_deny), SUM(reviewed),
+                    SUM(agree), SUM(disagree), SUM(stricter), SUM(looser), SUM(unreviewed),
+                    MIN(oldest_unreviewed_at), SUM(reviewed_allow), SUM(reviewed_pend),
+                    SUM(reviewed_deny)
+             FROM shadow_decision_days
+             WHERE project_id = ?1
+             GROUP BY mode, action_class
+         )
+         GROUP BY mode, action_class
+         ORDER BY mode, action_class"
+    );
+
+    // `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str` by default. Safe here by
+    // construction: the only interpolated fragment is `tally_select`, built from the private
+    // `AGREE_CASE` const, and the project id stays a bound parameter — no caller input reaches the
+    // SQL text.
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(project_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// The shadow-exit bar (spec §8.2/§8.8, `.ai/decisions.md` 2026-07-27): an action class earns
+/// promotion once enough of its shadow decisions have been reviewed AND the classifier agreed with
+/// the human on nearly all of them. A class that withheld decisions (`would_pend > 0`) is not ready
+/// until at least one of them was reviewed (`reviewed_pend > 0`): agreement on its allows alone says
+/// nothing about the cases that mattered.
+///
+/// **This is the single source of truth for the rule.** The shell reads the computed
+/// `classes_ready`/`promotable` off the daemon rather than recomputing them, so the warning the
+/// user sees and the bar the daemon computes can never be judged on different numbers.
+pub const READINESS_MIN_REVIEWED: i64 = 10;
+pub const READINESS_MIN_AGREE_PERCENT: i64 = 95;
+
+/// Named hazard classes whose ready, uniformly withheld decisions demonstrate restraint.
+///
+/// Agreeing with the classifier's caution about something it did not recognise says nothing about
+/// its judgement on the hazards it did. This allowlist therefore fails closed: a new classifier
+/// class is not evidence of restraint until it is deliberately added here.
+const RESTRAINT_EVIDENCE_CLASSES: &[&str] = &[
+    "push-merge-deploy",
+    "destructive",
+    // Split out of `destructive` when the classifier learned to answer separately about a delete's
+    // TARGET. It is evidence of restraint by exactly the same argument as its sibling, and the
+    // allowlist above says a new class is not evidence until somebody puts it here on purpose.
+    //
+    // What it costs, said out loud because it reads as a bug to whoever meets it cold: `promotable`
+    // requires `classes_ready == classes_total` over the classes a run EXERCISED, so this is one
+    // more class that has to get ready — its own `READINESS_MIN_REVIEWED` reviews at
+    // `READINESS_MIN_AGREE_PERCENT` — and the reviews already won under `destructive` for
+    // out-of-workspace cases do NOT transit. Splitting the class rewinds the promotion clock for
+    // that hazard. Fail-closed, therefore correct, and therefore worth a paragraph rather than a
+    // surprise.
+    "destructive-outside",
+    // The NucleOS database: a compiled hard deny, no approval path. Every one of its decisions is a
+    // refusal, so it is restraint evidence by construction. Like `destructive-outside` above, a new
+    // class starts its own `READINESS_MIN_REVIEWED` count from zero: fail-closed, and intended.
+    "nucleos-data",
+    "self-governing-file",
+    "outside-workspace",
+    "executes-on-next-command",
+];
+
+/// `agree / reviewed >= 0.95` in integer arithmetic — a float ratio rounds at the boundary, and this
+/// is exactly the boundary the gate is decided on.
+pub fn class_ready(reviewed: i64, agree: i64) -> bool {
+    reviewed >= READINESS_MIN_REVIEWED && agree * 100 >= READINESS_MIN_AGREE_PERCENT * reviewed
+}
+
+/// A project has earned leaving shadow once it has exercised at least one action class, EVERY
+/// exercised class clears the bar, and at least one of those ready classes contains ONLY decisions
+/// where the classifier WITHHELD (`pending_approval` or `deny`). Classes never exercised don't
+/// count against it (a project would otherwise wait forever on a `deploy` it never attempts), but
+/// zero exercised classes is NOT promotable — "no evidence" must not read as "all the evidence is good".
+///
+/// The withheld requirement is the part that looks redundant and is not: a corpus made entirely of
+/// `allow` decisions validates the classifier's PERMISSIVENESS — that it lets through what it
+/// should — and says nothing whatsoever about its RESTRAINT. Restraint is the only property that
+/// matters once the project starts acting on its own, so it has to have been checked before it may.
+pub fn promotable(classes_ready: i64, classes_total: i64, withheld_classes_ready: i64) -> bool {
+    classes_total > 0 && classes_ready == classes_total && withheld_classes_ready > 0
+}
+
+/// `(classes_ready, classes_total, withheld_classes_ready)` per project, over SHADOW-mode decisions
+/// only.
+///
+/// Shadow-mode only because promotion OUT of shadow is earned by evidence gathered IN shadow: a
+/// `worktree`-mode decision was actually enforced, not a hypothetical the human could still overrule.
+/// Projects with no shadow decisions are absent from the map (the caller reads that as `(0, 0, 0)`).
+///
+/// Each action class contributes exactly one row, even when historical classifier versions recorded
+/// different decisions for it. Review and agreement counts therefore cover the whole class. A class
+/// counts as withheld only when every recorded decision is `pending_approval` or `deny`; any
+/// `allow` makes the conservative result "not withheld" so mixed evidence cannot unlock promotion.
+///
+/// A class is ready only if it clears `class_ready` AND, when it has any `pending_approval`
+/// decision, at least one of those was reviewed. Otherwise its agreement is measured on the other
+/// decisions alone, which says nothing about whether the classifier was right to hold back.
+///
+/// The whole history, pruned or not: the rows still in `shadow_decisions` together with what
+/// `rollup::prune` kept of the ones it deleted — their counts in `shadow_decision_days` and their
+/// distinct reviewed actions (as hashes) in `shadow_reviewed_actions`. The distinct counts are taken over the
+/// UNION of the live keys and the kept ones, never added, so an action reviewed on both sides of
+/// the retention window is still one action. "Withheld" is "every decision was `pending_approval`
+/// or `deny`", i.e. the count of those equals the count of all, which adds across days where the
+/// `MIN` it replaces would not.
+pub async fn shadow_readiness(
+    pool: &SqlitePool,
+) -> sqlx::Result<std::collections::HashMap<String, (i64, i64, i64)>> {
+    const SQL: &str = "WITH counted AS (
+             SELECT runs.project_id AS project_id,
+                    shadow_decisions.action_class AS action_class,
+                    COUNT(*) AS total,
+                    SUM(CASE
+                        WHEN shadow_decisions.decision IN ('pending_approval', 'deny') THEN 1
+                        ELSE 0
+                    END) AS withheld_total,
+                    SUM(CASE WHEN shadow_decisions.decision = 'pending_approval' THEN 1 ELSE 0 END)
+                        AS would_pend,
+                    SUM(CASE
+                        WHEN shadow_decisions.human_verdict IS NOT NULL
+                             AND shadow_decisions.decision = 'pending_approval' THEN 1
+                        ELSE 0
+                    END) AS reviewed_pend
+             FROM shadow_decisions
+             JOIN runs ON runs.id = shadow_decisions.run_id
+             WHERE runs.mode = 'shadow'
+             GROUP BY runs.project_id, shadow_decisions.action_class
+             UNION ALL
+             SELECT project_id, action_class, SUM(total), SUM(would_pend + would_deny),
+                    SUM(would_pend), SUM(reviewed_pend)
+             FROM shadow_decision_days
+             WHERE mode = 'shadow'
+             GROUP BY project_id, action_class
+         ),
+         classes AS (
+             SELECT project_id, action_class, SUM(total) AS total,
+                    SUM(withheld_total) AS withheld_total, SUM(would_pend) AS would_pend,
+                    SUM(reviewed_pend) AS reviewed_pend
+             FROM counted
+             GROUP BY project_id, action_class
+         ),
+         digests AS (
+             SELECT runs.project_id AS project_id,
+                    shadow_decisions.action_class AS action_class,
+                    shadow_decisions.policy_digest AS policy_digest
+             FROM shadow_decisions
+             JOIN runs ON runs.id = shadow_decisions.run_id
+             WHERE runs.mode = 'shadow'
+             UNION ALL
+             SELECT project_id, action_class, NULLIF(policy_digest, '')
+             FROM shadow_decision_days
+             WHERE mode = 'shadow'
+         ),
+         policies AS (
+             SELECT project_id, action_class, COUNT(DISTINCT policy_digest) AS policies
+             FROM digests
+             GROUP BY project_id, action_class
+         )
+         SELECT classes.project_id,
+                classes.action_class,
+                CASE WHEN classes.withheld_total = classes.total THEN 1 ELSE 0 END AS withheld,
+                COALESCE(policies.policies, 0) AS policies,
+                classes.would_pend,
+                classes.reviewed_pend
+         FROM classes
+         LEFT JOIN policies
+                ON policies.project_id = classes.project_id
+               AND policies.action_class = classes.action_class";
+
+    // One row per (project, action class): project_id, action_class, then the four counters in the
+    // order the SELECT lists them. The distinct reviewed actions are counted below, in Rust.
+    type ReadinessRow = (String, String, i64, i64, i64, i64);
+    let rows: Vec<ReadinessRow> = sqlx::query_as(SQL).fetch_all(pool).await?;
+
+    // Live reviewed rows, grouped in SQL by the raw action and hashed here, beside the hashes
+    // `rollup::prune` kept. (project, class) -> action hash -> a person ever disagreed.
+    let live: Vec<ReviewedActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT runs.project_id, shadow_decisions.action_class, shadow_decisions.tool_name,
+                COALESCE(shadow_decisions.tool_input, ''),
+                MAX(CASE WHEN ({AGREE_CASE}) = 0 THEN 1 ELSE 0 END)
+         FROM shadow_decisions
+         JOIN runs ON runs.id = shadow_decisions.run_id
+         WHERE runs.mode = 'shadow' AND shadow_decisions.human_verdict IS NOT NULL
+         GROUP BY runs.project_id, shadow_decisions.action_class, shadow_decisions.tool_name,
+                  COALESCE(shadow_decisions.tool_input, '')"
+    )))
+    .fetch_all(pool)
+    .await?;
+    let kept: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT project_id, action_class, action_hash, disagreed FROM shadow_reviewed_actions",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut actions: std::collections::HashMap<
+        (String, String),
+        std::collections::HashMap<String, bool>,
+    > = std::collections::HashMap::new();
+    let hashed = live
+        .into_iter()
+        .map(|(project, class, name, input, d)| (project, class, action_hash(&name, &input), d));
+    for (project, class, hash, disagreed) in hashed.chain(kept) {
+        let slot = actions
+            .entry((project, class))
+            .or_default()
+            .entry(hash)
+            .or_insert(false);
+        *slot |= disagreed != 0;
+    }
+
+    let mut readiness: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new();
+    for (project_id, action_class, withheld, policies, would_pend, reviewed_pend) in rows {
+        // A count and NOT a `GROUP BY`, and the tempting change is the wrong one. This function's
+        // contract above is that each action class contributes exactly one row, "even when
+        // historical classifier versions recorded different decisions for it" — grouping by digest
+        // would fragment the sample, and with `READINESS_MIN_REVIEWED = 10` every edit of
+        // `~/.nucleos/github.yaml` would restart ten reviews of progress toward promotion. Whoever tuned
+        // their policy more often would be permanently further from being allowed to use it.
+        //
+        // It goes into a WARNING and not into the tuple, deliberately. `shadow_readiness` returns
+        // `(i64, i64, i64)` and the shell reads those computed numbers off the daemon "so the button
+        // the user sees and the bar the product enforces can never gate on different numbers" — a
+        // fourth number changes the signature and every consumer, and the shell is out of scope.
+        // Putting it on screen is one line in another delivery, alongside the shell change it forces.
+        if policies > 1 {
+            tracing::warn!(
+                project_id = %project_id,
+                action_class = %action_class,
+                policies,
+                "shadow evidence for one action class spans more than one github policy"
+            );
+        }
+        // Distinct actions over the UNION of the live keys and the kept ones: an action reviewed
+        // on both sides of the retention window is one action, and one disagreement anywhere
+        // makes it a disagreement ("an action anyone disagreed about never counts as agreement").
+        let (reviewed, agree) = actions
+            .get(&(project_id.clone(), action_class.clone()))
+            .map_or((0, 0), |keys| {
+                let reviewed = keys.len() as i64;
+                let disagreed = keys.values().filter(|&&d| d).count() as i64;
+                (reviewed, reviewed - disagreed)
+            });
+        let entry = readiness.entry(project_id).or_insert((0, 0, 0));
+        entry.1 += 1;
+        // Here and not inside `class_ready`, which the judge also reads and which knows nothing of
+        // decisions. `deny` is left out of this check on purpose.
+        let withheld_unchecked = would_pend > 0 && reviewed_pend == 0;
+        if class_ready(reviewed, agree) && !withheld_unchecked {
+            entry.0 += 1;
+            if withheld != 0 && RESTRAINT_EVIDENCE_CLASSES.contains(&action_class.as_str()) {
+                entry.2 += 1;
+            }
+        }
+    }
+    Ok(readiness)
+}
+
+/// `(classes_ready, classes_total, withheld_classes_ready)` for one project — same rule as
+/// `shadow_readiness`, used by the promotion nudge to spot the moment a project crosses the bar.
+pub async fn project_readiness(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<(i64, i64, i64)> {
+    Ok(shadow_readiness(pool)
+        .await?
+        .remove(project_id)
+        .unwrap_or((0, 0, 0)))
+}
+
+/// The project a shadow decision belongs to, or `None` when the decision id is unknown.
+pub async fn project_of_decision(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT runs.project_id
+         FROM shadow_decisions
+         JOIN runs ON runs.id = shadow_decisions.run_id
+         WHERE shadow_decisions.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::governance::classifier::Decision;
+    use crate::governance::classifier::{CLASSIFIER_VERSION, Classification};
+    use serde_json::json;
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        crate::testdb::fresh_pool().await
+    }
+
+    async fn insert_run(pool: &sqlx::SqlitePool, project_id: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, created_at)
+             VALUES (?, 'test', 'running', '2026-07-18T00:00:00Z')",
+        )
+        .bind(project_id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn insert_run_with_mode(pool: &sqlx::SqlitePool, project_id: &str, mode: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES (?, 'test', 'running', ?, '2026-07-18T00:00:00Z')",
+        )
+        .bind(project_id)
+        .bind(mode)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A DISTINCT action each time. Readiness counts distinct actions rather than rows, so a helper
+    /// that reused one `tool_input` would quietly turn every arithmetic test into one piece of
+    /// evidence repeated N times — the exact thing readiness now refuses to accept.
+    async fn insert_shadow(
+        pool: &sqlx::SqlitePool,
+        run_id: i64,
+        action_class: &str,
+        decision: &str,
+        verdict: Option<&str>,
+    ) -> i64 {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        insert_shadow_with_input(
+            pool,
+            run_id,
+            action_class,
+            decision,
+            verdict,
+            &format!(r#"{{"command":"cmd-{unique}"}}"#),
+        )
+        .await
+    }
+
+    async fn insert_shadow_with_input(
+        pool: &sqlx::SqlitePool,
+        run_id: i64,
+        action_class: &str,
+        decision: &str,
+        verdict: Option<&str>,
+        tool_input: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO shadow_decisions
+             (run_id, tool_name, tool_input, decision, reason, action_class,
+              classifier_version, human_verdict, reviewed_at, created_at)
+             VALUES (?, 'Bash', ?, ?, 'test reason', ?, ?, ?,
+                     CASE WHEN ? IS NULL THEN NULL ELSE '2026-07-18T01:00:00Z' END,
+                     '2026-07-18T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(tool_input)
+        .bind(decision)
+        .bind(action_class)
+        .bind(CLASSIFIER_VERSION as i64)
+        .bind(verdict)
+        .bind(verdict)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    fn classification(decision: &str, action_class: &'static str) -> Classification {
+        Classification {
+            decision: Decision {
+                decision: decision.to_owned(),
+                reason: "classified reason".to_owned(),
+            },
+            action_class,
+            reason: "classified reason".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_decision_persists_reviewable_classifier_snapshot() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let tool_input = json!({"command": "cargo test", "nested": {"full": true}});
+
+        let id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "read-local"),
+            "0123456789abcdef",
+        )
+        .await
+        .unwrap();
+
+        let row: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.run_id, run_id);
+        assert_eq!(row.tool_name, "Bash");
+        assert_eq!(
+            row.tool_input.as_deref(),
+            Some(tool_input.to_string().as_str())
+        );
+        assert_eq!(row.decision, "allow");
+        assert_eq!(row.reason.as_deref(), Some("classified reason"));
+        assert_eq!(row.action_class, "read-local");
+        assert_eq!(row.classifier_version, CLASSIFIER_VERSION as i64);
+        // Both identifiers, because they mean different things: the version is the CODE, and the
+        // digest is the configuration a person edits. A row carrying only the first cannot tell two
+        // machines on the same version that decided the same `gh` line differently apart.
+        assert_eq!(row.policy_digest.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(row.human_verdict, None);
+        assert_eq!(row.reviewed_at, None);
+        chrono::DateTime::parse_from_rfc3339(&row.created_at).unwrap();
+        // Nothing to join yet — `PostToolUse` has not fired for this call.
+        assert_eq!(row.outcome, None);
+        assert_eq!(row.outcome_at, None);
+        assert_eq!(row.outcome_event, None);
+    }
+
+    /// Every row is served to the review screen, so a secret on the command line or in what the
+    /// tool printed is redacted before it is stored, a huge response is cut with a marker, and the
+    /// input stays JSON the judge can parse back. The outcome still lands on its own decision:
+    /// both halves store the input the same way.
+    #[tokio::test]
+    async fn a_stored_decision_is_redacted_and_capped() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let token = format!("ghp_{}", "a".repeat(36));
+        let tool_input =
+            json!({"command": format!("export GITHUB_TOKEN=\"ghsecret1\"; echo {token}")});
+
+        let id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "read-local"),
+            "digest",
+        )
+        .await
+        .unwrap();
+        let tool_response = json!({
+            "stdout": format!("{token}\n{}", "x".repeat(STORED_TEXT_CHARS * 4)),
+            "exit_code": 0
+        });
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &tool_response,
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let row: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let input = row.tool_input.expect("the input is stored");
+        assert!(!input.contains(&token), "{input}");
+        assert!(!input.contains("ghsecret1"), "{input}");
+        serde_json::from_str::<Value>(&input).expect("the stored input is still JSON");
+
+        let outcome = row.outcome.expect("the outcome landed on its own decision");
+        assert!(!outcome.contains(&token), "{outcome}");
+        assert!(
+            outcome.chars().count() <= STORED_TEXT_CHARS,
+            "{}",
+            outcome.len()
+        );
+        assert!(outcome.contains("[...]"), "a cut is marked");
+    }
+
+    /// The ledger's whole point: one `Bash` call, its decision AND its outcome, on the same row.
+    #[tokio::test]
+    async fn record_outcome_joins_a_bash_calls_decision_and_result() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let tool_input = json!({"command": "git push origin main"});
+
+        let id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "push-merge-deploy"),
+            "digest",
+        )
+        .await
+        .unwrap();
+
+        let tool_response = json!({"success": true, "exit_code": 0});
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &tool_response,
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let row: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // The decision half, untouched by recording the outcome.
+        assert_eq!(row.decision, "allow");
+        // The outcome half, now filled in.
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some(tool_response.to_string().as_str())
+        );
+        assert_eq!(row.outcome_event.as_deref(), Some("PostToolUse"));
+        chrono::DateTime::parse_from_rfc3339(row.outcome_at.as_deref().unwrap()).unwrap();
+    }
+
+    /// Two pending decisions for the identical `(tool_name, tool_input)`, before either outcome
+    /// lands: the ordering has to pick between them, not just find "a" row. Outcomes arrive in the
+    /// same order the decisions were taken, so the first outcome belongs to the first decision and
+    /// the second to the second — never the reverse, which is what `DESC` used to produce.
+    #[tokio::test]
+    async fn record_outcome_matches_the_oldest_unfilled_decision_of_two_identical_ones() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let tool_input = json!({"command": "git push origin main"});
+
+        let first_id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "push-merge-deploy"),
+            "digest",
+        )
+        .await
+        .unwrap();
+        let second_id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "push-merge-deploy"),
+            "digest",
+        )
+        .await
+        .unwrap();
+
+        let first_response = json!({"success": true, "exit_code": 0});
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &first_response,
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let second_response = json!({"success": false, "exit_code": 1});
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &second_response,
+            "PostToolUseFailure",
+        )
+        .await
+        .unwrap();
+
+        let first: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(first_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let second: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(second_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // The first decision taken gets the first outcome to arrive, not the second.
+        assert_eq!(
+            first.outcome.as_deref(),
+            Some(first_response.to_string().as_str())
+        );
+        assert_eq!(first.outcome_event.as_deref(), Some("PostToolUse"));
+        // The second decision taken gets the second outcome, on its own row.
+        assert_eq!(
+            second.outcome.as_deref(),
+            Some(second_response.to_string().as_str())
+        );
+        assert_eq!(second.outcome_event.as_deref(), Some("PostToolUseFailure"));
+    }
+
+    /// The half of the invariant that keeps `record_outcome` from inventing evidence: a `real`-mode
+    /// run has no `shadow_decisions` row at all (`record_decision` is never called for it), so an
+    /// outcome arriving for one must record nothing — not fail, and not create a row that would
+    /// make `list_unreviewed`/`scoreboard` think a decision was taken when none was.
+    #[tokio::test]
+    async fn an_outcome_with_no_matching_decision_records_nothing_and_does_not_fail() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let tool_input = json!({"command": "git push origin main"});
+
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &json!({"success": true}),
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no decision row existed, so none must be invented"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoreboard_is_project_scoped_and_counts_would_decisions_by_class() {
+        let pool = test_pool().await;
+        let run_a = insert_run(&pool, "project-a").await;
+        let run_b = insert_run(&pool, "project-b").await;
+        insert_shadow(&pool, run_a, "read-local", "allow", None).await;
+        insert_shadow(&pool, run_a, "read-local", "pending_approval", None).await;
+        insert_shadow(&pool, run_a, "destructive", "deny", None).await;
+        insert_shadow(&pool, run_b, "read-local", "deny", Some("reject")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(
+            tallies,
+            vec![
+                ClassTally {
+                    mode: "real".to_owned(),
+                    action_class: "destructive".to_owned(),
+                    total: 1,
+                    would_allow: 0,
+                    would_pend: 0,
+                    would_deny: 1,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
+                },
+                ClassTally {
+                    mode: "real".to_owned(),
+                    action_class: "read-local".to_owned(),
+                    total: 2,
+                    would_allow: 1,
+                    would_pend: 1,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 2,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoreboard_splits_tallies_by_run_mode() {
+        let pool = test_pool().await;
+        let shadow_run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        insert_shadow(&pool, shadow_run, "read-local", "allow", None).await;
+        insert_shadow(
+            &pool,
+            shadow_run,
+            "push-merge-deploy",
+            "pending_approval",
+            None,
+        )
+        .await;
+        insert_shadow(&pool, worktree_run, "read-local", "allow", None).await;
+        insert_shadow(
+            &pool,
+            worktree_run,
+            "push-merge-deploy",
+            "pending_approval",
+            None,
+        )
+        .await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(
+            tallies,
+            vec![
+                ClassTally {
+                    mode: "shadow".to_owned(),
+                    action_class: "push-merge-deploy".to_owned(),
+                    total: 1,
+                    would_allow: 0,
+                    would_pend: 1,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
+                },
+                ClassTally {
+                    mode: "shadow".to_owned(),
+                    action_class: "read-local".to_owned(),
+                    total: 1,
+                    would_allow: 1,
+                    would_pend: 0,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
+                },
+                ClassTally {
+                    mode: "worktree".to_owned(),
+                    action_class: "push-merge-deploy".to_owned(),
+                    total: 1,
+                    would_allow: 0,
+                    would_pend: 1,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
+                },
+                ClassTally {
+                    mode: "worktree".to_owned(),
+                    action_class: "read-local".to_owned(),
+                    total: 1,
+                    would_allow: 1,
+                    would_pend: 0,
+                    would_deny: 0,
+                    reviewed: 0,
+                    agree: 0,
+                    disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoreboard_counts_human_agreement_and_disagreement() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("approve")).await;
+        insert_shadow(
+            &pool,
+            run_id,
+            "governance",
+            "pending_approval",
+            Some("reject"),
+        )
+        .await;
+        insert_shadow(&pool, run_id, "governance", "deny", Some("approve")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(tallies[0].mode, "real");
+        assert_eq!(tallies[0].reviewed, 3);
+        assert_eq!(tallies[0].agree, 2);
+        assert_eq!(tallies[0].disagree, 1);
+    }
+
+    async fn set_created_at(pool: &sqlx::SqlitePool, id: i64, created_at: &str) {
+        sqlx::query("UPDATE shadow_decisions SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoreboard_stricter_plus_looser_equals_disagree() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("reject")).await;
+        insert_shadow(&pool, run_id, "governance", "deny", Some("approve")).await;
+        insert_shadow(
+            &pool,
+            run_id,
+            "governance",
+            "pending_approval",
+            Some("approve"),
+        )
+        .await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("approve")).await;
+        insert_shadow(&pool, run_id, "governance", "deny", Some("reject")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(tallies[0].disagree, 3);
+        assert_eq!(tallies[0].stricter, 1, "reject of an allow is stricter");
+        assert_eq!(tallies[0].looser, 2, "approve of a deny/pend is looser");
+        assert_eq!(tallies[0].stricter + tallies[0].looser, tallies[0].disagree);
+    }
+
+    #[tokio::test]
+    async fn scoreboard_reports_unreviewed_oldest_and_reviewed_by_decision() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let newer = insert_shadow(&pool, run_id, "governance", "pending_approval", None).await;
+        let older = insert_shadow(&pool, run_id, "governance", "allow", None).await;
+        set_created_at(&pool, newer, "2026-07-20T00:00:00Z").await;
+        set_created_at(&pool, older, "2026-07-10T00:00:00Z").await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("approve")).await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("reject")).await;
+        insert_shadow(
+            &pool,
+            run_id,
+            "governance",
+            "pending_approval",
+            Some("approve"),
+        )
+        .await;
+        insert_shadow(&pool, run_id, "governance", "deny", Some("reject")).await;
+        insert_shadow(&pool, run_id, "read-local", "allow", Some("approve")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        let gov = tallies
+            .iter()
+            .find(|t| t.action_class == "governance")
+            .unwrap();
+        assert_eq!(gov.unreviewed, 2);
+        assert_eq!(
+            gov.oldest_unreviewed_at.as_deref(),
+            Some("2026-07-10T00:00:00Z")
+        );
+        assert_eq!(gov.reviewed_allow, 2);
+        assert_eq!(gov.reviewed_pend, 1);
+        assert_eq!(gov.reviewed_deny, 1);
+        let other = tallies
+            .iter()
+            .find(|t| t.action_class == "read-local")
+            .unwrap();
+        assert_eq!(other.unreviewed, 0);
+        assert_eq!(other.oldest_unreviewed_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_mixed_class_is_not_ready_with_no_withheld_decision_reviewed() {
+        let pool = test_pool().await;
+        let run_id = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run_id, "governance", "allow", Some("approve")).await;
+        }
+        for _ in 0..3 {
+            insert_shadow(&pool, run_id, "governance", "pending_approval", None).await;
+        }
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+        let t = &tallies[0];
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (ready, total, _withheld) = readiness.get("project-a").copied().unwrap();
+
+        assert!(
+            class_ready(t.reviewed, t.agree),
+            "the allows alone must clear the bar, or this test no longer isolates the withheld rule"
+        );
+        assert_eq!(
+            (ready, total),
+            (0, 1),
+            "agreement on allows alone must not make a class with unreviewed withholds ready"
+        );
+        assert_eq!(t.reviewed_pend, 0, "no withheld decision was reviewed");
+        assert!(t.would_pend > 0);
+    }
+
+    #[tokio::test]
+    async fn scoreboard_keeps_worktree_in_its_own_row_for_the_new_fields() {
+        let pool = test_pool().await;
+        let shadow_run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        let pending = insert_shadow(&pool, shadow_run, "governance", "allow", None).await;
+        set_created_at(&pool, pending, "2026-07-10T00:00:00Z").await;
+        insert_shadow(&pool, worktree_run, "governance", "allow", Some("reject")).await;
+        insert_shadow(&pool, worktree_run, "governance", "deny", Some("approve")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(tallies.len(), 2);
+        let (s, w) = (&tallies[0], &tallies[1]);
+        assert_eq!((s.mode.as_str(), w.mode.as_str()), ("shadow", "worktree"));
+        assert_eq!(s.unreviewed, 1);
+        assert_eq!(
+            s.oldest_unreviewed_at.as_deref(),
+            Some("2026-07-10T00:00:00Z")
+        );
+        assert_eq!((s.stricter, s.looser, s.reviewed_allow), (0, 0, 0));
+        assert_eq!(w.unreviewed, 0);
+        assert_eq!(w.oldest_unreviewed_at, None);
+        assert_eq!((w.stricter, w.looser), (1, 1));
+        assert_eq!(
+            (w.reviewed_allow, w.reviewed_pend, w.reviewed_deny),
+            (1, 0, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoreboard_new_fields_do_not_change_existing_counts_or_the_95_percent_edge() {
+        let pool = test_pool().await;
+        let run_id = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for i in 0..20 {
+            let a = if i < 1 { "reject" } else { "approve" };
+            let b = if i < 2 { "reject" } else { "approve" };
+            insert_shadow(&pool, run_id, "edge-a", "allow", Some(a)).await;
+            insert_shadow(&pool, run_id, "edge-b", "allow", Some(b)).await;
+        }
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        let (a, b) = (&tallies[0], &tallies[1]);
+        assert_eq!(
+            (a.total, a.would_allow, a.would_pend, a.would_deny),
+            (20, 20, 0, 0)
+        );
+        assert_eq!((a.reviewed, a.agree, a.disagree), (20, 19, 1));
+        assert_eq!((b.reviewed, b.agree, b.disagree), (20, 18, 2));
+        assert!(class_ready(20, 19));
+        assert!(!class_ready(20, 18));
+        assert!(class_ready(a.reviewed, a.agree));
+        assert!(!class_ready(b.reviewed, b.agree));
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 2, 0)));
+    }
+
+    #[tokio::test]
+    async fn list_unreviewed_returns_only_null_verdicts_for_project() {
+        let pool = test_pool().await;
+        let run_a = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let run_b = insert_run_with_mode(&pool, "project-b", "shadow").await;
+        let expected = insert_shadow(&pool, run_a, "read-local", "allow", None).await;
+        insert_shadow(&pool, run_a, "destructive", "deny", Some("reject")).await;
+        insert_shadow(&pool, run_b, "read-local", "allow", None).await;
+
+        let decisions = list_unreviewed(&pool, "project-a").await.unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].id, expected);
+        assert_eq!(decisions[0].human_verdict, None);
+    }
+
+    /// `list_unreviewed` shows exactly what `shadow_readiness` counts toward promotion: unreviewed
+    /// decisions from `shadow`-mode runs, and nothing from a `worktree`-mode run, which was already
+    /// enforced and has no verdict left to collect.
+    #[tokio::test]
+    async fn a_lista_de_revisao_so_mostra_o_que_conta_para_promocao() {
+        let pool = test_pool().await;
+        let shadow_run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        let expected = insert_shadow(&pool, shadow_run, "read-local", "allow", None).await;
+        insert_shadow(&pool, worktree_run, "read-local", "allow", None).await;
+
+        let decisions = list_unreviewed(&pool, "project-a").await.unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].id, expected);
+    }
+
+    #[tokio::test]
+    async fn set_verdict_removes_unreviewed_and_updates_scoreboard() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let id = insert_shadow(&pool, run_id, "read-local", "allow", None).await;
+
+        set_verdict(&pool, id, "approve").await.unwrap();
+
+        assert!(
+            list_unreviewed(&pool, "project-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT human_verdict, reviewed_at FROM shadow_decisions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0.as_deref(), Some("approve"));
+        chrono::DateTime::parse_from_rfc3339(row.1.as_deref().unwrap()).unwrap();
+        let tally = &scoreboard(&pool, "project-a").await.unwrap()[0];
+        assert_eq!(tally.mode, "real");
+        assert_eq!((tally.reviewed, tally.agree, tally.disagree), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_verdict_is_recorded_once_and_a_replay_leaves_it_alone() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let id = insert_shadow(&pool, run_id, "read-local", "allow", None).await;
+
+        assert!(set_verdict(&pool, id, "approve").await.unwrap());
+        let first: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT human_verdict, reviewed_at FROM shadow_decisions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // The replay must change nothing AND report that it changed nothing: `post_shadow_verdict`
+        // turns `Ok(false)` into 404, which is the behaviour its own comment already promises.
+        // Before the `human_verdict IS NULL` guard this returned true, answered 204, and moved
+        // `reviewed_at` — so a double click rewrote when the decision was judged, and a correction
+        // destroyed the original instant with no trace that there had been one.
+        assert!(!set_verdict(&pool, id, "reject").await.unwrap());
+        let after: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT human_verdict, reviewed_at FROM shadow_decisions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after, first);
+        assert_eq!(after.0.as_deref(), Some("approve"));
+
+        // An unknown id is the other honest `false`, and the handler answers it the same way.
+        assert!(!set_verdict(&pool, id + 999, "approve").await.unwrap());
+    }
+
+    #[test]
+    fn class_ready_needs_both_enough_reviews_and_enough_agreement() {
+        // Under the review floor, however perfect the agreement.
+        assert!(!class_ready(9, 9));
+        // Exactly at the floor, unanimous.
+        assert!(class_ready(10, 10));
+        // Exactly at the rate — 19/20 is 95%, the boundary the gate is decided on.
+        assert!(class_ready(20, 19));
+        // Just under: 18/20 is 90%.
+        assert!(!class_ready(20, 18));
+        // No reviews at all is not "vacuously perfect".
+        assert!(!class_ready(0, 0));
+    }
+
+    #[test]
+    fn promotable_requires_evidence_not_just_the_absence_of_failure() {
+        // A project that has never exercised a class has not earned anything.
+        assert!(!promotable(0, 0, 0));
+        assert!(promotable(1, 1, 1));
+        assert!(promotable(4, 4, 1));
+        // One class still short holds the whole project.
+        assert!(!promotable(3, 4, 1));
+    }
+
+    #[tokio::test]
+    async fn promotable_requires_a_withheld_class_not_just_reads() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // Both exercised classes are classifier allows, and both clear the existing review bar.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+            insert_shadow(&pool, run, "vcs-local", "allow", Some("approve")).await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap();
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (2, 2, 0)
+        );
+        assert!(!promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_class_with_two_decisions_counts_as_one_class() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // Historical classifier versions can leave one action class carrying more than one
+        // decision. Both row-groups independently clear the review bar, but they are still evidence
+        // for one exercised class.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+            insert_shadow(&pool, run, "read-local", "pending_approval", Some("reject")).await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap();
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (1, 1, 0),
+            "one action class must not become two readiness classes when its decision changes"
+        );
+        assert!(!promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn promotable_once_a_withheld_class_is_reviewed_and_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // The same ready allow-only corpus is not enough by itself.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+            insert_shadow(&pool, run, "vcs-local", "allow", Some("approve")).await;
+        }
+        // A reviewed class where the classifier withheld supplies the missing evidence.
+        for _ in 0..10 {
+            insert_shadow(
+                &pool,
+                run,
+                "push-merge-deploy",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap();
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (3, 3, 1)
+        );
+        assert!(promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_catch_all_class_is_not_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(
+                &pool,
+                run,
+                "unrecognized",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = project_readiness(&pool, "project-a").await.unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 0));
+        assert!(!promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
+    async fn a_named_hazard_class_is_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(
+                &pool,
+                run,
+                "push-merge-deploy",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = shadow_readiness(&pool)
+            .await
+            .unwrap()
+            .get("project-a")
+            .copied()
+            .unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 1));
+        assert!(promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
+    async fn the_nucleos_data_class_is_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // A hard deny has no approval path: every decision of the class is a refusal.
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(&pool, run, "nucleos-data", "deny", Some("reject")).await;
+        }
+
+        let readiness = shadow_readiness(&pool)
+            .await
+            .unwrap()
+            .get("project-a")
+            .copied()
+            .unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 1));
+        assert!(promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_workspace_is_not_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(
+                &pool,
+                run,
+                "no-workspace",
+                "pending_approval",
+                Some("reject"),
+            )
+            .await;
+        }
+
+        let readiness = project_readiness(&pool, "project-a").await.unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 0));
+        assert!(!promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
+    async fn zero_exercised_classes_is_still_not_promotable() {
+        let pool = test_pool().await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (classes_ready, classes_total, withheld_classes_ready) =
+            readiness.get("project-a").copied().unwrap_or((0, 0, 0));
+
+        assert_eq!(
+            (classes_ready, classes_total, withheld_classes_ready),
+            (0, 0, 0)
+        );
+        assert!(!promotable(
+            classes_ready,
+            classes_total,
+            withheld_classes_ready
+        ));
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn shadow_readiness_counts_ready_classes_per_project() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // `read-local` clears the bar: 10 reviewed, all agreeing.
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        // `push-merge-deploy` is exercised but nowhere near reviewed enough.
+        insert_shadow(
+            &pool,
+            run,
+            "push-merge-deploy",
+            "pending_approval",
+            Some("reject"),
+        )
+        .await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        // The only ready class is an `allow` one, so nothing withheld has been validated yet.
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 2, 0)));
+        assert!(!promotable(1, 2, 0));
+    }
+
+    /// A class with withheld (`pending_approval`) decisions but none of them reviewed is not ready:
+    /// the allow-side evidence says nothing about whether the withholds were right.
+    #[tokio::test]
+    async fn class_with_unreviewed_pending_approval_is_not_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        insert_shadow(&pool, run, "read-local", "pending_approval", None).await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        assert_eq!(readiness.get("project-a").copied(), Some((0, 1, 0)));
+    }
+
+    /// Symmetric guard: one reviewed, agreeing `pending_approval` decision keeps the class ready.
+    #[tokio::test]
+    async fn class_with_reviewed_pending_approval_stays_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        insert_shadow(&pool, run, "read-local", "pending_approval", Some("reject")).await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        // Mixed allow + pending evidence is never "withheld", so the third number stays 0.
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 1, 0)));
+    }
+
+    /// Symmetric guard: a class with no `pending_approval` decisions at all is unaffected.
+    #[tokio::test]
+    async fn class_with_only_allow_decisions_stays_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 1, 0)));
+    }
+
+    /// The promotion bar exists to say the classifier has been checked against enough real
+    /// variety. One command looped ten times and bulk-approved is one thing checked ten times, and
+    /// counting rows let exactly that unlock active mode.
+    #[tokio::test]
+    async fn repeating_one_action_does_not_earn_promotion() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        for _ in 0..10 {
+            insert_shadow_with_input(
+                &pool,
+                run,
+                "read-local",
+                "allow",
+                Some("approve"),
+                r#"{"command":"ls"}"#,
+            )
+            .await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        assert_eq!(
+            readiness.get("project-a").copied(),
+            Some((0, 1, 0)),
+            "one action reviewed ten times is one piece of evidence"
+        );
+        assert!(!promotable(0, 1, 0));
+    }
+
+    /// A person disagreeing about an action means the classifier does not handle it, however many
+    /// times it was also approved. Counting agreements per row let a later approval cancel out an
+    /// earlier rejection of the very same command.
+    #[tokio::test]
+    async fn an_action_ever_rejected_never_counts_as_agreement() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // Nine distinct actions the human agreed with.
+        for _ in 0..9 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        // A tenth action, rejected once and approved once — the classifier called it `allow`.
+        let contested = r#"{"command":"curl http://evil.test"}"#;
+        insert_shadow_with_input(&pool, run, "read-local", "allow", Some("reject"), contested)
+            .await;
+        insert_shadow_with_input(
+            &pool,
+            run,
+            "read-local",
+            "allow",
+            Some("approve"),
+            contested,
+        )
+        .await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        // 10 distinct actions reviewed, 9 agreed = 90%, under the 95% bar.
+        assert_eq!(readiness.get("project-a").copied(), Some((0, 1, 0)));
+    }
+
+    /// The window between the classifier change and the migration, and the reason it is harmless.
+    ///
+    /// Rows written before `policy_digest` existed carry NULL, and the reader counts distinct
+    /// digests rather than grouping by them — so those rows go on counting toward review and
+    /// agreement exactly as they always did. Under a `GROUP BY` they would have formed an orphan
+    /// pocket that never reaches ten reviews and never promotes anything, which is the shape of the
+    /// bug this test exists to keep out.
+    #[tokio::test]
+    async fn rows_with_no_digest_still_count_toward_promotion() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+
+        assert_eq!(
+            shadow_readiness(&pool)
+                .await
+                .unwrap()
+                .get("project-a")
+                .copied(),
+            Some((1, 1, 0)),
+            "a class whose evidence predates the column must still be able to become ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_readiness_ignores_non_shadow_runs() {
+        let pool = test_pool().await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, worktree_run, "read-local", "allow", Some("approve")).await;
+        }
+
+        // Promotion out of shadow is earned by shadow evidence; an enforced worktree decision was
+        // never a hypothetical the human could have overruled, so it must not count toward the bar.
+        assert_eq!(
+            shadow_readiness(&pool).await.unwrap().get("project-a"),
+            None
+        );
+        assert_eq!(
+            project_readiness(&pool, "project-a").await.unwrap(),
+            (0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn project_readiness_scopes_to_one_project() {
+        let pool = test_pool().await;
+        let run_a = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let run_b = insert_run_with_mode(&pool, "project-b", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run_a, "read-local", "allow", Some("approve")).await;
+        }
+        insert_shadow(&pool, run_b, "read-local", "allow", None).await;
+
+        assert_eq!(
+            project_readiness(&pool, "project-a").await.unwrap(),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            project_readiness(&pool, "project-b").await.unwrap(),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            project_readiness(&pool, "project-c").await.unwrap(),
+            (0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn project_of_decision_resolves_through_the_run() {
+        let pool = test_pool().await;
+        let run = insert_run(&pool, "project-a").await;
+        let id = insert_shadow(&pool, run, "read-local", "allow", None).await;
+
+        assert_eq!(
+            project_of_decision(&pool, id).await.unwrap().as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(project_of_decision(&pool, id + 999).await.unwrap(), None);
+    }
+}

@@ -1,0 +1,823 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn(), openStream: vi.fn() }));
+vi.mock("../data/client", async (original) => ({
+  ...(await original<typeof import("../data/client")>()),
+  ...daemon,
+}));
+
+import { Browser } from "./Browser";
+import { ApiRefusal } from "../data/client";
+import type { BrowserSession, Site, SidecarState, SubsystemReadout, Written } from "../data/browser";
+import { forgetSeat, rememberSeat, seatNonce } from "../data/seat";
+import { daemonFetch, daemonState, project, renderWithRouter } from "../test/harness";
+
+beforeEach(() => {
+  for (const id of [1, 2, 3, 5]) forgetSeat(id);
+  daemon.apiFetch.mockReset();
+  daemon.apiText.mockReset();
+  daemon.probeHealth.mockReset();
+  daemon.openStream.mockReset();
+});
+
+/* ------------------------------------------------------------- fixtures -- */
+
+function session(overrides: Partial<BrowserSession> = {}): BrowserSession {
+  return {
+    id: 5,
+    sidecar_id: "sc-1",
+    run_id: null,
+    project_id: "alpha",
+    profile_kind: "project",
+    profile_id: "alpha",
+    requested_url: "https://example.com/login",
+    final_url: "https://example.com/login",
+    rule: "ask",
+    mode: "human",
+    seat: null,
+    shell_eligible: false,
+    visible: false,
+    owner_chat_id: null,
+    refusal: null,
+    proposal_id: null,
+    chain: null,
+    chain_decided_at: null,
+    opened_at: "2026-08-17T09:00:00Z",
+    closed_at: null,
+    ...overrides,
+  };
+}
+
+function site(overrides: Partial<Site> = {}): Site {
+  return {
+    origin: "https://jira.example.org:443",
+    kind: "destination",
+    granted_at: "2026-08-17T09:00:00Z",
+    granted_for: null,
+    writable: false,
+    ...overrides,
+  };
+}
+
+function written(overrides: Partial<Written> = {}): Written {
+  return {
+    id: 1,
+    session_id: 5,
+    origin: "https://jira.example.org:443",
+    action: "https://jira.example.org/browse/X-1/comment",
+    method: "POST",
+    fields: ["body", "password"],
+    field_count: 2,
+    element_ref: "e7",
+    verb: "click",
+    files: [],
+    written_at: "2026-08-17T09:30:00Z",
+    ...overrides,
+  };
+}
+
+interface BrowserWorld {
+  sessions: BrowserSession[];
+  readout: { status: string; subsystems: SubsystemReadout[] };
+  sidecars: SidecarState[];
+  projects: ReturnType<typeof project>[];
+  /** What `GET /browser/sites/{id}` and `GET /browser/writes/{id}` answer. */
+  sites: Site[];
+  writes: Written[];
+  /** What `POST /browser/window` answers. Throw an `ApiRefusal` to refuse. */
+  onWindow: (body: string) => unknown;
+  /** Every non-GET body this page sent, by path, so a test can assert what left. */
+  posted: { path: string; body: string }[];
+}
+
+function browserWorld(overrides: Partial<BrowserWorld> = {}): BrowserWorld {
+  return {
+    sessions: [],
+    readout: { status: "ok", subsystems: [{ name: "browser_sidecar", status: "ok" }] },
+    sidecars: [],
+    projects: [],
+    sites: [],
+    writes: [],
+    onWindow: () => session({ id: 9 }),
+    posted: [],
+    ...overrides,
+  };
+}
+
+/**
+ * The pillar's own routes, over the foundation's responder — `Waiting.test.tsx`'s
+ * pattern. Anything this does not know falls through to the shared fixture, so
+ * `/projects` and `/autopilot/*` still answer without this file teaching them.
+ */
+function browserFetch(world: BrowserWorld): (path: string, init?: RequestInit) => Promise<unknown> {
+  const shared = daemonFetch(daemonState({ projects: world.projects }));
+  return async (path, init) => {
+    if (init?.method !== undefined && init.method !== "GET") {
+      world.posted.push({ path, body: String(init.body ?? "") });
+      if (path === "/browser/window" && init.method === "POST") {
+        return world.onWindow(String(init.body));
+      }
+      const take = /^\/browser\/sessions\/(\d+)\/take$/.exec(path);
+      if (take) {
+        const row = world.sessions.find((one) => one.id === Number(take[1]));
+        if (row) {
+          row.mode = "human";
+          row.seat = "shell";
+        }
+        return { session: row, seat_nonce: "n1" };
+      }
+      const real = /^\/browser\/sessions\/(\d+)\/window$/.exec(path);
+      if (real) {
+        const row = world.sessions.find((one) => one.id === Number(real[1]));
+        if (row) row.seat = "window";
+        return { session: row };
+      }
+      if (path === "/browser/return") {
+        return { chain: ["https://jira.example.org/login", "https://jira.example.org/browse/X-1"] };
+      }
+      if (path === "/browser/keep") {
+        return { granted: ["https://jira.example.org:443"] };
+      }
+      if (path === "/browser/readonly") return undefined;
+      return await shared(path, init);
+    }
+    switch (path) {
+      case "/browser/sessions":
+        return world.sessions;
+      case "/health/readout":
+        return world.readout;
+      case "/sidecars":
+        return world.sidecars;
+      default:
+        // Site grants render as soon as a project exists; answer them so that panel
+        // does not error into this file's output.
+        if (path.startsWith("/browser/sites/")) return world.sites;
+        if (path.startsWith("/browser/writes/")) return world.writes;
+        return await shared(path, init);
+    }
+  };
+}
+
+function renderBrowser() {
+  return renderWithRouter(<Browser />, { initialPath: "/browser" });
+}
+
+/* ---------------------------------------------------------- live sessions -- */
+
+describe("Browser - live sessions", () => {
+  it("lists every session mode and offers no wheel decision on this page", async () => {
+    const world = browserWorld({
+      sessions: [
+        session({ id: 1, mode: "agent" }),
+        session({ id: 2, mode: "wheel-requested", proposal_id: 91 }),
+        session({ id: 3, mode: "human" }),
+        session({ id: 4, mode: "delivery-failed" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    // Every mode's own copy, once each.
+    expect(await screen.findByText("agent is driving")).toBeDefined();
+    expect(screen.getByText("asking for the wheel")).toBeDefined();
+    expect(screen.getByText("you are driving")).toBeDefined();
+    expect(screen.getByText("the window would not open")).toBeDefined();
+
+    // The wheel-requested row points at Waiting rather than offering a
+    // decision of its own — the buttons that decide it appear exactly once
+    // in the app, and this is not the page that has them.
+    expect(screen.getByRole("link", { name: "answer it there" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: /wheel #\d+/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Refuse wheel/ })).toBeNull();
+
+    // This page's own actions exist, worded differently so neither is ever
+    // mistaken for the wheel decision above.
+    expect(screen.getByRole("button", { name: "Give the wheel back" })).toBeDefined();
+    expect(screen.getAllByRole("button", { name: "Close session" })).toHaveLength(2);
+
+    // And nothing on this page decided the wheel behind the scenes either.
+    const posted = daemon.apiFetch.mock.calls
+      .filter(([, init]) => (init as RequestInit | undefined)?.method === "POST")
+      .map(([path]) => String(path));
+    expect(posted).toEqual([]);
+  });
+
+  it("offers Watch on agent rows, one open at a time", async () => {
+    const world = browserWorld({
+      sessions: [
+        session({ id: 1, mode: "agent" }),
+        session({ id: 2, mode: "agent" }),
+        session({ id: 3, mode: "human" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    // A stream that never speaks: the view stays open and nothing else happens.
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    // Two agent rows, two buttons; the human row has none.
+    const watch = await screen.findAllByRole("button", { name: "Watch" });
+    expect(watch).toHaveLength(2);
+    expect(watch[0].getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(watch[0]);
+    expect(await screen.findByRole("button", { name: "Stop watching" })).toBeDefined();
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalledTimes(1));
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/1/live");
+
+    // Opening the other closes the first: still exactly one "Stop watching".
+    fireEvent.click(screen.getByRole("button", { name: "Watch" }));
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalledTimes(2));
+    expect(daemon.openStream.mock.calls[1][0]).toBe("/browser/sessions/2/live");
+    expect(screen.getAllByRole("button", { name: "Stop watching" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Watch" })).toHaveLength(1);
+    expect(screen.queryByAltText("live view of session 1")).toBeNull();
+
+    // And stopping leaves none open.
+    fireEvent.click(screen.getByRole("button", { name: "Stop watching" }));
+    expect(await screen.findAllByRole("button", { name: "Watch" })).toHaveLength(2);
+  });
+});
+
+/* ------------------------------------------------------ the wheel, in shell -- */
+
+describe("Browser - driving a session from the shell", () => {
+  const postsTo = (world: BrowserWorld, path: string) => world.posted.filter((one) => one.path === path);
+
+  it("offers Take the wheel only on an eligible agent session and drives with the returned nonce", async () => {
+    const world = browserWorld({
+      sessions: [
+        session({ id: 1, mode: "agent", shell_eligible: true }),
+        session({ id: 2, mode: "agent", shell_eligible: false }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    // One eligible row, one button; the other agent row only has Watch and Close.
+    const take = await screen.findAllByRole("button", { name: "Take the wheel" });
+    expect(take).toHaveLength(1);
+
+    fireEvent.click(take[0]);
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Stop the agent and drive it here" }));
+
+    await waitFor(() => expect(postsTo(world, "/browser/sessions/1/take")).toHaveLength(1));
+    // The nonce the core returned is the one this shell now holds, and the view opened on it.
+    await waitFor(() => expect(seatNonce(1)).toBe("n1"));
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalled());
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/1/live");
+    // The session came back as `human` on a shell seat: the toggle says it is driving.
+    expect(await screen.findByRole("button", { name: "Stop driving" })).toBeDefined();
+  });
+
+  it("a shell seat offers Give back to the agent, Close and Open real window", async () => {
+    const world = browserWorld({
+      sessions: [session({ id: 5, mode: "human", seat: "shell" })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    expect(await screen.findByRole("button", { name: "Give back to the agent" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Close" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Open real window" })).toBeDefined();
+    // The window-seat wording is not the one a shell seat gets.
+    expect(screen.queryByRole("button", { name: "Give the wheel back" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Give back to the agent" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Restore the fence and hand it back" }));
+    await waitFor(() => expect(postsTo(world, "/browser/return")).toHaveLength(1));
+    expect(JSON.parse(postsTo(world, "/browser/return")[0].body)).toEqual({ session_id: 5, to: "agent" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Close it and bring the chain back" }));
+    await waitFor(() => expect(postsTo(world, "/browser/return")).toHaveLength(2));
+    expect(JSON.parse(postsTo(world, "/browser/return")[1].body)).toEqual({ session_id: 5, to: "close" });
+
+    // Reversible, so a plain click and no hold.
+    fireEvent.click(screen.getByRole("button", { name: "Open real window" }));
+    await waitFor(() => expect(postsTo(world, "/browser/sessions/5/window")).toHaveLength(1));
+  });
+
+  it("on Windows shows no sessions list and no Open real window, but keeps the bar and site grants", async () => {
+    const ua = vi
+      .spyOn(navigator, "userAgent", "get")
+      .mockReturnValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    try {
+      const world = browserWorld({
+        sessions: [session({ id: 5, mode: "human", seat: "shell" })],
+      });
+      daemon.apiFetch.mockImplementation(browserFetch(world));
+      daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+      await renderBrowser();
+
+      expect(await screen.findByText("Site grants")).toBeDefined();
+      expect(screen.queryByRole("button", { name: "Open real window" })).toBeNull();
+      expect(screen.queryByText("Live sessions")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Give back to the agent" })).toBeNull();
+    } finally {
+      ua.mockRestore();
+    }
+  });
+
+  it("offers Drive here on a shell seat whose nonce was lost, and never otherwise", async () => {
+    const world = browserWorld({
+      sessions: [
+        session({ id: 1, mode: "human", seat: "shell" }),
+        session({ id: 2, mode: "human", seat: "shell" }),
+        session({ id: 3, mode: "human", seat: "window" }),
+      ],
+    });
+    rememberSeat(2, "held");
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    // Only row 1 lost its nonce: row 2 holds one, row 3 is a real window.
+    const drive = await screen.findAllByRole("button", { name: "Drive here" });
+    expect(drive).toHaveLength(1);
+
+    fireEvent.click(drive[0]);
+
+    await waitFor(() => expect(postsTo(world, "/browser/sessions/1/take")).toHaveLength(1));
+    await waitFor(() => expect(seatNonce(1)).toBe("n1"));
+    // With a nonce in hand the button is gone and the live view is driven.
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Drive here" })).toBeNull());
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalled());
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/1/live");
+    forgetSeat(2);
+  });
+
+  it("offers Watch on a wheel-requested row", async () => {
+    const world = browserWorld({
+      sessions: [session({ id: 2, mode: "wheel-requested", proposal_id: 91 })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    const watch = await screen.findByRole("button", { name: "Watch" });
+    expect(screen.getByRole("link", { name: "answer it there" })).toBeDefined();
+    fireEvent.click(watch);
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalledTimes(1));
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/2/live");
+  });
+});
+
+/* ---------------------------------------------------------------- health -- */
+
+describe("Browser - health", () => {
+  it("puts a non-running sidecar reason in the headline", async () => {
+    const world = browserWorld({
+      readout: { status: "degraded", subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }] },
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText("the browser sidecar is down: not-running")).toBeDefined();
+  });
+
+  it("reports the one browser subsystem the daemon has", async () => {
+    const world = browserWorld({
+      readout: {
+        status: "degraded",
+        subsystems: [
+          { name: "web_sidecar", status: "down", reason: "not-configured" },
+          { name: "browser_sidecar", status: "down", reason: "not-running" },
+          { name: "email_sidecar", status: "ok" },
+        ],
+      },
+      sidecars: [
+        {
+          name: "browser",
+          state: "down",
+          started_at: null,
+          last_failure: "exited: exit code: 1",
+          last_failure_at: "2026-08-18T08:00:00Z",
+          restarts: 3,
+          last_line: "panic: no display",
+          last_line_at: "2026-08-18T08:00:01Z",
+        },
+        {
+          name: "web",
+          state: "running",
+          started_at: "2026-08-18T07:00:00Z",
+          last_failure: null,
+          last_failure_at: null,
+          restarts: 0,
+          last_line: null,
+          last_line_at: null,
+        },
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    // The line under the bar: the browser's own last failure and restart count, from the row of
+    // `GET /sidecars` matched by the literal "browser" — not the health probe's "browser_sidecar".
+    const line = (await screen.findByText(/exited: exit code: 1/)).closest("p");
+    expect(line).not.toBeNull();
+    expect(line?.textContent).toMatch(/3 restarts/);
+
+    // The daemon answered with THREE subsystems and this call site asked for ONE: the other
+    // subsystem's reason is nowhere on the page, proving it was filtered rather than drawn first.
+    expect(screen.queryByText(/not-configured/)).toBeNull();
+  });
+});
+
+/** The dwell `ConfirmButton` needs between arming and confirming — a real gap. */
+function afterDwell(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 350));
+}
+
+/* ------------------------------------------------------------- writing -- */
+
+describe("Browser - the write grant", () => {
+  const withProject = (overrides: Partial<BrowserWorld> = {}) =>
+    browserWorld({ projects: [project({ project_id: "alpha" })], ...overrides });
+
+  /**
+   * The permissive answer is the one a person has to choose.
+   *
+   * A box that arrived ticked would make writing something granted by not
+   * reading the screen, which is the shape of consent that is not consent. The
+   * assertion is on the BODY that leaves, not on the checkbox: what the daemon
+   * receives is the permission, and a box wired to nothing would look identical
+   * on screen.
+   */
+  it("says a visible window's wheel goes back to the agent, not that the window closes", async () => {
+    // `give_back` routes a visible row to the panel's return: the window stays and the agent drives.
+    const world = withProject({
+      sessions: [session({ id: 4, mode: "human", seat: "window", visible: true, owner_chat_id: "c-web" })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+    fireEvent.click(await screen.findByRole("button", { name: "Give the wheel back" }));
+    await afterDwell();
+    expect(
+      await screen.findByRole("button", { name: "Hand it back to the agent in its window" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Close the window and bring the chain back" })).toBeNull();
+  });
+
+  it("keeps the chain without granting writing until somebody ticks the box", async () => {
+    const world = withProject({ sessions: [session({ id: 3, mode: "human" })] });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+    fireEvent.click(await screen.findByRole("button", { name: "Give the wheel back" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Close the window and bring the chain back" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Keep them" }));
+    // The question takes keyboard focus when it appears.
+    expect(document.activeElement).toBe(screen.getByRole("group", { name: "Keep these?" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Grant read on 2 origins" }));
+
+    await waitFor(() => {
+      expect(world.posted.some((one) => one.path === "/browser/keep")).toBe(true);
+    });
+    const kept = world.posted.find((one) => one.path === "/browser/keep");
+    expect(JSON.parse(kept?.body ?? "{}")).toEqual({
+      session_id: 3,
+      keep: true,
+      writable: false,
+    });
+  });
+
+  /** And the same act with the box ticked, which is the other half of the pair. */
+  it("grants writing when the box is ticked, in the same answer", async () => {
+    const world = withProject({ sessions: [session({ id: 3, mode: "human" })] });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+    fireEvent.click(await screen.findByRole("button", { name: "Give the wheel back" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Close the window and bring the chain back" }));
+
+    fireEvent.click(await screen.findByLabelText(/submit forms here/i));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep them" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Grant read on 2 origins, and form submission on the site you ended on" }));
+
+    await waitFor(() => {
+      expect(world.posted.some((one) => one.path === "/browser/keep")).toBe(true);
+    });
+    const kept = world.posted.find((one) => one.path === "/browser/keep");
+    expect(JSON.parse(kept?.body ?? "{}").writable).toBe(true);
+  });
+
+  /**
+   * Two permissions, two ways of taking one back.
+   *
+   * A person may want to end only the larger one — "this has been useful and I
+   * would rather it stopped pressing Send" — and a screen where the only door
+   * is Revoke turns that into a choice between keeping too much and losing the
+   * site. The read-only door is offered ONLY where there is something to
+   * narrow, which is the other half of this assertion.
+   */
+  it("offers to narrow a writable grant, and offers nothing to narrow on a read-only one", async () => {
+    const world = withProject({
+      sites: [
+        site({ origin: "https://jira.example.org:443", writable: true }),
+        site({ origin: "https://docs.example.org:443", writable: false }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    // One badge and one door, for the one site that has something to narrow.
+    expect(await screen.findByText("submits forms")).toBeDefined();
+    expect(screen.getAllByRole("button", { name: "Stop submitting" })).toHaveLength(1);
+    // Both sites can still be revoked outright; narrowing is the extra door.
+    expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop submitting" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Stop form submits" }));
+
+    await waitFor(() => {
+      expect(world.posted.some((one) => one.path === "/browser/readonly")).toBe(true);
+    });
+    const narrowed = world.posted.find((one) => one.path === "/browser/readonly");
+    expect(JSON.parse(narrowed?.body ?? "{}")).toEqual({
+      project_id: "alpha",
+      origin: "https://jira.example.org:443",
+    });
+  });
+
+  /**
+   * The record, on the screen where the grant comes off.
+   *
+   * This is the whole argument for the feature being supervisable: the agent
+   * works alone inside the grant, so the supervision is afterwards, and
+   * supervision that lives on another page is supervision nobody performs.
+   *
+   * The password field is why the fixture has one. Its NAME belongs here — a
+   * person reviewing this needs to know a form with a password in it was
+   * submitted — and there is nowhere in the shape for its contents, which is
+   * the price this design pays and states.
+   */
+  it("shows what was submitted beside the grant, by field name", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written()],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText("https://jira.example.org/browse/X-1/comment")).toBeDefined();
+    expect(screen.getByText(/2 fields: body, password/)).toBeDefined();
+    expect(screen.getByText(/sent by a click on e7/)).toBeDefined();
+  });
+
+  /**
+   * A submission that carried a document is not the same event as one that carried a comment, and
+   * the record is the only place the owner ever sees either. The names show; what the file said is
+   * deliberately not in the database at all (migration 0098), so there is nothing here to leak.
+   */
+  it("says when a submission carried a file, and says what it was called", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written({ files: ["relatorio.txt"] })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/with a file: relatorio.txt/)).toBeDefined();
+  });
+
+  /** And a submission that carried none says nothing about files, rather than "0 files". */
+  it("stays quiet about files when none went", async () => {
+    const world = withProject({
+      sites: [site({ writable: true })],
+      writes: [written()],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/2 fields: body, password/)).toBeDefined();
+    expect(screen.queryByText(/with a file/)).toBeNull();
+    expect(screen.queryByText(/with 0 files/)).toBeNull();
+  });
+
+  /** A profile that has written nothing shows no record at all, rather than a heading over nothing. */
+  it("shows no record when nothing has been submitted", async () => {
+    daemon.apiFetch.mockImplementation(browserFetch(withProject({ sites: [site()] })));
+
+    await renderBrowser();
+
+    await screen.findByRole("heading", { level: 2, name: "Site grants" });
+    expect(screen.queryByRole("heading", { level: 3, name: /submitted/i })).toBeNull();
+  });
+});
+
+/* --------------------------------------------------- opening a window -- */
+
+describe("Browser - opening a window yourself", () => {
+  const withProject = (overrides: Partial<BrowserWorld> = {}) =>
+    browserWorld({ projects: [project({ project_id: "alpha" })], ...overrides });
+
+  it("opens a window with the agent from a typed address and links to the conversation that owns it", async () => {
+    const bodies: string[] = [];
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: (body) => {
+            bodies.push(body);
+            return {
+              session: session({ id: 12, visible: true, owner_chat_id: "c-web" }),
+              chat_id: "c-web",
+            };
+          },
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open with agent" }));
+
+    expect(await screen.findByText(/opened session #12 with the agent/i)).toBeTruthy();
+    expect(JSON.parse(bodies[0])).toEqual({
+      project_id: "alpha",
+      url: "https://jira.example.com",
+      agent: true,
+    });
+    // A toast action and not an inline link: the result must not shift the page.
+    expect(screen.queryByRole("link", { name: /open its conversation/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open conversation" })).toBeTruthy();
+  });
+
+  it("says when the agent's window opened in a throwaway, and how to bring the project's login into it", async () => {
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: () => ({
+            session: session({ id: 13, visible: true, owner_chat_id: "c-web", profile_kind: "ephemeral" }),
+            chat_id: "c-web",
+          }),
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://news.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open with agent" }));
+
+    expect(await screen.findByText(/opened session #13 with the agent/i)).toBeTruthy();
+    expect(screen.getByText(/in a throwaway profile/i)).toBeTruthy();
+    expect(screen.getByText(/log in with Open a window and keep the site first/i)).toBeTruthy();
+  });
+
+  it("asks for an address before opening with the agent, because the browser opens https pages only", async () => {
+    daemon.apiFetch.mockImplementation(browserFetch(withProject()));
+
+    await renderBrowser();
+
+    const withAgent = (await screen.findByRole("button", { name: "Open with agent" })) as HTMLButtonElement;
+    expect(withAgent.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    expect(withAgent.disabled).toBe(false);
+  });
+
+  it("opens a window on the chosen project's profile from a typed address and names the session it opened", async () => {
+    const bodies: string[] = [];
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: (body) => {
+            bodies.push(body);
+            return session({ id: 9, profile_kind: "project", profile_id: "alpha" });
+          },
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open a window" }));
+
+    expect(await screen.findByText(/opened session #9/i)).toBeTruthy();
+    expect(JSON.parse(bodies[0])).toEqual({
+      project_id: "alpha",
+      url: "https://jira.example.com",
+    });
+  });
+
+  it("tells a pillar that is off apart from nobody being present, by rendering the daemon's own sentence", async () => {
+    // Both causes are 409 with only prose to separate them, so the page must not
+    // substitute a sentence of its own for either.
+    const refuse = (detail: string) => () => {
+      throw new ApiRefusal(409, "conflict", detail);
+    };
+
+    daemon.apiFetch.mockImplementation(
+      browserFetch(withProject({ onWindow: refuse("the browser pillar is off") })),
+    );
+    const off = await renderBrowser();
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open a window" }));
+    expect(await screen.findByText(/the browser pillar is off/i)).toBeTruthy();
+    off.unmount();
+
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: refuse(
+            "a window is opened for somebody to sit at, and nobody is at this machine",
+          ),
+        }),
+      ),
+    );
+    await renderBrowser();
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open a window" }));
+    expect(await screen.findByText(/nobody is at this machine/i)).toBeTruthy();
+  });
+
+  it("opens a blank window when no address is given, and asks for no confirmation", async () => {
+    const bodies: string[] = [];
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: (body) => {
+            bodies.push(body);
+            return session({ id: 9 });
+          },
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    // Nothing typed, and the button is live: the address is optional.
+    const open = await screen.findByRole("button", { name: "Open a window" });
+    expect(open.hasAttribute("disabled")).toBe(false);
+    // One click and it opens — the label never changes, because nothing here is
+    // destructive and there is no arming step to pass through.
+    fireEvent.click(open);
+    expect(await screen.findByText(/opened session #9/i)).toBeTruthy();
+    expect(JSON.parse(bodies[0]).url).toBe("about:blank");
+
+    fireEvent.change(screen.getByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open a window" }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(JSON.parse(bodies[1]).url).toBe("https://jira.example.com");
+  });
+});
+
+describe("Browser - the bar while the sidecar is down", () => {
+  it("says why a window cannot open, and leaves the button live", async () => {
+    const world = browserWorld({
+      projects: [project({ project_id: "alpha" })],
+      readout: { status: "degraded", subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }] },
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/the browser is not running, so no window can open/i)).toBeDefined();
+    const button = screen.getByRole("button", { name: "Open a window" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+  });
+});

@@ -1,0 +1,982 @@
+// §spec novo-frontend
+
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { apiFetch, probeHealth } from "./client";
+import type { ChannelNotifyPolicy, NotifyPolicy } from "./feed";
+import { keys } from "./keys";
+import { POLL, backgroundCadence } from "./poll";
+
+/** Autopilot's three settings for a project. `off` is not "broken" and `shadow` is not "on". */
+export type AutopilotMode = "off" | "shadow" | "active";
+
+export interface KillSwitchState {
+  engaged: boolean;
+}
+
+export interface BudgetView {
+  /** `null` is "no ceiling", which is a different fact from a ceiling of zero. */
+  limit_usd: number | null;
+  period: "daily" | "weekly" | "monthly";
+  hourly_limit_usd: number | null;
+  per_run_reserve_usd: number;
+  time_cost_per_hour_usd: number;
+  window_spend_usd: number;
+  hourly_spend_usd: number;
+  /** Whether autonomous work is currently held. `reason` is why, and is non-null exactly when this is true. */
+  paused: boolean;
+  reason: string | null;
+  /** The spend ceiling of one relay chain — conversations handing work to each other — beside the house budget, not part of it. */
+  relay_chain_limit_usd: number;
+}
+
+/** The quota brake's three owner settings, returned by GET/POST /autopilot/quota-brake, plus the active runner's read-only provider (only its windows count). */
+export interface QuotaBrakeView {
+  enabled: boolean;
+  pause_above_percent_5h: number;
+  pause_above_percent_7d: number;
+  provider: string;
+}
+
+export interface ProjectSummary {
+  project_id: string;
+  /**
+   * The git remote of the project's folder. The daemon's `/projects` sends it; absent remains
+   * compatible with older daemons, and means no remote: such a project exists only on its machine.
+   */
+  remote?: string | null;
+  mode: AutopilotMode;
+  /** `null` when the project has no root on disk yet — the promote flow asks for one. */
+  project_root: string | null;
+  pending: number;
+  /** Action classes clearing the shadow-exit bar, out of those the project has exercised. */
+  classes_ready: number;
+  classes_total: number;
+  /**
+   * Optional because the shell can be newer than the daemon it talks to. Absent
+   * reads as zero, which keeps the promote control locked rather than
+   * unlocking it — the safe direction for a field that is not there.
+   */
+  withheld_classes_ready?: number;
+  promotable: boolean;
+  open_review_items: number;
+  /**
+   * The two queues that total is made of.
+   *
+   * Optional because the shell can be newer than the daemon it talks to. Absent reads as "not
+   * known", and every caller then says only the total — the behaviour before these existed —
+   * rather than inventing a zero for a queue that may be full.
+   */
+  open_proposals?: number;
+  open_shadow_decisions?: number;
+  wip_limit: number | null;
+  queue_full: boolean;
+  /**
+   * Whether the recorded folder is actually on the disk, answered by the daemon.
+   *
+   * **Three states, and `data/roster.ts` keeps them three.** `null` means no folder was ever named,
+   * which is unfinished; `false` means one was named and is not there, which is broken. The roster
+   * used to work this out by asking for a directory listing per project — twenty-five requests on
+   * every load to learn one bit each — and its headline counted recorded roots while its rows
+   * probed folders, so the two could contradict each other on screen.
+   *
+   * Optional because the shell can be newer than the daemon: absent reads as `null`, which says
+   * "not named" rather than inventing a folder that is there.
+   */
+  root_exists?: boolean | null;
+  /**
+   * What this project's gate last said, and when — `passed`, `failed`, `errored`, or absent.
+   *
+   * Absent is not a fourth failure: a project with no gate command has no definition of green.
+   */
+  last_gate?: string | null;
+  last_gate_at?: string | null;
+}
+
+export interface Proposal {
+  id: number;
+  /** What kind of decision this is. The card is polymorphic on it; there is no generic proposal. */
+  kind: string;
+  status: string;
+  run_id: number | null;
+  session_id: string | null;
+  project_id: string | null;
+  tool_name: string | null;
+  reasoning: string;
+  tool_input: string | null;
+  /**
+   * What the turn had read when it reached for this, as a JSON array of
+   * `{tool, arguments, at}` — the daemon's `run_untrusted_reads`, copied onto
+   * the row so it survives the run being pruned.
+   *
+   * `null` is a legitimate answer and must never be rendered as "read nothing".
+   * A refusal that fired on whose work it is rather than on what was read has no
+   * provenance to carry, and neither does one whose recording failed; the two
+   * are indistinguishable from here, which is why the card shows nothing rather
+   * than a claim.
+   */
+  read_from: string | null;
+  created_at: string;
+  decided_at: string | null;
+  /**
+   * Joined in only by `GET /proposals/skipped-items`; absent or null elsewhere
+   * means the query did not ask, while null there means the run or item is gone.
+   */
+  job_id?: number | null;
+  run_stage?: string | null;
+  item_ordinal?: number | null;
+  item_description?: string | null;
+  /**
+   * The run behind an action approval, joined in only by `GET /proposals`: its state, where it
+   * works, how its prompt opens (cut at 600 characters), and its last three steps as a JSON array
+   * of `{name, detail}`, oldest first. Null when the run was pruned or never recorded them.
+   */
+  run_status?: string | null;
+  run_cwd?: string | null;
+  run_prompt?: string | null;
+  run_recent?: string | null;
+  /**
+   * The department behind a team action or a recruitment, joined in only by their two listings:
+   * the team run that asked, the team's name, what that run was asked to do (cut at 600
+   * characters), the agent who asked, and — when a specialist asked — the item it was working on.
+   */
+  team_run_id?: string | null;
+  team_name?: string | null;
+  team_request?: string | null;
+  asked_by?: string | null;
+  asked_for?: string | null;
+  /** What each job in a fleet-exclusion request is doing: its prompt's opening, or its rule. */
+  job_low_task?: string | null;
+  job_high_task?: string | null;
+}
+
+/**
+ * Is the daemon answering at all?
+ *
+ * Keeps polling with the window hidden, unlike almost everything else here: it
+ * is the global handshake, and a shell that comes back from the tray showing a
+ * connection state it stopped checking ten minutes ago is lying. It also never
+ * rejects — `false` is the answer for "not there" — so react-query's retry and
+ * error states stay out of a question that has only two outcomes.
+ */
+export function useHealth() {
+  return useQuery({
+    queryKey: keys.health,
+    queryFn: probeHealth,
+    refetchInterval: backgroundCadence(POLL.fast),
+    refetchIntervalInBackground: true,
+  });
+}
+
+/**
+ * The kill switch, as the daemon has it.
+ *
+ * Also polled in the background, and for a sharper reason than health: this
+ * control is visible in every view of the app, and a switch that reads
+ * *disengaged* because the window was hidden while something engaged it is the
+ * single most dangerous stale value in the shell.
+ */
+export function useKillSwitch() {
+  return useQuery({
+    queryKey: keys.autopilot.kill,
+    queryFn: () => apiFetch<KillSwitchState>("/autopilot/kill"),
+    refetchInterval: backgroundCadence(POLL.fast),
+    refetchIntervalInBackground: true,
+  });
+}
+
+/**
+ * Engage or release the kill switch.
+ *
+ * The optimistic update is not cosmetic here — engaging is a panic gesture and
+ * has to look like it took immediately. The `cancelQueries` in `onMutate` is
+ * what stops a 3-second tick already in flight from landing *after* the
+ * optimistic write and resurrecting the old value; `onSettled` then invalidates
+ * so the daemon, not this cache, has the last word.
+ *
+ * `retry: false` is deliberate and applies to every mutation in this layer: a
+ * refusal is settled, and a retried write is a second attempt at an action a
+ * person asked for once.
+ */
+export function useSetKillSwitch() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (engaged: boolean) =>
+      apiFetch<void>("/autopilot/kill", {
+        method: "POST",
+        body: JSON.stringify({ engaged }),
+      }),
+    retry: false,
+    onMutate: async (engaged: boolean) => {
+      await queryClient.cancelQueries({ queryKey: keys.autopilot.kill });
+      const previous = queryClient.getQueryData<KillSwitchState>(keys.autopilot.kill);
+      queryClient.setQueryData<KillSwitchState>(keys.autopilot.kill, { engaged });
+      return { previous };
+    },
+    onError: (_error, _engaged, context) => {
+      // Put back exactly what was there, including "there was nothing" — writing
+      // a guessed value on a failed write would invent a state the daemon never had.
+      if (context !== undefined) {
+        queryClient.setQueryData<KillSwitchState | undefined>(keys.autopilot.kill, context.previous);
+      }
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.kill });
+    },
+  });
+}
+
+/** Spend against the ceilings, and whether either one is currently holding work. */
+export function useBudget() {
+  return useQuery({
+    queryKey: keys.autopilot.budget,
+    queryFn: () => apiFetch<BudgetView>("/autopilot/budget"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** What `POST /autopilot/budget` accepts (`http/fleet.rs`, `BudgetRequest`). SIX fields, all of them, every time. */
+export interface BudgetChange {
+  limit_usd: number | null;
+  period: "daily" | "weekly" | "monthly";
+  hourly_limit_usd: number | null;
+  per_run_reserve_usd: number;
+  time_cost_per_hour_usd: number;
+  relay_chain_limit_usd: number;
+}
+
+/**
+ * Replace the budget, whole.
+ *
+ * `POST /autopilot/budget` answers **200 with the full `BudgetResponse`**
+ * (`http.rs:1876-1892`), not 204 — so the mutation is typed against
+ * `BudgetView` and its result is written straight into the cache in
+ * `onSuccess`, confirmed by an `invalidateQueries` in `onSettled`. No
+ * optimistic write, unlike the kill switches above: a ceiling drawn before the
+ * daemon accepted it is a ceiling somebody may act on.
+ */
+export function useSetBudget() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: BudgetChange) =>
+      apiFetch<BudgetView>("/autopilot/budget", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSuccess: (data) => {
+      queryClient.setQueryData<BudgetView>(keys.autopilot.budget, data);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.budget });
+    },
+  });
+}
+
+/** The quota brake is independent from spend budget and polls at the same (queue) cadence. */
+export function useQuotaBrake() {
+  return useQuery({
+    queryKey: keys.autopilot.quotaBrake,
+    queryFn: () => apiFetch<QuotaBrakeView>("/autopilot/quota-brake"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** Replace all quota-brake settings after the daemon accepts them. */
+export function useSetQuotaBrake() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: Omit<QuotaBrakeView, "provider">) =>
+      apiFetch<QuotaBrakeView>("/autopilot/quota-brake", {
+        method: "POST",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSuccess: (data) => {
+      queryClient.setQueryData<QuotaBrakeView>(keys.autopilot.quotaBrake, data);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.autopilot.quotaBrake });
+    },
+  });
+}
+
+/**
+ * The project roster with its governance counts.
+ *
+ * `keepPreviousData` on this and on the proposals list below: these feed page
+ * headers and badges, and a list that blanks on every refetch makes the whole
+ * shell flicker once every three seconds. A stale view with a timestamp beats
+ * an empty one — the pages say so, with `StaleNote`.
+ */
+export function useProjects() {
+  return useQuery({
+    queryKey: keys.projects.all,
+    queryFn: () => apiFetch<ProjectSummary[]>("/projects"),
+    refetchInterval: POLL.queue,
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Everything waiting on a human decision.
+ *
+ * Fixed at the fast cadence rather than the queue cadence because this list is
+ * also the sidebar's pending badge — it is on screen on every page, not only
+ * on the queue, and a badge is the thing that tells you to go and look.
+ */
+export function useProposals() {
+  return useQuery({
+    queryKey: keys.proposals.all,
+    queryFn: () => apiFetch<Proposal[]>("/proposals"),
+    refetchInterval: POLL.fast,
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Tell the daemon someone is here.
+ *
+ * A plain function and not a hook on purpose: this has no cache entry, nothing
+ * renders from it, and its caller is a visibility listener rather than a
+ * component tree. Making it a mutation would give it a status nobody reads.
+ *
+ * An empty `project_id` is a 400 from the daemon — a blank string is not a
+ * scope — so a blank collapses to the global heartbeat here rather than
+ * travelling to the núcleo to be rejected.
+ */
+export async function postAttention(projectId?: string): Promise<void> {
+  const scoped = projectId !== undefined && projectId.trim() !== "";
+  await apiFetch<void>("/autopilot/attention", {
+    method: "POST",
+    body: JSON.stringify(scoped ? { project_id: projectId } : {}),
+  });
+}
+
+/* ------------------------------------------------------------------ health -- */
+
+/**
+ * The System pillar's health: the daemon's own subsystem readout and the
+ * sidecars' liveness rows, moved here from `data/browser.ts` — this is the
+ * ONE health query in the app, and every pillar's own reading (Browser's
+ * included) narrows this same cache entry rather than asking again.
+ */
+
+/** One sidecar's own liveness row — `sidecar::SidecarState`, `GET /sidecars`. */
+export interface SidecarState {
+  name: string;
+  state: "running" | "down";
+  started_at: string | null;
+  last_failure: string | null;
+  last_failure_at: string | null;
+  restarts: number;
+  last_line: string | null;
+  last_line_at: string | null;
+}
+
+/**
+ * Where NucleOS itself lives — `GET /home`, the folder the daemon was started from.
+ *
+ * Asked once and kept: it cannot change while the daemon runs, and a new daemon is a new
+ * connection. `root` is null when the daemon could not read its own directory.
+ */
+export function useHome() {
+  return useQuery({
+    queryKey: keys.system.home,
+    queryFn: () => apiFetch<{ root: string | null }>("/home"),
+    staleTime: Infinity,
+  });
+}
+
+/** One subsystem's readiness — `health::SubsystemReadout`, inside `GET /health/readout`. */
+export interface SubsystemReadout {
+  name: string;
+  status: "ok" | "degraded" | "down" | "disabled";
+  reason?:
+    | "timeout"
+    | "not-configured"
+    | "unreachable"
+    | "permission-denied"
+    | "missing"
+    | "not-running"
+    | "low-disk-space"
+    | "unknown";
+  /** Named tallies a subsystem keeps beside its state; absent when it keeps none. */
+  counts?: Record<string, number>;
+}
+
+/** One tally of a subsystem row, ready to draw. */
+export interface SubsystemCount {
+  name: string;
+  /** The key with a trailing `_unix` dropped and `_` read as a space. */
+  label: string;
+  value: number;
+  /** A `_unix` key holds an instant in epoch seconds, not a count. */
+  instant: boolean;
+}
+
+/** A row's tallies sorted by key, whatever order the daemon wrote them in. */
+export function subsystemCounts(row: SubsystemReadout): SubsystemCount[] {
+  return Object.entries(row.counts ?? {})
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([name, value]) => ({
+      name,
+      label: name.replace(/_unix$/, "").replace(/_/g, " "),
+      value,
+      instant: name.endsWith("_unix"),
+    }));
+}
+
+/** `GET /health/readout` — `health::HealthReadout`. */
+export interface HealthReadout {
+  status: "ok" | "degraded" | "down" | "disabled";
+  subsystems: SubsystemReadout[];
+}
+
+/**
+ * The whole daemon's health, in the daemon's own subsystem order — render it
+ * as given, never sorted: `sqlite_pool`, `cli_binary`, `credential_manager`,
+ * `worktree_disk`, `echo_sidecar`, `telegram_sidecar`, `email_sidecar`,
+ * `web_sidecar`, `browser_sidecar`, `voice_transcriber` (`health.rs:142-183`).
+ */
+export function useSystemHealth(refetchInterval: number = POLL.fast) {
+  return useQuery({
+    queryKey: keys.system.health,
+    queryFn: () => apiFetch<HealthReadout>("/health/readout"),
+    /**
+     * How often, and why it is an argument rather than a constant.
+     *
+     * This readout is not a cheap one — it probes ten subsystems and has its own
+     * timeout — so who is watching it decides how often it is worth asking. The
+     * System page wants the live figure and takes the default; the rail wants
+     * only to know whether to draw a dot, and asks slowly.
+     *
+     * Same query key, so both share one cache entry, and TanStack schedules a
+     * refetch for every active observer's own interval — which means the fast
+     * one wins exactly while somebody is on the page that asked for it, and the
+     * slow one is what the app costs the rest of the time. Nothing to reconcile
+     * and nothing to turn off on the way out.
+     */
+    refetchInterval,
+  });
+}
+
+/**
+ * Every sidecar's own liveness row — `GET /sidecars`, a bare array.
+ *
+ * `enabled: false` lets a caller that only wants the rows in some states (the
+ * browser's health, while its subsystem is failing) stop polling the rest of
+ * the time; another observer of the same key keeps it fresh regardless.
+ */
+export function useSidecars({ enabled = true }: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: keys.system.sidecars,
+    queryFn: () => apiFetch<SidecarState[]>("/sidecars"),
+    refetchInterval: POLL.queue,
+    enabled,
+  });
+}
+
+/** The supervisor key for a health-readout row, or `null` when it is not supervised. */
+export function sidecarKeyOf(rowName: string): string | null {
+  const SUFFIX = "_sidecar";
+  if (!rowName.endsWith(SUFFIX)) return null;
+  const key = rowName.slice(0, -SUFFIX.length);
+  return key === "" ? null : key;
+}
+
+/** What `POST /sidecars/{name}/restart` answers when the supervisor was asked. */
+export interface SidecarRestartAsked {
+  name: string;
+  asked: boolean;
+}
+
+/** Ask a sidecar's supervisor to stop waiting out its backoff and start it now. */
+export function useRestartSidecar() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiFetch<SidecarRestartAsked>(`/sidecars/${encodeURIComponent(name)}/restart`, {
+        method: "POST",
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.health });
+      void queryClient.invalidateQueries({ queryKey: keys.system.sidecars });
+    },
+  });
+}
+
+/**
+ * Did the whole readout time out?
+ *
+ * `health.rs` answers a timed-out readout with `status: "down"` and exactly
+ * ONE subsystem named `aggregate` — the other nine are not *down*, they were
+ * never measured. A page that renders that as nine missing subsystems is
+ * inventing an outage.
+ */
+export function isAggregateTimeout(readout: HealthReadout): boolean {
+  return readout.subsystems.length === 1 && readout.subsystems[0].name === "aggregate";
+}
+
+/**
+ * Is this a reading somebody should go and look at?
+ *
+ * A named function rather than a comparison inside the rail, because it decides
+ * what the word "alert" means for the whole app and that is worth stating once,
+ * in the file that owns the type, where a test can hold it.
+ *
+ * `down` and `degraded`, and deliberately not `disabled`: a subsystem nobody
+ * configured is not a fault, and drawing a dot for one would teach people that
+ * the dot means nothing. That is the same rule the rail's dimmed rows already
+ * follow — present, plainly not ready, and not an emergency.
+ *
+ * `undefined` is `false`, and that is the honest-absence rule rather than
+ * optimism: nothing has answered yet, so there is nothing to report. A dot drawn
+ * before the first answer would be a claim nobody measured.
+ */
+export function wantsAttention(readout: HealthReadout | undefined): boolean {
+  return readout?.status === "down" || readout?.status === "degraded";
+}
+
+/* ----------------------------------------------------------------- backups -- */
+
+/** One stored snapshot — `backup::BackupInfo`. */
+export interface BackupInfo {
+  name: string;
+  /** Who took it: a person pressing the button, or the daemon's weekly `auto-` copy. */
+  kind: "manual" | "auto";
+  /** Absent when the snapshot predates version stamping — absent is not zero. */
+  migration_version: number | null;
+  size_bytes: number;
+}
+
+/** What a restore request answers with — `backup::StagedRestore`. */
+export interface StagedRestore {
+  name: string;
+  migration_version: number;
+  /** The daemon's own sentence about when this takes effect. Render it; do not paraphrase. */
+  applies: string;
+}
+
+/** The stored snapshots — `GET /backups`. */
+export function useBackups() {
+  return useQuery({
+    queryKey: keys.system.backups,
+    queryFn: () => apiFetch<BackupInfo[]>("/backups"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * What the database file and the folders beside it occupy — `GET /system/storage`.
+ *
+ * The three folder sizes are `null` when the daemon could not measure them in time, which is not
+ * the same claim as an empty folder.
+ */
+export interface StorageReport {
+  db_bytes: number;
+  wal_bytes: number;
+  page_size: number;
+  page_count: number;
+  /** Pages the file keeps for reuse after deletes; a `VACUUM` would give them back. */
+  freelist_count: number;
+  reclaimable_bytes: number;
+  backups_bytes: number | null;
+  files_bytes: number | null;
+  logs_bytes: number | null;
+  /** `nucleos.db.*` copies lying beside the database that nothing prunes. */
+  loose_bytes: number;
+  /** When the newest automatic backup was taken (ISO instant); `null` when none exists. */
+  auto_backup_last: string | null;
+  /** A compaction is scheduled for the next start (`POST /system/storage/compact`). */
+  compaction_pending: boolean;
+}
+
+/** What scheduling a compaction answers — the daemon's own sentence about when it happens. */
+export interface StagedCompaction {
+  applies: string;
+}
+
+/** The "Space" panel's reading — `GET /system/storage`. */
+export function useStorage() {
+  return useQuery({
+    queryKey: keys.system.storage,
+    queryFn: () => apiFetch<StorageReport>("/system/storage"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * Schedule a compaction (`VACUUM`) of the database for the next start.
+ *
+ * `POST /system/storage/compact`, no body. Nothing shrinks now: the daemon leaves a marker and
+ * does the work before it opens the database, so the next start takes longer. The daemon
+ * answers 409 while a restore is pending. The storage reading is refetched so the panel says
+ * "scheduled" from the daemon's own state rather than from this call having returned.
+ */
+export function useStageCompaction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<StagedCompaction>("/system/storage/compact", { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.storage });
+    },
+  });
+}
+
+/** When the daemon starts by itself: with the owner's login, or with the machine. */
+export type AutostartMode = "at-login" | "at-boot";
+
+/** `GET /system/autostart` — the current mode and what this platform can do. */
+export interface AutostartView {
+  mode: AutostartMode;
+  at_boot: boolean;
+  /** Whether switching to `at-boot` needs the account's password (Windows). */
+  needs_password: boolean;
+  /** Why `at_boot` is false, in the daemon's words. */
+  why_not: string | null;
+}
+
+/** No poll: the mode changes when the owner changes it, and a form must not move under their hands. */
+export function useAutostart() {
+  return useQuery({
+    queryKey: keys.system.autostart,
+    queryFn: () => apiFetch<AutostartView>("/system/autostart"),
+  });
+}
+
+/**
+ * `PUT /system/autostart`. The password goes in this one request and is never written to the
+ * query cache; react-query keeps a mutation's variables until `reset()`, so the panel resets it
+ * as soon as the call settles. A refusal carries the system tool's own words in its `detail`.
+ */
+export function useSetAutostart() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: { mode: AutostartMode; password?: string }) =>
+      apiFetch<AutostartView>("/system/autostart", {
+        method: "PUT",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSuccess: (data) => {
+      queryClient.setQueryData<AutostartView>(keys.system.autostart, data);
+    },
+  });
+}
+
+/**
+ * Take a snapshot now.
+ *
+ * `POST /backup` — SINGULAR, one letter apart from the listing route above and
+ * answered by a different handler (`http.rs:48-49`). No body; the daemon
+ * decides the name and retention.
+ */
+export function useTakeBackup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch<BackupInfo>("/backup", { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.backups });
+    },
+  });
+}
+
+/**
+ * Stage a restore, by snapshot name.
+ *
+ * Nothing changes immediately — `StagedRestore.applies` is the daemon's own
+ * sentence about when the swap actually happens (its next start), and pages
+ * render it verbatim rather than paraphrasing.
+ */
+export function useStageRestore() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiFetch<StagedRestore>(`/backups/${encodeURIComponent(name)}/restore`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.backups });
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ tokens -- */
+
+/** The three durable key levels — `auth::ApiTokenLevel`, kebab-case on the wire. */
+export type ApiTokenLevel = "read-only" | "run-creating" | "admin";
+
+/** A token as the LISTING gives it — no secret here, ever. */
+export interface ApiTokenSummary {
+  name: string;
+  level: ApiTokenLevel;
+  created_at: string;
+}
+
+/**
+ * What minting answers with — the ONLY place `token` exists.
+ *
+ * `ApiTokenSummary` above never carries it: the daemon does not keep the plain
+ * value around to answer a second read with, so this one response is the
+ * token's entire lifetime as a readable string. `ui/CopyOnce` exists because
+ * of this shape.
+ */
+export interface CreatedApiToken {
+  name: string;
+  level: ApiTokenLevel;
+  created_at: string;
+  token: string;
+}
+
+export interface MintToken {
+  name: string;
+  level: ApiTokenLevel;
+}
+
+/** The minted tokens — `GET /api-tokens`. No poll: the list does not change while the window is open. */
+export function useApiTokens() {
+  return useQuery({
+    queryKey: keys.system.tokens,
+    queryFn: () => apiFetch<ApiTokenSummary[]>("/api-tokens"),
+  });
+}
+
+/**
+ * Mint a token.
+ *
+ * `retry: false` like every mutation in this layer — a refusal is settled, not
+ * a glitch to retry past. The answer carries the only copy of the secret the
+ * daemon will ever give out; the caller holds it in component state and shows
+ * it through `CopyOnce`, never writing it into the query cache — a cache entry
+ * is a thing that can be refetched, and this value cannot be.
+ */
+export function useMintToken() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mint: MintToken) =>
+      apiFetch<CreatedApiToken>("/api-tokens", {
+        method: "POST",
+        body: JSON.stringify(mint),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.tokens });
+    },
+  });
+}
+
+/**
+ * Revoke a token by name.
+ *
+ * `DELETE /api-tokens/{name}` answers **204**, typed `void` — `apiFetch`
+ * already exempts 204/205 from its JSON parse. A 404 means the token is
+ * already gone, which the page treats as a success in substance rather than a
+ * failure; invalidating here either way is what makes the listing catch up
+ * with that reading without a special case in the mutation itself.
+ */
+export function useRevokeToken() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiFetch<void>(`/api-tokens/${encodeURIComponent(name)}`, { method: "DELETE" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.tokens });
+    },
+  });
+}
+
+/* ------------------------------------------------------------------- config -- */
+
+/** `GET /config/email` — `EmailConfigView`. No SMTP field exists; there is no send pre-flight. */
+export interface EmailConfig {
+  enabled: boolean;
+  armed: boolean;
+  host: string;
+  username: string;
+  mailbox: string;
+  sent_mailbox: string | null;
+  poll_interval_secs: number;
+  notify_classes: string[];
+  digest_hour_utc: number;
+  retain_bodies_days: number;
+  local_triage_disabled: string | null;
+}
+
+/** `GET /voice/config` — note the path is NOT under `/config/`. */
+export interface VoiceConfig {
+  armed: boolean;
+  hints: string[];
+  cleanup_prompt: string;
+  cleanup_model: string | null;
+  retain_dictations_days: number;
+  hotkey: string;
+  memo_hotkey: string;
+  max_capture_seconds: number;
+  max_body_bytes: number;
+}
+
+/**
+ * `GET /calendar/config` — also NOT under `/config/`, and owned by the pillar.
+ *
+ * Re-exported rather than declared, because it was declared twice: this module
+ * had its own `CalendarConfig` and `useCalendarConfig` against the same route,
+ * keyed `["system","config","calendar"]`, while `data/calendar.ts` had
+ * `CalendarConfigView` keyed `["calendar","config"]`. Two identical types and
+ * two cache entries for one route — the System page and the Calendar page each
+ * fetching it and neither able to see the other's answer. The pillar's module
+ * is the owner; the alias keeps this module's name for the System page, which
+ * reads it as one config among six.
+ */
+export type { CalendarConfigView as CalendarConfig } from "./calendar";
+export { useCalendarConfig } from "./calendar";
+
+/** The e-mail pillar's own configuration. No poll: config does not change while the window is open. */
+export function useEmailConfig() {
+  return useQuery({
+    queryKey: keys.system.config("email"),
+    queryFn: () => apiFetch<EmailConfig>("/config/email"),
+  });
+}
+
+/** The voice pillar's own configuration — `GET /voice/config`, asymmetric with the other two. */
+export function useVoiceConfig() {
+  return useQuery({
+    queryKey: keys.system.config("voice"),
+    queryFn: () => apiFetch<VoiceConfig>("/voice/config"),
+  });
+}
+
+
+/* -------------------------------------------------------------------- pii -- */
+
+/** One row of the PII tally — `GET /pii/observations` is an aggregate, not a list of observations. */
+export interface PiiTallyRow {
+  column: string;
+  class: string;
+  count: number;
+}
+
+/** The PII tally. No `refetchInterval` — read once per open, per design §6.20. */
+export function usePiiTally() {
+  return useQuery({
+    queryKey: keys.system.pii,
+    queryFn: () => apiFetch<PiiTallyRow[]>("/pii/observations"),
+  });
+}
+
+/* ------------------------------------------------- notification policy -- */
+
+/**
+ * Which feed kinds still reach a messaging channel — `GET /notifications/policy`.
+ *
+ * **No `refetchInterval`, deliberately**, and it says so here because in this
+ * layer not polling is the exception: almost every neighbour runs at
+ * `POLL.fast`, and a reader who finds none assumes an oversight. This is the
+ * initial state of a FORM. Refetching it every three seconds would walk over
+ * the switches somebody is in the middle of flipping — so it refreshes when a
+ * save settles (`useSetNotifyPolicy` below) and not on a clock.
+ *
+ * A brand-new install answers `{"families": [], "kinds": []}` rather than 404:
+ * no rule is not an error, it is the default that lets everything through.
+ */
+export function useNotifyPolicy() {
+  return useQuery({
+    queryKey: keys.system.notifyPolicy,
+    queryFn: () => apiFetch<NotifyPolicy>("/notifications/policy"),
+  });
+}
+
+/**
+ * Which kinds this machine has actually written — `GET /notifications/kinds`.
+ *
+ * **No `refetchInterval`**, for a different reason from the one above: this is
+ * an observation of the feed over ninety days, and it does not meaningfully
+ * change while somebody has a settings tab open. Reading it once per open is
+ * what makes the absence of an index on `feed (kind)` the right trade — the
+ * `DISTINCT` runs when the tab is opened, not every three seconds.
+ *
+ * The list is the RETENTION WINDOW, not all of history: `feed::prune` deletes
+ * anything past ninety days. The tab unions it with the kinds that only exist
+ * as a stored rule — see `groupKinds` — so a rule for a kind that has not shown
+ * up in a year still has a row to be undone in.
+ */
+export function useObservedKinds() {
+  return useQuery({
+    queryKey: keys.system.notifyKinds,
+    queryFn: () => apiFetch<string[]>("/notifications/kinds"),
+  });
+}
+
+/**
+ * Save the whole policy — `PUT /notifications/policy`, answering **204**.
+ *
+ * Sends the policy WHOLE rather than a delta, because the núcleo replaces
+ * rather than merges: a partial write would invite the two halves to drift.
+ * Two people editing at once means the last save wins, silently — accepted
+ * rather than solved, because this is a single-owner desktop app and optimistic
+ * concurrency is machinery for a case that needs two windows open on the same
+ * page at the same time.
+ *
+ * `retry: false` like every mutation here — a 400 is a refusal, not a glitch —
+ * and `onSettled` invalidates the read, the same pattern `useMintToken` uses.
+ * That is what replaces the poll: the read does not repeat on a clock, it
+ * repeats when somebody saves.
+ *
+ * What it does NOT do is undo a refused edit. React Query shares structure
+ * between fetches, so a refetch that finds the policy unchanged hands back the
+ * SAME object, and a page keyed on that reference never re-seeds. The rejected
+ * switches stay as the owner left them — which is the better outcome anyway,
+ * because the refusal names the row they need to fix and throwing their edits
+ * away would make them type it twice.
+ */
+export function useSetNotifyPolicy() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (policy: NotifyPolicy) =>
+      apiFetch<void>("/notifications/policy", {
+        method: "PUT",
+        body: JSON.stringify(policy),
+      }),
+    retry: false,
+    onSettled: () => {
+      // React Query invalidates by prefix: `notifyPolicy` is the prefix of every
+      // `notifyPolicyFor(channel)`, so the per-channel reads refresh here too.
+      void queryClient.invalidateQueries({ queryKey: keys.system.notifyPolicy });
+    },
+  });
+}
+
+/**
+ * One channel's view of the policy — `GET /notifications/policy?channel=<id>`.
+ * No `refetchInterval`, for the same reason as `useNotifyPolicy`: it seeds a form.
+ */
+export function useChannelNotifyPolicy(channel: string) {
+  return useQuery({
+    queryKey: keys.system.notifyPolicyFor(channel),
+    queryFn: () =>
+      apiFetch<ChannelNotifyPolicy>(`/notifications/policy?channel=${encodeURIComponent(channel)}`),
+  });
+}
+
+/**
+ * Save one channel's overrides, whole — `PUT /notifications/policy?channel=<id>`.
+ * Invalidates only that channel's read, not the shared prefix.
+ */
+export function useSetChannelNotifyPolicy(channel: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (overrides: NotifyPolicy) =>
+      apiFetch<void>(`/notifications/policy?channel=${encodeURIComponent(channel)}`, {
+        method: "PUT",
+        body: JSON.stringify(overrides),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.notifyPolicyFor(channel) });
+    },
+  });
+}

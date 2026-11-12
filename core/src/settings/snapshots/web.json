@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides\nwhat counts as trustworthy.",
+  "properties": {
+    "enabled": {
+      "default": false,
+      "description": "Opt-in, like every pillar that reaches the network.",
+      "type": "boolean"
+    },
+    "fetch_timeout_seconds": {
+      "default": 20,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_page_bytes": {
+      "default": 2000000,
+      "format": "int64",
+      "type": "integer"
+    },
+    "pillar_search_enabled": {
+      "default": false,
+      "description": "Whether a pillar may search on its own, with nobody watching (spec §10.5).\n\nSeparate from `enabled`, and off by default, because the query leaves the machine: enriching\na correspondent means searching a person's name, and nobody decided to share that.\n\nIt lives in the file format and NOT yet on `WebRuntime`, because nothing consumes it: no\npillar reaches the web in this version. Carrying it into the runtime would be a switch that\ngrants nothing, and a switch that grants nothing is one somebody later assumes is working.\nThe first pillar to search is what moves it across.",
+      "type": "boolean"
+    },
+    "provider": {
+      "default": "brave",
+      "description": "`brave` or `searxng`. Validated by the sidecar, which is what has to build one.",
+      "type": "string"
+    },
+    "retain_pages_days": {
+      "default": 30,
+      "format": "int64",
+      "type": "integer"
+    },
+    "searxng_url": {
+      "default": "",
+      "type": "string"
+    },
+    "trusted_hosts": {
+      "default": [],
+      "description": "Hosts whose extracted text may reach an agent as written — and only then when the owner\nasked (`trust.rs`, spec §5.2).\n\nEmpty by default, and that is the load-bearing choice in this struct. Every other field's\ndefault is a convenience; this one's is a refusal. A `~/.nucleos/web.yaml` that is missing,\nunreadable, or malformed therefore trusts NOTHING rather than falling back to a list nobody\ncan see — the opposite direction from `VoiceConfig`, whose defaults are all benign.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "title": "WebConfig",
+  "type": "object"
+}

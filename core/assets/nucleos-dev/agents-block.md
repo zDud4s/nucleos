@@ -1,0 +1,45 @@
+# >>> AI WORKFLOW MANAGED BLOCK >>>
+
+**Headless node rule (`NODE_PROMPT_HEADER`).** If your prompt starts with "You are the agent for NucleOS tree node ", you are a headless node of a tree: ignore the conductor routing, `manual:`, `/compact` and `wait_advice`; that prompt and your cockpit are your instructions.
+
+## AI workflow integration
+
+This repository uses an AI workflow. See `.nucleos/workflow/workflow.md` for full pipeline details.
+
+Roles: configured in `models.yaml` under the project state directory (`state_dir` in `.nucleos/workflow/project.json`)
+
+## Orchestration entry point
+
+For any development task, follow the `orchestrate` skill:
+- Claude: invoke "Use the orchestrate skill. Task: <description>" (skill at `.claude/skills/orchestrate/SKILL.md`)
+- Codex: read `.agents/skills/orchestrate/SKILL.md` **in this repository**, and only fall back to `~/.agents/skills/orchestrate/SKILL.md` if the repo ships no mirror
+
+Both paths resolve to the same pipeline contract; only the discovery path differs — and the repo's own copy wins. `~/.agents/skills/` is shared by every project on the machine while the workflow is versioned per repository, so a global-only entry point could hand a Codex session another project's copy.
+
+## Default routing
+
+The top-level session does not execute: it launches. Pick the route by task size (skill `conduct`):
+
+| Size | Route |
+|---|---|
+| Small: one file, no decision | `Agent` with `wf-leaf` |
+| Medium: one feature, 2-6 files | `Agent` + the `orchestrate` skill |
+| Large: several specs, or "finish everything" | `tree_launch` / `spec_finish` (if available) |
+
+`tree.py` is retiring. It is not removed yet; it goes once the tree launch path (`tree_launch`) is in production.
+
+Top-level sessions of a project are conductors by default: they launch agents; they may only make small edits by hand (at most 2 files and 40 changed lines per owner prompt) and read up to ~15k tokens per call. A prompt starting with `manual:` lets the owner work by hand for that prompt; `manual:on` keeps it until a `manual:off` prompt.
+
+A node forced to wrap closes as `handoff`. For runs the daemon owns, it opens a sibling with the same scope to continue, at most 3 in a chain.
+
+The owner can opt out of the routing for one prompt by starting it with `manual:` (`manual:on` to keep it until `manual:off`). Before a long wait, call `wait_advice` (if available). To resume a session, ask the daemon (`POST /conductor/resume`); never `claude --resume`.
+
+Execution rules (a short copy for readers without hooks; `workflow.md` is the authority):
+1. Prefer the smallest correct change; touch only relevant files; do not broaden scope silently.
+2. If blocked, stop and report the blocker.
+3. Fill the Handoff section before declaring done, with one evidence block (exit code + output tail) per validation command. A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Run no other test or build tool: the controller runs the single final verification through the daemon's `verify`.
+4. After implementation, report: summary, files changed, validation, risks, assumptions.
+5. Never execute delete or mass-removal commands (rm -rf, rmdir, del, Remove-Item, git clean). List required deletions in Handoff `Pending deletions` — the orchestrator executes them after review.
+6. Never commit/push history; the orchestrator owns that after review.
+
+# <<< AI WORKFLOW MANAGED BLOCK <<<

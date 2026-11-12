@@ -1,0 +1,35 @@
+.pairing-code {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-start;
+}
+
+.pairing-code-digits {
+  margin: 0;
+  user-select: all;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-2xl);
+  letter-spacing: 0.2em;
+}
+
+.pairing-code-command {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  max-width: 100%;
+}
+
+.pairing-code-command code {
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.pairing-countdown {
+  font-variant-numeric: tabular-nums;
+}
+
+.pairing-expired {
+  opacity: 0.8;
+}

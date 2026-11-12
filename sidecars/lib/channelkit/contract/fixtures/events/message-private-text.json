@@ -1,0 +1,5 @@
+{ "event_id": "upd-88124",
+  "conversation": {"ref": "4242", "kind": "private"},
+  "sender": {"ref": "4242"},
+  "type": "message",
+  "message": { "ref": "992", "parts": [ {"type": "text", "text": "/kill on"} ] } }

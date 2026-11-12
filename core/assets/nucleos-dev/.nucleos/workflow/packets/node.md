@@ -1,0 +1,89 @@
+# Node Packet
+
+<!-- READ-ONLY TEMPLATE. See packets/README.md for the contract.
+  Filled by the parent (or the root controller) and handed to a sub-orchestrator or leaf.
+  Pointers only: never paste the parent's plan or spec into this packet. -->
+
+Node ID: <!-- the id returned by mcp__nucleos__node_open -->
+Root ID: <!-- the work tree's root node id -->
+Parent ID: <!-- the parent node id, or `none` for a root -->
+Task ID: <!-- the ROOT's task_id; ledger rows for this node use it with node_id in the payload -->
+Kind: <!-- orchestrator | leaf -->
+Title: <!-- a few words -->
+
+## Goal
+<!-- 1-3 verifiable sentences: what must be true when this node closes `done` -->
+
+## Ownership
+Owned paths: <!-- globs; the daemon refuses overlap with a running sibling. Touch nothing outside them. -->
+Budget tokens: <!-- planned context budget for this node -->
+
+## Inherited limits
+Current depth: <!-- this node's depth in the tree -->
+Max depth: <!-- from the speed profile; a child that would exceed it is refused by node_open -->
+Max width: <!-- max open siblings per parent -->
+Leaf budget: <!-- default budget_tokens for a leaf child -->
+Orchestrator budget: <!-- default budget_tokens for an orchestrator child -->
+Ceiling: <!-- `nodes.ceiling` from the speed profile (200000); absolute context ceiling; at ~80% of Budget tokens stop, write the handoff, close `handoff` -->
+Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this task -->
+
+## Pointers
+<!-- paths with line ranges into the parent plan/spec, one per line: `<path>:<start>-<end> - why it matters`.
+  Never content. Read only these ranges. -->
+
+## Constraints
+- Run no build or test tool (compilers, package managers, test runners) beyond the leaf self-check in `Rules by role`: list the exact commands in the handoff for the root to run.
+- Write state through `mcp__nucleos__node_update` on every status change, decision and context peak.
+- Dispatch only your own direct children (kind `orchestrator` or `leaf`); never another node's phases.
+- Close through `mcp__nucleos__node_close` (a top-of-branch orchestrator excepted: it returns its report and stays `running` until merge) with a summary of at most 1500 characters and the path of the full handoff, written first from `packets/handoff.md`.
+- An orchestrator never implements and never rotates its own context: at the ceiling it closes `handoff` and the parent relaunches a fresh node from the daemon tree.
+
+## Rules by role
+
+<!-- Read by `scripts/tree.py prompt`: `### all` plus the subsection of the node's role are copied into the generated prompt under `## Rules`. This is the only copy of these rules; edit them here, never in a skill or in a hand-written prompt. -->
+
+### all
+- A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Put every other command you would have run in your report under `Commands for the root`; the root runs it. Orchestrators run no cargo.
+- Run no other build or test tool either (compilers, package managers, test runners).
+- Make no commit, merge, stash or push.
+- The contract file is read-only. A gap in it that is internal to your own files: choose the smallest reading, do it, and record the choice under Decisions. Only when the choice changes an interface shared with a sibling: stop and return `Outcome: contract_request` with the options.
+- At ~80% of your context budget, or near 200k tokens, stop and write your handoff.
+
+### leaf
+- Write only inside your Owned paths. A file outside them is reverted by the root and fails your node.
+- You open no child nodes.
+
+### orchestrator
+- Edit no file: you have no Edit tool, and an orchestrator that changes code is refused.
+- Open children with `node_open`; their `owned_paths` must be disjoint and contained in yours.
+- Split only into independent pieces. A piece that needs a new interface shared between siblings, or a path outside yours, is a `contract_request`, not a split.
+- The top-of-branch orchestrator (the one the root launched) does not close itself: when every child is closed it returns its report and its node stays `running` until the branch is merged. A sub-orchestrator inside the branch closes itself `done` when every child is closed.
+
+### review
+- Read only: change nothing, not even a comment.
+- Return the findings in `Open items / next step`, one per line as `R<n> <file>: <note>`, most serious first.
+
+## Report format
+
+<!-- Read by `scripts/tree.py prompt`: `### all` plus `### file` (leaf, orchestrator) or `### message` (review) are copied into the generated prompt under `## Report`. Placeholders filled by tree.py: {max_lines} (tree.report_max_lines), {role}, {status_map} (from tree_state.OUTCOME_STATUS) and {handoff} (this node's handoff path). The only copy of this text; edit it here. -->
+
+### all
+- Finish with a report in the format of `.nucleos/workflow/packets/handoff.md`: at most {max_lines} lines, not counting HTML comments.
+- Header: `Role: {role}`; `Outcome` is one of done, split, contract_request, blocked, failed; `Status` must match it ({status_map}).
+
+### file
+- Write it to `{handoff}` before you call node_close.
+
+### message
+- You have no Write tool: return the report as your final message; the root records it.
+
+### template
+<!-- A fillable model report. `tree.py prompt` does not copy this block: its `report_block` emits only `### all` plus `### file` or `### message`. Fill every field; the section headings after the header are the `## ` headings of `packets/handoff.md`, in that order. -->
+Node ID: <your node id>
+Root ID: <the root id>
+Status: done
+Role: {role}
+Outcome: done
+Contract used: none
+Change Outcome if it is not done: split, contract_request, blocked or failed. Status must follow it (done or split -> done, contract_request or blocked -> blocked, failed -> failed). Contract used is the ids from contract.md, or none.
+Then the sections of `packets/handoff.md`: Summary, What was done, Decisions, Files touched, Commands for the root, Open items / next step, Contract request, Blocked reason. At most {max_lines} lines; write it to {handoff}.

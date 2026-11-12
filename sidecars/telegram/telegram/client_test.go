@@ -1,0 +1,403 @@
+package telegram
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestClientGetUpdates(t *testing.T) {
+	const token = "test-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/bot"+token+"/getUpdates" {
+			t.Errorf("path = %q, want %q", r.URL.Path, "/bot"+token+"/getUpdates")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":[{"update_id":10,"message":{"message_id":1,"chat":{"id":42},"text":"hi"}}]}`))
+	}))
+	defer server.Close()
+
+	client := New(token)
+	client.apiBase = server.URL
+
+	updates, err := client.GetUpdates(0, 50)
+	if err != nil {
+		t.Fatalf("GetUpdates() error = %v", err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("len(updates) = %d, want 1", len(updates))
+	}
+	if updates[0].UpdateID != 10 {
+		t.Errorf("UpdateID = %d, want 10", updates[0].UpdateID)
+	}
+	if updates[0].Message == nil {
+		t.Fatal("Message = nil, want a message")
+	}
+	if updates[0].Message.Chat.ID != 42 {
+		t.Errorf("Message.Chat.ID = %d, want 42", updates[0].Message.Chat.ID)
+	}
+	if updates[0].Message.Text != "hi" {
+		t.Errorf("Message.Text = %q, want %q", updates[0].Message.Text, "hi")
+	}
+}
+
+func TestClientSendMessage(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	defer server.Close()
+
+	client := New("token")
+	client.apiBase = server.URL
+
+	if err := client.SendMessage(Destination{ChatID: 42}, "hello"); err != nil {
+		t.Fatalf("SendMessage() error = %v", err)
+	}
+	if request["chat_id"] != float64(42) {
+		t.Errorf("chat_id = %#v, want 42", request["chat_id"])
+	}
+	if request["text"] != "hello" {
+		t.Errorf("text = %#v, want %q", request["text"], "hello")
+	}
+}
+
+func TestClientSendMessageWithButtons(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	defer server.Close()
+
+	client := New("token")
+	client.apiBase = server.URL
+
+	rows := [][]Button{{{Text: "Approve", CallbackData: "approve:7"}}}
+	if err := client.SendMessageWithButtons(Destination{ChatID: 42}, "proposal", rows); err != nil {
+		t.Fatalf("SendMessageWithButtons() error = %v", err)
+	}
+
+	replyMarkup, ok := request["reply_markup"].(map[string]any)
+	if !ok {
+		t.Fatalf("reply_markup = %#v, want object", request["reply_markup"])
+	}
+	keyboard, ok := replyMarkup["inline_keyboard"].([]any)
+	if !ok || len(keyboard) == 0 {
+		t.Fatalf("inline_keyboard = %#v, want non-empty array", replyMarkup["inline_keyboard"])
+	}
+	firstRow, ok := keyboard[0].([]any)
+	if !ok || len(firstRow) == 0 {
+		t.Fatalf("first row = %#v, want non-empty array", keyboard[0])
+	}
+	firstButton, ok := firstRow[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first button = %#v, want object", firstRow[0])
+	}
+	if firstButton["callback_data"] != "approve:7" {
+		t.Errorf("callback_data = %#v, want %q", firstButton["callback_data"], "approve:7")
+	}
+}
+
+func TestClientTelegramError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"description":"boom"}`))
+	}))
+	defer server.Close()
+
+	client := New("token")
+	client.apiBase = server.URL
+
+	err := client.SendMessage(Destination{ChatID: 42}, "hello")
+	if err == nil {
+		t.Fatal("SendMessage() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error = %q, want it to contain %q", err, "boom")
+	}
+}
+
+// The bot token is a path segment of every request URL, and Go reports a transport failure as a
+// *url.Error whose Error() prints that whole URL. Transport failures are routine here — the update
+// loop holds a 50s long poll open, so a DNS blip, a reset or a timeout happens often — and each one
+// used to be logged verbatim, writing the token to stderr and to whatever captures it.
+func TestATransportFailureNeverPutsTheBotTokenInTheErrorText(t *testing.T) {
+	const token = "8000000:AAH-this-is-the-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	// Closed on purpose: the port stops accepting, which is the failure shape being pinned.
+	server.Close()
+
+	client := New(token)
+	client.apiBase = server.URL
+
+	_, err := client.GetUpdates(0, 1)
+	if err == nil {
+		t.Fatal("GetUpdates() error = nil, want a transport error")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("GetUpdates() error = %q, want the bot token redacted out of it", err)
+	}
+
+	_, err = client.DownloadFile("voice/file.ogg")
+	if err == nil {
+		t.Fatal("DownloadFile() error = nil, want a transport error")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("DownloadFile() error = %q, want the bot token redacted out of it", err)
+	}
+
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Errorf("DownloadFile() error = %v, want the transport error still reachable by errors.As", err)
+	}
+}
+
+// Telegram answers a throttled sender with 429 and says how long to wait. Retrying that wait is the
+// difference between an approval prompt arriving late and never arriving at all.
+func TestARateLimitedRequestWaitsTheAdvertisedDelayAndRetries(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 2","parameters":{"retry_after":2}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	defer server.Close()
+
+	client := New("token")
+	client.apiBase = server.URL
+	var waited time.Duration
+	client.sleep = func(_ context.Context, d time.Duration) bool {
+		waited = d
+		return true
+	}
+
+	if err := client.SendMessage(Destination{ChatID: 42}, "hello"); err != nil {
+		t.Fatalf("SendMessage() error = %v, want the retry to succeed", err)
+	}
+	if calls != 2 {
+		t.Errorf("server calls = %d, want 2 (the throttled one and the retry)", calls)
+	}
+	if waited != 2*time.Second {
+		t.Errorf("waited = %s, want the 2s Telegram asked for", waited)
+	}
+}
+
+// A throttle that outlives the retries must be recognisable as a throttle: the caller has to know
+// that sending something else immediately is the one thing that makes it worse.
+func TestAThrottleThatNeverClearsIsReportedAsRateLimiting(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`))
+	}))
+	defer server.Close()
+
+	client := New("token")
+	client.apiBase = server.URL
+	client.sleep = func(context.Context, time.Duration) bool { return true }
+
+	err := client.SendHTML(Destination{ChatID: 42}, "<b>hi</b>")
+	if !IsRateLimited(err) {
+		t.Errorf("IsRateLimited(%v) = false, want true", err)
+	}
+	if IsRateLimited(errors.New("invalid entities")) {
+		t.Error("IsRateLimited(a plain error) = true, want false")
+	}
+}
+
+// A rejection Telegram itself issued (bad HTML entities, say) is worth answering differently from a
+// request that never arrived, so the two must stay distinguishable.
+func TestATelegramRejectionIsNotMistakenForATransportFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"Bad Request: can't parse entities"}`))
+	}))
+	defer server.Close()
+
+	client := New("token")
+	client.apiBase = server.URL
+
+	err := client.SendHTML(Destination{ChatID: 42}, "<b>hi")
+	if err == nil {
+		t.Fatal("SendHTML() error = nil, want a rejection")
+	}
+	if IsTransport(err) {
+		t.Errorf("IsTransport(%v) = true, want false — Telegram answered", err)
+	}
+	if IsRateLimited(err) {
+		t.Errorf("IsRateLimited(%v) = true, want false", err)
+	}
+	if !strings.Contains(err.Error(), "can't parse entities") {
+		t.Errorf("error = %q, want Telegram's description kept", err)
+	}
+}
+
+func TestGetUpdatesStopsWhenItsContextIsCancelled(t *testing.T) {
+	// The handler holds the poll open the way Telegram does; `release` is only there so the test
+	// server can be shut down afterwards.
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	client := New("token")
+	client.apiBase = server.URL
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	if _, err := client.GetUpdatesContext(ctx, 0, 50); err == nil {
+		t.Fatal("GetUpdatesContext() error = nil, want the cancellation reported")
+	}
+}
+
+// captureSend stands up a fake Bot API that records the JSON body of one sendMessage call.
+func captureSend(t *testing.T, body *map[string]any) *Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := New("token")
+	client.apiBase = server.URL
+	return client
+}
+
+// This is where the silent failure lives. Without the thread on the way out, every reply lands in
+// the group's General topic and nothing errors — the only way to find out is to look at a phone.
+func TestSendCarriesTheThread(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		send func(*Client) error
+	}{
+		{"SendMessage", func(c *Client) error {
+			return c.SendMessage(Destination{ChatID: -100123, ThreadID: 7}, "olá")
+		}},
+		{"SendHTML", func(c *Client) error {
+			return c.SendHTML(Destination{ChatID: -100123, ThreadID: 7}, "<b>olá</b>")
+		}},
+		{"SendMessageWithButtons", func(c *Client) error {
+			return c.SendMessageWithButtons(Destination{ChatID: -100123, ThreadID: 7}, "olá",
+				[][]Button{{{Text: "ok", CallbackData: "ok"}}})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			if err := tc.send(captureSend(t, &body)); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			if body["message_thread_id"] != float64(7) {
+				t.Fatalf("the reply lost its topic: %v", body)
+			}
+			if body["chat_id"] != float64(-100123) {
+				t.Fatalf("chat_id = %v, want -100123", body["chat_id"])
+			}
+		})
+	}
+}
+
+// A one-to-one chat has no topic, and a zero sent as one is a topic that does not exist — Telegram
+// answers 400. Absent has to mean absent from the body.
+func TestSendOmitsAnAbsentThread(t *testing.T) {
+	var body map[string]any
+	client := captureSend(t, &body)
+
+	if err := client.SendMessage(Destination{ChatID: -100123}, "olá"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if _, present := body["message_thread_id"]; present {
+		t.Fatalf("an absent topic must not travel in the body: %v", body)
+	}
+}
+
+func TestUpdateCarriesTheThread(t *testing.T) {
+	var update Update
+	raw := `{"update_id":1,"message":{"message_id":2,"chat":{"id":-100123},
+	         "message_thread_id":7,"is_topic_message":true,"text":"olá"}}`
+	if err := json.Unmarshal([]byte(raw), &update); err != nil {
+		t.Fatal(err)
+	}
+	if update.Message.MessageThreadID != 7 {
+		t.Fatalf("the topic did not arrive: %+v", update.Message)
+	}
+	if !update.Message.IsTopicMessage {
+		t.Fatalf("the message says it is in a forum topic and the struct does not: %+v", update.Message)
+	}
+}
+
+// Telegram sets `message_thread_id` on a plain reply chain in a supergroup too, and only
+// `is_topic_message` says it is a forum topic. Reading the id on its own would give every reply
+// chain in an ordinary group its own key — and on the day this ships, every one of those
+// conversations would lose its session.
+func TestDestinationIgnoresAThreadThatIsNotATopic(t *testing.T) {
+	message := &Message{
+		Chat:            Chat{ID: -100123},
+		MessageThreadID: 55,
+		IsTopicMessage:  false,
+	}
+	if got := message.Destination(); got != (Destination{ChatID: -100123}) {
+		t.Fatalf("Destination() = %+v, want the bare chat", got)
+	}
+
+	message.IsTopicMessage = true
+	if got := message.Destination(); got != (Destination{ChatID: -100123, ThreadID: 55}) {
+		t.Fatalf("Destination() = %+v, want the topic", got)
+	}
+}
+
+func TestAReplyCarriesTheMessageItAnswersAndWhetherItsAuthorIsABot(t *testing.T) {
+	raw := `{"message_id":5,"chat":{"id":42},"from":{"id":42,"is_bot":false},"text":"it was the VPN",
+		"reply_to_message":{"message_id":4,"chat":{"id":42},"from":{"id":999,"is_bot":true},"text":"📣 🧠 x · job #7 #cap7"}}`
+	var m Message
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.ReplyToMessage == nil {
+		t.Fatal("ReplyToMessage = nil, want the replied-to message")
+	}
+	if !m.ReplyToMessage.From.IsBot {
+		t.Error("ReplyToMessage.From.IsBot = false, want true")
+	}
+	if m.From.IsBot {
+		t.Error("From.IsBot = true, want false")
+	}
+	if m.ReplyToMessage.Text != "📣 🧠 x · job #7 #cap7" {
+		t.Errorf("ReplyToMessage.Text = %q", m.ReplyToMessage.Text)
+	}
+}

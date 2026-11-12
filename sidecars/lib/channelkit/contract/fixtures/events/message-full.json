@@ -1,0 +1,11 @@
+{ "event_id": "upd-88123",
+  "at": "2026-10-19T10:30:00Z",
+  "conversation": {"ref": "-100123:5", "kind": "thread", "parent": "-100123"},
+  "sender": {"ref": "4242", "name": "Duarte"},
+  "type": "message",
+  "message": { "ref": "991", "reply_to": "987",
+    "parts": [ {"type": "text",  "text": "Vê isto e diz-me o que achas"},
+               {"type": "audio", "media": "m_17", "mime": "audio/ogg", "duration_ms": 4100},
+               {"type": "image", "media": "m_18", "caption": "o ecrã de erro"},
+               {"type": "file",  "media": "m_19", "name": "x.pdf", "caption": "o relatório"},
+               {"type": "unsupported", "label": "sticker"} ] } }

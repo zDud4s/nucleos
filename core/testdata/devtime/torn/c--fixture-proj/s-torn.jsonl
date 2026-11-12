@@ -1,0 +1,5 @@
+{"type":"user","timestamp":"2026-10-04T10:00:00.000Z","sessionId":"s-torn","cwd":"C:/fixture/proj","entrypoint":"cli","origin":{"kind":"human"},"message":{"role":"user","content":"go"}}
+{"type":"assistant","timestamp":"2026-10-04T10:00:01.000Z","sessionId":"s-torn","cwd":"C:/fixture/proj","entrypoint":"cli","message":{"id":"mt1","model":"claude-x","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":5},"content":[{"type":"text","text":"one"}]}}
+{"type":"assistant","timestamp":"2026-10-04T10:00:02.000Z","sessionId":"s-torn","message":{"id":"broken
+{"type":"zzz-future-record","timestamp":"2026-10-04T10:00:03.000Z","sessionId":"s-torn"}
+{"type":"assistant","timestamp":"2026-10-04T10:00:05.000Z","sessionId":"s-torn","cwd":"C:/fixture/proj","entrypoint":"cli","message":{"id":"mt2","model":"claude-x","usage":{"input_tokens":11,"cache_read_input_tokens":110,"cache_creation_input_tokens":0,"output_tokens":6},"content":[{"type":"text","text":"two"}]}}

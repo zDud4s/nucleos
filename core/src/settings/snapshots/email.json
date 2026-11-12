@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`~/.nucleos/email.yaml` (spec §3.4). Every field has a default, so a partial file is valid and an\nabsent one switches the pillar off in silence rather than blocking startup.",
+  "properties": {
+    "digest_hour_utc": {
+      "default": 7,
+      "description": "Hour (UTC) the daily digest is emitted. Validated to `0..=21` so its two-hour window cannot\nstraddle midnight and emit twice (§6.3).",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "enabled": {
+      "default": false,
+      "description": "Opt-in. The pillar reads a real mailbox, so nothing about it starts by accident.",
+      "type": "boolean"
+    },
+    "host": {
+      "default": "",
+      "type": "string"
+    },
+    "mailbox": {
+      "default": "INBOX",
+      "type": "string"
+    },
+    "notify_classes": {
+      "default": [
+        "urgent"
+      ],
+      "description": "Which triage classes are worth interrupting a person for.\n\nAn EMPTY list is a valid value meaning \"notify about nothing\" — only an ABSENT key gives\nthe `[\"urgent\"]` default. The distinction carries the rollout's first week (spec §9), where\nthe whole point is to watch the classifier without being paged by it; treating `[]` as\nabsent would notify from day one and burn the calibration ramp.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "poll_interval_secs": {
+      "default": 300,
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "port": {
+      "default": 993,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "retain_bodies_days": {
+      "default": 14,
+      "description": "How long a classified message keeps its body (§7.2). Defaults to 14 rather than 0 because\nthe pillar's first state after being switched on is always the calibration week, which is\nexactly when the bodies are needed. Capped at 30, where row pruning removes the row anyway.",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "sent_mailbox": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "smtp_host": {
+      "default": "",
+      "description": "The submission host, kept apart from `host` above because reading a mailbox and posting a\nmessage to it are two different servers as often as they are one — `imap.gmail.com` and\n`smtp.gmail.com` being the case most people are in. Empty is the shipped state and means\nsending is unconfigured: the send route answers 503 rather than guessing a host from the\nIMAP one, because a guessed submission server either refuses the login or, far worse,\nbelongs to somebody else.",
+      "type": "string"
+    },
+    "smtp_port": {
+      "default": 465,
+      "description": "465 (implicit TLS) rather than 587 (STARTTLS): the pillar's premise is that a message the\nmailbox's owner cannot recall does not leave this machine in the clear, and only one of the\ntwo is encrypted before the first byte of the conversation.",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "username": {
+      "default": "",
+      "type": "string"
+    }
+  },
+  "title": "EmailConfig",
+  "type": "object"
+}

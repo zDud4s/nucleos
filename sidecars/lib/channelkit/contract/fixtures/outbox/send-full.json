@@ -1,0 +1,11 @@
+{ "id": 57, "type": "send", "conversation": "-100123:5",
+  "reply_to": 52, "reply_to_platform_ref": "980",
+  "parts": [
+    { "type": "text",
+      "text": "**Proposal 12**: install `ripgrep`\n\n| field | value |\n|---|---|\n| cost | 0 |\n\n- see [the docs](https://example.org)\n\n    rg --version" },
+    { "type": "image", "media": "m_31", "caption": "diff" },
+    { "type": "file",  "media": "m_32", "name": "relatorio.pdf", "mime": "application/pdf" },
+    { "type": "audio", "media": "m_33", "mime": "audio/ogg" } ],
+  "buttons": [ [ {"label": "Approve", "token": "tk_9f2c"},
+                 {"label": "Reject",  "token": "tk_9f2d"} ] ],
+  "silent": true }

@@ -1,0 +1,354 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { screen, within } from "@testing-library/react";
+import { Home } from "./Home";
+import { daemonFetch, daemonState, project, proposal, renderWithRouter } from "../test/harness";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
+vi.mock("../data/client", async (original) => ({
+  ...(await original<typeof import("../data/client")>()),
+  ...daemon,
+}));
+
+beforeEach(() => {
+  daemon.apiFetch.mockReset();
+});
+
+/**
+ * The spend meter row. Spend is a ceiling, so the redesign draws it as a full-width labelled
+ * meter row linking to /system, not as a fourth StatCard (no `article`).
+ */
+async function spendRow(): Promise<HTMLElement> {
+  return await screen.findByRole("link", { name: /^Spend/ });
+}
+
+/** The card with this label, once its query has landed. */
+async function card(label: string): Promise<HTMLElement> {
+  return await screen.findByRole("article", { name: new RegExp(`^${label}`) });
+}
+
+describe("Home", () => {
+  it("shows the four readings of §6.1 from the daemon's answers", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(
+        daemonState({
+          projects: [
+            project({ project_id: "alpha", mode: "active", pending: 0 }),
+            project({ project_id: "beta", mode: "shadow", pending: 4 }),
+            project({ project_id: "gamma", mode: "off", pending: 3 }),
+          ],
+          proposals: [proposal({ id: 1 }), proposal({ id: 2 })],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Home />);
+
+    const projects = await card("Projects");
+    expect(within(projects).getByText("3")).toBeDefined();
+    expect(within(projects).getByText("1 active · 1 shadow")).toBeDefined();
+
+    // Summed, not counted: one project holding seven decisions is not the same
+    // news as seven projects holding one.
+    expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
+    expect(await within(await card("Waiting on you")).findByText("2")).toBeDefined();
+    expect((await card("Waiting on you")).textContent).toContain(
+      "2 decisions need your answer",
+    );
+    const spend = await spendRow();
+    expect(within(spend).getByText(/\$1\.42/)).toBeDefined();
+    expect(spend.getAttribute("href")).toBe("/system");
+
+    // Four cards now plus the spend meter row (not an article): "Subsystems healthy" is
+    // System's own headline, on the first screen because that is where somebody finds out
+    // a subsystem is down. The readings of §6.1 are still all there and still say what §6.1
+    // says they say.
+    expect(screen.getAllByRole("article")).toHaveLength(4);
+  });
+
+  it("the headline counts the whole waiting queue", async () => {
+    const answer = daemonFetch(daemonState({ proposals: [proposal({ id: 1 })] }));
+    // The badge reads the daemon's own count; one approval and one team action are two lists.
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/waiting/count"
+        ? { ...(await answer(path, init) as object), team_actions: 1 }
+        : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    expect(await within(await card("Waiting on you")).findByText("2")).toBeDefined();
+    expect((await screen.findByText(/2 waiting on you/)).textContent).toMatch(/; 2 waiting on you$/);
+  });
+
+  it("the waiting card says what the number is", async () => {
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ proposals: [proposal({ id: 1 })] })));
+
+    await renderWithRouter(<Home />);
+
+    expect((await card("Waiting on you")).textContent).toContain(
+      "1 decision needs your answer",
+    );
+    // The card is itself the door to the queue; the separate "Where to look next" sentence was
+    // removed by the redesign.
+    expect(screen.getByRole("link", { name: /^Waiting on you/ }).getAttribute("href")).toBe("/waiting");
+  });
+
+  it("reads an absent ceiling as no ceiling, never as zero", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(daemonState({ budget: { ...daemonState().budget, limit_usd: null } })),
+    );
+
+    await renderWithRouter(<Home />);
+
+    const spend = await spendRow();
+    // `null` means nothing will ever stop the spend; `0.00` means nothing will
+    // ever run. Rendering the first as the second invents a policy nobody set.
+    expect(within(spend).getByText(/no ceiling/)).toBeDefined();
+    expect(spend.textContent).not.toMatch(/0\.00/);
+  });
+
+  it("the window spend shows its share of the ceiling, and shows no bar when there is no ceiling", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(daemonState({ budget: { ...daemonState().budget, window_spend_usd: 4.1, limit_usd: 5 } })),
+    );
+    const first = await renderWithRouter(<Home />);
+    const spend = await spendRow();
+    const fill = spend.querySelector(".ui-gauge-fill") as HTMLElement;
+    expect(fill.style.width).toBe("82%");
+    expect(spend.querySelector(".ui-gauge")?.className).toContain("ui-gauge-quantity");
+    // The head (label and "$4.10 / $5.00") is now part of the row, not written beside it.
+    expect(spend.querySelector(".ui-gauge-head")?.textContent).toContain("$4.10 / $5.00");
+    first.unmount();
+
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(daemonState({ budget: { ...daemonState().budget, limit_usd: null } })),
+    );
+    await renderWithRouter(<Home />);
+    expect((await spendRow()).querySelector(".ui-gauge-fill")).toBeNull();
+  });
+
+  it("one note with a Retry replaces the repeated refusal when nothing could be read", async () => {
+    daemon.apiFetch.mockRejectedValue(new Error("down"));
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeDefined();
+    expect(document.body.textContent).not.toContain("did not answer");
+    expect(document.body.textContent).not.toContain("núcleo");
+  });
+
+  it("holds a skeleton, not a dash and 'reading…', in each card still waiting for its read", async () => {
+    // Only the budget answers; the rest never does, so the grid is real cards for what landed and
+    // a Skeleton the size of the card for what has not.
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/autopilot/budget" ? daemonFetch(daemonState())(path, init) : new Promise(() => {}),
+    );
+
+    await renderWithRouter(<Home />);
+
+    await spendRow();
+    for (const label of [
+      "Loading waiting on you",
+      "Loading subsystem health",
+      "Loading projects",
+      "Loading shadow decisions",
+    ]) {
+      expect((await screen.findByText(label)).closest("[role=status]")).not.toBeNull();
+    }
+    expect(screen.queryAllByRole("article")).toHaveLength(0);
+    expect(document.body.textContent).not.toContain("reading");
+  });
+
+  it("shows an em dash rather than a zero when a read failed", async () => {
+    // A count nobody has managed to fetch and a count that is genuinely zero are
+    // different pieces of news, and only one of them means you can go to lunch.
+    const answer = daemonFetch(daemonState());
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/projects" ? Promise.reject(new Error("down")) : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    for (const label of ["Projects", "Shadow decisions pending"]) {
+      const failed = await card(label);
+      expect(within(failed).getByText("—")).toBeDefined();
+      expect(failed.textContent).toContain("could not read");
+    }
+  });
+
+  it("holds the grid with a card skeleton until the first read lands", async () => {
+    daemon.apiFetch.mockReturnValue(new Promise(() => {}));
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByText("Loading your readings")).toBeDefined();
+    expect(screen.queryAllByRole("article")).toHaveLength(0);
+  });
+
+  it("says out loud when a ceiling is holding autonomous work", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(
+        daemonState({
+          budget: { ...daemonState().budget, paused: true, reason: "the daily ceiling is spent" },
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByText(/the daily ceiling is spent/)).toBeDefined();
+  });
+
+  it("the headline names the worst live fact and links to system", async () => {
+    // The harness's `daemonFetch` has no `/health/readout` case and falls through to
+    // `undefined`, so the readout is wrapped AROUND it rather than passed through it.
+    const answer = daemonFetch(daemonState({ proposals: [] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/health/readout"
+        ? {
+            status: "degraded",
+            subsystems: [
+              { name: "sqlite_pool", status: "ok" },
+              { name: "worktree_disk", status: "degraded", reason: "low-disk-space" },
+              { name: "browser_sidecar", status: "down", reason: "not-running" },
+            ],
+          }
+        : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    // Named, and a door. "1 subsystem down" would send somebody to /system to find out
+    // which one, and the answer is three words long — so the sentence says it, and the
+    // sentence is the way there.
+    const door = await screen.findByRole("link", {
+      // The redesign writes subsystems as a person would: `browser_sidecar` -> "browser".
+      name: /1 subsystem down \(browser\), 1 degraded/,
+    });
+    expect(door.getAttribute("href")).toBe("/system");
+
+    // The waiting clause is still appended to it: the worst fact leads the sentence, it
+    // does not replace it.
+    expect(door.closest("p")?.textContent).toBe(
+      "1 subsystem down (browser), 1 degraded; nothing waiting on you",
+    );
+
+    /*
+      And it is the wrong colour for a wrong fact.
+
+      A bare `<Link>` here rendered Signal Cyan — the wordmark's colour, which the design
+      spends on identity and navigation and on nothing that is a state. The worst live fact
+      about the machine was being reported in the one colour that means "nothing is
+      happening". `.ui-wrong` carries the tone and `.ui-wrong-door` takes it from the clause
+      around it, because `base.css` styles `a` unlayered and a Tailwind utility cannot beat
+      that. Both are classes rather than paint, because jsdom applies no stylesheet.
+    */
+    expect(door.className).toContain("ui-wrong-door");
+    expect(door.parentElement?.className).toContain("ui-wrong");
+
+    // And the card that counts the same fact wears the same tone. The figure reads
+    // "2/3" whether or not anything is wrong; the tone is what says which it is.
+    const subsystemsCard = screen.getByRole("article", { name: /^Subsystems healthy/ });
+    expect(subsystemsCard.className).toBe("ui-stat");
+    expect(subsystemsCard.querySelector(".ui-stat-value")?.className).toBe("ui-stat-value");
+    // ui-wrong lands on the span StatCard's detail slot wraps, not on the slot's own
+    // p.ui-stat-detail — Boundary.tsx's rule is that the whole sentence carries the tone.
+    expect(
+      screen
+        .getByRole("article", { name: /^Subsystems healthy/ })
+        .querySelector(".ui-stat-detail .ui-wrong"),
+    ).not.toBeNull();
+  });
+
+  it("a subsystem down tones the whole sentence, not just the numeral", async () => {
+    // The same fixture the neighbouring case uses — since round 11 the detail wears `.ui-wrong`
+    // and `StatCard` has no tone of its own.
+    const answer = daemonFetch(daemonState({ proposals: [] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/health/readout"
+        ? {
+            status: "degraded",
+            subsystems: [
+              { name: "sqlite_pool", status: "ok" },
+              { name: "worktree_disk", status: "degraded", reason: "low-disk-space" },
+              { name: "browser_sidecar", status: "down", reason: "not-running" },
+            ],
+          }
+        : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    const card_ = await screen.findByRole("article", { name: /^Subsystems healthy/ });
+    expect(card_.className).toBe("ui-stat");
+    // The detail carries it too: one reading, one treatment — Boundary.tsx's rule.
+    expect(card_.querySelector(".ui-stat-detail .ui-wrong")).not.toBeNull();
+  });
+
+  it("an all-clear keeps the mode sentence and all four cards and the spend row", async () => {
+    const answer = daemonFetch(
+      daemonState({
+        projects: [
+          project({ project_id: "alpha", mode: "active" }),
+          project({ project_id: "beta", mode: "shadow" }),
+          project({ project_id: "gamma", mode: "shadow" }),
+        ],
+        proposals: [],
+      }),
+    );
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/health/readout"
+        ? {
+            status: "ok",
+            subsystems: [
+              { name: "sqlite_pool", status: "ok" },
+              { name: "worktree_disk", status: "ok" },
+              { name: "browser_sidecar", status: "ok" },
+            ],
+          }
+        : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByText("1 acting, 2 in shadow; nothing waiting on you")).toBeDefined();
+    // The healthy card is itself a link to /system now, so it is the sentence that must offer no door.
+    expect(screen.queryByRole("link", { name: / down| degraded/ })).toBeNull();
+
+    // And the cards do not recede. A card that appeared only when something was wrong
+    // would teach the reader that an absent card is an absent fact.
+    expect(screen.getAllByRole("article")).toHaveLength(4);
+    await spendRow();
+
+    // Nor does the healthy card wear the tone. A figure that is always red says nothing
+    // when something actually goes wrong.
+    expect(screen.getByRole("article", { name: /^Subsystems healthy/ }).className).toBe("ui-stat");
+    expect(
+      screen
+        .getByRole("article", { name: /^Subsystems healthy/ })
+        .querySelector(".ui-stat-detail .ui-wrong"),
+    ).toBeNull();
+  });
+
+  it("mutates nothing — the first screen is a reading, not a console", async () => {
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ projects: [project()] })));
+
+    await renderWithRouter(<Home />);
+    await card("Projects");
+
+    // Every action lives one click away, on the page that also shows what you
+    // would be acting on. A control here would be pressed by somebody looking at
+    // the state of five seconds ago.
+    // Glossary Tip marks (aria-describedby) only explain, and Retry only reads again.
+    expect(
+      screen
+        .queryAllByRole("button")
+        .filter((b) => b.getAttribute("aria-describedby") === null && b.textContent !== "Retry" && b.getAttribute("aria-label") !== "Dismiss notification"),
+    ).toHaveLength(0);
+    // Each reading is a link to its page (no more "Where to look next").
+    expect(screen.getByRole("link", { name: /^Shadow decisions pending/ }).getAttribute("href")).toBe("/autopilot");
+    expect(screen.getByRole("link", { name: /^Waiting on you/ }).getAttribute("href")).toBe("/waiting");
+  });
+});

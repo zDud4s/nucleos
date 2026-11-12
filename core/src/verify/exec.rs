@@ -1,0 +1,1575 @@
+//! The daemon's verification executor: a persisted queue of verification units
+//! (`verify_runs`), scheduled by [`verify_sched::pick`] under a machine-wide weight capacity,
+//! each run with its project's warm state — spec
+//! `<state_dir>/specs/2026-10-05-selecao-de-testes-design.md` §4.6.
+//!
+//! [`Executor::submit`] queues (or joins) a unit and wakes the worker; [`run_executor`] is the
+//! worker loop; [`Executor::start_ready`] is one scheduling pass. Weight and in-use warm dirs are
+//! released by a drop guard, so every way a unit ends gives its capacity back.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+
+use sqlx::SqlitePool;
+use tokio::sync::Notify;
+
+use crate::config::VerifyConfig;
+use crate::execution::admission::{AdmissionBook, VerifyGrant};
+use crate::gate::{self, ArgvOutcome};
+use crate::tests_map::{self, MapState};
+use crate::verify::runs::{self as verify_runs, Claimed, Request, State, Submitted};
+use crate::verify::{live, resolve};
+use crate::verify_sched::{self, Candidate};
+use crate::warm;
+
+/// A project's warm-state ceiling when its stored rules set none.
+pub const DEFAULT_PROJECT_DISK_CAP_GB: u64 = 30;
+/// Cadence while a unit is in flight (or a warm dir is being removed).
+const POLL: Duration = Duration::from_millis(500);
+/// Fallback cadence when nothing is in flight. Every enqueue (`submit`) and every unit finish
+/// (`Reservation::drop`) wakes the worker, so this only covers a missed wake.
+const IDLE_POLL: Duration = Duration::from_secs(30);
+const SWEEP_EVERY: Duration = Duration::from_secs(30 * 60);
+/// How often a unit looks again at a warm dir the sweep is removing.
+const REMOVING_POLL: Duration = Duration::from_millis(100);
+const GIB: u64 = 1024 * 1024 * 1024;
+/// Budget for the few git reads that find a post-merge gate unit's `NUCLEOS_GATE_BASE`.
+const GATE_BASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Weight of a unit: what the heavy-command broker charges for the same program.
+/// `cargo` (any case, with or without `.exe`) weighs 2, everything else 1, never above `capacity`.
+pub fn weight_of(argv: &[String], capacity: i64) -> i64 {
+    let program = argv.first().map(String::as_str).unwrap_or("");
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lower = base.to_ascii_lowercase();
+    let name = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
+    let weight = if name == "cargo" { 2 } else { 1 };
+    weight.min(capacity.max(1))
+}
+
+/// The argv that actually runs: the machine's broker, then the unit.
+fn final_argv(prefix: &[String], argv: &[String]) -> Vec<String> {
+    prefix.iter().chain(argv.iter()).cloned().collect()
+}
+
+/// The exit code `scripts/heavy.py` returns when it could not even start the wrapped program.
+/// Keep in step with `EXIT_SPAWN_FAILED` in `scripts/heavy.py`.
+pub const BROKER_SPAWN_FAILED_EXIT: i32 = 71;
+/// The line prefix `scripts/heavy.py` prints before that exit code. Keep in step with
+/// `SPAWN_FAILED_MARKER` in `scripts/heavy.py`.
+const BROKER_SPAWN_FAILED_MARKER: &str = "heavy: spawn failed: ";
+
+/// How a finished process maps onto a row's status and exit code. `via_broker` says the argv
+/// ran behind the heavy-command broker prefix.
+fn status_of(outcome: &ArgvOutcome, via_broker: bool) -> (&'static str, Option<i64>) {
+    if outcome.timed_out || outcome.error.is_some() {
+        return (
+            verify_runs::STATUS_ERRORED,
+            outcome.exit_code.map(i64::from),
+        );
+    }
+    match outcome.exit_code {
+        Some(0) => (verify_runs::STATUS_PASSED, Some(0)),
+        // A broker that could not start the command measured nothing, so the unit is errored.
+        // 127 alone stays failed: a wrapped program can exit 127 itself (e.g. a missing tool
+        // inside the gate script).
+        Some(code)
+            if via_broker
+                && code == BROKER_SPAWN_FAILED_EXIT
+                && outcome.tail.contains(BROKER_SPAWN_FAILED_MARKER) =>
+        {
+            (verify_runs::STATUS_ERRORED, Some(i64::from(code)))
+        }
+        Some(code) => (verify_runs::STATUS_FAILED, Some(i64::from(code))),
+        None => (verify_runs::STATUS_ERRORED, None),
+    }
+}
+
+/// The tail recorded for an outcome: why it errored, if it did, then the output.
+fn tail_of(outcome: &ArgvOutcome) -> String {
+    let head = if outcome.timed_out {
+        Some(format!("timed out after {}s", outcome.duration.as_secs()))
+    } else {
+        outcome.error.clone()
+    };
+    match head {
+        Some(head) if outcome.tail.is_empty() => head,
+        // A row keeps only the last characters of its tail, so a timeout is also said at the end:
+        // the gate reads it there to tell a time ceiling from a crash (`TIME_CEILING_MARKER`).
+        Some(head) if outcome.timed_out => format!("{head}\n{}\n[{head}]", outcome.tail),
+        Some(head) => format!("{head}\n{}", outcome.tail),
+        None => outcome.tail.clone(),
+    }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn seconds_to_ms(seconds: u64) -> i64 {
+    i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX)
+}
+
+#[derive(Default)]
+struct InFlight {
+    /// Weight of every unit reserved or running.
+    used: i64,
+    /// Per project, the counter value of its last start (higher = more recent).
+    last_start: HashMap<Option<String>, u64>,
+    counter: u64,
+    /// Warm worktree dirs in use, with how many units hold each.
+    in_use: HashMap<PathBuf, usize>,
+    /// Warm worktree dirs the sweep is removing right now; no unit may hold one.
+    removing: HashSet<PathBuf>,
+}
+
+pub struct Executor {
+    pub pool: SqlitePool,
+    pub config: VerifyConfig,
+    /// Capacity and unit timeout as the settings store has them now.
+    limits: live::Limits,
+    pub machine_root: Option<PathBuf>,
+    /// Where warm state lives (`warm::home`): the machine root unless the daemon moved it.
+    warm_home: Option<PathBuf>,
+    pub wake: Arc<Notify>,
+    in_flight: Mutex<InFlight>,
+    /// A warm sweep is running; the next tick skips rather than overlap it.
+    sweeping: AtomicBool,
+    /// The runs' heavy-command budget, shared once at startup ([`Self::share_budget`]).
+    admission: OnceLock<Arc<AdmissionBook>>,
+}
+
+/// Holds a unit's weight and warm dirs; gives them back on drop, whatever path ended the unit.
+struct Reservation {
+    executor: Arc<Executor>,
+    weight: i64,
+    dirs: Vec<PathBuf>,
+    /// The unit's share of the runs' budget; returned when the reservation drops.
+    _admission: Option<VerifyGrant>,
+}
+
+impl Reservation {
+    /// Holds `dir` for this unit, first waiting out a sweep that is removing it.
+    async fn hold_dir(&mut self, dir: PathBuf) {
+        loop {
+            {
+                let mut state = self.executor.lock();
+                if !state.removing.contains(&dir) {
+                    *state.in_use.entry(dir.clone()).or_insert(0) += 1;
+                    break;
+                }
+            }
+            tokio::time::sleep(REMOVING_POLL).await;
+        }
+        self.dirs.push(dir);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        {
+            let mut state = self.executor.lock();
+            state.used -= self.weight;
+            for dir in self.dirs.drain(..) {
+                if let Some(count) = state.in_use.get_mut(&dir) {
+                    *count -= 1;
+                    if *count == 0 {
+                        state.in_use.remove(&dir);
+                    }
+                }
+            }
+        }
+        self.executor.wake.notify_one();
+    }
+}
+
+impl Executor {
+    /// Keeps `config`'s capacity and timeout for good: no live source, so tests do not depend on
+    /// the global settings store.
+    pub fn new(pool: SqlitePool, config: VerifyConfig, machine_root: Option<PathBuf>) -> Arc<Self> {
+        let warm_home = machine_root.clone();
+        let source: live::Source = Arc::new(|| None);
+        Self::build(pool, config, machine_root, warm_home, source)
+    }
+
+    /// `new` with warm state kept under `warm_home` rather than the machine root; `main` passes
+    /// `warm::home`, so `NUCLEOS_WARM_HOME` moves it. Tests keep `new`, whatever the env says.
+    /// Capacity and the unit timeout follow the settings store live.
+    pub fn with_warm_home(
+        pool: SqlitePool,
+        config: VerifyConfig,
+        machine_root: Option<PathBuf>,
+        warm_home: Option<PathBuf>,
+    ) -> Arc<Self> {
+        Self::build(
+            pool,
+            config,
+            machine_root,
+            warm_home,
+            live::settings_source(),
+        )
+    }
+
+    /// `new` with capacity and unit timeout read from `source` on every use.
+    #[cfg(test)]
+    pub(crate) fn with_limits_source(
+        pool: SqlitePool,
+        config: VerifyConfig,
+        machine_root: Option<PathBuf>,
+        source: live::Source,
+    ) -> Arc<Self> {
+        let warm_home = machine_root.clone();
+        Self::build(pool, config, machine_root, warm_home, source)
+    }
+
+    fn build(
+        pool: SqlitePool,
+        config: VerifyConfig,
+        machine_root: Option<PathBuf>,
+        warm_home: Option<PathBuf>,
+        source: live::Source,
+    ) -> Arc<Self> {
+        let limits = live::Limits::new(&config, source);
+        Arc::new(Self {
+            pool,
+            config,
+            limits,
+            machine_root,
+            warm_home,
+            wake: Arc::new(Notify::new()),
+            in_flight: Mutex::new(InFlight::default()),
+            sweeping: AtomicBool::new(false),
+            admission: OnceLock::new(),
+        })
+    }
+
+    /// The pool this executor's writes go through: the daemon's write queue, else its own pool.
+    fn writes(&self) -> SqlitePool {
+        crate::write_pool::for_writes(&self.pool)
+    }
+
+    /// Draw units from the runs' heavy-command budget too, and get woken when it frees up.
+    pub fn share_budget(&self, book: Arc<AdmissionBook>) {
+        book.set_verify_wake(self.wake.clone());
+        let _ = self.admission.set(book);
+    }
+
+    /// Short critical sections only; never held across an `.await`.
+    fn lock(&self) -> MutexGuard<'_, InFlight> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn capacity(&self) -> i64 {
+        self.limits.capacity()
+    }
+
+    /// The configured ceiling of one unit, in seconds, as the settings hold it now.
+    pub(crate) fn unit_timeout_seconds(&self) -> u64 {
+        self.limits.unit_timeout_seconds()
+    }
+
+    /// The sweep's guard: grants `dir` for removal unless a unit holds it, and keeps units off it
+    /// until [`Self::release_removal`].
+    fn try_reserve_removal(&self, dir: &Path) -> bool {
+        let mut state = self.lock();
+        if state.in_use.contains_key(dir) {
+            return false;
+        }
+        state.removing.insert(dir.to_path_buf());
+        true
+    }
+
+    fn release_removal(&self, dir: &Path) {
+        self.lock().removing.remove(dir);
+    }
+
+    /// Queues (or joins) a unit and wakes the worker.
+    pub async fn submit(&self, mut request: Request) -> sqlx::Result<Submitted> {
+        let capacity = self.capacity();
+        request.weight = if request.weight > 0 {
+            request.weight.min(capacity)
+        } else {
+            weight_of(&request.argv, capacity)
+        };
+        if request.timeout_ms <= 0 {
+            request.timeout_ms = seconds_to_ms(self.limits.unit_timeout_seconds());
+        }
+        let submitted = verify_runs::enqueue(&self.writes(), &request, now_ms()).await?;
+        self.wake.notify_one();
+        Ok(submitted)
+    }
+
+    pub async fn get(&self, id: i64) -> sqlx::Result<Option<State>> {
+        verify_runs::get(&self.pool, id).await
+    }
+
+    /// Starts every unit that fits now. Returns how many started. (One scheduling pass.)
+    pub async fn start_ready(self: &Arc<Self>) -> usize {
+        let aging_ms = seconds_to_ms(self.config.aging_seconds);
+        let mut started = 0;
+        // Units whose asking run ended or is gone fail fast, loudly, before they take a slot.
+        match verify_runs::cancel_orphaned_queued(&self.writes()).await {
+            Ok(orphans) => {
+                for (unit, ticket) in orphans {
+                    tracing::warn!(
+                        unit,
+                        ticket,
+                        "verify executor: ended an orphaned queued unit"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "verify executor: cannot sweep orphaned units"),
+        }
+        loop {
+            let queued = match verify_runs::queued(&self.pool).await {
+                Ok(queued) => queued,
+                Err(error) => {
+                    tracing::warn!(%error, "verify executor: cannot read the queue");
+                    break;
+                }
+            };
+            // Pick and reserve under one short lock, so two passes never overcommit.
+            let picked = {
+                let mut state = self.lock();
+                let capacity = self.capacity();
+                let book = self.admission.get();
+                // The most a unit can ever be granted: with a shared book, the smaller of the
+                // two capacities, or a unit heavier than the book would never be picked.
+                let ceiling = match book {
+                    Some(book) => capacity.min(i64::from(book.capacity())).max(1),
+                    None => capacity,
+                };
+                // A row queued under a larger capacity would never fit: charge it the whole
+                // ceiling instead. Picked, reserved and released with this same value.
+                let charge = |weight: i64| weight.clamp(1, ceiling);
+                let candidates: Vec<Candidate> = queued
+                    .iter()
+                    .map(|q| Candidate {
+                        id: q.id,
+                        project: q.project_id.as_deref(),
+                        priority: q.priority,
+                        weight: charge(q.weight),
+                        enqueued_ms: q.enqueued_ms,
+                    })
+                    .collect();
+                let own_free = capacity - state.used;
+                // With a shared book a unit also needs the runs' budget to have room.
+                let free = match book {
+                    Some(book) => own_free.min(i64::from(book.free())),
+                    None => own_free,
+                };
+                let pick = |free: i64, last_start: &HashMap<Option<String>, u64>| {
+                    verify_sched::pick(&candidates, free, last_start, now_ms(), aging_ms)
+                        .and_then(|id| queued.iter().find(|q| q.id == id))
+                };
+                let chosen = pick(free, &state.last_start);
+                match (chosen, book) {
+                    (Some(chosen), book) => {
+                        let weight = charge(chosen.weight);
+                        let grant = match book {
+                            Some(book) => {
+                                let grant =
+                                    book.try_take_verify(u32::try_from(weight).unwrap_or(1));
+                                if grant.is_none() {
+                                    // Lost the room to a run between the read and the take.
+                                    book.set_verify_demand(true);
+                                    break;
+                                }
+                                grant
+                            }
+                            None => None,
+                        };
+                        state.used += weight;
+                        Some((chosen.id, weight, chosen.project_id.clone(), grant))
+                    }
+                    (None, Some(book)) => {
+                        // Held back by the shared budget alone: hold the runs back in turn.
+                        let blocked =
+                            free < own_free && pick(own_free, &state.last_start).is_some();
+                        book.set_verify_demand(blocked);
+                        if blocked {
+                            break;
+                        }
+                        None
+                    }
+                    (None, None) => None,
+                }
+            };
+            let Some((id, weight, project, grant)) = picked else {
+                break;
+            };
+            let reservation = Reservation {
+                executor: Arc::clone(self),
+                weight,
+                dirs: Vec::new(),
+                _admission: grant,
+            };
+            let claimed = match verify_runs::claim(&self.writes(), id).await {
+                Ok(Some(claimed)) => claimed,
+                // Taken by another pass: the reservation drops and the loop looks again.
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, id, "verify executor: cannot claim a unit");
+                    break;
+                }
+            };
+            {
+                let mut state = self.lock();
+                state.counter += 1;
+                let counter = state.counter;
+                state.last_start.insert(project, counter);
+            }
+            tokio::spawn(run_unit(Arc::clone(self), claimed, reservation));
+            started += 1;
+        }
+        started
+    }
+
+    /// The env a unit's warm state contributes. Empty when there is no machine root, no project,
+    /// no valid map or no `warm:`; a `prepare` error is logged and the unit runs without it.
+    async fn warm_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
+        let (Some(root), Some(project)) = (self.warm_home.clone(), claimed.project_id.clone())
+        else {
+            return Vec::new();
+        };
+        let worktree = PathBuf::from(&claimed.worktree);
+        let result = tokio::task::spawn_blocking(move || {
+            let map = match tests_map::load(&worktree) {
+                MapState::Valid(map) if !map.tests.warm.is_empty() => map,
+                _ => return Ok(Vec::new()),
+            };
+            warm::prepare(&root, &project, &worktree, &map.tests.warm)
+        })
+        .await;
+        match result {
+            Ok(Ok(env)) => env
+                .into_iter()
+                .map(|(var, path)| (var, path.to_string_lossy().into_owned()))
+                .collect(),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    id = claimed.id,
+                    "verify executor: warm prepare failed; running without it"
+                );
+                Vec::new()
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    id = claimed.id,
+                    "verify executor: warm prepare panicked; running without it"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate or the daemon's probe requested; empty
+    /// for any other unit.
+    ///
+    /// The gate runs in a worktree at the target's tip, where `gate-diff.sh` defaults its base to
+    /// the merge base with `master` — `HEAD` itself — and so gates nothing. A probe runs at the
+    /// master head, the very same situation, so a `gate_command` proof would gate nothing too.
+    /// Computed here, from the stored state, rather than when the unit is queued: crash recovery
+    /// and bisect probes run units the tick that queued them never saw.
+    async fn gate_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
+        let (verify_runs::REQUESTED_BY_POSTGATE | verify_runs::REQUESTED_BY_PROBE, Some(project)) =
+            (claimed.requested_by.as_str(), claimed.project_id.as_deref())
+        else {
+            return Vec::new();
+        };
+        let deadline = Instant::now() + GATE_BASE_TIMEOUT;
+        match resolve::postgate_gate_base(
+            &self.pool,
+            project,
+            Path::new(&claimed.worktree),
+            deadline,
+        )
+        .await
+        {
+            Some(base) => vec![("NUCLEOS_GATE_BASE".to_owned(), base)],
+            None => {
+                tracing::warn!(
+                    id = claimed.id,
+                    "verify executor: no gate base; the unit runs with gate-diff's own default"
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Runs one claimed unit to its terminal row. The reservation is released when it drops.
+async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Reservation) {
+    if let (Some(root), Some(project)) = (&executor.warm_home, &claimed.project_id) {
+        // Lexical, no filesystem access; an invalid project id has no warm state to hold.
+        if let Ok(dir) = warm::worktree_dir(root, project, Path::new(&claimed.worktree)) {
+            reservation.hold_dir(dir).await;
+        }
+    }
+    let mut env = executor.warm_env(&claimed).await;
+    env.extend(executor.gate_env(&claimed).await);
+    let argv = final_argv(&executor.config.broker_prefix, &claimed.argv);
+    let timeout_ms = if claimed.timeout_ms > 0 {
+        u64::try_from(claimed.timeout_ms).unwrap_or(u64::MAX)
+    } else {
+        executor.limits.unit_timeout_seconds().saturating_mul(1000)
+    };
+    let outcome = gate::run_argv(
+        &argv,
+        Path::new(&claimed.worktree),
+        &env,
+        Duration::from_millis(timeout_ms),
+    )
+    .await;
+    let (status, exit_code) = status_of(&outcome, !executor.config.broker_prefix.is_empty());
+    let tail = tail_of(&outcome);
+    // The full output is still in `outcome.tail` here; `finish` keeps only 4000 characters of it. The
+    // ids are written BEFORE `finish` makes the row terminal: a reader that sees `failed` must already
+    // find them, or it would classify the unit as "no ids".
+    if status == verify_runs::STATUS_FAILED
+        && let Some(failures) = crate::verify::failures::extract(&outcome.tail)
+        && let Err(error) =
+            verify_runs::set_failed_tests(&executor.writes(), claimed.id, &failures).await
+    {
+        tracing::warn!(%error, id = claimed.id, "verify executor: cannot record the failed test ids");
+    }
+    let duration_ms = i64::try_from(outcome.duration.as_millis()).unwrap_or(i64::MAX);
+    if let Err(error) = verify_runs::finish(
+        &executor.writes(),
+        claimed.id,
+        status,
+        exit_code,
+        duration_ms,
+        (!tail.is_empty()).then_some(tail.as_str()),
+    )
+    .await
+    {
+        tracing::warn!(
+            %error,
+            id = claimed.id,
+            "verify executor: cannot record a finished unit"
+        );
+    }
+    drop(reservation);
+}
+
+/// The caps the sweep enforces: the machine's, and each project's from its stored rules (the
+/// settings snapshot). The projects are enumerated under `warm_home`; `_machine_root` is kept in the
+/// signature but no longer read, since the caps are not files any more.
+fn sweep_caps(warm_home: &Path, _machine_root: &Path, config: &VerifyConfig) -> warm::Caps {
+    let mut project_bytes = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(warm_home.join("warm")) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(project) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let cap = crate::project::rules::autopilot(&project)
+                .ok()
+                .and_then(|rules| rules.verify_disk_cap_gb)
+                .unwrap_or(DEFAULT_PROJECT_DISK_CAP_GB);
+            project_bytes.insert(project, cap.saturating_mul(GIB));
+        }
+    }
+    warm::Caps {
+        machine_bytes: config.disk_cap_gb.saturating_mul(GIB),
+        project_bytes,
+        default_project_bytes: DEFAULT_PROJECT_DISK_CAP_GB.saturating_mul(GIB),
+    }
+}
+
+/// Marks a sweep as running; clears the mark when dropped, a panic included.
+struct Sweeping(Arc<Executor>);
+
+impl Sweeping {
+    /// `None` while another sweep is still running.
+    fn start(executor: &Arc<Executor>) -> Option<Self> {
+        executor
+            .sweeping
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(executor)))
+    }
+}
+
+impl Drop for Sweeping {
+    fn drop(&mut self) {
+        self.0.sweeping.store(false, Ordering::Release);
+    }
+}
+
+/// One warm-state sweep, off the async threads. `_running` is released when it ends.
+async fn sweep_once(executor: Arc<Executor>, _running: Sweeping) {
+    let (Some(home), Some(machine_root)) =
+        (executor.warm_home.clone(), executor.machine_root.clone())
+    else {
+        return;
+    };
+    let config = executor.config.clone();
+    let guard = Arc::clone(&executor);
+    let result = tokio::task::spawn_blocking(move || {
+        let caps = sweep_caps(&home, &machine_root, &config);
+        warm::sweep(
+            &home,
+            &caps,
+            &|dir| guard.try_reserve_removal(dir),
+            &|dir| guard.release_removal(dir),
+        )
+    })
+    .await;
+    match result {
+        Ok(removed) if !removed.is_empty() => {
+            tracing::info!(
+                count = removed.len(),
+                "verify executor: warm sweep removed dirs"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "verify executor: warm sweep panicked"),
+    }
+}
+
+impl Executor {
+    /// How long the worker may sleep before looking again: `POLL` while anything is in flight or
+    /// being removed, `IDLE_POLL` otherwise.
+    fn poll_interval(&self) -> Duration {
+        let state = self.lock();
+        if state.used > 0 || !state.removing.is_empty() {
+            POLL
+        } else {
+            IDLE_POLL
+        }
+    }
+}
+
+/// The worker: schedules on every wake and every poll interval, sweeps warm state every
+/// `SWEEP_EVERY`.
+pub async fn run_executor(executor: Arc<Executor>) {
+    let first_sweep = tokio::time::Instant::now() + SWEEP_EVERY;
+    let mut sweep = tokio::time::interval_at(first_sweep, SWEEP_EVERY);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Rows queued before this worker existed (e.g. requeued after a restart) start now, not
+    // after the first idle poll.
+    executor.start_ready().await;
+    loop {
+        let interval = executor.poll_interval();
+        tokio::select! {
+            _ = executor.wake.notified() => {}
+            _ = tokio::time::sleep(interval) => {}
+            _ = sweep.tick() => {
+                // A sweep still walking from the last tick is left to finish.
+                if let Some(running) = Sweeping::start(&executor) {
+                    tokio::spawn(sweep_once(Arc::clone(&executor), running));
+                }
+            }
+        }
+        executor.start_ready().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::admission::{AdmissionBook, Poll};
+
+    async fn test_pool() -> SqlitePool {
+        crate::testdb::fresh_pool().await
+    }
+
+    /// A project's disk cap comes from its stored rules, not from a file under the machine root; an
+    /// unreadable document or none at all falls back to the default cap. The stand-in home holds only
+    /// the warm directories: no `autopilot.yaml` is written anywhere.
+    #[test]
+    fn the_sweep_reads_each_projects_cap_from_its_stored_rules() {
+        use crate::project::rules::testing::{Home, publish_rules, publish_unreadable};
+        let home = Home::new();
+        for project in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir_all(home.path().join("warm").join(project)).unwrap();
+        }
+        publish_rules(
+            "alpha",
+            "verify_disk_cap_gb: 7
+",
+        );
+        publish_unreadable("beta", "autopilot", "unknown field");
+
+        let caps = sweep_caps(home.path(), home.path(), &VerifyConfig::default());
+
+        assert_eq!(
+            caps.project_bytes["alpha"],
+            7 * GIB,
+            "the stored cap is read"
+        );
+        assert_eq!(
+            caps.project_bytes["beta"],
+            DEFAULT_PROJECT_DISK_CAP_GB * GIB
+        );
+        assert_eq!(
+            caps.project_bytes["gamma"],
+            DEFAULT_PROJECT_DISK_CAP_GB * GIB
+        );
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn request(worktree: &Path, argv: &[&str], fingerprint: Option<&str>, weight: i64) -> Request {
+        Request {
+            project_id: Some("proj".to_owned()),
+            worktree: worktree.to_string_lossy().into_owned(),
+            scope: verify_runs::SCOPE_FULL.to_owned(),
+            origin: verify_runs::ORIGIN_RUN.to_owned(),
+            origin_id: Some(1),
+            requested_by: "agent".to_owned(),
+            group_name: Some("core".to_owned()),
+            kind: Some("test".to_owned()),
+            argv: strings(argv),
+            fingerprint: fingerprint.map(str::to_owned),
+            priority: verify_runs::PRIORITY_INTERACTIVE,
+            weight,
+            timeout_ms: 0,
+        }
+    }
+
+    async fn executor(capacity: u32, root: &Path) -> Arc<Executor> {
+        let config = VerifyConfig {
+            capacity,
+            ..VerifyConfig::default()
+        };
+        Executor::new(test_pool().await, config, Some(root.to_path_buf()))
+    }
+
+    async fn wait_terminal(executor: &Arc<Executor>, id: i64) -> State {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let state = executor.get(id).await.unwrap().unwrap();
+                if state.status != verify_runs::STATUS_QUEUED
+                    && state.status != verify_runs::STATUS_RUNNING
+                {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the unit did not finish in time")
+    }
+
+    fn outcome(exit_code: Option<i32>, timed_out: bool, error: Option<&str>) -> ArgvOutcome {
+        ArgvOutcome {
+            exit_code,
+            tail: "out".to_owned(),
+            duration: Duration::from_secs(3),
+            timed_out,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_submitted_unit_runs_and_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 0))
+            .await
+            .unwrap();
+        assert!(!submitted.joined);
+        assert_eq!(ex.start_ready().await, 1);
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        assert_eq!(state.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_failing_unit_is_recorded_as_failed() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let argv = ["git", "definitely-not-a-git-subcommand"];
+        let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_FAILED);
+        assert!(matches!(state.exit_code, Some(code) if code != 0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_unit_stores_the_test_ids_the_runner_printed() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        // `sh` is the portable shell the neighbouring tests of this module (runs.rs) use.
+        let script = "printf 'test a::boom ... FAILED\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\\n'; exit 1";
+        let argv = ["sh", "-c", script];
+        let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+
+        let state = wait_terminal(&ex, submitted.id).await;
+
+        assert_eq!(state.status, verify_runs::STATUS_FAILED);
+        let failures = state.failed_tests.expect("ids stored");
+        assert!(failures.tests.contains("a::boom"), "{failures:?}");
+    }
+
+    #[tokio::test]
+    async fn a_passed_unit_and_a_failed_one_without_ids_store_none() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        for argv in [
+            ["git", "--version"],
+            ["git", "definitely-not-a-git-subcommand"],
+        ] {
+            let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+            assert_eq!(ex.start_ready().await, 1);
+            let state = wait_terminal(&ex, submitted.id).await;
+            assert_eq!(state.failed_tests, None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn status_of_maps_every_outcome() {
+        let timed = outcome(None, true, None);
+        assert_eq!(status_of(&timed, false).0, verify_runs::STATUS_ERRORED);
+        assert!(tail_of(&timed).starts_with("timed out after 3s"));
+
+        let spawn_failed = outcome(None, false, Some("spawn failed"));
+        assert_eq!(
+            status_of(&spawn_failed, false).0,
+            verify_runs::STATUS_ERRORED
+        );
+        assert!(tail_of(&spawn_failed).starts_with("spawn failed"));
+
+        assert_eq!(
+            status_of(&outcome(Some(0), false, None), false),
+            (verify_runs::STATUS_PASSED, Some(0))
+        );
+        assert_eq!(
+            status_of(&outcome(Some(2), false, None), false),
+            (verify_runs::STATUS_FAILED, Some(2))
+        );
+        assert_eq!(
+            status_of(&outcome(None, false, None), false),
+            (verify_runs::STATUS_ERRORED, None)
+        );
+        // A long output pushes the head out of the recorded tail; the timeout is said at the end too.
+        let text = tail_of(&timed);
+        assert!(text.starts_with("timed out after 3s\nout"), "{text}");
+        assert!(text.ends_with("[timed out after 3s]"), "{text}");
+        assert_eq!(tail_of(&outcome(Some(0), false, None)), "out");
+    }
+
+    /// An `outcome` whose tail is the broker's spawn-failure line.
+    fn spawn_failed_outcome(exit_code: Option<i32>) -> ArgvOutcome {
+        ArgvOutcome {
+            tail: "heavy: spawn failed: git: boom\n".into(),
+            ..outcome(exit_code, false, None)
+        }
+    }
+
+    #[test]
+    fn a_broker_spawn_failure_is_errored_not_failed() {
+        let (status, code) = status_of(&spawn_failed_outcome(Some(BROKER_SPAWN_FAILED_EXIT)), true);
+        assert_eq!(status, verify_runs::STATUS_ERRORED);
+        assert_eq!(code, Some(i64::from(BROKER_SPAWN_FAILED_EXIT)));
+    }
+
+    #[test]
+    fn exit_71_without_the_marker_or_without_a_broker_stays_failed() {
+        // Exit 71 behind the broker, but the tail does not carry the marker: the program itself
+        // exited 71.
+        assert_eq!(
+            status_of(&outcome(Some(BROKER_SPAWN_FAILED_EXIT), false, None), true),
+            (verify_runs::STATUS_FAILED, Some(71))
+        );
+        // The marker and exit 71 without a broker prefix: nothing wrote that marker on purpose.
+        assert_eq!(
+            status_of(&spawn_failed_outcome(Some(BROKER_SPAWN_FAILED_EXIT)), false),
+            (verify_runs::STATUS_FAILED, Some(71))
+        );
+    }
+
+    #[test]
+    fn exit_127_through_the_broker_stays_failed() {
+        // A wrapped program that is not found is the unit's own failure, not the broker's.
+        assert_eq!(
+            status_of(&spawn_failed_outcome(Some(127)), true),
+            (verify_runs::STATUS_FAILED, Some(127))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_cannot_start_the_unit_records_errored() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        // A stand-in broker: prints the spawn-failure line and exits 71, whatever follows it.
+        let config = VerifyConfig {
+            capacity: 2,
+            broker_prefix: strings(&[
+                "sh",
+                "-c",
+                "printf 'heavy: spawn failed: git: boom\n'; exit 71",
+                "broker",
+            ]),
+            ..VerifyConfig::default()
+        };
+        let ex = Executor::new(test_pool().await, config, Some(root.path().to_path_buf()));
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 0))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+
+        let state = wait_terminal(&ex, submitted.id).await;
+
+        assert_eq!(state.status, verify_runs::STATUS_ERRORED);
+        assert_eq!(state.exit_code, Some(i64::from(BROKER_SPAWN_FAILED_EXIT)));
+    }
+
+    #[tokio::test]
+    async fn two_equal_submits_run_once() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let argv = ["git", "--version"];
+        let first = ex
+            .submit(request(wt.path(), &argv, Some("fp"), 0))
+            .await
+            .unwrap();
+        let second = ex
+            .submit(request(wt.path(), &argv, Some("fp"), 0))
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert!(second.joined);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM verify_runs")
+            .fetch_one(&ex.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Parks every unit of `wt` before it runs, its weight held, until `release_removal`: the
+    /// unit waits on a warm dir the sweep is "removing".
+    fn park(ex: &Arc<Executor>, root: &Path, wt: &Path) -> PathBuf {
+        let dir = warm::worktree_dir(root, "proj", wt).unwrap();
+        assert!(ex.try_reserve_removal(&dir));
+        dir
+    }
+
+    #[tokio::test]
+    async fn capacity_holds_back_what_does_not_fit() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let argv = ["git", "--version"];
+        let first = ex.submit(request(wt.path(), &argv, None, 2)).await.unwrap();
+        let second = ex.submit(request(wt.path(), &argv, None, 2)).await.unwrap();
+        // The first cannot finish (and give its weight back) while parked, so this is exact.
+        assert_eq!(ex.start_ready().await, 1);
+        assert_eq!(ex.lock().used, 2);
+        let waiting = ex.get(second.id).await.unwrap().unwrap();
+        assert_eq!(waiting.status, verify_runs::STATUS_QUEUED);
+        ex.release_removal(&parked);
+        wait_terminal(&ex, first.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_row_heavier_than_the_capacity_still_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        let parked = park(&ex, root.path(), wt.path());
+        // Queued straight to the table, as if under an older, larger capacity.
+        let row = request(wt.path(), &["git", "--version"], None, 4);
+        let queued = verify_runs::enqueue(&ex.pool, &row, now_ms())
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        assert_eq!(ex.lock().used, 2);
+        ex.release_removal(&parked);
+        wait_terminal(&ex, queued.id).await;
+    }
+
+    type Setting = Arc<Mutex<Option<VerifyConfig>>>;
+
+    fn settings(capacity: u32, unit_timeout_seconds: u64) -> VerifyConfig {
+        VerifyConfig {
+            capacity,
+            unit_timeout_seconds,
+            ..VerifyConfig::default()
+        }
+    }
+
+    /// An executor whose capacity and unit timeout follow `setting` live; `None` there means
+    /// "nothing new", so the initial config stays.
+    async fn live_executor(initial: VerifyConfig, root: &Path, setting: &Setting) -> Arc<Executor> {
+        let reader = Arc::clone(setting);
+        let source: crate::verify::live::Source = Arc::new(move || reader.lock().unwrap().clone());
+        Executor::with_limits_source(test_pool().await, initial, Some(root.to_path_buf()), source)
+    }
+
+    async fn status_of_unit(ex: &Arc<Executor>, id: i64) -> String {
+        ex.get(id).await.unwrap().unwrap().status
+    }
+
+    /// Waits until every reservation has been given back.
+    async fn wait_idle(ex: &Arc<Executor>) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while ex.lock().used != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the reservations were not released in time");
+    }
+
+    #[tokio::test]
+    async fn lowering_capacity_admits_nothing_new_and_kills_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(3, 600), root.path(), &setting).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let argv = ["git", "--version"];
+        let mut running = Vec::new();
+        for _ in 0..3 {
+            running.push(ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap());
+        }
+        // Parked on the warm dir, so all three hold their weight and stay running.
+        assert_eq!(ex.start_ready().await, 3);
+        assert_eq!(ex.lock().used, 3);
+        let waiting = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+
+        *setting.lock().unwrap() = Some(settings(1, 600));
+        assert_eq!(
+            ex.start_ready().await,
+            0,
+            "used 3 + 1 does not fit the new capacity of 1"
+        );
+        assert_eq!(ex.lock().used, 3, "the running units keep their weight");
+        for unit in &running {
+            assert_eq!(
+                status_of_unit(&ex, unit.id).await,
+                verify_runs::STATUS_RUNNING,
+                "a running unit is not touched by the lower capacity"
+            );
+        }
+        assert_eq!(
+            status_of_unit(&ex, waiting.id).await,
+            verify_runs::STATUS_QUEUED
+        );
+
+        ex.release_removal(&parked);
+        for unit in &running {
+            let done = wait_terminal(&ex, unit.id).await;
+            assert_eq!(done.status, verify_runs::STATUS_PASSED);
+        }
+        wait_idle(&ex).await;
+        assert_eq!(ex.start_ready().await, 1, "it fits once the units are done");
+        let done = wait_terminal(&ex, waiting.id).await;
+        assert_eq!(done.status, verify_runs::STATUS_PASSED);
+    }
+
+    #[tokio::test]
+    async fn raising_capacity_admits_the_queued_unit_on_the_next_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(1, 600), root.path(), &setting).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let argv = ["git", "--version"];
+        let first = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        let second = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        assert_eq!(
+            status_of_unit(&ex, second.id).await,
+            verify_runs::STATUS_QUEUED
+        );
+
+        *setting.lock().unwrap() = Some(settings(2, 600));
+        assert_eq!(ex.start_ready().await, 1, "the raised capacity has room");
+        assert_eq!(ex.lock().used, 2);
+        assert_eq!(
+            status_of_unit(&ex, second.id).await,
+            verify_runs::STATUS_RUNNING
+        );
+        ex.release_removal(&parked);
+        wait_terminal(&ex, first.id).await;
+        wait_terminal(&ex, second.id).await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_setting_keeps_the_last_good_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(2, 600), root.path(), &setting).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let argv = ["git", "--version"];
+        let first = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+
+        // Capacity 0 is rejected by `VerifyConfig::check`: the capacity of 2 stays.
+        *setting.lock().unwrap() = Some(settings(0, 600));
+        let second = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(
+            ex.start_ready().await,
+            1,
+            "the old capacity of 2 still has room for a second unit"
+        );
+        assert_eq!(ex.lock().used, 2);
+        let third = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 0, "and not for a third");
+        assert_eq!(
+            status_of_unit(&ex, third.id).await,
+            verify_runs::STATUS_QUEUED
+        );
+        ex.release_removal(&parked);
+        wait_terminal(&ex, first.id).await;
+        wait_terminal(&ex, second.id).await;
+        wait_idle(&ex).await;
+        assert_eq!(ex.start_ready().await, 1);
+        wait_terminal(&ex, third.id).await;
+    }
+
+    async fn stored_timeout_ms(ex: &Arc<Executor>, id: i64) -> Option<i64> {
+        sqlx::query_scalar("SELECT timeout_ms FROM verify_runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&ex.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_unit_submitted_after_the_timeout_changed_gets_the_new_one() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(4, 600), root.path(), &setting).await;
+        let argv = ["git", "--version"];
+        let before = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+
+        *setting.lock().unwrap() = Some(settings(4, 30));
+        let after = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+
+        assert_eq!(stored_timeout_ms(&ex, before.id).await, Some(600_000));
+        assert_eq!(stored_timeout_ms(&ex, after.id).await, Some(30_000));
+    }
+
+    #[tokio::test]
+    async fn a_unit_waits_while_its_warm_dir_is_being_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 0))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let state = ex.get(submitted.id).await.unwrap().unwrap();
+        assert_eq!(state.status, verify_runs::STATUS_RUNNING);
+        assert!(!ex.lock().in_use.contains_key(&parked));
+        ex.release_removal(&parked);
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+    }
+
+    #[tokio::test]
+    async fn the_idle_poll_is_slow_and_the_busy_poll_is_fast() {
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        assert_eq!(ex.poll_interval(), IDLE_POLL);
+        ex.lock().used = 1;
+        assert_eq!(ex.poll_interval(), POLL);
+        ex.lock().used = 0;
+        ex.lock().removing.insert(root.path().join("d"));
+        assert_eq!(ex.poll_interval(), POLL);
+    }
+
+    #[tokio::test]
+    async fn a_submit_is_started_by_the_wake_not_the_idle_poll() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        assert!(IDLE_POLL >= Duration::from_secs(30));
+        let worker = tokio::spawn(run_executor(Arc::clone(&ex)));
+        // Let the worker reach its (30 s) idle sleep before anything is queued.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 0))
+            .await
+            .unwrap();
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        worker.abort();
+    }
+
+    /// An executor of `capacity` that shares `book` with the runs' admission.
+    async fn sharing(capacity: u32, root: &Path, book: &Arc<AdmissionBook>) -> Arc<Executor> {
+        let ex = executor(capacity, root).await;
+        ex.share_budget(Arc::clone(book));
+        ex
+    }
+
+    fn private_book(capacity: u32) -> Arc<AdmissionBook> {
+        Arc::new(AdmissionBook::new(
+            capacity,
+            Duration::from_secs(900),
+            Duration::from_secs(7200),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_unit_waits_while_runs_hold_the_shared_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(1);
+        // A heavy command of a run holds the whole shared budget; the executor alone has room.
+        assert!(matches!(book.request(1, "a", 1), Poll::Granted { .. }));
+        let ex = sharing(4, root.path(), &book).await;
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 1))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 0);
+        assert_eq!(ex.lock().used, 0, "a refused take leaves no weight behind");
+        let waiting = ex.get(submitted.id).await.unwrap().unwrap();
+        assert_eq!(waiting.status, verify_runs::STATUS_QUEUED);
+
+        assert!(book.release(1, "a"));
+        assert_eq!(ex.start_ready().await, 1);
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        assert_eq!(book.free(), 1, "the unit gives its grant back when it ends");
+    }
+
+    #[tokio::test]
+    async fn a_unit_the_shared_budget_cannot_fit_raises_demand() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(2);
+        assert!(matches!(book.request(1, "a", 1), Poll::Granted { .. }));
+        let ex = sharing(4, root.path(), &book).await;
+        // Two units wide: the executor fits it, the shared budget (one free) does not.
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 2))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 0);
+        assert!(
+            book.snapshot().verify_demand,
+            "a unit that only the shared budget holds back must hold the runs back in turn"
+        );
+
+        assert!(book.release(1, "a"));
+        assert_eq!(ex.start_ready().await, 1);
+        assert!(
+            !book.snapshot().verify_demand,
+            "demand drops once the queue is empty"
+        );
+        wait_terminal(&ex, submitted.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_unit_heavier_than_the_shared_book_still_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(1);
+        let ex = sharing(4, root.path(), &book).await;
+        // Two units wide, but the shared book holds one: it is charged the book's whole capacity.
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 2))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        assert!(
+            !book.snapshot().verify_demand,
+            "a unit that fits once clamped must not hold the runs back"
+        );
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        assert_eq!(book.free(), 1, "the unit gives its grant back when it ends");
+    }
+
+    #[tokio::test]
+    async fn a_dir_in_use_cannot_be_reserved_for_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let dir = root.path().join("warm/proj/abc");
+        ex.lock().in_use.insert(dir.clone(), 1);
+        assert!(!ex.try_reserve_removal(&dir));
+        assert!(!ex.lock().removing.contains(&dir));
+        ex.lock().in_use.clear();
+        assert!(ex.try_reserve_removal(&dir));
+        ex.release_removal(&dir);
+        assert!(ex.lock().removing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sweep_does_not_overlap_another() {
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let running = Sweeping::start(&ex).expect("the first sweep starts");
+        assert!(Sweeping::start(&ex).is_none());
+        drop(running);
+        assert!(Sweeping::start(&ex).is_some());
+    }
+
+    #[test]
+    fn weight_of_charges_cargo_double() {
+        assert_eq!(weight_of(&strings(&["cargo", "test"]), 4), 2);
+        assert_eq!(weight_of(&strings(&["C:\\x\\cargo.exe", "test"]), 4), 2);
+        assert_eq!(weight_of(&strings(&["CARGO.EXE"]), 4), 2);
+        assert_eq!(weight_of(&strings(&["git", "status"]), 4), 1);
+        assert_eq!(weight_of(&strings(&["cargo"]), 1), 1);
+    }
+
+    #[tokio::test]
+    async fn a_unit_gets_its_warm_env() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let map = concat!(
+            "version: 1\n",
+            "tests:\n",
+            "  groups:\n",
+            "    core:\n",
+            "      paths: [core/]\n",
+            "      command: cargo test -p nucleos-core\n",
+            "  warm:\n",
+            "    NUCLEOS_PROBE_DIR:\n",
+            "      dir: probe\n",
+        );
+        std::fs::write(wt.path().join(tests_map::MAP_FILE), map).unwrap();
+        let ex = executor(4, root.path()).await;
+        let claimed = Claimed {
+            id: 0,
+            project_id: Some("proj".to_owned()),
+            worktree: wt.path().to_string_lossy().into_owned(),
+            requested_by: "agent".to_owned(),
+            argv: strings(&["git", "--version"]),
+            weight: 1,
+            timeout_ms: 1000,
+        };
+        let env = ex.warm_env(&claimed).await;
+        let expected = warm::worktree_dir(root.path(), "proj", wt.path())
+            .unwrap()
+            .join("probe");
+        let value = env
+            .iter()
+            .find(|(var, _)| var == "NUCLEOS_PROBE_DIR")
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("NUCLEOS_PROBE_DIR is in the env");
+        assert_eq!(value, expected);
+        assert!(expected.is_dir());
+    }
+
+    /// A moved warm home takes the warm dirs; the machine root keeps none of them.
+    #[tokio::test]
+    async fn warm_env_lives_under_the_warm_home_when_one_is_given() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let map = concat!(
+            "version: 1\n",
+            "tests:\n",
+            "  groups:\n",
+            "    core:\n",
+            "      paths: [core/]\n",
+            "      command: cargo test -p nucleos-core\n",
+            "  warm:\n",
+            "    NUCLEOS_PROBE_DIR:\n",
+            "      dir: probe\n",
+        );
+        std::fs::write(wt.path().join(tests_map::MAP_FILE), map).unwrap();
+        let ex = Executor::with_warm_home(
+            test_pool().await,
+            VerifyConfig::default(),
+            Some(root.path().to_path_buf()),
+            Some(home.path().to_path_buf()),
+        );
+        let claimed = Claimed {
+            id: 0,
+            project_id: Some("proj".to_owned()),
+            worktree: wt.path().to_string_lossy().into_owned(),
+            requested_by: "agent".to_owned(),
+            argv: strings(&["git", "--version"]),
+            weight: 1,
+            timeout_ms: 1000,
+        };
+        let env = ex.warm_env(&claimed).await;
+        let expected = warm::worktree_dir(home.path(), "proj", wt.path())
+            .unwrap()
+            .join("probe");
+        let value = env
+            .iter()
+            .find(|(var, _)| var == "NUCLEOS_PROBE_DIR")
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("NUCLEOS_PROBE_DIR is in the env");
+        assert_eq!(value, expected);
+        assert!(expected.is_dir());
+        assert!(!root.path().join("warm").exists());
+    }
+
+    /// Runs git in `dir`, asserts it succeeded, and returns its trimmed stdout.
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository with three empty commits; returns its dir and the shas, oldest first.
+    fn history() -> (tempfile::TempDir, Vec<String>) {
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q"]);
+        let shas = (0..3)
+            .map(|n| {
+                git_in(
+                    repo.path(),
+                    &["commit", "-q", "--allow-empty", "-m", &format!("c{n}")],
+                );
+                git_in(repo.path(), &["rev-parse", "HEAD"])
+            })
+            .collect();
+        (repo, shas)
+    }
+
+    async fn store_postgate(pool: &SqlitePool, last_green: Option<&str>, covered: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, last_green_sha, covered_sha) \
+             VALUES ('proj', 'main', ?, ?)",
+        )
+        .bind(last_green)
+        .bind(covered)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn claimed_in(worktree: &Path, requested_by: &str) -> Claimed {
+        Claimed {
+            id: 0,
+            project_id: Some("proj".to_owned()),
+            worktree: worktree.to_string_lossy().into_owned(),
+            requested_by: requested_by.to_owned(),
+            argv: strings(&["git", "--version"]),
+            weight: 1,
+            timeout_ms: 1000,
+        }
+    }
+
+    fn gate_base(env: &[(String, String)]) -> Option<&str> {
+        env.iter()
+            .find(|(var, _)| var == "NUCLEOS_GATE_BASE")
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_diffs_from_the_last_green_ancestor() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_probe_unit_diffs_from_the_last_green_like_the_postgate() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        // A probe of `gate_command` runs at the master head, where gate-diff.sh would default its
+        // base to HEAD itself and gate nothing.
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_PROBE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_takes_the_newer_of_covered_and_green() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[0]), Some(&shas[1])).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_with_no_green_ancestor_diffs_from_the_root_commit() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+
+        // No state at all.
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+
+        // A green that is not in this history (nor even a commit here) is no base either.
+        store_postgate(&ex.pool, Some(&"0".repeat(40)), None).await;
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_ignores_a_green_that_is_not_an_ancestor() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        // Recorded as green, then the gated commit moved back before it.
+        store_postgate(&ex.pool, Some(&shas[2]), None).await;
+        git_in(repo.path(), &["reset", "-q", "--hard", &shas[0]]);
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_unit_the_gate_did_not_request_gets_no_gate_base() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        let claimed = claimed_in(repo.path(), "agent");
+        assert!(ex.gate_env(&claimed).await.is_empty());
+    }
+
+    #[test]
+    fn the_broker_prefix_goes_in_front() {
+        let prefix = strings(&["python", "heavy.py", "--"]);
+        assert_eq!(
+            final_argv(&prefix, &strings(&["cargo", "test"])),
+            strings(&["python", "heavy.py", "--", "cargo", "test"])
+        );
+        assert_eq!(final_argv(&[], &strings(&["git"])), strings(&["git"]));
+    }
+}

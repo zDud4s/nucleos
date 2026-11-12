@@ -1,0 +1,364 @@
+/**
+ * The Contacts slice: the roster and the identity questions above it,
+ * `contacts-` throughout — as `waiting-` is for the decision queue this page
+ * borrows its merge doors from, and `mail-` for the sibling pillar this one
+ * shares a sender's verdict with.
+ *
+ * The rule this file lives under: **no `contacts-` class appears in
+ * `Contacts.tsx` that is not defined below.** `tsc` and vitest both pass happily
+ * on a class no stylesheet has ever heard of, and the defect shows up only as
+ * something looking wrong on a screen nobody is testing. Grep the component
+ * against this file before calling the page done. `ui-` classes are the
+ * exception and are not this file's to define — they arrive with a primitive
+ * imported from `../ui`, which is where their recipe and their argument both
+ * live.
+ */
+
+/* =============================================================== shared == */
+
+/**
+ * The prose standing above a list.
+ *
+ * It sits above a list that has something in it and says what the reader is
+ * about to decide.
+ */
+.contacts-note {
+  max-width: var(--measure-prose);
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/* "no name recorded" stands where a name would, so it must not look like one: an
+   absence set in the name's own weight and ink reads as somebody called that. */
+.contacts-missing {
+  font-weight: var(--weight-regular);
+  color: var(--text-muted);
+}
+
+/* Body type, not mono: this line is counts and relative times, prose with numbers in
+   it. Tabular figures keep the digits from jittering as the times tick over. */
+/* Message counts and last-seen times hold one width as they change (#16). */
+.contacts-meta {
+  font-variant-numeric: tabular-nums;
+}
+
+.contacts-meta {
+  margin: 0;
+  font-family: var(--font-body);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* `RelativeTime` brings `--text-sm` and the faint rung of its own, which is right
+   standing alone and wrong mid-sentence: "last seen 18min ago" had its last two
+   words a size larger than the rest of the line. Inside a line, the line wins. */
+.contacts-meta .ui-reading-time {
+  font-size: inherit;
+  color: inherit;
+}
+
+/* "Same person as …", and the one control that undoes it, on one line. */
+.contacts-sameas {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* The search and the chips, set off from the grid they filter. They sat flush on
+   the first row of cards, so the filter read as the top edge of a card. */
+.contacts-filter {
+  margin-bottom: var(--space-4);
+}
+
+/* "Show more" under the grid. */
+.contacts-more {
+  display: flex;
+  justify-content: center;
+  margin-top: var(--space-3);
+}
+
+.contacts-reasoning {
+  max-width: var(--measure-prose);
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/**
+ * A row of controls — the two doors on an identity question, the three sender
+ * verdicts on a roster row, and the unmerge button beside them.
+ *
+ * One recipe and not three. These were `contacts-actions`, `contacts-verdict
+ * -actions` and `contacts-unmerge`, written out separately with the same four
+ * declarations between them — the duplication this pass is treating, one file
+ * further down. `align-items: center` is the half the verdict group was
+ * missing: without it a refusal note landing beside the buttons stretches them
+ * to its own height.
+ */
+.contacts-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* What the last decision did — a receipt, not a state of the machine. */
+.contacts-outcome {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  color: var(--tone-active-fg);
+}
+
+/* ==================================================== identity questions == */
+
+/* The column of questions. It is `Rows`, and each question is a `Row` — the
+   hairlines and the fill are the shared layer's; this only resets the margin. */
+.contacts-questions {
+  margin: 0;
+}
+
+/* The question, its reason, the two sides and the doors: four groups, so the row
+   spaces them as groups. At `--space-2` the reason sat closer to "Stays" than
+   "Stays" sat to the name under it, and the sides read as part of the sentence. */
+.contacts-question {
+  gap: var(--space-3);
+}
+
+.contacts-question-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+/**
+ * The question the two buttons answer — "Are Ana and Ana Silva one person?".
+ *
+ * It was "question #21", the daemon's number, which told nobody anything, and
+ * then the pair with "(stays)" and "(merged in)" after each name, which the side
+ * headings below already say. Body type in the primary rung, one step up from
+ * the prose under it: it heads the row and names people, not an identifier.
+ */
+.contacts-question-who {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/**
+ * The two sides, read across.
+ *
+ * Capped columns rather than halves of the panel: at the design width each half
+ * was ~36rem, so "Merged in" sat a screen's width away from the side it is
+ * being compared with. The hairline between them is a rule, not a box (see
+ * `.contacts-side` for why there is no box).
+ */
+.contacts-merge {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 22rem));
+  gap: var(--space-5);
+}
+
+.contacts-merge > * + * {
+  padding-left: var(--space-5);
+  border-left: var(--hairline) solid var(--border);
+}
+
+/* Heading to name is one step, tighter than the gap between the groups above. */
+.contacts-merge .ui-section {
+  gap: var(--space-2);
+}
+
+/* The conflict says one thing about the pair; it is as wide as the pair. */
+.contacts-conflict {
+  max-width: calc(44rem + var(--space-5));
+}
+
+/**
+ * The facts of one side of a merge, stacked tight under its own heading.
+ *
+ * **No box, and that is the decision.** This sits inside a card inside a panel,
+ * and the system graduates exactly twice — a bordered, filled box here is a
+ * third card rank, which is the boxes-in-boxes the anti-references name. It
+ * used to be one: a `--radius-sm` frame on `--surface`, a rung *below* the
+ * inset it sits in, so in dark it read as a well pretending to be a card and in
+ * light — where `--surface` and `--surface-raised` are the same white — as a
+ * bare outline around nothing.
+ *
+ * What separates the two sides now is the grid gap and the heading each
+ * carries. The heading is the point: the merge is not symmetrical, and which of
+ * the two survives is the whole reason both are shown. `.waiting-side` reached
+ * the same answer from the same starting recipe.
+ */
+.contacts-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.contacts-side-name {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* Addresses read character by character, the same posture `.waiting-addresses`
+   takes for the same reason: a lookalike only shows up if nothing truncates. */
+.contacts-side-addresses {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ===================================================================== roster == */
+
+/**
+ * The roster as profile cards, wrapping rather than scrolling sideways — the
+ * `.fleet-columns` recipe.
+ *
+ * Every card is the same height, across rows too — the owner's call
+ * (2026-10-02): a grid of profiles whose cards grow with their badges and
+ * buttons reads as ragged. `grid-auto-rows: 1fr` sizes every implicit row to
+ * the tallest card, and the default `stretch` fills each cell; the actions
+ * then sit on the bottom edge (`margin-top: auto` below) so they line up.
+ *
+ * Each card is `.ui-panel-inset`, the one card rank a Panel may hold; this
+ * file only arranges what is inside it.
+ */
+.contacts-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  grid-auto-rows: 1fr;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.contacts-card {
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.contacts-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* Initials in a neutral disc. It was cyan (owner's call, 2026-10-05) and the
+   owner took that back on 2026-10-09: seven identical cyan discs were the
+   loudest thing on the page and said nothing about anyone. */
+.contacts-avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.02em;
+}
+
+.contacts-card-who {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* Two lines at most, so one long name cannot make its card taller than the rest of
+   the row (the full name is in the `title`). The address below is never clipped. */
+.contacts-card-name {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* Never truncated: a lookalike address only shows up if nothing is cut. */
+.contacts-card-address {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.contacts-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* Small and text-weight, so it reads as part of the "Same person as" line, flush
+   with its words. The height is the hit area, not part of the look. */
+.contacts-unmerge .ui-button {
+  min-height: 1.25rem;
+  padding: 0;
+  font-size: var(--text-xs);
+}
+
+/* `ConfirmButton` reserves the width of its longer, armed label and centres the
+   one showing — right for a button, wrong for words on a line, which then start
+   a few characters in from the sentence above them. */
+.contacts-unmerge .ui-confirm-stack {
+  justify-items: start;
+}
+
+.contacts-unmerge .ui-confirm-stack > * {
+  justify-content: flex-start;
+}
+
+/* A verdict or unmerge that failed, said inside the card it belongs to. */
+.contacts-problem {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.contacts-problem > .ui-note {
+  margin: 0;
+}
+
+/* The verdict buttons, pinned to the card's foot; the rule sets the controls
+   apart from the profile. */
+.contacts-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: auto;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}

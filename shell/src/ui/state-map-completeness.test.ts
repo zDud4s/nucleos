@@ -1,0 +1,403 @@
+// @vitest-environment node
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { RUN_STATUSES, runIsAlive } from "../data/runs";
+import { readState, statesOf } from "./state-map";
+
+const moduleUrl = import.meta.url.startsWith("file:") ? import.meta.url : `file://${import.meta.url}`;
+const repoRoot = fileURLToPath(new URL("../../../", moduleUrl));
+const jobRs = moduleSource("core/src/execution/job");
+const teamRs = readFileSync(`${repoRoot}core/src/team.rs`, "utf8");
+const concurrencyRs = readFileSync(`${repoRoot}core/src/execution/concurrency.rs`, "utf8");
+const runsRs = moduleSource("core/src/execution/runs");
+const sidecarRs = readFileSync(`${repoRoot}core/src/sidecar.rs`, "utf8");
+const quotaRs = readFileSync(`${repoRoot}core/src/quota.rs`, "utf8");
+const registryRs = readFileSync(`${repoRoot}core/src/channels/registry.rs`, "utf8");
+
+/**
+ * Every `.rs` under `core/src`, subdirectories included. The judge's module (`core/src/judge/`)
+ * was the first directory there, and a top-level read would miss every feed kind it writes —
+ * the test would pass while the map could not read the kinds the núcleo writes there.
+ */
+function coreFiles(): { name: string; source: string }[] {
+  const walk = (dir: string, prefix: string): { name: string; source: string }[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      if (entry.isDirectory()) return walk(`${dir}/${entry.name}`, `${prefix}${entry.name}/`);
+      if (!entry.isFile() || !entry.name.endsWith(".rs")) return [];
+      return [{ name: `${prefix}${entry.name}`, source: readFileSync(`${dir}/${entry.name}`, "utf8") }];
+    });
+  return walk(`${repoRoot}core/src`, "");
+}
+
+/**
+ * A module split into a folder (`job.rs` beside `job/*.rs`), read as one text: the declarations
+ * this test parses move between the files as the module is reorganised, and the test is about
+ * what the module says, not which file says it. Each file is cut at its test module first.
+ */
+function moduleSource(path: string): string {
+  const files = [`${repoRoot}${path}.rs`];
+  for (const entry of readdirSync(`${repoRoot}${path}`, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(".rs")) files.push(`${repoRoot}${path}/${entry.name}`);
+  }
+  return files
+    .map((file) => readFileSync(file, "utf8"))
+    .map((source) => withoutTestModule(source))
+    .join("\n");
+}
+
+function withoutTestModule(source: string): string {
+  // An inline module only: `#[cfg(test)] mod x;` declares a file and leaves the code after it in scope.
+  // The module ends at its closing brace in column 0, and what follows it is production code too
+  // (`http/projects.rs` writes `project_onboarded` below its small test module).
+  const opening = /^#\[cfg\(test\)\]\r?\nmod \w+ \{/m.exec(source);
+  if (opening === null) return source;
+  const closing = /^\}/m.exec(source.slice(opening.index + opening[0].length));
+  if (closing === null) return source.slice(0, opening.index);
+  const end = opening.index + opening[0].length + closing.index + 1;
+  return source.slice(0, opening.index) + source.slice(end);
+}
+
+function argumentAt(source: string, open: number, position: number): string | null {
+  let depth = 0;
+  let start = open + 1;
+  let index = open;
+  let found = 1;
+  while (index < source.length) {
+    const char = source[index];
+    if (char === '"') {
+      index += 1;
+      while (index < source.length && source[index] !== '"') index += source[index] === "\\" ? 2 : 1;
+    } else if (char === "/" && source[index + 1] === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+    } else if (char === "(" || char === "[" || char === "{") {
+      depth += 1;
+    } else if (char === ")" || char === "]" || char === "}") {
+      if (char === ")" && depth === 1) return found === position ? source.slice(start, index).trim() : null;
+      depth -= 1;
+    } else if (char === "," && depth === 1) {
+      if (found === position) return source.slice(start, index).trim();
+      found += 1;
+      start = index + 1;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+const WRITERS: { name: string; position: number }[] = [
+  { name: "append", position: 3 },
+  { name: "append_on", position: 3 },
+  { name: "say", position: 3 },
+  // `execution/job/spawn.rs::say_once` forwards to `say` only when the same line is not already written.
+  { name: "say_once", position: 3 },
+  { name: "deliver_or_defer", position: 2 },
+];
+
+const FORWARDED: Record<string, Record<string, string[]>> = {
+  "feed.rs": { kind: [] },
+  "execution/job/spawn.rs": { kind: [] },
+  "integrations/notify.rs": { kind: [] },
+  "execution/runner/auth_watch.rs": { kind: ["run_on_api_key", "run_on_subscription", "run_rate_limited"] },
+  "execution/runs/spawn.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
+  // `announce_once` binds `crate::execution::land::RESOLUTION_FAILED_KIND` to a local first.
+  "resolver.rs": { kind: ["land_resolution_failed"] },
+  // The channels' own `say` queues a chat reply in `channel_outbox`; it is no feed writer, so it names no kind.
+  "channels/commands.rs": {
+    reply: [],
+    "strings::render(&Text::CaptureNeedsText)": [],
+    "strings::render(&Text::CaptureDigestHint{jobs})": [],
+  },
+  "channels/ingest.rs": {
+    "Text::PairInvalid": [],
+    "Text::Unsupported{label:label.clone(),}": [],
+    "Text::Queued{position}": [],
+    "turn_refusal(refusal)": [],
+  },
+  // The fake channel's `feed_row` stimulus writes whatever kind the test script supplies.
+  "channels/fake.rs": { 'text_of(stimulus,"kind")?': [] },
+  // A test-only module (`#[cfg(test)] mod port_tests_commands;`): its `feed_line` helper forwards
+  // the kind each test passes, so it writes no kind of the product's own.
+  "channels/port_tests_commands.rs": { kind: [] },
+  // `param_store::append` appends a parameter's history row, not a feed line; its third argument is
+  // the bundle, so it names no kind (the store's own `feed::append_on` writes the kinds).
+  "workflows/param_service.rs": { "ctx.bundle": [] },
+  "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
+  // `announce_close` writes the kind `work_nodes::feed_line` picked for the closed node.
+  "http/nodes.rs": { kind: ["work_tree_parked", "work_tree_finished"] },
+};
+
+const EMAIL_CLASS_KINDS = ["email_urgent"];
+
+function stringConstants(body: string): Map<string, string> {
+  return new Map([...body.matchAll(/const (\w+): &str = "([^"]+)";/g)].map(([, key, value]) => [key, value]));
+}
+
+/** `land.rs` -> `crate::land`, `judge/mod.rs` -> `crate::judge`, `judge/row.rs` -> `crate::judge::row`. */
+function modulePath(name: string): string {
+  return `crate::${name.replace(/\.rs$/, "").replace(/\/mod$/, "").replace(/\//g, "::")}`;
+}
+
+/** The module a `super::` path names from `name`: the parent of the file's own module. */
+function parentModule(name: string): string {
+  return modulePath(name).replace(/::\w+$/, "");
+}
+
+/** `super::X` / `self::X` as a `crate::` path, so a constant one module up is read like any other. */
+function absolutePath(name: string, path: string): string {
+  if (path.startsWith("super::")) return `${parentModule(name)}::${path.slice("super::".length)}`;
+  if (path.startsWith("self::")) return `${modulePath(name)}::${path.slice("self::".length)}`;
+  return path;
+}
+
+/**
+ * The constants a file imports by name (`use super::{A, NEEDS_LOGIN_KIND};`,
+ * `use crate::accounts::UNPINNED_KIND;`), each mapped to its absolute path, so a bare constant the
+ * file did not declare itself is read from the module that did. Flat braces only; a glob is skipped.
+ */
+function importedConstants(name: string, body: string): Map<string, string> {
+  const imports = new Map<string, string>();
+  for (const [, base, list] of body.matchAll(/\buse\s+((?:crate|super|self)(?:::\w+)*)::\{([^{}]*)\}/g)) {
+    for (const item of list.split(",").map((part) => part.trim())) {
+      if (/^[A-Z][A-Z0-9_]*$/.test(item)) imports.set(item, absolutePath(name, `${base}::${item}`));
+    }
+  }
+  for (const [, base, item] of body.matchAll(/\buse\s+((?:crate|super|self)(?:::\w+)*)::([A-Z][A-Z0-9_]*)\s*;/g)) {
+    imports.set(item, absolutePath(name, `${base}::${item}`));
+  }
+  return imports;
+}
+
+/**
+ * `main.rs` and the top-level files of the modules it declares (`mod startup;`): the binary's side,
+ * where the lib is in scope by glob and a bare module path names the lib's module.
+ */
+const BINARY_FILES = new Set([
+  "main.rs",
+  ...[...readFileSync(`${repoRoot}core/src/main.rs`, "utf8").matchAll(/^mod (\w+);/gm)].map(([, m]) => `${m}.rs`),
+]);
+
+function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: string[] } {
+  const kinds = new Set<string>();
+  const unresolved: string[] = [];
+  const files = coreFiles();
+  // A writer may name another module's constant by path (`crate::land::RESOLUTION_FAILED_KIND`),
+  // so every module's constants are read before any call is resolved.
+  const byModule = new Map(
+    files.map(({ name, source }) => [modulePath(name), stringConstants(withoutTestModule(source))]),
+  );
+  for (const { name, source } of files) {
+    const body = withoutTestModule(source);
+    const constants = stringConstants(body);
+    const imports = importedConstants(name, body);
+    for (const writer of WRITERS) {
+      const call = new RegExp(`(?<![A-Za-z0-9_])${writer.name}\\s*\\(`, "g");
+      for (const match of body.matchAll(call)) {
+        const open = match.index! + match[0].length - 1;
+        if (/fn\s+$/.test(body.slice(Math.max(0, match.index! - 8), match.index!))) continue;
+        const argument = argumentAt(body, open, writer.position);
+        if (argument === null) continue;
+        if (argument.startsWith('"')) {
+          kinds.add(argument.slice(1, -1));
+          continue;
+        }
+        if (/^[A-Z][A-Z0-9_]*$/.test(argument)) {
+          // Declared in this file, or imported by name from the module that declares it.
+          const imported = imports.get(argument);
+          const owner = imported === undefined ? undefined : /^(crate(?:::\w+)+)::[A-Z][A-Z0-9_]*$/.exec(imported);
+          const value = constants.get(argument) ?? (owner ? byModule.get(owner[1])?.get(argument) : undefined);
+          if (value === undefined) unresolved.push(`${name}: ${argument}`);
+          else kinds.add(value);
+          continue;
+        }
+        // `main.rs` is the binary over the lib (`use nucleos_core::*`), and so is every module it
+        // declares (`startup.rs` reads `use super::*`): a bare `onboarding::X` there, or a
+        // `nucleos_core::onboarding::X` anywhere, is the lib's `crate::onboarding::X`.
+        let path = absolutePath(name, argument.replace(/\s+/g, "").replace(/^nucleos_core::/, "crate::"));
+        if (BINARY_FILES.has(name) && !path.startsWith("crate::")) path = `crate::${path}`;
+        const qualified = /^(crate(?:::\w+)+)::([A-Z][A-Z0-9_]*)$/.exec(path);
+        if (qualified) {
+          const value = byModule.get(qualified[1])?.get(qualified[2]);
+          if (value === undefined) unresolved.push(`${name}: ${qualified[0]}`);
+          else kinds.add(value);
+          continue;
+        }
+        const key = argument.replace(/\s+/g, "").replace(/^&/, "");
+        const declared = FORWARDED[name]?.[key];
+        if (declared === undefined) unresolved.push(`${name}: ${key}`);
+        else for (const kind of declared) kinds.add(kind);
+      }
+    }
+  }
+  return { kinds, files: files.length, unresolved };
+}
+
+function statusConstants(source: string): Map<string, string> {
+  return new Map(
+    [...source.matchAll(/pub const (STATUS_\w+): &str = "([^"]+)";/g)].map(([, name, value]) => [name, value]),
+  );
+}
+
+function literals(source: string, declaration: RegExp, constants = new Map<string, string>()): string[] {
+  const match = declaration.exec(source);
+  expect(match, `could not parse ${declaration}`).not.toBeNull();
+  const values = match![1]
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((value) => (value.startsWith('"') ? value.slice(1, -1) : constants.get(value)))
+    .filter((value): value is string => value !== undefined);
+  expect(values).not.toHaveLength(0);
+  return values;
+}
+
+describe("state-map completeness", () => {
+  it("every job and team-run literal in the Rust source has a reading", () => {
+    const constants = statusConstants(jobRs);
+    const jobLive = literals(jobRs, /pub const LIVE_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/, constants);
+    const jobTerminal = literals(jobRs, /pub const TERMINAL_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/, constants);
+    const teamLive = literals(teamRs, /pub const LIVE_STATES: &\[&str\] = &\[([^\]]*)\];/);
+    const teamTerminal = literals(teamRs, /pub const TERMINAL_STATES: &\[&str\] = &\[([^\]]*)\];/);
+
+    expect(new Set(statesOf("job"))).toEqual(new Set([...jobLive, ...jobTerminal]));
+    expect(new Set(statesOf("team_run"))).toEqual(new Set([...teamLive, ...teamTerminal]));
+  });
+
+  /**
+   * `job_items.status` has no Rust list of its own — `LIVE_ITEM_STATUSES` is test-only and
+   * covers only the unfinished half — so the vocabulary is read where the núcleo reads it back:
+   * the arms of `item_state_from`. `pending` is the one stored value that function reaches
+   * through `_ =>`, because it is the column's default, and it is asserted separately so the
+   * scan cannot quietly lose it.
+   */
+  it("every job item status the núcleo reads back has a reading, and conflicted is not a summons", () => {
+    const start = jobRs.indexOf("fn item_state_from(");
+    expect(start, "item_state_from is gone from job.rs").toBeGreaterThan(-1);
+    // The function's own closing brace, at column 0 — `\r?` because the checkout may be CRLF,
+    // and a search for "\n}\n" that never matched ran on into the next function's arms.
+    const rest = jobRs.slice(start);
+    const end = rest.search(/\r?\n\}\r?\n/);
+    expect(end, "could not find where item_state_from ends").toBeGreaterThan(0);
+    const body = rest.slice(0, end);
+    const constants = statusConstants(jobRs);
+    const arms = new Set<string>();
+    for (const [, literal] of body.matchAll(/"([a-z_]+)"(?:\s+if [^=]+)?\s*=>/g)) arms.add(literal);
+    for (const [, name] of body.matchAll(/\b(STATUS_\w+)\s*=>/g)) {
+      const value = constants.get(name);
+      expect(value, `${name} is not a pub const in job.rs`).toBeDefined();
+      arms.add(value!);
+    }
+    expect(arms.size).toBeGreaterThanOrEqual(12);
+    expect(jobRs).toMatch(/_ => ItemState::Pending/);
+
+    expect(new Set(statesOf("job_item"))).toEqual(new Set([...arms, "pending"]));
+    // Put down rather than failed (`core/src/execution/job.rs`, `ItemState::Conflicted`), so held and not
+    // wrong; and not a summons either, because the queue starts the resolution run itself.
+    expect(readState("job_item", "conflicted")?.tone).toBe("paused");
+    expect(readState("job_item", "conflicted")?.tone).toBe(readState("feed", "job_item_conflicted")?.tone);
+  });
+
+  /**
+   * The `quota` domain, which nothing else in this file covers.
+   *
+   * Every other block here fixes one domain and one shape in the Rust — an array by name, the arms
+   * of one function, four fixed strings, the feed's emitters. None of them has a generic mechanism
+   * over `StateDomain`, so a domain added to `state-map.ts` is checked by nothing unless somebody
+   * writes the block for it. That was true of this one until this test existed, and the map would
+   * have drifted from `QUOTA_STATES` without a single gate turning red.
+   *
+   * What a drift costs is worth naming: `readState` returns null for a state it has no row for,
+   * `StateBadge` then renders the bare literal, and a ring falls back to a neutral tone. A quota
+   * that is spent would be painted the same as one that is fine.
+   */
+  it("both liveness states a sidecar row can carry have a reading", () => {
+    const states = ["RUNNING", "DOWN"].map((name) => sidecarRs.match(new RegExp(`const ${name}: &str = "([a-z_]+)";`))?.[1]);
+
+    expect(states).toEqual(["running", "down"]);
+    expect(new Set(statesOf("sidecar"))).toEqual(new Set(states));
+    expect(readState("sidecar", "down")?.tone).toBe("danger");
+    expect(readState("sidecar", "running")?.tone).toBe("active");
+  });
+
+  it("every channel state the registry can report has a reading", () => {
+    const body = /pub enum ChannelState \{([^}]*)\}/.exec(registryRs)?.[1];
+    expect(body, "ChannelState is gone from channels/registry.rs").toBeDefined();
+    // `#[serde(rename_all = "snake_case")]` is what the shell receives.
+    const states = [...body!.matchAll(/\b([A-Z][A-Za-z]*),/g)].map(([, variant]) =>
+      variant.replace(/(?<!^)([A-Z])/g, "_$1").toLowerCase(),
+    );
+
+    expect(states).toHaveLength(5);
+    expect(new Set(statesOf("channel"))).toEqual(new Set(states));
+    // Not set up is a fact about the machine, not a fault; the two that stop delivery are.
+    expect(readState("channel", "not_configured")?.tone).toBe("off");
+    expect(readState("channel", "offline")?.tone).toBe("danger");
+    expect(readState("channel", "incompatible")?.tone).toBe("danger");
+  });
+
+  it("every quota state the núcleo can produce has a reading", () => {
+    const states = literals(quotaRs, /pub const QUOTA_STATES: \[&str; \d+\] = \[([^\]]*)\];/);
+
+    expect(states).toHaveLength(5);
+    expect(new Set(statesOf("quota"))).toEqual(new Set(states));
+    // The two that must never be stated with the confidence of a measurement: one is a number
+    // about a window that has ended, the other is no number at all. A brake is later allowed to
+    // act on this domain, so a quiet tone here is a safety property and not a taste.
+    expect(readState("quota", "stale")?.tone).toBe("off");
+    expect(readState("quota", "unmeasured")?.tone).toBe("off");
+    // And the one that asks the owner for a decision wears the colour that means exactly that.
+    expect(readState("quota", "warn")?.tone).toBe("pending");
+  });
+
+  it("a team item has four states and planned is not one of them", () => {
+    const itemStates = ["done", "failed", "pending", "running"];
+    expect(statesOf("team_item").sort()).toEqual(itemStates);
+    for (const state of itemStates) {
+      expect(teamRs.includes(`'${state}'`)).toBe(true);
+    }
+    expect(teamRs.includes("'planned'")).toBe(false);
+  });
+
+  it("every run literal in the Rust source has a reading, and the shell's two lists agree", () => {
+    const live = literals(concurrencyRs, /pub const LIVE_RUN_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/);
+    const terminal = literals(runsRs, /pub const TERMINAL_RUN_STATUSES: &\[&str\] = &\[([^\]]*)\];/);
+    const union = [...live, ...terminal];
+
+    expect(new Set(statesOf("run"))).toEqual(new Set(union));
+    expect(new Set(RUN_STATUSES)).toEqual(new Set(union));
+  });
+
+  it("only a running run changes on its own", () => {
+    const live = literals(concurrencyRs, /pub const LIVE_RUN_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/);
+    const terminal = literals(runsRs, /pub const TERMINAL_RUN_STATUSES: &\[&str\] = &\[([^\]]*)\];/);
+
+    expect([...live, ...terminal].filter(runIsAlive)).toEqual(["running"]);
+  });
+
+  it("the feed domain's map is the núcleo's own enumeration", () => {
+    const { kinds, files } = writtenFeedKinds();
+    expect(files).toBeGreaterThanOrEqual(100);
+    expect(kinds.size).toBeGreaterThanOrEqual(60);
+    const mapped = new Set(statesOf("feed"));
+    expect([...kinds].filter((kind) => !mapped.has(kind)).sort()).toEqual([]);
+    expect([...mapped].filter((kind) => !kinds.has(kind) && !EMAIL_CLASS_KINDS.includes(kind)).sort()).toEqual([]);
+  });
+
+  it("a feed kind the scan cannot read is named, not dropped", () => {
+    expect(writtenFeedKinds().unresolved).toEqual([]);
+  });
+
+  it("the wrappers and the test-module cut are proven, not assumed", () => {
+    const { kinds } = writtenFeedKinds();
+    expect(kinds.has("job_waiting")).toBe(true);
+    expect(kinds.has("job_finished")).toBe(true);
+    expect(kinds.has("job_review_skipped")).toBe(true);
+    expect(kinds.has("token_efficiency")).toBe(true);
+    expect(kinds.has("land_resolution_failed")).toBe(true);
+    expect(kinds.has("shadow_run_completed")).toBe(true);
+    expect(kinds.has("worktree_run_completed")).toBe(true);
+    expect(kinds.has("global")).toBe(false);
+    expect(kinds.has("project")).toBe(false);
+    expect(kinds.has("email_action")).toBe(false);
+  });
+});

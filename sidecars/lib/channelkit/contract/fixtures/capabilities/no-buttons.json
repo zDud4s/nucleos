@@ -1,0 +1,16 @@
+{ "missing": "buttons",
+  "hello": { "kind": "fake", "version": "1.0.0",
+             "capabilities": { "edit": true, "typing": true, "threads": true, "reply_to": true,
+                               "max_text": 4096, "media_in": ["audio", "image", "file"],
+                               "media_out": ["image", "file", "audio"] } },
+  "setup": { "identities": [ {"sender_ref": "4242", "conversation_ref": "4242", "home": true} ] },
+  "steps": [
+    { "core": {"do": "proposal_pending", "proposal_id": 12, "title": "Install ripgrep"},
+      "expect": { "actions": [ { "type": "send", "conversation": "4242", "$absent": ["buttons"],
+                                 "parts": [ {"type": "text",
+                                             "$contains": ["approve 12", "reject 12"]} ] } ] } },
+    { "event": { "event_id": "nb-1", "conversation": {"ref": "4242", "kind": "private"},
+                 "sender": {"ref": "4242", "name": "Duarte"}, "type": "message",
+                 "message": {"ref": "100", "parts": [ {"type": "text", "text": "approve 12"} ]} },
+      "expect": { "response": {"accepted": true},
+                  "state": { "proposal": {"id": 12, "status": "approved"} } } } ] }

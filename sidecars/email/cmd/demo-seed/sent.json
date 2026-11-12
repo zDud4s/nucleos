@@ -1,0 +1,33 @@
+{
+  "mailbox": "Sent",
+  "direction": "outbound",
+  "uidvalidity": 424242,
+  "max_uid_examined": 201,
+  "skipped": [],
+  "messages": [
+    {
+      "message_id": "demo-sent-maria@example.test",
+      "uid": 200,
+      "from_addr": "me@example.test",
+      "from_name": "Demo User",
+      "subject": "Re: Approve the supplier quote by Friday",
+      "received_at": "2026-07-28T17:00:00Z",
+      "has_attachments": false,
+      "headers": {
+        "to": "Maria <maria@example.test>"
+      }
+    },
+    {
+      "message_id": "demo-sent-oncall@example.test",
+      "uid": 201,
+      "from_addr": "me@example.test",
+      "from_name": "Demo User",
+      "subject": "Re: Production payments are failing now",
+      "received_at": "2026-07-28T17:05:00Z",
+      "has_attachments": false,
+      "headers": {
+        "to": "oncall@example.test"
+      }
+    }
+  ]
+}

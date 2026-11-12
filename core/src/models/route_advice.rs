@@ -1,0 +1,3447 @@
+//! The llm-router as an adviser: which model and effort should run the agent the daemon is about to
+//! launch. Plan: `<state_dir>/plans/2026-09-30-router-como-conselheiro.md`.
+//!
+//! **The daemon decides; the router suggests.** The router never runs anything for us — it answers
+//! one `POST /v1/route` (`router_client.rs`) and the daemon keeps the final word. Its rules travel
+//! IN the request rather than as a filter applied to the answer: the models this agent may use go in
+//! `models`, the runners this run can take (eligibility minus whatever the quota brake is holding)
+//! go in `runners`, and the attempts that already failed the item go in `failed`. What stays here is
+//! small and is not a decision: the fallback (router down, slow, 400 or 422 launches exactly what
+//! would have launched without it), a check that the answer stayed inside what was sent, and the
+//! speed profile's effort ceiling.
+//!
+//! **Off is structural, not a branch.** `main.rs` calls [`front`], which hands back the very `Arc`
+//! it was given unless `router.yaml` turns a surface on. Only then is the primary runner wrapped
+//! in a [`RoutedRunner`], whose one difference from what it wraps is answering
+//! `CommandRunner::router()` with `Some` — a capability on the trait, not an `AppState` field.
+//!
+//! Three modes, in `router.yaml`: `off` (the default, and what an absent, malformed or unknown
+//! value means), `shadow` (ask, record the advice beside what ran, launch what would have launched)
+//! and `apply` (launch the advice when it passes the checks). One switch per surface — `runs`,
+//! `team`, `council`, `recruit` — so `apply` can be turned on a surface at a time.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Deserialize;
+use sqlx::SqlitePool;
+
+use crate::execution::runner::{CommandRunner, Permission, ToolPolicy};
+use crate::router_client::{RouteAdvice, RouteRequest, RouterClient};
+use crate::speed::Speed;
+
+mod engines;
+mod item_context;
+pub use engines::{Engines, RoutedRunner, allowed_models, front, front_with, installed_engines};
+use engines::{codex_runner, engines_without_headroom_now, resolve_pin};
+pub use item_context::{ItemContext, ItemRef, failed_label, item_context};
+
+/// Where the router listens unless `router.yaml` says otherwise.
+pub const DEFAULT_URL: &str = "http://127.0.0.1:18733";
+/// The ceiling on one route call. A run waits at most this long before launching without advice.
+pub const DEFAULT_TIMEOUT_MS: u64 = 2500;
+pub(crate) const MIN_TIMEOUT_MS: u64 = 100;
+pub(crate) const MAX_TIMEOUT_MS: u64 = 10_000;
+/// How much of the prompt leaves the daemon as `task`: the head, where the ask is.
+pub const TASK_CHARS: usize = 4000;
+/// How much of the gate's output goes as `gate_output`: the tail, where the failure is. The router
+/// keeps the same tail (`route_api.GATE_OUTPUT_CHARS`), so sending more is only bytes.
+pub const GATE_TAIL_CHARS: usize = 1500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Off,
+    Shadow,
+    Apply,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Apply => "apply",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "shadow" => Some(Self::Shadow),
+            "apply" => Some(Self::Apply),
+            _ => None,
+        }
+    }
+
+    /// A YAML value as a mode. `false` is accepted as `off` because a YAML 1.1 reader — and a
+    /// person who learnt YAML from one — writes `off` and means the boolean.
+    fn from_yaml(value: &serde_yaml::Value) -> Option<Self> {
+        match value {
+            serde_yaml::Value::String(text) => Self::parse(text.trim()),
+            serde_yaml::Value::Bool(false) => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// The places the daemon already chooses an agent's model, each with its own switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Runs,
+    Team,
+    Council,
+    Recruit,
+}
+
+impl Surface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runs => "runs",
+            Self::Team => "team",
+            Self::Council => "council",
+            Self::Recruit => "recruit",
+        }
+    }
+
+    pub(crate) const ALL: [Self; 4] = [Self::Runs, Self::Team, Self::Council, Self::Recruit];
+}
+
+/// A CLI the daemon can launch, named as the router names it (`route_api.RUNNERS`).
+///
+/// A table-backed id: the named consts are the rows the production code names, and any other CLI
+/// row is a `RunnerKind` of its own, never a stand-in for Claude. Ordered by table position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RunnerKind(pub(crate) crate::engines::EngineId);
+
+#[allow(non_upper_case_globals)]
+impl RunnerKind {
+    pub const Claude: RunnerKind =
+        RunnerKind(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
+    pub const Codex: RunnerKind =
+        RunnerKind(crate::engines::EngineId::from_row(crate::engines::CODEX));
+    pub const Agy: RunnerKind = RunnerKind(crate::engines::EngineId::from_row(crate::engines::AGY));
+
+    pub fn as_str(self) -> &'static str {
+        self.0.as_str()
+    }
+
+    /// The kind of a CLI row of the production table; `None` for any other id (`local` included).
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::parse_in(crate::engines::TABLE, value)
+    }
+
+    /// The kind of a CLI row of `table`; `None` for any other id.
+    pub fn parse_in(table: &[crate::engines::EngineDescription], value: &str) -> Option<Self> {
+        let row = crate::engines::cli_row_in(table, value)?;
+        Some(Self(crate::engines::EngineId::from_row(row.id)))
+    }
+
+    /// A kind outside the production table, to exercise the fail-closed arms.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn for_test(id: &'static str) -> Self {
+        Self(crate::engines::EngineId::for_test(id))
+    }
+}
+
+/// `router.yaml`, read once at startup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterConfig {
+    /// The mode of every surface that names none of its own.
+    pub mode: Mode,
+    pub url: String,
+    pub timeout_ms: u64,
+    /// Runners besides the primary that a routed run may be moved to. Empty: the primary only.
+    pub runners: Vec<String>,
+    /// Per runner, the globs the router may choose from. Absent for a runner: the daemon's own
+    /// catalogue for it (see [`allowed_models`]).
+    pub models: BTreeMap<String, Vec<String>>,
+    /// A surface's own mode, overriding `mode`.
+    pub surfaces: BTreeMap<&'static str, Mode>,
+}
+
+impl RouterConfig {
+    pub fn off() -> Self {
+        Self {
+            mode: Mode::Off,
+            url: DEFAULT_URL.to_owned(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            runners: Vec::new(),
+            models: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
+        }
+    }
+
+    /// The mode a surface runs under: its own when the file names one, else the global one.
+    pub fn mode_for(&self, surface: Surface) -> Mode {
+        self.surfaces
+            .get(surface.as_str())
+            .copied()
+            .unwrap_or(self.mode)
+    }
+
+    /// Every surface off: nothing to front, and [`front`] hands the runner back untouched.
+    pub fn is_off(&self) -> bool {
+        Surface::ALL
+            .iter()
+            .all(|surface| self.mode_for(*surface) == Mode::Off)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    #[serde(default)]
+    mode: Option<serde_yaml::Value>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    runners: Vec<String>,
+    #[serde(default)]
+    models: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    surfaces: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// Reads `router.yaml`, which lives under `machine_config::root()` (`~/.nucleos/`). Anything
+/// short of a well-formed, loopback configuration is `off`.
+///
+/// An absent file is the ordinary case and is silent. A malformed one, an unknown mode or a URL off
+/// this machine is `off` plus a warning: the prompt's head travels in the request, and task text
+/// must not leave the machine because somebody mistyped a host.
+pub fn load_config(path: &Path) -> RouterConfig {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path = %path.display(), "no router config; routing is off");
+            return RouterConfig::off();
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "router config unreadable; routing is off");
+            return RouterConfig::off();
+        }
+    };
+    match parse_config(&text) {
+        Ok(config) => config,
+        Err(why) => {
+            tracing::warn!(path = %path.display(), %why, "router config refused; routing is off");
+            RouterConfig::off()
+        }
+    }
+}
+
+/// The stored `router` document as a configuration; `off` when none is stored or the document
+/// names a router off this machine (`RouterDoc::to_config` is the loopback fence).
+pub fn current_config() -> RouterConfig {
+    let Some(doc) =
+        crate::settings::get_opt::<super::route_doc::RouterDoc>(&crate::settings::Scope::Machine)
+    else {
+        return RouterConfig::off();
+    };
+    match doc.to_config() {
+        Ok(config) => config,
+        Err(why) => {
+            tracing::warn!(%why, "stored router document refused; routing is off");
+            RouterConfig::off()
+        }
+    }
+}
+
+/// The pure half of [`load_config`]: the reason a file is refused, or the configuration it names.
+pub fn parse_config(text: &str) -> Result<RouterConfig, String> {
+    let raw: RawConfig = serde_yaml::from_str(text).map_err(|error| error.to_string())?;
+    let mode = match raw.mode.as_ref() {
+        None => Mode::Off,
+        Some(value) => {
+            Mode::from_yaml(value).ok_or_else(|| format!("unknown router mode {value:?}"))?
+        }
+    };
+    // `from_yaml` accepts `false` as `off`; the document carries the canonical word instead.
+    let mut surfaces = BTreeMap::new();
+    for (name, value) in &raw.surfaces {
+        let surface_mode = Mode::from_yaml(value)
+            .ok_or_else(|| format!("unknown router mode {value:?} for surface {name}"))?;
+        surfaces.insert(name.clone(), surface_mode.as_str().to_owned());
+    }
+    super::route_doc::RouterDoc {
+        mode: mode.as_str().to_owned(),
+        url: raw.url.unwrap_or_else(|| DEFAULT_URL.to_owned()),
+        timeout_ms: raw.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+        runners: raw.runners,
+        models: raw.models,
+        surfaces,
+    }
+    .to_config()
+}
+
+/// Only `http(s)://` to 127.0.0.1, localhost or ::1.
+pub(crate) fn is_loopback(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.username().is_empty()
+        && matches!(
+            parsed.host_str(),
+            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+        )
+}
+
+/// One runner the daemon can launch a routed run on.
+pub struct Available {
+    pub kind: RunnerKind,
+    pub runner: Arc<dyn CommandRunner>,
+    /// What this runner launches when the request names no model. Recorded as the effective model,
+    /// so the next retry can name it in `failed`.
+    pub default_model: String,
+    /// The globs over tier names and model ids the router may choose from for this runner.
+    pub models: Vec<String>,
+}
+
+/// The router, as the daemon holds it: its configuration, the client, and the runners it may pick.
+pub struct Router {
+    pub config: RouterConfig,
+    pub client: RouterClient,
+    pub primary: Available,
+    pub alternates: Vec<Available>,
+    /// The effort levels each model the models file lists takes, by its id (`ModelChoice::efforts`).
+    /// Only models that name some are here; a model absent from it is held to `EFFORT_ORDER` alone.
+    pub model_efforts: Vec<(String, Vec<String>)>,
+}
+
+impl std::fmt::Debug for Router {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Router")
+            .field("config", &self.config)
+            .field("primary", &self.primary.kind)
+            .finish()
+    }
+}
+
+impl Router {
+    pub fn new(config: RouterConfig, primary: Available, alternates: Vec<Available>) -> Self {
+        let client = RouterClient::new(&config.url, Duration::from_millis(config.timeout_ms));
+        Self {
+            config,
+            client,
+            primary,
+            alternates,
+            model_efforts: Vec::new(),
+        }
+    }
+
+    /// The same router, holding each model's own effort levels (see `model_efforts`).
+    pub fn with_model_efforts(mut self, model_efforts: Vec<(String, Vec<String>)>) -> Self {
+        self.model_efforts = model_efforts
+            .into_iter()
+            .filter(|(_, efforts)| !efforts.is_empty())
+            .collect();
+        self
+    }
+
+    /// Whether `model` (by id) takes `effort`: a level the models file does not list for it is refused,
+    /// a model the file does not list is not second-guessed.
+    pub fn takes_effort(&self, model: &str, effort: &str) -> bool {
+        EFFORT_ORDER.contains(&effort)
+            && self
+                .model_efforts
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(model))
+                .is_none_or(|(_, efforts)| efforts.iter().any(|level| level == effort))
+    }
+
+    /// Whether the advised effort can be handed to the CLI as it comes. It goes to `--effort` /
+    /// `model_reasoning_effort=` unchecked by anything after this, so a level this daemon cannot
+    /// rank, or one the models file says the advised model (by id or tier) does not take, would
+    /// fail the launch at spawn: that is a router failure, and the launch falls back.
+    pub fn check_effort(&self, advice: &RouteAdvice) -> Result<(), String> {
+        let Some(effort) = advice.effort.as_deref() else {
+            return Ok(());
+        };
+        if !EFFORT_ORDER.contains(&effort) {
+            return Err(format!("effort {effort:?} is not one this daemon launches"));
+        }
+        let names = std::iter::once(advice.model.as_str()).chain(advice.tier.as_deref());
+        for name in names {
+            if let Some((model, efforts)) = self
+                .model_efforts
+                .iter()
+                .find(|(model, _)| model.eq_ignore_ascii_case(name))
+                && !efforts.iter().any(|level| level == effort)
+            {
+                return Err(format!(
+                    "effort {effort} is not one {model} takes {efforts:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The mode `surface` runs under.
+    pub fn mode_for(&self, surface: Surface) -> Mode {
+        self.config.mode_for(surface)
+    }
+
+    /// The runs surface's mode: what `resolve` asks under and records.
+    pub fn runs_mode(&self) -> Mode {
+        self.mode_for(Surface::Runs)
+    }
+
+    pub fn available(&self, kind: RunnerKind) -> Option<&Available> {
+        std::iter::once(&self.primary)
+            .chain(self.alternates.iter())
+            .find(|available| available.kind == kind)
+    }
+
+    /// Which runners a run of this shape may be moved to. A safety property, not a preference.
+    ///
+    /// The primary is always eligible: it is what launches without a router. Nothing else is for a
+    /// resume, which continues a session only the CLI that started it can read. Codex needs more
+    /// again: `CodexCliRunner` refuses every permission rung above `Default`, a restrictive tool
+    /// policy and a classifier-governed run (it has no `PreToolUse` hook), so offering it such a run
+    /// would either fail the launch or ungovern it.
+    pub fn eligible(&self, shape: RunShape) -> Vec<RunnerKind> {
+        let mut kinds = vec![self.primary.kind];
+        if shape.resume {
+            return kinds;
+        }
+        for alternate in &self.alternates {
+            let fits = match alternate.kind {
+                RunnerKind::Claude => true,
+                RunnerKind::Codex => codex_can_take(shape),
+                // Agy is offered only while its gate is open and for a read-only run it can honour;
+                // `spawn.rs` drops it again for a run whose controls the runner refuses (job MCP,
+                // steering, a forked session).
+                RunnerKind::Agy => agy_can_take(shape) && crate::engines::agy::enabled(),
+                // An engine with no arm is never offered as an alternate.
+                _ => false,
+            };
+            if fits && !kinds.contains(&alternate.kind) {
+                kinds.push(alternate.kind);
+            }
+        }
+        kinds
+    }
+
+    /// The request, with the daemon's rules in it: `runners` as given (already eligible and clear of
+    /// the quota brake), `models` as the union of those runners' globs, and the item's history.
+    pub fn build_request(&self, query: &RouteQuery, runners: &[RunnerKind]) -> RouteRequest {
+        let mut models: Vec<String> = Vec::new();
+        for kind in runners {
+            if let Some(available) = self.available(*kind) {
+                for glob in &available.models {
+                    if !models.contains(glob) {
+                        models.push(glob.clone());
+                    }
+                }
+            }
+        }
+        let item = query.item.clone().unwrap_or_default();
+        RouteRequest {
+            task: head(&query.task, TASK_CHARS).to_owned(),
+            stage: query.stage.clone(),
+            files: item.files,
+            attempt: item.attempt,
+            gate_output: item
+                .gate_output
+                .as_deref()
+                .map(|output| tail(output, GATE_TAIL_CHARS).to_owned())
+                .filter(|output| !output.trim().is_empty()),
+            failed: item.failed,
+            runners: runners
+                .iter()
+                .map(|kind| kind.as_str().to_owned())
+                .collect(),
+            packet: None,
+            models,
+            exclude: Vec::new(),
+        }
+    }
+
+    /// Whether an answer stayed inside what was sent. An answer outside it is a router failure.
+    ///
+    /// The router filters before it chooses, so this should never refuse anything — which is exactly
+    /// why it is checked: a router that ignored a filter would otherwise move a run onto a runner
+    /// the daemon ruled out, and nothing would say so.
+    pub fn check_answer(
+        &self,
+        advice: &RouteAdvice,
+        sent: &RouteRequest,
+    ) -> Result<RunnerKind, String> {
+        if !sent.runners.iter().any(|runner| runner == &advice.runner) {
+            return Err(format!(
+                "runner {} is not among those sent {:?}",
+                advice.runner, sent.runners
+            ));
+        }
+        let kind = RunnerKind::parse(&advice.runner)
+            .ok_or_else(|| format!("runner {} cannot be launched here", advice.runner))?;
+        if advice.model.trim().is_empty() {
+            return Err("the advice names no model".to_owned());
+        }
+        let names: Vec<&str> = std::iter::once(advice.model.as_str())
+            .chain(advice.tier.as_deref())
+            .collect();
+        let matches = |globs: &[String]| {
+            globs
+                .iter()
+                .any(|glob| names.iter().any(|name| glob_match(glob, name)))
+        };
+        // An empty `models` is "any model" to the router, so a request that carried none held the
+        // answer to nothing and no answer to it can be shown to be one the daemon allows.
+        if sent.models.is_empty() {
+            return Err("the request carried no model globs to hold the answer to".to_owned());
+        }
+        if !matches(&sent.models) {
+            return Err(format!(
+                "model {} matches none of the globs sent {:?}",
+                advice.model, sent.models
+            ));
+        }
+        let own = self
+            .available(kind)
+            .map(|available| available.models.as_slice())
+            .unwrap_or_default();
+        if !own.is_empty() && !matches(own) {
+            return Err(format!(
+                "model {} is not one {} may run {:?}",
+                advice.model,
+                kind.as_str(),
+                own
+            ));
+        }
+        self.check_effort(advice)?;
+        Ok(kind)
+    }
+
+    /// Warns, once at startup, about every allowed glob the router serves nothing for. Such a glob
+    /// is not an error — but a catalogue that names models by ids the router does not know turns
+    /// every routed run into a 422 and a fallback, and this is the only place that would be said.
+    pub async fn check_targets(&self) {
+        let targets = match self.client.targets().await {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!(%error, "could not list the llm-router's targets");
+                return;
+            }
+        };
+        for available in std::iter::once(&self.primary).chain(self.alternates.iter()) {
+            for glob in &available.models {
+                let served = targets.iter().any(|target| {
+                    target.runner == available.kind.as_str()
+                        && (glob_match(glob, &target.model) || glob_match(glob, &target.tier))
+                });
+                if !served {
+                    tracing::warn!(
+                        runner = available.kind.as_str(),
+                        %glob,
+                        "the llm-router serves no tier this allowed model matches"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `fnmatch.fnmatchcase` over lowercased text, as the router matches `models`: `*` any run, `?` one
+/// character. Character classes are not supported and match literally; nothing here writes one.
+pub fn glob_match(glob: &str, text: &str) -> bool {
+    fn go(pattern: &[char], text: &[char]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some(('*', rest)) => (0..=text.len()).any(|skip| go(rest, &text[skip..])),
+            Some(('?', rest)) => !text.is_empty() && go(rest, &text[1..]),
+            Some((c, rest)) => text.first() == Some(c) && go(rest, &text[1..]),
+        }
+    }
+    let pattern: Vec<char> = glob.to_lowercase().chars().collect();
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    go(&pattern, &text)
+}
+
+/// The shape of a run, as far as runner eligibility cares.
+#[derive(Debug, Clone, Copy)]
+pub struct RunShape {
+    pub permission: Permission,
+    pub classifier_governs_tools: bool,
+    pub tool_policy: ToolPolicy,
+    pub resume: bool,
+}
+
+/// Whether a run of this shape may be offered to agy: not a resume, not classifier-governed, not
+/// `Bypass` (the runner refuses it), and read-only, since agy has neither the `PreToolUse` hook nor a
+/// permission ladder: a plan run, or a restricted tool policy (`--mode plan --sandbox`).
+pub fn agy_can_take(shape: RunShape) -> bool {
+    !shape.resume
+        && !shape.classifier_governs_tools
+        && shape.permission != Permission::Bypass
+        && (shape.permission == Permission::Plan || shape.tool_policy != ToolPolicy::Unrestricted)
+}
+
+/// Why `CodexCliRunner` would refuse a run of this shape, in a sentence; `None` when it can take it.
+/// The one place the Codex predicate lives: the router's `eligible` and a pinned launch both ask it.
+pub fn codex_refusal(shape: RunShape) -> Option<String> {
+    if shape.permission == Permission::Plan {
+        return Some(
+            "codex has no plan mode, so a plan-only run cannot be pinned to it".to_owned(),
+        );
+    }
+    if shape.permission != Permission::Default {
+        return Some(format!(
+            "codex exec cannot honour Permission::{:?}",
+            shape.permission
+        ));
+    }
+    if shape.classifier_governs_tools {
+        return Some(
+            "codex has no PreToolUse hook, so a classifier-governed run cannot be pinned to it"
+                .to_owned(),
+        );
+    }
+    if shape.tool_policy != ToolPolicy::Unrestricted {
+        return Some(format!(
+            "codex exec cannot honour ToolPolicy::{:?}",
+            shape.tool_policy
+        ));
+    }
+    None
+}
+
+/// Whether Codex can take a run of this shape.
+pub fn codex_can_take(shape: RunShape) -> bool {
+    codex_refusal(shape).is_none()
+}
+
+/// What the daemon would launch, or what it will.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choice {
+    pub kind: RunnerKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Effort levels, weakest first: the order the ceiling is compared in.
+const EFFORT_ORDER: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// The effort ceiling a speed allows the router to advise.
+///
+/// Owned here rather than read from the workflow's speed table, which the daemon deliberately does
+/// not read (`speed.rs`): this is the router's clamp, and the values are the spec's §2 row for
+/// `reasoning_effort` (`normal` medium, `fast` low, `thorough` high).
+pub fn effort_ceiling(speed: Speed) -> &'static str {
+    match speed {
+        Speed::Normal => "medium",
+        Speed::Fast => "low",
+        Speed::Thorough => "high",
+    }
+}
+
+/// `effort` held at or under `ceiling`. An effort this daemon cannot rank is taken down to the
+/// ceiling rather than trusted, since it cannot be shown to sit under it.
+pub fn clamp_effort(effort: &str, ceiling: &str) -> String {
+    let rank = |value: &str| EFFORT_ORDER.iter().position(|level| *level == value);
+    match (rank(effort), rank(ceiling)) {
+        (Some(asked), Some(limit)) if asked <= limit => effort.to_owned(),
+        _ => ceiling.to_owned(),
+    }
+}
+
+/// The speed a launch is told, read from the environment it is handed (`speed::Capacity::env`).
+/// Absent is `normal`.
+pub fn speed_of(env: &[(String, String)]) -> Speed {
+    Speed::from_column(
+        env.iter()
+            .find(|(name, _)| name == crate::speed::SPEED_VAR)
+            .map(|(_, value)| value.as_str()),
+    )
+}
+
+/// What launches. `shadow` and `off` launch the configured choice whatever the advice. `apply`
+/// launches a checked advice, its effort held under the speed's ceiling, and falls back to the
+/// configured choice when there is none.
+pub fn choose(
+    mode: Mode,
+    configured: Choice,
+    advice: Option<(&RouteAdvice, RunnerKind)>,
+    ceiling: &str,
+) -> Choice {
+    match (mode, advice) {
+        (Mode::Apply, Some((advice, kind))) if !advice.model.trim().is_empty() => Choice {
+            kind,
+            model: Some(advice.model.clone()),
+            effort: advice
+                .effort
+                .as_deref()
+                .map(|effort| clamp_effort(effort, ceiling)),
+        },
+        _ => configured,
+    }
+}
+
+/// What a run tells the router about itself.
+#[derive(Debug, Clone)]
+pub struct RouteQuery {
+    pub task: String,
+    pub stage: Option<String>,
+    /// Read when the run is created, not when it is routed: `job.rs` points the item at the new run
+    /// right after creating it, and after that the previous attempt — the one that failed — can no
+    /// longer be found from the item.
+    pub item: Option<ItemContext>,
+    pub resume: bool,
+    /// `Some` narrows the runners the router may choose from to these kinds (eligible ∩ this −
+    /// braked). A node launcher's `restrict_runners`.
+    pub restrict_runners: Option<Vec<RunnerKind>>,
+    /// `Some` bypasses the router: this runner, this model, this effort.
+    pub pin: Option<EnginePinRoute>,
+    /// The run's answer will be validated by the driver, which reports to the router afterwards;
+    /// `outcome_at_run_end` stays silent for it.
+    pub judged_later: bool,
+    /// The effort a node asked for with no engine pin: the router still picks runner and model, but
+    /// the launch runs at this effort (checked against the model it lands on).
+    pub effort: Option<String>,
+    /// What a node's agent needs of Codex, carried even when the node is not pinned: if the router
+    /// moves the run to Codex, the launch gets a runner that pins this, not the shared alternate
+    /// (which pins nothing). `None` for every run that is not an agent node.
+    pub codex_profile: Option<CodexProfile>,
+}
+
+/// The Codex settings an agent's capabilities translate to: the sandbox that is the barrier on Codex
+/// and the `web_search` mode. One value for the pinned and the routed path, so they cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexProfile {
+    /// `read-only` | `workspace-write`.
+    pub sandbox: &'static str,
+    /// `"live"` when the agent declares `web`; `None` leaves Codex's own default.
+    pub web_search: Option<&'static str>,
+}
+
+impl RouteQuery {
+    /// The query with agy taken out of the runners it may choose from, for a run the agy runner
+    /// would refuse. No restriction becomes one naming the other runners.
+    pub fn without_agy(mut self) -> Self {
+        self.restrict_runners = Some(match self.restrict_runners.take() {
+            Some(kinds) => kinds
+                .into_iter()
+                .filter(|kind| *kind != RunnerKind::Agy)
+                .collect(),
+            None => vec![RunnerKind::Claude, RunnerKind::Codex],
+        });
+        self
+    }
+
+    /// A query that restricts, pins and defers nothing: how every run but a launcher-shaped node
+    /// is routed.
+    pub fn plain(
+        task: String,
+        stage: Option<String>,
+        item: Option<ItemContext>,
+        resume: bool,
+    ) -> Self {
+        Self {
+            task,
+            stage,
+            item,
+            resume,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
+            codex_profile: None,
+        }
+    }
+}
+
+/// A fixed engine and model, from a node launcher's pin (`dispatch::EnginePin` is this type).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnginePinRoute {
+    pub runner: RunnerKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Codex only: the sandbox the pinned launch runs in (`read-only` | `workspace-write`), derived
+    /// from the agent's capabilities. On Codex this sandbox is the barrier, since `codex exec` has no
+    /// permission modes and no `PreToolUse` hook. `None` keeps the runner the daemon already holds.
+    pub sandbox: Option<&'static str>,
+    /// Codex only: the `web_search` mode to pin (`"live"`), set when the agent declares `web`.
+    /// `None` leaves Codex's own default, and an `McpOnly` run's `"disabled"` still wins over it.
+    pub web_search: Option<&'static str>,
+}
+
+/// The runners the quota brake is holding right now, by the stored readings only.
+///
+/// Side-effect free on purpose: `quota::quota_permits_new_run` announces a blind brake and clears
+/// markers, which is the scheduler's job, and a live sidecar call could cost the run 25 seconds.
+/// Fails open like the brake itself — an unreadable policy or reading holds nothing.
+pub async fn braked_runners(pool: &SqlitePool) -> Vec<RunnerKind> {
+    let Ok(policy) = crate::quota::load_brake_policy(pool).await else {
+        return Vec::new();
+    };
+    if !policy.enabled {
+        return Vec::new();
+    }
+    let now = chrono::Utc::now();
+    let Ok(providers) = crate::quota::stored(pool, now).await else {
+        return Vec::new();
+    };
+    [RunnerKind::Claude, RunnerKind::Codex]
+        .into_iter()
+        .filter(|kind| {
+            matches!(
+                crate::quota::judge(&policy, kind.as_str(), &providers, now),
+                crate::quota::Verdict::Over { .. }
+            )
+        })
+        .collect()
+}
+
+/// `runners` minus the engines whose provider pool has no account out of risk right now (design
+/// §8), in `runners`' order. The per-launch filter `resolve` applies, for the launchers that build
+/// their own runner list outside it (`seat_advice`). Empty means "do not route": a caller never asks
+/// the router with it, since an empty list is "any runner" there.
+pub(crate) fn without_headroom(runners: &[RunnerKind]) -> Vec<RunnerKind> {
+    drop_engines(runners, &engines_without_headroom_now())
+}
+
+/// `runners` minus every kind whose `as_str()` is in `blocked`, in `runners`' order.
+pub(crate) fn drop_engines(runners: &[RunnerKind], blocked: &[String]) -> Vec<RunnerKind> {
+    runners
+        .iter()
+        .copied()
+        .filter(|kind| !blocked.iter().any(|name| name == kind.as_str()))
+        .collect()
+}
+
+/// What `spawn_run` launches, and what it keeps for reporting the outcome.
+pub struct Resolved {
+    pub runner: Arc<dyn CommandRunner>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub decision_id: Option<String>,
+    pub router: Option<Arc<Router>>,
+    /// Why the launch cannot happen at all (a pin to an engine this daemon does not hold). `spawn_run`
+    /// fails the run with this sentence before any CLI starts.
+    pub refused: Option<String>,
+}
+
+/// Asks the router about one run, records the choice beside the advice, and says what to launch.
+///
+/// With no router (routing off), no query (a triage run, a handoff) or the runs surface off, it
+/// returns its inputs untouched and writes nothing: off is today's launch, byte for byte. Otherwise
+/// every path — advice, 400, 422, timeout, an answer outside the set — writes ONE update, so a row
+/// never holds half a decision, and a failed write only warns.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve(
+    pool: &SqlitePool,
+    run_id: i64,
+    runner: Arc<dyn CommandRunner>,
+    model: Option<String>,
+    effort: Option<String>,
+    route: Option<RouteQuery>,
+    shape: RunShape,
+    speed: Speed,
+) -> Resolved {
+    resolve_with(
+        pool,
+        run_id,
+        runner,
+        model,
+        effort,
+        route,
+        shape,
+        speed,
+        &engines_without_headroom_now,
+    )
+    .await
+}
+
+/// `resolve` with the inter-provider filter's source given, so a test does not depend on the
+/// daemon's global account pool. `without_headroom` is read once per routed launch.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_with(
+    pool: &SqlitePool,
+    run_id: i64,
+    runner: Arc<dyn CommandRunner>,
+    model: Option<String>,
+    effort: Option<String>,
+    route: Option<RouteQuery>,
+    shape: RunShape,
+    speed: Speed,
+    without_headroom: &(dyn Fn() -> Vec<String> + Sync),
+) -> Resolved {
+    let pin = route.as_ref().and_then(|query| query.pin.clone());
+    // A node's own effort (no pin) beats the configured one on every path that does not route.
+    let hint = route
+        .as_ref()
+        .and_then(|query| query.effort.clone())
+        .filter(|effort| EFFORT_ORDER.contains(&effort.as_str()));
+    let effort = hint.clone().or(effort);
+    // A pin goes to the pin path whenever the daemon holds engines, router or not: it bypasses the
+    // router entirely, whatever mode the runs surface is in (no HTTP, no decision id, and
+    // `route_mode` and the `advised_*` columns stay NULL).
+    if let (Some(pin), Some(engines)) = (pin.clone(), runner.engines()) {
+        let router = runner.router();
+        return resolve_pin(pool, run_id, runner, router, &engines, pin, shape).await;
+    }
+    let (Some(router), Some(query)) = (runner.router(), route) else {
+        // No engines to hold the pin's runner against (a bare runner), so only its model and effort
+        // are applied to the runner the run already has. A pin is never silently dropped.
+        let (model, effort) = match pin {
+            Some(pin) => (pin.model, pin.effort),
+            None => (model, effort),
+        };
+        return Resolved {
+            runner,
+            model,
+            effort,
+            decision_id: None,
+            router: None,
+            refused: None,
+        };
+    };
+    let mode = router.runs_mode();
+    if mode == Mode::Off {
+        return Resolved {
+            runner,
+            model,
+            effort,
+            decision_id: None,
+            router: None,
+            refused: None,
+        };
+    }
+
+    let shape = RunShape {
+        resume: shape.resume || query.resume,
+        ..shape
+    };
+    // A resume continues a session the configured model and effort started, and switching either
+    // mid-session is not the router's call: it is asked and recorded, and never applied — the
+    // closest a resume comes to the handoff path, which is not routed at all.
+    let mode = if shape.resume && mode == Mode::Apply {
+        Mode::Shadow
+    } else {
+        mode
+    };
+    let eligible = router.eligible(shape);
+    // Design §8: an engine whose provider pool has no account out of risk is held like a braked
+    // one, the primary included. Judged now, on every launch, not when the front was built.
+    let blocked = without_headroom();
+    let braked: Vec<RunnerKind> = braked_runners(pool)
+        .await
+        .into_iter()
+        .chain(
+            eligible
+                .iter()
+                .copied()
+                .filter(|kind| blocked.iter().any(|name| name == kind.as_str())),
+        )
+        .collect();
+    // The restriction is applied to the eligible set BEFORE the quota brake is subtracted.
+    let runners = narrowed_runners(eligible, query.restrict_runners.as_deref(), &braked);
+    if query
+        .restrict_runners
+        .as_ref()
+        .is_some_and(|only| !only.is_empty())
+        && runners.is_empty()
+    {
+        tracing::warn!(
+            run_id,
+            restrict = ?query.restrict_runners,
+            "a node's engine restriction leaves no runner the router can use; not routing"
+        );
+    }
+    let request = router.build_request(&query, &runners);
+    // Never asked with no runners: an empty list is "any runner" to the router.
+    let advice = if runners.is_empty() {
+        tracing::info!(
+            run_id,
+            "every eligible runner is held by the quota brake or has no account headroom; not routing"
+        );
+        None
+    } else {
+        match router.client.route(&request).await {
+            Ok(advice) => match router.check_answer(&advice, &request) {
+                Ok(kind) => Some((advice, kind)),
+                Err(why) => {
+                    tracing::warn!(run_id, %why, "llm-router answered outside what was sent; ignoring it");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(run_id, %error, "no advice from the llm-router; launching as configured");
+                None
+            }
+        }
+    };
+
+    let configured = Choice {
+        kind: router.primary.kind,
+        model: model.clone(),
+        effort: effort.clone(),
+    };
+    let mut choice = choose(
+        mode,
+        configured,
+        advice.as_ref().map(|(advice, kind)| (advice, *kind)),
+        effort_ceiling(speed),
+    );
+    // The node asked for an effort and pinned no engine: the router still chose runner and model, and
+    // the effort holds when the model it landed on takes it.
+    if let Some(hint) = hint.as_deref()
+        && !shape.resume
+    {
+        let landed = router.available(choice.kind).unwrap_or(&router.primary);
+        let name = choice
+            .model
+            .as_deref()
+            .unwrap_or(landed.default_model.as_str());
+        if router.takes_effort(name, hint) {
+            choice.effort = Some(hint.to_owned());
+        }
+    }
+    let launched = router.available(choice.kind).unwrap_or(&router.primary);
+    let effective_model = choice
+        .model
+        .clone()
+        .unwrap_or_else(|| launched.default_model.clone());
+    let route_failed = (!request.failed.is_empty())
+        .then(|| serde_json::to_string(&request.failed).unwrap_or_default());
+    let advised = advice.as_ref().map(|(advice, _)| advice);
+    if let Err(error) = sqlx::query(
+        "UPDATE runs SET model = ?, effort = ?, runner = ?, route_mode = ?, route_decision_id = ?,
+                         advised_runner = ?, advised_model = ?, advised_effort = ?, route_failed = ?
+          WHERE id = ?",
+    )
+    .bind(&effective_model)
+    .bind(&choice.effort)
+    .bind(choice.kind.as_str())
+    .bind(mode.as_str())
+    .bind(advised.map(|advice| advice.decision_id.as_str()))
+    .bind(advised.map(|advice| advice.runner.as_str()))
+    .bind(advised.map(|advice| advice.model.as_str()))
+    .bind(advised.and_then(|advice| advice.effort.as_deref()))
+    .bind(&route_failed)
+    .bind(run_id)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(run_id, %error, "could not record a run's route decision");
+    }
+
+    // The runner the run already held whenever the primary launches: the wrapper, not what it
+    // wraps, so nothing downstream can tell a routed-to-primary launch from an unrouted one.
+    let chosen_runner = if choice.kind == router.primary.kind {
+        runner
+    } else if let (RunnerKind::Codex, Some(profile)) = (choice.kind, query.codex_profile.as_ref()) {
+        // A routed agent node on Codex gets the same sandbox and web search a pinned one would; the
+        // shared alternate pins neither, so Codex would fall back to the user's config.
+        codex_runner(
+            launched.default_model.clone(),
+            profile.sandbox,
+            profile.web_search,
+        )
+    } else {
+        Arc::clone(&launched.runner)
+    };
+    Resolved {
+        runner: chosen_runner,
+        model: choice.model,
+        effort: choice.effort,
+        decision_id: advised.map(|advice| advice.decision_id.clone()),
+        router: Some(router),
+        refused: None,
+    }
+}
+
+/// `eligible ∩ restrict − braked`, in `eligible`'s order. `restrict` of `None` restricts nothing.
+pub fn narrowed_runners(
+    eligible: Vec<RunnerKind>,
+    restrict: Option<&[RunnerKind]>,
+    braked: &[RunnerKind],
+) -> Vec<RunnerKind> {
+    eligible
+        .into_iter()
+        .filter(|kind| restrict.is_none_or(|only| only.contains(kind)))
+        .filter(|kind| !braked.contains(kind))
+        .collect()
+}
+
+fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> String {
+    match kind {
+        RunnerKind::Claude => models.claude_model.clone(),
+        RunnerKind::Codex => models.codex_model.clone(),
+        // No model file names an agy default; the engine's own constant does.
+        RunnerKind::Agy => crate::engines::agy::DEFAULT_MODEL.to_owned(),
+        // An engine with no arm has no default model: the empty string names none, and never
+        // borrows Claude's.
+        _ => {
+            tracing::warn!(kind = kind.as_str(), "engine has no default model");
+            String::new()
+        }
+    }
+}
+
+/// The first `limit` characters, cut on a character boundary.
+fn head(text: &str, limit: usize) -> &str {
+    match text.char_indices().nth(limit) {
+        Some((index, _)) => &text[..index],
+        None => text,
+    }
+}
+
+/// The last `limit` characters, cut on a character boundary.
+fn tail(text: &str, limit: usize) -> &str {
+    let count = text.chars().count();
+    if count <= limit {
+        return text;
+    }
+    match text.char_indices().nth(count - limit) {
+        Some((index, _)) => &text[index..],
+        None => text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::runner::{RunOutcome, RunRequest, TurnEvent};
+    use crate::router_client::test_support::{dead_address, slow_router, stub_router};
+    use async_trait::async_trait;
+    use tokio::sync::mpsc::UnboundedSender;
+
+    async fn pool() -> SqlitePool {
+        crate::testdb::fresh_pool().await
+    }
+
+    async fn seed_run(pool: &SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('p', 'x', 'running', 'worktree', '2026-09-30T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    fn outcome(stdout: &str) -> RunOutcome {
+        RunOutcome {
+            exit_code: 0,
+            stdout: stdout.into(),
+            stderr: String::new(),
+            session_id: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+            model_requested: false,
+        }
+    }
+
+    /// A runner whose every method answers something no trait default would.
+    struct Probe;
+
+    #[async_trait]
+    impl CommandRunner for Probe {
+        async fn run_prompt(
+            &self,
+            request: RunRequest,
+            _session_tx: UnboundedSender<String>,
+            _transcript: Arc<std::sync::Mutex<String>>,
+        ) -> std::io::Result<RunOutcome> {
+            Ok(outcome(&format!(
+                "plain {}",
+                request.model.unwrap_or_default()
+            )))
+        }
+
+        async fn run_prompt_with_context_fill(
+            &self,
+            _request: RunRequest,
+            _session_tx: UnboundedSender<String>,
+            _transcript: Arc<std::sync::Mutex<String>>,
+            context_fill: Arc<std::sync::Mutex<Option<i64>>>,
+        ) -> std::io::Result<RunOutcome> {
+            *context_fill.lock().unwrap() = Some(7);
+            Ok(outcome("fill"))
+        }
+
+        async fn run_prompt_with_turns(
+            &self,
+            _request: RunRequest,
+            _session_tx: UnboundedSender<String>,
+            _transcript: Arc<std::sync::Mutex<String>>,
+            _context_fill: Arc<std::sync::Mutex<Option<i64>>>,
+            turns: Option<UnboundedSender<TurnEvent>>,
+        ) -> std::io::Result<RunOutcome> {
+            if let Some(turns) = turns {
+                let _ = turns.send(TurnEvent::Line("a turn".into()));
+            }
+            Ok(outcome("turns"))
+        }
+
+        fn model_for_stage(&self, stage: Option<&str>) -> Option<String> {
+            stage.map(|stage| format!("{stage}-model"))
+        }
+
+        fn authored_prompt(
+            &self,
+            request: &RunRequest,
+        ) -> Option<crate::prompt_budget::AuthoredPrompt> {
+            Some(crate::execution::runner::authored_prompt(request))
+        }
+
+        fn reports_model_request(&self) -> bool {
+            true
+        }
+    }
+
+    fn request() -> RunRequest {
+        RunRequest {
+            prompt: "a prompt".into(),
+            env: Vec::new(),
+            cwd: None,
+            permission: Permission::Default,
+            resume_session_id: None,
+            mcp_config: None,
+            mcp_job: None,
+            mcp_team_run: None,
+            tool_policy: ToolPolicy::Unrestricted,
+            progress_timeout: None,
+            max_turns: None,
+            session_id: None,
+            fork_session: false,
+            include_partial_messages: false,
+            images: Vec::new(),
+            steerable: false,
+            classifier_governs_tools: false,
+            mcp_servers: Vec::new(),
+            model: Some("m".into()),
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: Some("sys".into()),
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
+            messages: None,
+            request_tx: None,
+            allowed_mcp_tools: None,
+            background_tasks: false,
+        }
+    }
+
+    fn config(mode: Mode, url: &str) -> RouterConfig {
+        RouterConfig {
+            mode,
+            url: url.to_owned(),
+            timeout_ms: 1000,
+            ..RouterConfig::off()
+        }
+    }
+
+    fn available(kind: RunnerKind, runner: Arc<dyn CommandRunner>, globs: &[&str]) -> Available {
+        Available {
+            kind,
+            runner,
+            default_model: match kind {
+                RunnerKind::Claude => "claude-sonnet-5".into(),
+                RunnerKind::Codex => "gpt-5.6-terra".into(),
+                RunnerKind::Agy => "agy/gemini-3.8-flash-high".into(),
+                // A kind the fixtures do not name has no default model.
+                _ => String::new(),
+            },
+            models: globs.iter().map(|glob| (*glob).to_owned()).collect(),
+        }
+    }
+
+    /// A routed runner over `inner`, with Codex as an alternate.
+    fn routed(
+        config: RouterConfig,
+        inner: Arc<dyn CommandRunner>,
+    ) -> (Arc<dyn CommandRunner>, Arc<dyn CommandRunner>) {
+        let codex: Arc<dyn CommandRunner> =
+            Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        let router = Arc::new(Router::new(
+            config,
+            available(RunnerKind::Claude, Arc::clone(&inner), &["claude-*"]),
+            vec![available(RunnerKind::Codex, Arc::clone(&codex), &["gpt-*"])],
+        ));
+        (Arc::new(RoutedRunner::routed(inner, router)), codex)
+    }
+
+    fn shape() -> RunShape {
+        RunShape {
+            permission: Permission::Default,
+            classifier_governs_tools: false,
+            tool_policy: ToolPolicy::Unrestricted,
+            resume: false,
+        }
+    }
+
+    fn query() -> RouteQuery {
+        RouteQuery {
+            task: "implement the thing".into(),
+            stage: Some("implement".into()),
+            item: None,
+            resume: false,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
+            codex_profile: None,
+        }
+    }
+
+    fn advice(runner: &str, model: &str, effort: Option<&str>) -> RouteAdvice {
+        RouteAdvice {
+            decision_id: "rt_1".into(),
+            runner: runner.into(),
+            model: model.into(),
+            effort: effort.map(str::to_owned),
+            tier: None,
+            estimated_cost_usd: None,
+            rule: None,
+        }
+    }
+
+    type RouteRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    async fn route_row(pool: &SqlitePool, run_id: i64) -> RouteRow {
+        sqlx::query_as(
+            "SELECT model, effort, runner, route_mode, route_decision_id,
+                    advised_runner, advised_model, advised_effort
+               FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    // --- configuration (AC1, AC9) ---
+
+    #[test]
+    fn no_config_file_means_off_and_fronts_nothing() {
+        let config = load_config(Path::new("definitely/not/here/router.yaml"));
+        assert_eq!(config.mode, Mode::Off);
+        assert!(config.is_off());
+
+        let primary: Arc<dyn CommandRunner> = Arc::new(Probe);
+        let fronted = front_with(
+            Arc::clone(&primary),
+            &crate::config::ModelsConfig::default(),
+            config,
+            &[],
+        );
+        assert!(Arc::ptr_eq(&primary, &fronted), "off must be the same Arc");
+        assert!(fronted.router().is_none());
+
+        let explicit = parse_config("mode: off\n").unwrap();
+        assert!(explicit.is_off());
+        let boolean = parse_config("mode: false\n").unwrap();
+        assert!(boolean.is_off());
+    }
+
+    #[test]
+    fn a_malformed_or_unknown_config_is_refused() {
+        assert!(parse_config("mode: sometimes\n").is_err());
+        assert!(parse_config("mode: [shadow\n").is_err());
+        assert!(parse_config("mode: shadow\nsurprise: 1\n").is_err());
+        assert!(parse_config("mode: shadow\nsurfaces:\n  kitchen: apply\n").is_err());
+    }
+
+    #[test]
+    fn a_router_off_this_machine_is_refused() {
+        for url in [
+            "http://10.0.0.5:18733",
+            "http://router.example.com",
+            "ftp://127.0.0.1:1",
+            "http://user@127.0.0.1:1",
+            "not a url",
+        ] {
+            assert!(
+                parse_config(&format!("mode: shadow\nurl: {url}\n")).is_err(),
+                "{url} must be refused"
+            );
+        }
+        for url in [
+            "http://127.0.0.1:18733",
+            "http://localhost:9",
+            "http://[::1]:9",
+        ] {
+            assert!(
+                parse_config(&format!("mode: shadow\nurl: {url}\n")).is_ok(),
+                "{url} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timeout_is_clamped_and_surfaces_override_the_global_mode() {
+        let config =
+            parse_config("mode: shadow\ntimeout_ms: 5\nsurfaces:\n  runs: apply\n  council: off\n")
+                .unwrap();
+        assert_eq!(config.timeout_ms, MIN_TIMEOUT_MS);
+        assert_eq!(config.url, DEFAULT_URL);
+        assert_eq!(config.mode_for(Surface::Runs), Mode::Apply);
+        assert_eq!(config.mode_for(Surface::Team), Mode::Shadow);
+        assert_eq!(config.mode_for(Surface::Council), Mode::Off);
+        assert_eq!(
+            parse_config("mode: shadow\ntimeout_ms: 999999\n")
+                .unwrap()
+                .timeout_ms,
+            MAX_TIMEOUT_MS
+        );
+        assert_eq!(
+            parse_config("mode: shadow\n").unwrap().timeout_ms,
+            DEFAULT_TIMEOUT_MS
+        );
+    }
+
+    /// `apply` configured for runs is `apply` live: nothing between the file and the launch
+    /// quietly degrades it to `shadow`.
+    #[test]
+    fn apply_on_runs_is_live() {
+        let (runner, _) = routed(config(Mode::Apply, DEFAULT_URL), Arc::new(Probe));
+        let router = runner.router().unwrap();
+        assert_eq!(router.mode_for(Surface::Runs), Mode::Apply);
+        assert_eq!(router.runs_mode(), Mode::Apply);
+    }
+
+    // --- the wrapper (the faithfulness risk) ---
+
+    #[tokio::test]
+    async fn the_fronted_runner_answers_exactly_as_the_runner_it_fronts() {
+        let inner: Arc<dyn CommandRunner> = Arc::new(Probe);
+        let (fronted, _) = routed(config(Mode::Shadow, DEFAULT_URL), Arc::clone(&inner));
+
+        assert!(fronted.router().is_some());
+        assert!(inner.router().is_none());
+        for stage in [None, Some("plan"), Some("review")] {
+            assert_eq!(fronted.model_for_stage(stage), inner.model_for_stage(stage));
+        }
+        assert_eq!(
+            fronted.authored_prompt(&request()),
+            inner.authored_prompt(&request())
+        );
+        assert!(fronted.reports_model_request());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(std::sync::Mutex::new(String::new()));
+        let plain = fronted
+            .run_prompt(request(), tx.clone(), Arc::clone(&transcript))
+            .await
+            .unwrap();
+        assert_eq!(plain.stdout, "plain m");
+
+        let fill = Arc::new(std::sync::Mutex::new(None));
+        let filled = fronted
+            .run_prompt_with_context_fill(
+                request(),
+                tx.clone(),
+                Arc::clone(&transcript),
+                Arc::clone(&fill),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled.stdout, "fill");
+        assert_eq!(*fill.lock().unwrap(), Some(7));
+
+        let (turns_tx, mut turns_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turned = fronted
+            .run_prompt_with_turns(request(), tx, transcript, fill, Some(turns_tx))
+            .await
+            .unwrap();
+        assert_eq!(turned.stdout, "turns");
+        assert!(matches!(turns_rx.recv().await, Some(TurnEvent::Line(line)) if line == "a turn"));
+    }
+
+    // --- eligibility (AC6) ---
+
+    #[test]
+    fn a_classifier_governed_run_is_never_offered_codex() {
+        let (runner, _) = routed(config(Mode::Shadow, DEFAULT_URL), Arc::new(Probe));
+        let router = runner.router().unwrap();
+
+        assert_eq!(
+            router.eligible(shape()),
+            vec![RunnerKind::Claude, RunnerKind::Codex]
+        );
+        let governed = RunShape {
+            classifier_governs_tools: true,
+            permission: Permission::Bypass,
+            ..shape()
+        };
+        let planning = RunShape {
+            permission: Permission::Plan,
+            ..shape()
+        };
+        let resumed = RunShape {
+            resume: true,
+            ..shape()
+        };
+        let restricted = RunShape {
+            tool_policy: ToolPolicy::McpOnly,
+            ..shape()
+        };
+        for ruled_out in [governed, planning, resumed, restricted] {
+            assert_eq!(
+                router.eligible(ruled_out),
+                vec![RunnerKind::Claude],
+                "{ruled_out:?}"
+            );
+            let sent = router.build_request(&query(), &router.eligible(ruled_out));
+            assert_eq!(sent.runners, vec!["claude".to_owned()]);
+            assert_eq!(sent.models, vec!["claude-*".to_owned()]);
+        }
+    }
+
+    // --- the request (AC3, AC7) ---
+
+    #[test]
+    fn the_request_carries_the_daemons_rules_and_nothing_else() {
+        let (runner, _) = routed(config(Mode::Shadow, DEFAULT_URL), Arc::new(Probe));
+        let router = runner.router().unwrap();
+        let long = "é".repeat(TASK_CHARS + 50);
+        let gate = format!("{}END", "x".repeat(3000));
+        let sent = router.build_request(
+            &RouteQuery {
+                task: long,
+                stage: Some("implement".into()),
+                item: Some(ItemContext {
+                    files: vec!["core/src/a.rs".into()],
+                    attempt: Some(2),
+                    gate_output: Some(gate),
+                    failed: vec!["claude-opus-5@high".into()],
+                }),
+                resume: false,
+                restrict_runners: None,
+                pin: None,
+                judged_later: false,
+                effort: None,
+                codex_profile: None,
+            },
+            &router.eligible(shape()),
+        );
+
+        assert_eq!(sent.task.chars().count(), TASK_CHARS);
+        let gate_output = sent.gate_output.clone().unwrap();
+        assert_eq!(gate_output.chars().count(), GATE_TAIL_CHARS);
+        assert!(gate_output.ends_with("END"));
+        assert_eq!(sent.runners, vec!["claude", "codex"]);
+        assert_eq!(sent.models, vec!["claude-*", "gpt-*"]);
+        assert_eq!(sent.failed, vec!["claude-opus-5@high"]);
+        assert_eq!(sent.attempt, Some(2));
+
+        let json = serde_json::to_value(&sent).unwrap();
+        let known = [
+            "task",
+            "stage",
+            "files",
+            "attempt",
+            "gate_output",
+            "failed",
+            "runners",
+            "packet",
+            "models",
+            "exclude",
+        ];
+        for key in json.as_object().unwrap().keys() {
+            assert!(known.contains(&key.as_str()), "{key} is not in the schema");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_names_every_model_that_already_failed_the_item() {
+        let pool = pool().await;
+        let job_id = sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES ('p', 'C:/p', 'running', 3, '2026-09-30T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let first = seed_run(&pool).await;
+        sqlx::query("UPDATE runs SET model = 'claude-opus-5', effort = 'high' WHERE id = ?")
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = seed_run(&pool).await;
+        sqlx::query(
+            "UPDATE runs SET model = 'claude-sonnet-5', effort = NULL,
+                             route_failed = '[\"claude-opus-5@high\"]' WHERE id = ?",
+        )
+        .bind(second)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let item_id = sqlx::query(
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, files, gate_attempts,
+                                    gate_output, gate_status, run_id)
+             VALUES (?, 'implement', 0, 'an item', 'gate_failed', '[\"a.rs\"]', 2, 'boom', 'failed', ?)",
+        )
+        .bind(job_id)
+        .bind(second)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let third = seed_run(&pool).await;
+
+        let by_ordinal = item_context(&pool, ItemRef::Ordinal { job_id, ordinal: 0 }, third).await;
+        assert_eq!(by_ordinal.attempt, Some(3));
+        assert_eq!(by_ordinal.files, vec!["a.rs"]);
+        assert_eq!(by_ordinal.gate_output.as_deref(), Some("boom"));
+        assert_eq!(
+            by_ordinal.failed,
+            vec!["claude-opus-5@high", "claude-sonnet-5"]
+        );
+        assert_eq!(
+            item_context(&pool, ItemRef::Id(item_id), third).await,
+            by_ordinal
+        );
+
+        // Once the item points at the run being routed, its predecessor is gone: nothing is guessed.
+        let pointing_here = item_context(&pool, ItemRef::Id(item_id), second).await;
+        assert!(pointing_here.failed.is_empty());
+    }
+
+    // --- the answer (AC5) ---
+
+    #[test]
+    fn an_answer_outside_what_was_sent_is_refused() {
+        let (runner, _) = routed(config(Mode::Shadow, DEFAULT_URL), Arc::new(Probe));
+        let router = runner.router().unwrap();
+        let only_claude = router.build_request(&query(), &[RunnerKind::Claude]);
+
+        assert_eq!(
+            router.check_answer(&advice("claude", "claude-opus-5", None), &only_claude),
+            Ok(RunnerKind::Claude)
+        );
+        assert!(
+            router
+                .check_answer(&advice("codex", "gpt-5.6-terra", None), &only_claude)
+                .is_err()
+        );
+        assert!(
+            router
+                .check_answer(&advice("claude", "gpt-5.6-terra", None), &only_claude)
+                .is_err()
+        );
+        assert!(
+            router
+                .check_answer(&advice("ollama", "qwen", None), &only_claude)
+                .is_err()
+        );
+        assert!(
+            router
+                .check_answer(&advice("claude", "", None), &only_claude)
+                .is_err()
+        );
+
+        // A glob may name the router's tier rather than the model id.
+        let by_tier = RouteAdvice {
+            tier: Some("claude-cheap".into()),
+            ..advice("claude", "some-model-id", None)
+        };
+        assert_eq!(
+            router.check_answer(&by_tier, &only_claude),
+            Ok(RunnerKind::Claude)
+        );
+    }
+
+    /// An effort goes to `--effort` / `model_reasoning_effort=` as it comes, so one this daemon
+    /// cannot rank, or one the models file says the chosen model does not take, is a router
+    /// failure: the launch would die at spawn.
+    #[test]
+    fn an_effort_outside_the_vocabulary_or_the_models_own_is_refused() {
+        let router = Router::new(
+            config(Mode::Apply, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*", "opus"]),
+            Vec::new(),
+        )
+        .with_model_efforts(vec![(
+            "opus".to_owned(),
+            vec!["low".to_owned(), "medium".to_owned()],
+        )]);
+        let sent = router.build_request(&query(), &[RunnerKind::Claude]);
+
+        for fine in [None, Some("low"), Some("max")] {
+            assert_eq!(
+                router.check_answer(&advice("claude", "claude-sonnet-5", fine), &sent),
+                Ok(RunnerKind::Claude),
+                "{fine:?}"
+            );
+        }
+        for unknown in ["turbo", "", "ultra"] {
+            assert!(
+                router
+                    .check_answer(&advice("claude", "claude-sonnet-5", Some(unknown)), &sent)
+                    .is_err(),
+                "{unknown}"
+            );
+        }
+        // The models file lists what `opus` takes, whether the router names it by id or by tier.
+        assert!(
+            router
+                .check_answer(&advice("claude", "opus", Some("high")), &sent)
+                .is_err()
+        );
+        let by_tier = RouteAdvice {
+            tier: Some("opus".into()),
+            ..advice("claude", "claude-opus-5", Some("xhigh"))
+        };
+        assert!(router.check_answer(&by_tier, &sent).is_err());
+        assert_eq!(
+            router.check_answer(&advice("claude", "opus", Some("medium")), &sent),
+            Ok(RunnerKind::Claude)
+        );
+    }
+
+    /// A request that carried no globs held the answer to nothing, so no answer to it is usable.
+    #[test]
+    fn an_answer_to_a_request_with_no_globs_is_refused() {
+        let (runner, _) = routed(config(Mode::Shadow, DEFAULT_URL), Arc::new(Probe));
+        let router = runner.router().unwrap();
+        let unconstrained = RouteRequest {
+            models: Vec::new(),
+            ..router.build_request(&query(), &[RunnerKind::Claude])
+        };
+
+        assert!(
+            router
+                .check_answer(&advice("claude", "claude-opus-5", None), &unconstrained)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn globs_match_as_the_router_matches_them() {
+        assert!(glob_match("claude-*", "Claude-Sonnet-5"));
+        assert!(glob_match("gpt-5.?-terra", "gpt-5.6-terra"));
+        assert!(glob_match("*", ""));
+        assert!(!glob_match("claude-*", "gpt-5"));
+        assert!(!glob_match("sonnet", "claude-sonnet-5"));
+    }
+
+    #[test]
+    fn the_effort_is_held_under_the_speed_ceiling() {
+        assert_eq!(effort_ceiling(Speed::Normal), "medium");
+        assert_eq!(effort_ceiling(Speed::Fast), "low");
+        assert_eq!(effort_ceiling(Speed::Thorough), "high");
+        assert_eq!(clamp_effort("low", "medium"), "low");
+        assert_eq!(clamp_effort("medium", "medium"), "medium");
+        assert_eq!(clamp_effort("max", "medium"), "medium");
+        assert_eq!(clamp_effort("ultra", "high"), "high");
+
+        let env = vec![(crate::speed::SPEED_VAR.to_owned(), "fast".to_owned())];
+        assert_eq!(speed_of(&env), Speed::Fast);
+        assert_eq!(speed_of(&[]), Speed::Normal);
+    }
+
+    #[test]
+    fn apply_uses_the_advised_model_and_effort_and_shadow_never_does() {
+        let configured = Choice {
+            kind: RunnerKind::Claude,
+            model: None,
+            effort: None,
+        };
+        let advised = advice("codex", "gpt-5.6-terra", Some("xhigh"));
+
+        let applied = choose(
+            Mode::Apply,
+            configured.clone(),
+            Some((&advised, RunnerKind::Codex)),
+            "high",
+        );
+        assert_eq!(
+            applied,
+            Choice {
+                kind: RunnerKind::Codex,
+                model: Some("gpt-5.6-terra".into()),
+                effort: Some("high".into()),
+            }
+        );
+        assert_eq!(
+            choose(
+                Mode::Shadow,
+                configured.clone(),
+                Some((&advised, RunnerKind::Codex)),
+                "high"
+            ),
+            configured
+        );
+        assert_eq!(
+            choose(Mode::Apply, configured.clone(), None, "high"),
+            configured
+        );
+    }
+
+    // --- resolve (AC1, AC2, AC4) ---
+
+    #[tokio::test]
+    async fn with_routing_off_nothing_is_asked_and_nothing_written() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) =
+            stub_router(200, serde_json::to_value(serde_json::json!({})).unwrap()).await;
+        let runner: Arc<dyn CommandRunner> = Arc::new(Probe);
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("plan-model".into()),
+            None,
+            Some(query()),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("plan-model"));
+        assert!(resolved.router.is_none());
+        assert!(received.try_recv().is_err(), "nothing may be asked: {url}");
+        assert_eq!(route_row(&pool, run_id).await, Default::default());
+    }
+
+    #[tokio::test]
+    async fn shadow_records_the_advice_and_keeps_the_configured_model() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_9", "tier": "opus", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high", "success": 0.9}),
+        )
+        .await;
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(query()),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(
+            resolved.model, None,
+            "shadow launches exactly as configured"
+        );
+        assert_eq!(resolved.effort, None);
+        assert_eq!(resolved.decision_id.as_deref(), Some("rt_9"));
+        assert_eq!(
+            route_row(&pool, run_id).await,
+            (
+                Some("claude-sonnet-5".into()),
+                None,
+                Some("claude".into()),
+                Some("shadow".into()),
+                Some("rt_9".into()),
+                Some("claude".into()),
+                Some("claude-opus-5".into()),
+                Some("high".into()),
+            )
+        );
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude", "codex"]));
+        assert_eq!(sent["models"], serde_json::json!(["claude-*", "gpt-*"]));
+        assert_eq!(sent["task"], "implement the thing");
+    }
+
+    /// A resume continues a session the configured model and effort started: under `apply` it is
+    /// asked and recorded as `shadow`, and launches exactly as configured — whether the resume is
+    /// the query's (an approved run resumed) or the launch's own session id.
+    #[tokio::test]
+    async fn a_resume_under_apply_records_the_advice_and_launches_as_configured() {
+        for (query_resume, shape_resume) in [(true, false), (false, true)] {
+            let pool = pool().await;
+            let run_id = seed_run(&pool).await;
+            let (url, _received) = stub_router(
+                200,
+                serde_json::json!({"decision_id": "rt_r", "runner": "claude",
+                                   "model": "claude-opus-5", "effort": "low"}),
+            )
+            .await;
+            let (runner, _) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+            let resolved = resolve(
+                &pool,
+                run_id,
+                Arc::clone(&runner),
+                Some("claude-sonnet-5".into()),
+                Some("medium".into()),
+                Some(RouteQuery {
+                    resume: query_resume,
+                    ..query()
+                }),
+                RunShape {
+                    resume: shape_resume,
+                    ..shape()
+                },
+                Speed::Normal,
+            )
+            .await;
+
+            assert!(Arc::ptr_eq(&resolved.runner, &runner));
+            assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+            assert_eq!(resolved.effort.as_deref(), Some("medium"));
+            let row = route_row(&pool, run_id).await;
+            assert_eq!(row.0.as_deref(), Some("claude-sonnet-5"));
+            assert_eq!(row.1.as_deref(), Some("medium"));
+            assert_eq!(row.3.as_deref(), Some("shadow"));
+            assert_eq!(
+                row.6.as_deref(),
+                Some("claude-opus-5"),
+                "the advice is recorded"
+            );
+        }
+    }
+
+    /// The advice launches on its own runner, its effort held under the speed's ceiling, and the
+    /// row records what launched beside what was advised.
+    #[tokio::test]
+    async fn apply_launches_the_advice_on_its_runner_with_its_effort_clamped() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, _received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_2", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "max"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+        let router = runner.router().unwrap();
+
+        // The pure half, exactly as `resolve` composes it once the surface is live.
+        let sent = router.build_request(&query(), &router.eligible(shape()));
+        let answer = router.client.route(&sent).await.unwrap();
+        let kind = router.check_answer(&answer, &sent).unwrap();
+        let choice = choose(
+            Mode::Apply,
+            Choice {
+                kind: RunnerKind::Claude,
+                model: None,
+                effort: None,
+            },
+            Some((&answer, kind)),
+            effort_ceiling(Speed::Normal),
+        );
+        assert_eq!(choice.kind, RunnerKind::Codex);
+        assert_eq!(choice.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(choice.effort.as_deref(), Some("medium"));
+        assert!(Arc::ptr_eq(
+            &router.available(choice.kind).unwrap().runner,
+            &codex
+        ));
+
+        // And through `resolve`, which records it under the mode that is live for runs.
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(query()),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(resolved.effort.as_deref(), Some("medium"));
+        assert_eq!(resolved.decision_id.as_deref(), Some("rt_2"));
+        assert_eq!(
+            route_row(&pool, run_id).await,
+            (
+                Some("gpt-5.6-terra".into()),
+                Some("medium".into()),
+                Some("codex".into()),
+                Some("apply".into()),
+                Some("rt_2".into()),
+                Some("codex".into()),
+                Some("gpt-5.6-terra".into()),
+                Some("max".into()),
+            )
+        );
+    }
+
+    /// Resolves an unpinned run under `apply` whose router answers Codex, carrying `profile`.
+    async fn resolve_routed_to_codex(
+        profile: Option<CodexProfile>,
+    ) -> (Resolved, Arc<dyn CommandRunner>) {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, _received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_9", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                codex_profile: profile,
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+        (resolved, codex)
+    }
+
+    /// The routed path must give an agent node what a Codex pin would: the translated sandbox and,
+    /// when the agent declares `web`, live web search. The shared alternate pins neither.
+    #[tokio::test]
+    async fn a_routed_agent_node_on_codex_gets_its_sandbox_and_web_search() {
+        let (resolved, codex) = resolve_routed_to_codex(Some(CodexProfile {
+            sandbox: "workspace-write",
+            web_search: Some("live"),
+        }))
+        .await;
+        assert!(!Arc::ptr_eq(&resolved.runner, &codex));
+        assert_eq!(
+            resolved.runner.codex_pins(),
+            Some((Some("workspace-write"), Some("live")))
+        );
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[tokio::test]
+    async fn a_routed_agent_node_without_web_leaves_web_search_unpinned() {
+        let (resolved, _) = resolve_routed_to_codex(Some(CodexProfile {
+            sandbox: "read-only",
+            web_search: None,
+        }))
+        .await;
+        assert_eq!(
+            resolved.runner.codex_pins(),
+            Some((Some("read-only"), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_is_not_an_agent_node_routed_to_codex_keeps_the_shared_alternate() {
+        let (resolved, codex) = resolve_routed_to_codex(None).await;
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+    }
+
+    /// AC6 through the whole path: a run the classifier governs is offered its primary only, and
+    /// a router that names Codex anyway is ignored — in `apply` the run still launches on Claude.
+    #[tokio::test]
+    async fn apply_never_moves_a_governed_run_to_codex() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_3", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, _codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            None,
+            Some(query()),
+            RunShape {
+                classifier_governs_tools: true,
+                ..shape()
+            },
+            Speed::Normal,
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolved.decision_id, None);
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude"]));
+    }
+
+    async fn assert_falls_back(url: &str, started_within: Duration) {
+        for mode in [Mode::Shadow, Mode::Apply] {
+            assert_falls_back_in(mode, url, started_within).await;
+        }
+    }
+
+    async fn assert_falls_back_in(mode: Mode, url: &str, started_within: Duration) {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let mut config = config(mode, url);
+        config.timeout_ms = 150;
+        let (runner, _) = routed(config, Arc::new(Probe));
+        let started = std::time::Instant::now();
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            Some("low".into()),
+            Some(query()),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        assert!(started.elapsed() < started_within, "{url}");
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolved.effort.as_deref(), Some("low"));
+        assert_eq!(resolved.decision_id, None);
+        let row = route_row(&pool, run_id).await;
+        assert_eq!(row.0.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(row.3.as_deref(), Some(mode.as_str()));
+        assert_eq!(row.4, None, "no decision to report against");
+        assert_eq!(row.6, None);
+    }
+
+    #[tokio::test]
+    async fn a_router_that_is_down_leaves_the_configured_model() {
+        assert_falls_back(&dead_address().await, Duration::from_secs(30)).await;
+    }
+
+    #[tokio::test]
+    async fn a_router_slower_than_the_timeout_leaves_the_configured_model() {
+        // Far slower than the 30s bound: only the router's own 150ms timeout can end the wait.
+        let url = slow_router(
+            Duration::from_secs(60),
+            serde_json::json!({"decision_id": "rt_late", "runner": "claude",
+                               "model": "claude-opus-5"}),
+        )
+        .await;
+        assert_falls_back(&url, Duration::from_secs(30)).await;
+    }
+
+    #[tokio::test]
+    async fn a_400_or_a_422_leaves_the_configured_model() {
+        let (bad, _rx) = stub_router(400, serde_json::json!({"error": "unknown fields"})).await;
+        assert_falls_back(&bad, Duration::from_secs(30)).await;
+        let (none, _rx) = stub_router(422, serde_json::json!({"error": "no tier"})).await;
+        assert_falls_back(&none, Duration::from_secs(30)).await;
+    }
+
+    #[tokio::test]
+    async fn an_answer_outside_the_set_leaves_the_configured_model() {
+        let (url, _rx) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_x", "runner": "ollama", "model": "qwen"}),
+        )
+        .await;
+        assert_falls_back(&url, Duration::from_secs(30)).await;
+        let (url, _rx) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_x", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "turbo"}),
+        )
+        .await;
+        assert_falls_back(&url, Duration::from_secs(30)).await;
+    }
+
+    #[tokio::test]
+    async fn a_runner_held_by_the_quota_brake_is_not_offered() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        crate::quota::test_support::arm(&pool, true, 50, 50).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO quota_readings (provider, window_name, used_fraction, fidelity, read_at)
+             VALUES ('codex', '5h', 0.9, 'official', ?), ('claude', '5h', 0.1, 'official', ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_q", "runner": "claude", "model": "claude-opus-5"}),
+        )
+        .await;
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+
+        resolve(
+            &pool,
+            run_id,
+            runner,
+            None,
+            None,
+            Some(query()),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude"]));
+        assert_eq!(sent["models"], serde_json::json!(["claude-*"]));
+    }
+
+    #[tokio::test]
+    async fn a_primary_without_headroom_is_not_offered_at_resolve() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_h", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve_with(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(query()),
+            shape(),
+            Speed::Normal,
+            &|| vec!["claude".to_owned()],
+        )
+        .await;
+
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["codex"]));
+        assert_eq!(sent["models"], serde_json::json!(["gpt-*"]));
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert!(resolved.refused.is_none());
+    }
+
+    #[tokio::test]
+    async fn headroom_is_judged_on_every_launch_not_when_the_front_was_built() {
+        let pool = pool().await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_l", "runner": "claude", "model": "claude-opus-5"}),
+        )
+        .await;
+        // One router for the three launches: only the headroom read changes between them.
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+        let launch = |blocked: Vec<String>| {
+            let pool = pool.clone();
+            let runner = Arc::clone(&runner);
+            async move {
+                let run_id = seed_run(&pool).await;
+                let without_headroom = move || blocked.clone();
+                resolve_with(
+                    &pool,
+                    run_id,
+                    runner,
+                    Some("claude-sonnet-5".into()),
+                    Some("low".into()),
+                    Some(query()),
+                    shape(),
+                    Speed::Normal,
+                    &without_headroom,
+                )
+                .await
+            }
+        };
+
+        launch(Vec::new()).await;
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude", "codex"]));
+
+        launch(vec!["codex".to_owned()]).await;
+        let sent = received.recv().await.unwrap();
+        assert_eq!(
+            sent["runners"],
+            serde_json::json!(["claude"]),
+            "codex ran out after the front was built"
+        );
+
+        // Every eligible engine without headroom: not routing, the configured launch.
+        let resolved = launch(vec!["claude".to_owned(), "codex".to_owned()]).await;
+        assert!(
+            received.try_recv().is_err(),
+            "the router is never asked with no runner"
+        );
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolved.decision_id, None);
+    }
+
+    #[test]
+    fn head_and_tail_cut_on_character_boundaries() {
+        assert_eq!(head("ééé", 2), "éé");
+        assert_eq!(head("ab", 5), "ab");
+        assert_eq!(tail("ééé", 2), "éé");
+        assert_eq!(tail("ab", 5), "ab");
+        assert_eq!(failed_label("m", Some("high")), "m@high");
+        assert_eq!(failed_label("m", None), "m");
+    }
+
+    // --- node launches: restriction, pin, validation deferred (M4 C2) ---
+
+    #[test]
+    fn a_restriction_intersects_the_eligible_runners() {
+        // Associated consts cannot be imported with `use`; local consts keep the short names.
+        #[allow(non_upper_case_globals)]
+        const Claude: RunnerKind = RunnerKind::Claude;
+        #[allow(non_upper_case_globals)]
+        const Codex: RunnerKind = RunnerKind::Codex;
+        let both = vec![Claude, Codex];
+        assert_eq!(narrowed_runners(both.clone(), None, &[]), both);
+        assert_eq!(
+            narrowed_runners(both.clone(), Some(&[Codex]), &[]),
+            vec![Codex]
+        );
+        // Order is eligible's, not the restriction's.
+        assert_eq!(
+            narrowed_runners(both.clone(), Some(&[Codex, Claude]), &[]),
+            both
+        );
+        assert_eq!(
+            narrowed_runners(both, Some(&[]), &[]),
+            Vec::<RunnerKind>::new()
+        );
+    }
+
+    #[test]
+    fn a_restriction_is_applied_before_the_quota_brake_subtracts() {
+        // Associated consts cannot be imported with `use`; local consts keep the short names.
+        #[allow(non_upper_case_globals)]
+        const Claude: RunnerKind = RunnerKind::Claude;
+        #[allow(non_upper_case_globals)]
+        const Codex: RunnerKind = RunnerKind::Codex;
+        let both = vec![Claude, Codex];
+        assert_eq!(
+            narrowed_runners(both.clone(), Some(&[Claude, Codex]), &[Claude]),
+            vec![Codex]
+        );
+        assert_eq!(
+            narrowed_runners(both, Some(&[Claude]), &[Claude]),
+            Vec::<RunnerKind>::new(),
+            "a braked runner stays braked even when it is the only one the node allows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restriction_narrows_what_the_router_is_asked() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_r", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                restrict_runners: Some(vec![RunnerKind::Codex]),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["codex"]));
+        assert_eq!(sent["models"], serde_json::json!(["gpt-*"]));
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert!(resolved.refused.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pin_skips_the_router_and_records_runner_model_and_effort_without_a_decision_id() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_never", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Codex,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: Some("low".into()),
+                    sandbox: None,
+                    web_search: None,
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        assert!(
+            received.try_recv().is_err(),
+            "a pinned launch must not call the router"
+        );
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(resolved.effort.as_deref(), Some("low"));
+        assert!(resolved.decision_id.is_none());
+        assert!(resolved.refused.is_none());
+        assert_eq!(
+            route_row(&pool, run_id).await,
+            (
+                Some("gpt-5.6-terra".into()),
+                Some("low".into()),
+                Some("codex".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        );
+
+        // A pin to the primary keeps the wrapper the run already held, and a pin with no model
+        // records the engine's own default.
+        let run_two = seed_run(&pool).await;
+        let resolved = resolve(
+            &pool,
+            run_two,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Claude,
+                    model: None,
+                    effort: None,
+                    sandbox: None,
+                    web_search: None,
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert!(resolved.model.is_none());
+        let row = route_row(&pool, run_two).await;
+        assert_eq!(row.0.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(row.2.as_deref(), Some("claude"));
+        assert!(row.3.is_none() && row.4.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_a_runner_the_router_does_not_hold_is_refused() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let inner: Arc<dyn CommandRunner> = Arc::new(Probe);
+        // No alternates: only the primary is held.
+        let router = Arc::new(Router::new(
+            config(Mode::Apply, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::clone(&inner), &["claude-*"]),
+            Vec::new(),
+        ));
+        let runner: Arc<dyn CommandRunner> = Arc::new(RoutedRunner::routed(inner, router));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            runner,
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Codex,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: None,
+                    sandbox: None,
+                    web_search: None,
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        let why = resolved.refused.expect("the launch is refused");
+        assert!(why.contains("codex"), "{why}");
+        let row = route_row(&pool, run_id).await;
+        assert!(row.0.is_none() && row.2.is_none(), "nothing was recorded");
+    }
+
+    /// Resolves a Codex pin carrying `sandbox` for a run of `run_shape`.
+    async fn resolve_codex_pin(
+        sandbox: Option<&'static str>,
+        run_shape: RunShape,
+    ) -> (Resolved, Arc<dyn CommandRunner>, Arc<dyn CommandRunner>) {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (runner, codex) = routed(config(Mode::Apply, DEFAULT_URL), Arc::new(Probe));
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Codex,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: None,
+                    sandbox,
+                    web_search: None,
+                }),
+                ..query()
+            }),
+            run_shape,
+            Speed::Normal,
+        )
+        .await;
+        (resolved, runner, codex)
+    }
+
+    #[tokio::test]
+    async fn a_codex_pin_with_a_sandbox_launches_a_runner_that_pins_it() {
+        let (resolved, _, codex) = resolve_codex_pin(Some("read-only"), shape()).await;
+        assert!(resolved.refused.is_none());
+        assert!(
+            !Arc::ptr_eq(&resolved.runner, &codex),
+            "the shared alternate pins no sandbox, so a pinned launch needs a runner of its own"
+        );
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[tokio::test]
+    async fn a_codex_pin_on_a_shape_codex_cannot_take_is_refused_with_the_reason() {
+        for (run_shape, said) in [
+            (
+                RunShape {
+                    permission: Permission::Plan,
+                    ..shape()
+                },
+                "plan mode",
+            ),
+            (
+                RunShape {
+                    permission: Permission::Bypass,
+                    classifier_governs_tools: true,
+                    ..shape()
+                },
+                "Bypass",
+            ),
+            (
+                RunShape {
+                    classifier_governs_tools: true,
+                    ..shape()
+                },
+                "classifier",
+            ),
+        ] {
+            let (resolved, runner, _) = resolve_codex_pin(Some("read-only"), run_shape).await;
+            let why = resolved.refused.expect("the launch is refused");
+            assert!(why.contains("codex") && why.contains(said), "{why}");
+            assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        }
+    }
+
+    /// A pin-only runner: routing off, Codex installed.
+    fn engines_only_runner() -> Arc<dyn CommandRunner> {
+        front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            RouterConfig::off(),
+            &[RunnerKind::Claude, RunnerKind::Codex],
+        )
+    }
+
+    async fn resolve_pin_only(
+        runner: Arc<dyn CommandRunner>,
+        kind: RunnerKind,
+        sandbox: Option<&'static str>,
+    ) -> Resolved {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        resolve(
+            &pool,
+            run_id,
+            runner,
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: kind,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: None,
+                    sandbox,
+                    web_search: None,
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await
+    }
+
+    #[test]
+    fn routing_off_with_another_engine_installed_still_holds_it_for_pins() {
+        let runner = engines_only_runner();
+        assert!(runner.router().is_none());
+        let engines = runner.engines().expect("the engines are held");
+        assert_eq!(engines.primary.kind, RunnerKind::Claude);
+        assert_eq!(engines.others.len(), 1);
+        assert_eq!(engines.others[0].kind, RunnerKind::Codex);
+    }
+
+    #[test]
+    fn routing_off_does_not_widen_what_the_router_may_route_to() {
+        let mut config = config(Mode::Shadow, DEFAULT_URL);
+        config.runners = Vec::new();
+        let runner = front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            config,
+            &[RunnerKind::Codex],
+        );
+        let router = runner.router().expect("routing is on");
+        assert!(router.alternates.is_empty(), "installed is not consent");
+        assert!(
+            runner
+                .engines()
+                .unwrap()
+                .available(RunnerKind::Codex)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn installed_engines_excludes_agy_when_gate_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
+        // The setting is off by default, so agy is absent even when its binary is on PATH.
+        assert!(!crate::engines::agy::enabled());
+        assert!(!installed_engines().contains(&RunnerKind::Agy));
+    }
+
+    /// E16 F7: agy is a router alternate for read-only work only.
+    #[test]
+    fn agy_alternate_is_eligible_only_for_a_read_only_run() {
+        let _gate = crate::engines::agy_test_support::agy_gate(true);
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![available(
+                RunnerKind::Agy,
+                Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                &["agy/*"],
+            )],
+        );
+        let with = |permission, tool_policy, classifier, resume| {
+            router.eligible(RunShape {
+                permission,
+                classifier_governs_tools: classifier,
+                tool_policy,
+                resume,
+            })
+        };
+        let takes = |kinds: Vec<RunnerKind>| kinds.contains(&RunnerKind::Agy);
+
+        // Read-only: a plan run, or a restricted tool policy.
+        assert!(takes(with(
+            Permission::Plan,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(takes(with(
+            Permission::Default,
+            ToolPolicy::McpOnly,
+            false,
+            false
+        )));
+        assert!(takes(with(
+            Permission::Default,
+            ToolPolicy::None,
+            false,
+            false
+        )));
+        assert!(agy_can_take(RunShape {
+            permission: Permission::Plan,
+            classifier_governs_tools: false,
+            tool_policy: ToolPolicy::Unrestricted,
+            resume: false,
+        }));
+        // Anything that writes, bypasses, is classifier-governed or resumes is not.
+        assert!(!takes(with(
+            Permission::Default,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::AcceptEdits,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Bypass,
+            ToolPolicy::McpOnly,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Bypass,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Plan,
+            ToolPolicy::McpOnly,
+            true,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Default,
+            ToolPolicy::McpOnly,
+            true,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Plan,
+            ToolPolicy::McpOnly,
+            false,
+            true
+        )));
+        // The primary is always there.
+        assert!(
+            with(Permission::Bypass, ToolPolicy::Unrestricted, false, true)
+                .contains(&RunnerKind::Claude)
+        );
+    }
+
+    /// E19 N1: closing the opt-in removes agy from the router at once, on the same built value.
+    #[test]
+    fn closing_the_gate_removes_agy_from_the_router() {
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![available(
+                RunnerKind::Agy,
+                Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                &["agy/*"],
+            )],
+        );
+        let read_only = RunShape {
+            permission: Permission::Plan,
+            classifier_governs_tools: false,
+            tool_policy: ToolPolicy::McpOnly,
+            resume: false,
+        };
+        {
+            let _open = crate::engines::agy_test_support::agy_gate(true);
+            assert!(router.eligible(read_only).contains(&RunnerKind::Agy));
+        }
+        let _closed = crate::engines::agy_test_support::agy_gate(false);
+        let kinds = router.eligible(read_only);
+        assert!(!kinds.contains(&RunnerKind::Agy), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+    }
+
+    /// An alternate whose runner kind has no arm in `eligible` is never offered, for any shape.
+    #[test]
+    fn eligible_excludes_unwired_runner() {
+        let zed = RunnerKind::for_test("zed");
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![Available {
+                kind: zed,
+                runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                default_model: String::new(),
+                models: vec!["zed/*".to_owned()],
+            }],
+        );
+        let kinds = router.eligible(shape());
+        assert!(!kinds.contains(&zed), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+    }
+
+    /// E16 F7: `spawn.rs` drops agy from the route of a run the runner would refuse, through the
+    /// existing `restrict_runners`.
+    #[test]
+    fn route_query_without_agy_leaves_the_other_runners() {
+        let none = query().without_agy();
+        let kinds = none
+            .restrict_runners
+            .expect("no restriction becomes one that names the other runners");
+        assert!(!kinds.contains(&RunnerKind::Agy), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Codex), "{kinds:?}");
+
+        let mut restricted = query();
+        restricted.restrict_runners = Some(vec![RunnerKind::Agy, RunnerKind::Codex]);
+        assert_eq!(
+            restricted.without_agy().restrict_runners,
+            Some(vec![RunnerKind::Codex])
+        );
+        let mut only_claude = query();
+        only_claude.restrict_runners = Some(vec![RunnerKind::Claude]);
+        assert_eq!(
+            only_claude.without_agy().restrict_runners,
+            Some(vec![RunnerKind::Claude])
+        );
+    }
+
+    #[test]
+    fn front_with_ignores_agy_runner_name_when_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
+        let mut config = config(Mode::Shadow, DEFAULT_URL);
+        config.runners = vec!["agy".to_owned()];
+        let runner = front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            config,
+            &[RunnerKind::Claude],
+        );
+        let router = runner.router().expect("routing is on");
+        assert!(
+            router.alternates.is_empty(),
+            "a runner name the daemon cannot launch is ignored"
+        );
+        // No engine is held for a pin either: it is refused with the existing sentence.
+        assert!(
+            runner
+                .engines()
+                .is_none_or(|engines| engines.available(RunnerKind::Agy).is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_codex_pin_without_a_router_launches_codex_instead_of_being_refused() {
+        let runner = engines_only_runner();
+        let resolved =
+            resolve_pin_only(Arc::clone(&runner), RunnerKind::Codex, Some("read-only")).await;
+        assert!(resolved.refused.is_none(), "{:?}", resolved.refused);
+        assert!(resolved.router.is_none());
+        assert!(
+            !Arc::ptr_eq(&resolved.runner, &runner),
+            "a Codex pin must not run on the primary"
+        );
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_the_primary_without_a_router_keeps_the_runs_own_runner() {
+        let runner = engines_only_runner();
+        let resolved = resolve_pin_only(Arc::clone(&runner), RunnerKind::Claude, None).await;
+        assert!(resolved.refused.is_none());
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_an_engine_that_is_not_installed_is_refused_without_a_router() {
+        let runner = front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            RouterConfig::off(),
+            &[RunnerKind::Claude],
+        );
+        // Nothing but the primary: the very same bare runner, holding no engines.
+        assert!(runner.engines().is_none());
+        let runner: Arc<dyn CommandRunner> = Arc::new(RoutedRunner {
+            inner: runner,
+            router: None,
+            engines: Some(Arc::new(Engines {
+                primary: available(RunnerKind::Claude, Arc::new(Probe), &[]),
+                others: Vec::new(),
+            })),
+        });
+        let resolved = resolve_pin_only(runner, RunnerKind::Codex, None).await;
+        let why = resolved.refused.expect("the launch is refused");
+        assert!(
+            why.contains("codex") && why.contains("cannot launch"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn the_codex_predicate_is_one_function_for_eligible_and_for_a_pin() {
+        assert!(codex_can_take(shape()));
+        let governed = RunShape {
+            classifier_governs_tools: true,
+            ..shape()
+        };
+        assert!(!codex_can_take(governed));
+        assert!(codex_refusal(governed).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_pin_or_restriction_launches_exactly_as_before() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_1", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high"}),
+        )
+        .await;
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(query()),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude", "codex"]));
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolved.effort.as_deref(), Some("medium"));
+        assert_eq!(resolved.decision_id.as_deref(), Some("rt_1"));
+        assert!(resolved.refused.is_none());
+        let row = route_row(&pool, run_id).await;
+        assert_eq!(row.3.as_deref(), Some("shadow"));
+        assert_eq!(row.4.as_deref(), Some("rt_1"));
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_nodes_effort_survives_the_router_choosing_the_engine() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, _received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_1", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high"}),
+        )
+        .await;
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(RouteQuery {
+                effort: Some("low".into()),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        assert_eq!(resolved.effort.as_deref(), Some("low"));
+        assert_eq!(resolved.decision_id.as_deref(), Some("rt_1"));
+        // An effort this daemon cannot launch is ignored rather than handed to the CLI.
+        let resolved = resolve(
+            &pool,
+            run_id,
+            runner,
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(RouteQuery {
+                effort: Some("bogus".into()),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+        assert_eq!(resolved.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn a_run_awaiting_validation_reports_nothing_at_run_end() {
+        let node = |judged_later: bool| RouteQuery {
+            stage: Some("review".into()),
+            item: None,
+            judged_later,
+            ..query()
+        };
+        assert!(!judged_by_a_job_gate(&node(false)));
+        assert!(judged_by_a_job_gate(&node(true)));
+    }
+}
+
+// ---- outcomes (P2) ----
+//
+// What became of a routed run, told back to the router so it can learn from it. Every report is
+// fire-and-forget: it is spawned, never awaited, and a failure only warns — a router that is down
+// must never cost a run, a gate or a job tick a single second. Only a run that holds a decision id
+// reports; a run launched with routing off, or on a fallback, has nothing to report against.
+
+pub use crate::router_client::Outcome;
+
+/// The router's word for a gate's verdict. `Errored` is the gate not measuring, which says nothing
+/// about the model, so it is `error` rather than `fail`.
+pub fn outcome_of_gate(outcome: &crate::gate::GateOutcome) -> Outcome {
+    match outcome {
+        crate::gate::GateOutcome::Passed => Outcome::Pass,
+        crate::gate::GateOutcome::Failed { .. } => Outcome::Fail,
+        crate::gate::GateOutcome::Errored { .. } => Outcome::Error,
+    }
+}
+
+/// What a run that ended `failed` without a gate verdict says about its infrastructure: a 429 is
+/// `rate_limited`, another API error a retry could get past is `error`. Anything else ended on the
+/// work itself and is left unreported — only a gate may say `fail`.
+pub fn outcome_of_run_end(stdout: &str) -> Option<Outcome> {
+    if crate::execution::runner::failed_on_rate_limit(stdout) {
+        Some(Outcome::RateLimited)
+    } else if crate::execution::runner::failed_on_a_transient_api_error(stdout) {
+        Some(Outcome::Error)
+    } else {
+        None
+    }
+}
+
+/// Whether a job gate, run after this run ends, is what judges its work: a sequential item or an
+/// implement node (which names an item, or is an `implement` resumed without one). That gate
+/// reports through `report_item_gate`, so the run itself must not also say `pass` or `fail`.
+pub fn judged_by_a_job_gate(query: &RouteQuery) -> bool {
+    query.item.is_some() || query.stage.as_deref() == Some("implement") || query.judged_later
+}
+
+/// What the router hears when a run has ended, or `None` for nothing to report.
+///
+/// - A gate verdict, when the run has one, is the answer.
+/// - `timed_out` is `error`, gated or not. Chosen over `fail` because `outcome_of_run_end`'s
+///   convention is that only a verdict on the work says `fail`, and a deadline is not one: a run
+///   cut short never got as far as being judged, and a slow tool or a hung build ends it the same
+///   way a slow model does.
+/// - A run nothing will gate (`judged_by_a_gate` false: a plan, a review, an ad-hoc run) is judged
+///   by its own exit: `completed` is `pass`; `failed` is what `outcome_of_run_end` says about the
+///   infrastructure (`rate_limited`, `error`) when it says anything, `error` for a run with no exit
+///   code of its own (`-1`: killed, or its stream broke), and `fail` otherwise — the turn ceiling
+///   included, since looping is the model's doing.
+/// - A gated run that ended without a verdict keeps the infrastructure rule only: its gate never
+///   ran, or reports on its own.
+pub fn outcome_at_run_end(
+    terminal_status: &str,
+    exit_code: i32,
+    stdout: &str,
+    gate: Option<&crate::gate::GateOutcome>,
+    judged_by_a_gate: bool,
+) -> Option<Outcome> {
+    if let Some(gate) = gate {
+        return Some(outcome_of_gate(gate));
+    }
+    match (terminal_status, judged_by_a_gate) {
+        ("timed_out", _) => Some(Outcome::Error),
+        ("failed", true) => outcome_of_run_end(stdout),
+        ("failed", false) => Some(outcome_of_run_end(stdout).unwrap_or(if exit_code == -1 {
+            Outcome::Error
+        } else {
+            Outcome::Fail
+        })),
+        ("completed", false) => Some(Outcome::Pass),
+        _ => None,
+    }
+}
+
+/// Reports `outcome` for `decision_id` on a task of its own and returns at once.
+pub fn report_detached(router: Arc<Router>, decision_id: String, outcome: Outcome) {
+    tokio::spawn(async move {
+        if let Err(error) = router.client.report(&decision_id, outcome).await {
+            tracing::warn!(
+                %decision_id,
+                outcome = outcome.as_str(),
+                %error,
+                "could not report a routed run's outcome to the llm-router"
+            );
+        }
+    });
+}
+
+/// Reports a sequential job item's gate verdict against the decision of the run the item points
+/// at. One DB read and a spawn: it cannot block on the network, and an unreadable row only warns.
+pub async fn report_item_gate(
+    pool: &SqlitePool,
+    router: Arc<Router>,
+    job_id: i64,
+    ordinal: i64,
+    outcome: &crate::gate::GateOutcome,
+) {
+    let decision: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT r.route_decision_id FROM job_nodes i JOIN runs r ON r.id = i.run_id
+          WHERE i.job_id = ? AND i.ordinal = ?",
+    )
+    .bind(job_id)
+    .bind(ordinal)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(job_id, ordinal, %error, "could not read an item's route decision");
+        None
+    });
+    if let Some(decision_id) = decision.flatten().filter(|id| !id.is_empty()) {
+        report_detached(router, decision_id, outcome_of_gate(outcome));
+    }
+}
+
+/// Reports a run something stopped — the user's cancel, or the daemon's hook ending a run that kept
+/// probing denied actions — against its decision, if it holds one. Same shape as
+/// `report_item_gate`: one DB read and a spawn, and an unreadable row only warns.
+///
+/// Always `error`, never `fail`: a cancel is a human changing their mind and a hook stop is a
+/// policy verdict on the run's behaviour, neither a verdict on the work — the run never got as far
+/// as being judged, exactly as with a deadline (`outcome_at_run_end`). Counting it as `fail` would
+/// teach the router that a model is bad at whatever people happen to stop.
+pub async fn report_stopped(pool: &SqlitePool, router: Arc<Router>, run_id: i64) {
+    let decision: Option<Option<String>> =
+        sqlx::query_scalar("SELECT route_decision_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(run_id, %error, "could not read a stopped run's route decision");
+                None
+            });
+    if let Some(decision_id) = decision.flatten().filter(|id| !id.is_empty()) {
+        report_detached(router, decision_id, Outcome::Error);
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::gate::GateOutcome;
+    use crate::router_client::test_support::{dead_address, outcome_router, slow_router};
+
+    async fn pool() -> SqlitePool {
+        crate::testdb::fresh_pool().await
+    }
+
+    fn router_at(url: &str) -> Arc<Router> {
+        let runner: Arc<dyn CommandRunner> =
+            Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        Arc::new(Router::new(
+            RouterConfig {
+                mode: Mode::Shadow,
+                url: url.to_owned(),
+                timeout_ms: 1000,
+                ..RouterConfig::off()
+            },
+            Available {
+                kind: RunnerKind::Claude,
+                runner,
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            Vec::new(),
+        ))
+    }
+
+    #[test]
+    fn gate_verdicts_map_to_router_outcomes() {
+        assert_eq!(outcome_of_gate(&GateOutcome::Passed), Outcome::Pass);
+        assert_eq!(
+            outcome_of_gate(&GateOutcome::Failed {
+                exit_code: 1,
+                output: "red".into()
+            }),
+            Outcome::Fail
+        );
+        assert_eq!(
+            outcome_of_gate(&GateOutcome::Errored {
+                reason: "no binary".into()
+            }),
+            Outcome::Error
+        );
+    }
+
+    #[test]
+    fn a_run_end_reports_only_what_the_infrastructure_did() {
+        let ended_on = |status: &str| {
+            format!(
+                "{{\"type\":\"result\",\"is_error\":true,\"terminal_reason\":\"api_error\",\
+                 \"api_error_status\":{status},\"result\":\"API Error\"}}"
+            )
+        };
+        assert_eq!(
+            outcome_of_run_end(&ended_on("429")),
+            Some(Outcome::RateLimited)
+        );
+        assert_eq!(outcome_of_run_end(&ended_on("529")), Some(Outcome::Error));
+        assert_eq!(outcome_of_run_end(&ended_on("null")), Some(Outcome::Error));
+        assert_eq!(outcome_of_run_end(&ended_on("400")), None);
+        assert_eq!(
+            outcome_of_run_end(
+                r#"{"type":"result","is_error":true,"terminal_reason":"max_turns"}"#
+            ),
+            None
+        );
+        assert_eq!(outcome_of_run_end(""), None);
+    }
+
+    /// A run its deadline cut short says `error`, whether or not a gate would have judged it: the
+    /// deadline ended it, not a verdict on the work.
+    #[test]
+    fn a_timed_out_run_reports_error_gated_or_not() {
+        for judged in [true, false] {
+            assert_eq!(
+                outcome_at_run_end(
+                    "timed_out",
+                    crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE,
+                    "",
+                    None,
+                    judged
+                ),
+                Some(Outcome::Error),
+                "judged by a gate: {judged}"
+            );
+        }
+    }
+
+    /// A run nothing will gate — a plan, a review, an ad-hoc run — is judged by its own exit.
+    #[test]
+    fn an_ungated_run_reports_on_its_own_exit() {
+        let rate_limited = r#"{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"API Error"}"#;
+        let cases = [
+            ("completed", 0, "", Some(Outcome::Pass)),
+            ("failed", 1, "", Some(Outcome::Fail)),
+            ("failed", 1, rate_limited, Some(Outcome::RateLimited)),
+            // No exit code of its own: the daemon killed it or its stream broke.
+            ("failed", -1, "", Some(Outcome::Error)),
+            // Looping until the ceiling is the model's doing.
+            (
+                "failed",
+                crate::execution::runner::TURN_CEILING_EXIT_CODE,
+                "",
+                Some(Outcome::Fail),
+            ),
+        ];
+        for (status, exit_code, stdout, expected) in cases {
+            assert_eq!(
+                outcome_at_run_end(status, exit_code, stdout, None, false),
+                expected,
+                "{status} / {exit_code}"
+            );
+        }
+    }
+
+    /// A gated run keeps today's rule: the gate's verdict when there is one, an infrastructure
+    /// failure otherwise, and nothing for a run that failed or finished without a verdict — the gate
+    /// that judges it reports separately.
+    #[test]
+    fn a_gated_run_leaves_pass_and_fail_to_its_gate() {
+        assert_eq!(
+            outcome_at_run_end("completed", 0, "", Some(&GateOutcome::Passed), true),
+            Some(Outcome::Pass)
+        );
+        assert_eq!(outcome_at_run_end("completed", 0, "", None, true), None);
+        assert_eq!(outcome_at_run_end("failed", 1, "", None, true), None);
+        assert_eq!(outcome_at_run_end("failed", -1, "", None, true), None);
+    }
+
+    /// Only a job's item work is gated by the job: a query with an item, or an `implement` node
+    /// resumed without one. A plan, a review and an ad-hoc run are not.
+
+    #[test]
+    fn only_item_work_is_judged_by_a_job_gate() {
+        let query = |stage: Option<&str>, item: bool| RouteQuery {
+            task: "t".into(),
+            stage: stage.map(str::to_owned),
+            item: item.then(|| ItemContext {
+                files: Vec::new(),
+                attempt: None,
+                gate_output: None,
+                failed: Vec::new(),
+            }),
+            resume: false,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
+            codex_profile: None,
+        };
+        assert!(judged_by_a_job_gate(&query(Some("implement"), true)));
+        assert!(judged_by_a_job_gate(&query(Some("implement"), false)));
+        assert!(judged_by_a_job_gate(&query(None, true)));
+        assert!(!judged_by_a_job_gate(&query(Some("plan"), false)));
+        assert!(!judged_by_a_job_gate(&query(Some("review"), false)));
+        assert!(!judged_by_a_job_gate(&query(None, false)));
+    }
+
+    /// Returns before the router has answered, and a router that is not there costs nothing.
+    #[tokio::test]
+    async fn a_detached_report_never_waits_on_the_router() {
+        let slow = slow_router(Duration::from_secs(5), serde_json::json!({})).await;
+        let dead = dead_address().await;
+        let started = std::time::Instant::now();
+        report_detached(router_at(&slow), "rt_1".into(), Outcome::Pass);
+        report_detached(router_at(&dead), "rt_1".into(), Outcome::Error);
+        // A second, against a router that takes five: waiting on it could not come in under. It was
+        // 100ms, and a loaded CI runner went over that while spawning two tasks (2026-10-02).
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    async fn seed_item(pool: &SqlitePool, decision: Option<&str>) -> i64 {
+        let job_id = sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES ('p', 'C:/p', 'running', 3, '2026-09-30T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, route_decision_id)
+             VALUES ('p', 'x', 'completed', 'worktree', '2026-09-30T00:00:00Z', ?)",
+        )
+        .bind(decision)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, run_id)
+             VALUES (?, 'implement', 0, 'an item', 'gating', ?)",
+        )
+        .bind(job_id)
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        job_id
+    }
+
+    #[tokio::test]
+    async fn a_settled_item_gate_reports_its_decision() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let job_id = seed_item(&pool, Some("rt_1")).await;
+
+        report_item_gate(
+            &pool,
+            router_at(&url),
+            job_id,
+            0,
+            &GateOutcome::Failed {
+                exit_code: 2,
+                output: "red".into(),
+            },
+        )
+        .await;
+
+        let (id, body) = tokio::time::timeout(Duration::from_secs(60), received.recv())
+            .await
+            .expect("reported within the 60s hang guard")
+            .unwrap();
+        assert_eq!(id, "rt_1");
+        assert_eq!(body, serde_json::json!({"status": "fail"}));
+    }
+
+    /// A cancelled run with a decision says `error`; one without (or no such run) says nothing.
+    #[tokio::test]
+    async fn a_cancelled_run_reports_error_against_its_decision() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let seed = |decision: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO runs (project_id, prompt, status, mode, created_at, route_decision_id)
+                     VALUES ('p', 'x', 'cancelled', 'worktree', '2026-10-01T00:00:00Z', ?)",
+                )
+                .bind(decision)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let routed = seed(Some("rt_9")).await;
+        let unrouted = seed(None).await;
+
+        report_stopped(&pool, router_at(&url), unrouted).await;
+        report_stopped(&pool, router_at(&url), routed + 99).await;
+        report_stopped(&pool, router_at(&url), routed).await;
+
+        let (id, body) = tokio::time::timeout(Duration::from_secs(60), received.recv())
+            .await
+            .expect("reported within the 60s hang guard")
+            .unwrap();
+        assert_eq!(id, "rt_9");
+        assert_eq!(body, serde_json::json!({"status": "error"}));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    /// A run launched unrouted, or on a fallback, has no decision and reports nothing.
+    #[tokio::test]
+    async fn an_item_whose_run_holds_no_decision_reports_nothing() {
+        let pool = pool().await;
+        let (url, mut received) = outcome_router(200).await;
+        let job_id = seed_item(&pool, None).await;
+
+        report_item_gate(&pool, router_at(&url), job_id, 0, &GateOutcome::Passed).await;
+        report_item_gate(&pool, router_at(&url), job_id + 99, 0, &GateOutcome::Passed).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err()
+        );
+    }
+}

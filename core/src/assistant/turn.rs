@@ -1,0 +1,2418 @@
+//! Local turns, runner selection, deadlines, and assistant turn launching.
+
+use super::*;
+
+mod outcome;
+mod prewarm;
+
+// Only this module calls the outcome helpers. The warm-up is re-exported so `assistant`'s own glob
+// of this module still reaches `prewarm_open_chat`, `should_prewarm` and `briefing_wanted` at the
+// visibility they had here.
+use self::outcome::*;
+pub use self::prewarm::*;
+
+/// Records and drives a turn answered by a `local_agent::LocalAssistant` tool-calling loop rather
+/// than the agent CLI — the local model on this machine (`answered_by == "local"`) or the hosted
+/// one reached over OpenRouter (`answered_by == "openrouter"`). One body for both: the two differ
+/// only in which `LocalChat` the assistant was built with (`runner::OllamaChat` or
+/// `openai_compatible::OpenAiCompatibleChat`) and in that one wire word, and a second copy of everything else
+/// here is exactly the drift this module's map exists to prevent.
+///
+/// Deliberately NOT a variant inside `spawn_assistant_turn`. That body is almost entirely about
+/// things this path does not have — an MCP config written to disk, a CLI session id arriving on a
+/// channel, a resumable session, a cost in dollars, a stderr stream that explains an exit code.
+/// Threading `Option`s through all of it to skip each in turn would make the CLI path harder to
+/// read in order to describe a path that shares three lines with it.
+///
+/// History is replayed rather than resumed. There is no session to resume — neither Ollama's chat
+/// endpoint nor OpenRouter's has a session protocol — so `recent_exchanges` rebuilds the
+/// conversation from the run rows the turns already wrote, under the same barrier `get_session`
+/// applies on the other path.
+///
+/// `relay_id` reaches here too, and is written into this INSERT for the same reason
+/// `send_message_inner` writes its own: a conversation's brain is a property of the CHAT
+/// (`chats::brain_of`), not of how the message that woke it up arrived, so a relay landing in a
+/// conversation set to `Local` takes this path exactly as a person's own message would — and its
+/// run must record where it came from just as reliably.
+///
+/// `origin` reaches here for the same reason and stops at the same place: this path writes its own
+/// `runs` row, so a column wired only into `send_message_inner` would be NULL on every turn a
+/// conversation set to `Local` ever answered. It is written, never READ here — the local path does
+/// not route on it, having already been chosen by the time this is called — which is exactly what
+/// makes forgetting it easy and invisible until `relay::admit` refuses a relay it should have
+/// admitted.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn spawn_local_turn(
+    state: &crate::state::AppState,
+    slot: ChatSlot,
+    text: String,
+    // What the model reads: `text` for an ordinary message, the expansion for a slash command.
+    // `runs.prompt` keeps `text`, the words that were typed.
+    model_text: String,
+    assistant: std::sync::Arc<crate::models::local_agent::LocalAssistant>,
+    relay_id: Option<i64>,
+    origin: Origin,
+    // The `runs.answered_by` wire word for this turn: `"local"` or `"openrouter"`, matching
+    // `chats::Brain::as_str()` for the brain that chose this path. A parameter and not a constant
+    // baked into the query below, because that hardcoded `'local'` is exactly what made this
+    // function local-only in the first place — generalising the call site, per this packet's own
+    // instruction, means the one fact that differs travels in, not a second copy of the query.
+    answered_by: &'static str,
+    // Whether this turn's price is unknown (it answers through Gemini): `runs.cost_usd` is then
+    // written NULL, not 0. Local and OpenRouter turns pass `false` and keep writing 0.
+    cost_unknown: bool,
+) -> Result<i64, String> {
+    // A session id even though nothing resumes it, because `budget.rs` keys spend on this column
+    // and a run row that is the one kind without one is a special case every reader downstream has
+    // to know about. It costs a uuid.
+    // Read BEFORE this turn's own row is inserted, so the turn cannot appear in its own history.
+    // An empty history on a database error, not a failure: a bot that answers without remembering
+    // is worse than one that remembers, and better than one that refuses to answer.
+    // Floored at a done `/compact`, whose handoff then leads every prompt until the next one.
+    let (history, handoff) = super::compaction::local_history(&state.pool, &slot.chat_id).await;
+
+    let session_id = crate::auth::generate_uuid_v4();
+    let id = sqlx::query(
+        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, from_relay_id,
+                           origin, created_at)
+         VALUES (?, 'running', 'assistant', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&text)
+    .bind(&session_id)
+    .bind(&slot.chat_id)
+    .bind(answered_by)
+    .bind(relay_id)
+    .bind(origin.as_wire())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .last_insert_rowid();
+    // A relay from a tainted sender marks this run before anything else learns it exists; a mark
+    // that fails ends it here, unstarted. The CLI path makes the same call at the same point.
+    inherit_relay_taint(&state.pool, id, relay_id).await?;
+    crate::chats::stamp_project(&state.pool, id, &slot.chat_id).await;
+    // A channel conversation sees "working" as soon as its turn exists. A no-op for any other chat.
+    crate::channels::replies::turn_started(state, id, &slot.chat_id).await;
+
+    // The relay learns which turn answered it, now that the turn has an id to learn.
+    //
+    // After the INSERT and not inside it, because the run's id does not exist until the run does —
+    // which is exactly why this pointer and `runs.from_relay_id` are not equally trusted. That one
+    // is written in the same statement as the run and is what `relay::chain_of` walks; this one is
+    // a second write that can fail on its own, and 0122's header says plainly that nothing
+    // security-critical may read it.
+    //
+    // A warning and not a refusal, therefore. The turn is already under way; undoing it because an
+    // audit pointer would not write would be trading the thing somebody is waiting for against the
+    // record of it.
+    if let Some(relay_id) = relay_id
+        && let Err(error) = crate::relay::mark_delivered(&state.pool, relay_id, id).await
+    {
+        tracing::warn!(%error, id, relay_id, "the relayed turn started but was not stamped onto its relay");
+    }
+
+    let prompt = super::compaction::with_handoff(handoff.as_deref(), model_text);
+
+    let pool = state.pool.clone();
+    let run_timeout = state.run_timeout;
+    // Kept for after the turn, as on the CLI path: `spawn_registered` takes the state, and the chat
+    // id lives on the slot, which is dropped before the automatic compaction is considered.
+    let after = state.clone();
+    let chat_id = slot.chat_id.clone();
+    crate::execution::runs::spawn_registered(state, id, async move {
+        // `slot`, captured by this block, holds the chat for the length of the turn and releases it
+        // however this ends, including by being aborted mid-await — the same guarantee `TurnGuard`
+        // gives the CLI path.
+        //
+        // Wrapped for the same reason the CLI path is: the slot is released by this task ending,
+        // so a turn that never ends is a chat that answers nothing ever again — every later message
+        // refused with 409 until the daemon restarts. The HTTP client has its own per-exchange
+        // timeout; this one bounds the whole turn, including a loop that keeps making progress
+        // slowly.
+        // Outside the future on purpose. A wall-clock timeout DROPS the turn and a transport error
+        // propagates out of it, and in both cases the turn may already have read a mail body with
+        // no `Turn` left to say so — so the run row would be written clean and the next turn in this
+        // chat would start with a stranger's words in its history and an open latch.
+        let taint = std::sync::atomic::AtomicBool::new(false);
+        // This turn's tools speak for this row, so a declaration names the run that taught it.
+        let outcome = tokio::time::timeout(
+            run_timeout,
+            assistant.answer_as_run(id, &history, &prompt, &taint),
+        )
+        .await;
+        let completed_at = chrono::Utc::now().to_rfc3339();
+
+        // Marked before any status is written, whatever the ending. `hooks.rs` refuses the READ
+        // when this fails, which is not available here — the reading already happened — so the
+        // fail-closed move left is to refuse the ANSWER: the turn is recorded as failed and its
+        // text is dropped rather than stored and handed to the next turn as history.
+        let mut unmarked = false;
+        // Set only once the turn's row really reads `completed`: a `/cancel` that got there first
+        // leaves it empty, and a turn that did not complete neither rotates nor compacts.
+        let mut auto_fill: Option<i64> = None;
+        if taint.load(std::sync::atomic::Ordering::SeqCst)
+            && let Err(error) = crate::execution::runs::mark_untrusted_context(&pool, id).await
+        {
+            tracing::error!(
+                run_id = id,
+                %answered_by,
+                %error,
+                "could not mark a turn as having read untrusted text — dropping its answer"
+            );
+            unmarked = true;
+        }
+
+        // Guarded on `status = 'running'` for the reason the CLI path sets out: a `/cancel` that
+        // already wrote its status can still be followed by one last wake-up here, and an unguarded
+        // write would report a completed turn for one that was killed.
+        let written = match outcome {
+            // `timed_out`, not `failed`, matching the CLI path below. A wall-clock kill is a
+            // distinct ending there and anything filtering runs by it would simply not see this
+            // turn — the status is what the rest of the system reads, so it has to mean the same
+            // thing whichever runner produced it.
+            Err(_) => {
+                tracing::warn!(run_id = id, %answered_by, "turn exceeded the wall clock");
+                sqlx::query(
+                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+            }
+            Ok(Ok(turn)) => {
+                if turn.ending != crate::models::local_agent::Ending::Answered {
+                    // Worth a log line and not worth an error: the person gets a usable sentence
+                    // either way, and this is the only place recording WHY it was that sentence.
+                    tracing::warn!(
+                        run_id = id,
+                        %answered_by,
+                        ending = ?turn.ending,
+                        tool_calls = turn.tool_calls,
+                        "turn ended without an answer of its own"
+                    );
+                }
+                // The turn read mail and the row could not be made to say so, so the answer is not
+                // stored. Anything else writes a chat message quoting a stranger's words onto a run
+                // marked clean, which `recent_exchanges` would then hand to the next turn with the
+                // latch open — the one state every refusal in this file assumes does not exist.
+                if unmarked {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind("this turn read third-party text and the daemon could not record that; its answer was dropped rather than stored unmarked")
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                } else {
+                    // These engines report no usage we read, so the window is estimated.
+                    let fill =
+                        super::compaction::local_fill_estimate(&history, &prompt, &turn.answer);
+                    let completed = sqlx::query(
+                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = ?, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(&turn.answer)
+                    .bind(if cost_unknown { None } else { Some(0.0_f64) })
+                    .bind(fill)
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    if completed
+                        .as_ref()
+                        .is_ok_and(|written| written.rows_affected() > 0)
+                    {
+                        auto_fill = Some(fill);
+                        // A turn that finished ends the streak of restart interruptions.
+                        crate::chats::auto_resume::reset(&pool, &chat_id).await;
+                    }
+                    completed
+                }
+            }
+            // Transport failure: Ollama stopped, OpenRouter refused the request, or the model was
+            // pulled out from under us. The chat is told rather than handed a silence it cannot
+            // interpret.
+            Ok(Err(error)) => {
+                tracing::warn!(run_id = id, %answered_by, %error, "turn failed");
+                sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(failure_text(&error.to_string(), None))
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+            }
+        };
+        crate::execution::runs::warn_on_terminal_write_err(&written, id, "completed");
+        super::compaction::settle(&pool, id).await;
+
+        // Released before the compaction is considered, which refuses a busy chat: this turn's own
+        // slot would otherwise stop it. In a task of its own for the reason the CLI path gives: a
+        // compaction turn must not start inside this one's registered task.
+        drop(slot);
+        // An unknown fill never fires, so a turn without one needs no task.
+        if auto_fill.is_some() {
+            spawn_after_local_turn(after, chat_id, id, auto_fill);
+        }
+    });
+
+    Ok(id)
+}
+
+/// Marks the just-inserted run `id` `read_untrusted` when the relay that bore it was sent by a
+/// conversation with third-party text behind it (`relay::sender_read_untrusted`). A no-op for a
+/// typed turn and for a relay from a clean sender.
+///
+/// Called by both turn launchers between their INSERT and their spawn, so the hooks see the mark
+/// from the first tool call and `turn.rs` never leaves a resumable session behind a prompt made of a
+/// stranger's words. `handover_of` already keeps such a turn `McpOnly`; that limits THIS turn, and
+/// only the mark limits what comes after it.
+///
+/// Fails closed: a mark that cannot be written ends the run as `failed` before it starts and returns
+/// the refusal, so the caller spawns nothing — a turn holding tainted words on a row that reads clean
+/// is the one state every barrier downstream assumes does not exist.
+pub(super) async fn inherit_relay_taint(
+    pool: &SqlitePool,
+    id: i64,
+    relay_id: Option<i64>,
+) -> Result<(), String> {
+    let Some(relay_id) = relay_id else {
+        return Ok(());
+    };
+    if !crate::relay::sender_read_untrusted(pool, relay_id).await {
+        return Ok(());
+    }
+    let Err(error) = crate::execution::runs::mark_untrusted_context(pool, id).await else {
+        return Ok(());
+    };
+    tracing::error!(run_id = id, relay_id, %error, "could not mark a turn relayed from a tainted sender; not starting it");
+    let written = sqlx::query(
+        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind("this turn was relayed from a conversation that read third-party text and the daemon could not record that; it was not started")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await;
+    crate::execution::runs::warn_on_terminal_write_err(&written, id, "failed");
+    Err(format!(
+        "could not record that the relayed turn carries untrusted text: {error}"
+    ))
+}
+
+/// What tools a conversation's turn may reach.
+///
+/// Four conditions, and every one of them is load-bearing. Written as one pure function so the
+/// rule has a single home and can be read whole; the caller supplies the filesystem answer.
+///
+/// **A directory.** A conversation continuing a session from the IDE is rooted somewhere and is
+/// about the code there. Every conversation that predates this has no root, which is why nothing
+/// changes for any of them: they take the first `None` arm and stay exactly as they were.
+///
+/// **The machine.** `Origin::Shell` means the person is sitting at this computer. Telegram stays on
+/// `McpOnly` because the policy — not the MCP allowlist, which only grants — is the one thing that
+/// keeps a message arriving over the network away from this machine's filesystem and shell.
+///
+/// `Origin::Voice` joins `Shell` here EXPLICITLY, and the explicitness is the point: letting it fall
+/// through to `_` would be the same question answered with a weaker policy for having been spoken,
+/// with nothing anywhere saying so. It belongs on this arm because the fact the arm turns on is
+/// physical presence, and a microphone is a stricter proof of it than a keyboard — a spoken turn
+/// requires being in the room, while a typed one only requires reaching the machine.
+///
+/// The argument against, which is real and loses: a transcript is a GUESS at what was said, and
+/// whisper mishears. But the guess is shown to the person as the turn is sent, the answer is spoken
+/// back to them, and the `PreToolUse` classifier this arm defers to is still the thing deciding. What
+/// would not survive scrutiny is the alternative — trusting a message that crossed the network more
+/// than one spoken into the machine's own microphone.
+///
+/// **A wired hook.** `Unrestricted` is not "ungoverned": it hands the decision to the `PreToolUse`
+/// classifier. But that hook is COOPERATIVE — it runs only if the `.claude/settings.json` resolved
+/// from the run's working directory registers it — so in a directory that never onboarded,
+/// `Unrestricted` would mean a shell with nothing watching it. The transcripts on this machine span
+/// sixty-nine directories and most were never NucleOS projects at all, so this is the common case
+/// and not the edge one.
+///
+/// **A turn of this conversation's own, or the first clean hop out of one.** A relayed turn is one
+/// another conversation handed over, and it arrives carrying that conversation's `origin`. The
+/// owner chose (2026-10-11, the relay design's §13) to let it keep the tools, so a conversation can
+/// delegate real work to another — but only as `Handover::FirstHop`: one hop from a turn a person
+/// wrote, sent by a conversation that read no third-party text. Every other relayed turn is
+/// `Handover::Withheld`, because past one hop the words were written by a turn nobody typed, and
+/// after an untrusted read they may be somebody else's words altogether. The third brake, a spend
+/// ceiling per chain, refuses the relay itself (`relay::chain_has_room`).
+///
+/// Every failing arm falls to `McpOnly`, which is what every chat turn has always used: the
+/// conversation still continues and still resumes its session, and what it loses is the ability to
+/// touch the machine.
+pub fn tool_policy_for(
+    cwd: Option<&str>,
+    origin: Origin,
+    hook_is_wired: bool,
+    handover: crate::relay::Handover,
+) -> crate::execution::runner::ToolPolicy {
+    use crate::relay::Handover;
+    match (cwd, origin, hook_is_wired, handover) {
+        (
+            Some(_),
+            Origin::Shell | Origin::Voice | Origin::BrowserPanel,
+            true,
+            Handover::Typed | Handover::FirstHop,
+        ) => crate::execution::runner::ToolPolicy::Unrestricted,
+        _ => crate::execution::runner::ToolPolicy::McpOnly,
+    }
+}
+
+/// The tool policy a turn answered by `cli` runs under. `tool_policy_for` grants `Unrestricted`
+/// because the Claude PreToolUse hook is wired; nothing shows agy honours that hook, so an agy chat
+/// is always MCP-only (`--mode plan --sandbox`). Every other engine keeps the policy it was given.
+pub fn tool_policy_for_engine(
+    cli: &str,
+    policy: crate::execution::runner::ToolPolicy,
+) -> crate::execution::runner::ToolPolicy {
+    use crate::execution::runner::ToolPolicy;
+    if cli == crate::engines::AGY && policy == ToolPolicy::Unrestricted {
+        ToolPolicy::McpOnly
+    } else {
+        policy
+    }
+}
+
+/// A chat bound to the agy engine while its opt-in is off. The turn is refused rather than handed
+/// to another engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineDisabled;
+
+impl std::fmt::Display for EngineDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this chat uses the agy engine, which is disabled in settings")
+    }
+}
+
+impl std::error::Error for EngineDisabled {}
+
+/// Chooses the CLI that should answer a conversation turn, or refuses when that CLI is agy and
+/// agy is switched off.
+pub fn answering_cli(
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> Result<&'static str, EngineDisabled> {
+    let cli = pinned
+        .and_then(|id| {
+            config
+                .runner_of(id)
+                .or_else(|| crate::models::model_catalog::runner_by_id(id))
+        })
+        .unwrap_or_else(|| {
+            crate::engines::runner_id_in(crate::engines::TABLE, config.active_runner())
+        });
+    if cli == crate::engines::AGY && !crate::engines::agy::enabled() {
+        return Err(EngineDisabled);
+    }
+    Ok(cli)
+}
+
+/// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
+pub fn runner_for_turn(
+    daemon: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+    assistants: &dyn crate::assistants::Assistants,
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> Result<
+    (
+        std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+        &'static str,
+    ),
+    EngineDisabled,
+> {
+    let cli = answering_cli(config, pinned)?;
+    if pinned.is_none() || cli == config.active_runner() {
+        Ok((daemon.clone(), cli))
+    } else {
+        match assistants.cli_runner(cli, pinned) {
+            Some(runner) => Ok((runner, cli)),
+            // The gate closed between two reads: an agy chat is refused, never answered by the
+            // daemon's own runner.
+            None if cli == crate::engines::AGY => Err(EngineDisabled),
+            None => Ok((daemon.clone(), cli)),
+        }
+    }
+}
+
+/// Whether this turn may retain a live CLI process for a later turn.
+pub fn may_keep_process(policy: crate::execution::runner::ToolPolicy, cli: &str) -> bool {
+    matches!(policy, crate::execution::runner::ToolPolicy::Unrestricted) && cli == "claude"
+}
+
+/// How long a chat turn may run: `silence` is how long without a new stream event, `ceiling` the
+/// total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TurnDeadlines {
+    pub(super) silence: Option<std::time::Duration>,
+    pub(super) ceiling: std::time::Duration,
+}
+
+/// A rooted turn (`Unrestricted`) dies on silence or a long ceiling; any other keeps the plain wall.
+pub(super) fn turn_deadlines(
+    run_timeout: std::time::Duration,
+    progress_timeout: std::time::Duration,
+    policy: crate::execution::runner::ToolPolicy,
+) -> TurnDeadlines {
+    match policy {
+        crate::execution::runner::ToolPolicy::Unrestricted => TurnDeadlines {
+            silence: Some(progress_timeout * crate::state::ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER),
+            ceiling: run_timeout * crate::state::ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER,
+        },
+        _ => TurnDeadlines {
+            silence: None,
+            ceiling: run_timeout,
+        },
+    }
+}
+
+pub(super) fn system_prompt_with_knowledge(
+    cli: &str,
+    instructions: Option<String>,
+    block: Option<&str>,
+) -> Option<String> {
+    if cli != "claude" {
+        return instructions;
+    }
+    let Some(block) = block else {
+        return instructions;
+    };
+    match instructions {
+        Some(instructions) => Some(format!("{instructions}{block}")),
+        None => Some(block.trim_start().to_owned()),
+    }
+}
+
+/// The request a conversation's CLI is launched with, built by the turn that asks for it and by the
+/// process warmed ahead of that turn, so the two cannot come to disagree about how a conversation is
+/// spawned (a kept process is compared against [`spawn_fingerprint`] of exactly these inputs).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn chat_run_request(
+    prompt: String,
+    images: Vec<crate::execution::runner::Attachment>,
+    env: Vec<(String, String)>,
+    cwd: Option<std::path::PathBuf>,
+    permission: crate::execution::runner::Permission,
+    resume: Option<String>,
+    session_id: String,
+    mcp_config: std::path::PathBuf,
+    tool_policy: crate::execution::runner::ToolPolicy,
+    answering: crate::chats::Answering,
+    doctrine: Option<String>,
+    cli: &str,
+    knowledge: Option<&str>,
+) -> crate::execution::runner::RunRequest {
+    // Read before `images` is moved into the request: this decides which door the run goes through.
+    let steerable = !images.is_empty();
+    crate::execution::runner::RunRequest {
+        prompt,
+        env,
+        // Set for every rooted conversation, elevated or not: this is how the CLI finds
+        // the session to resume in the first place. A conversation with no root keeps
+        // `None`, because one quietly given a working directory is one whose relative paths
+        // moved.
+        cwd,
+        permission,
+        resume_session_id: resume,
+        // An MCP config only grants, and agy has no flag to take it, so an agy chat answers without
+        // NucleOS tools; the runner keeps refusing a config it cannot honour.
+        mcp_config: (cli != crate::engines::AGY).then_some(mcp_config),
+        mcp_job: None,
+        mcp_team_run: None,
+        // Decided by `tool_policy_for`, which is where the rule is written out. The
+        // default remains what it always was — the orchestrator talks to NucleOS and to
+        // nothing else, and the MCP allowlist does not enforce that on its own, because
+        // an allowlist only grants.
+        tool_policy,
+        // Stays `None` in the request: `serve_turn` decides the silence rule per door (the
+        // runner's own deadline one-shot, a per-event timeout on a living process).
+        progress_timeout: None,
+        // No ceiling, and the only production `None`. A chat turn is
+        // watched by the person who asked for it, who can stop it — and a turn cut off
+        // mid-answer by a limit nobody set reads as the app breaking rather than as a
+        // brake working. The guard is the turn's deadlines: silence plus a 4 h ceiling for a rooted
+        // turn, the plain 600 s wall for an McpOnly one.
+        max_turns: None,
+        // Always set. `cli_args` reads this only when there is no `--resume`, which is
+        // exactly the first turn — the one that used to be launched with no session id
+        // at all.
+        session_id: Some(session_id),
+        fork_session: false,
+        // Asked for so the tail above carries the answer AS IT IS WRITTEN rather than a
+        // paragraph at a time. It costs nothing when nobody is watching: these are more
+        // events on a stream the daemon already reads line by line, and `extract_reply`
+        // takes the reply from the `result` event either way.
+        include_partial_messages: true,
+        // An orchestrator turn is one message answered and closed; the next one arrives
+        // as its own turn on the resumed session, which is where a Telegram reply
+        // already goes. Nothing here needs a stdin, so it keeps a closed one.
+        images,
+        // Bytes only fit on stdin: an argument vector holds a string and there is
+        // nowhere in it for a picture to go. So a turn carrying one takes the other
+        // door — which is the same one-turn run either way, because `messages` is None
+        // and stdin closes the moment the opening line is written.
+        steerable,
+
+        // An orchestrator turn is answered by a person watching a chat, so the CLI's
+        // own permission surface is the right one: there IS somebody to approve. It is
+        // `McpOnly` besides, so the surface being argued over is nearly empty.
+        classifier_governs_tools: false,
+        messages: None,
+        request_tx: None,
+        // Registry servers reach only an Unrestricted turn (spec §8.2): an unrooted, Telegram
+        // or withheld relayed turn is `McpOnly` and gets the NucleOS server alone.
+        mcp_servers: crate::chats::mcp_servers::active_names(tool_policy, &answering.mcp_servers),
+        // What the conversation was pinned to, or `None` for the runner's configured model.
+        //
+        // This was `None` unconditionally, with a comment saying an orchestrator turn has no
+        // role to route — true of JOB roles, and it read as though the field had no other use.
+        // It had: `cli_args` turns it into `--model`, so the one kind of run a person actually
+        // watches was the one kind that could not choose who answered it.
+        model: answering.model,
+        // `None` for every conversation that never asked, which leaves the CLI's own default in
+        // place — the behaviour every chat had before the column existed.
+        effort: answering.effort,
+        // Who answers when the chosen model is overloaded. Empty for every conversation that
+        // named nobody, which is the CLI's own behaviour: fail rather than quietly substitute.
+        fallback_model: answering.fallback_model,
+        // Beyond `cwd`, which is set just above and is where the turn actually runs. These only
+        // ever GRANT reach, so a conversation that named none is exactly as confined as before.
+        add_dirs: answering
+            .extra_dirs
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        // A ceiling on THIS answer, not on the conversation. The CLI stops the invocation; the
+        // turn's deadlines around this call are still the other guard, and `max_turns` above is
+        // deliberately `None` here for the reason its own comment gives.
+        max_budget_usd: answering.turn_budget_usd,
+        // The helpers this conversation defined, ADDED to whatever the CLI finds in the
+        // project's own `.claude/agents/`. A conversation that defined none sends no flag, and
+        // that is not the same as sending an empty one — see `agents` on `RunRequest`.
+        agents: answering.agents.clone(),
+        // On EVERY turn, because the flag is per invocation and this daemon spawns one per
+        // turn. Instructions sent only on the first would govern the opening message and then
+        // quietly stop mattering — wrong in the way that is hardest to see, since the first
+        // answer is the right one.
+        //
+        // `.or(doctrine)`, not `.or_else`: the chat's own `system_prompt` — read moments ago
+        // from `chats::answering`, where `origin` no longer exists — always wins when it is
+        // there, and the configured Telegram doctrine only fills the slot when it is empty. A
+        // person's own instructions are never replaced, only completed.
+        append_system_prompt: system_prompt_with_knowledge(
+            cli,
+            answering.system_prompt.clone().or(doctrine),
+            knowledge,
+        ),
+        // What this conversation is called, so the session it mints is findable in the CLI's
+        // own `--resume` picker instead of being one more nameless timestamp there.
+        session_name: answering.session_name.clone(),
+        context_window: Some(crate::assistant::window_of(answering.context_window)),
+        // Merged with whatever `tool_policy` denies by `cli_args`, into one flag. This can only
+        // ever narrow: the allow-listing flag beside it grants rather than restricts, so there
+        // is no widening version of this to get wrong.
+        denied_tools: answering.denied_tools.clone(),
+        // The wildcard, on purpose: an orchestrator turn acts for the person watching
+        // the chat and carries the control token, so narrowing what it is offered would
+        // only take away tools it is entitled to call.
+        allowed_mcp_tools: None,
+        // A person is watching, so a background task is worth launching even on the one-shot
+        // path where it dies with the turn. The live path (`start_live_chat`) keeps its process
+        // between turns and would have kept them anyway.
+        background_tasks: true,
+    }
+}
+
+/// Everything about how a conversation's CLI is spawned that a kept process cannot be told to change.
+///
+/// A process takes its model, effort, tool denials, directories and instructions as arguments once,
+/// when it starts, so a conversation that changed any of them must get a new process rather than a
+/// wrong one. [`serve_turn_briefed`] compares this against what the process was spawned with
+/// (`LiveChat::spawned_with`).
+///
+/// Computed from the conversation's own settings and NEVER from the per-turn briefing: that block
+/// differs on every turn, and if it entered this string every turn would respawn the process it
+/// exists to keep.
+pub(super) fn spawn_fingerprint(
+    answering: &crate::chats::Answering,
+    doctrine: Option<&str>,
+    tool_policy: crate::execution::runner::ToolPolicy,
+) -> String {
+    serde_json::json!({
+        "model": answering.model,
+        "effort": answering.effort,
+        "fallback_model": answering.fallback_model,
+        "extra_dirs": answering.extra_dirs,
+        "turn_budget_usd": answering.turn_budget_usd,
+        "agents": answering.agents,
+        // The chat's own instructions win; the doctrine only fills the slot when it is empty, which
+        // is exactly the rule the request applies.
+        "system_prompt": answering.system_prompt.as_deref().or(doctrine),
+        "denied_tools": answering.denied_tools,
+        "context_window": answering.context_window,
+        "tool_policy": format!("{tool_policy:?}"),
+        // Name plus a digest of the definition: a same-named server with a new command, args or env
+        // must respawn, and env values are secrets that never enter this string in plain text.
+        "mcp_servers":
+            crate::chats::mcp_servers::active_fingerprints(tool_policy, &answering.mcp_servers),
+    })
+    .to_string()
+}
+
+/// Everything one orchestrator turn is launched with.
+///
+/// A struct rather than a row of parameters, for the reason `RunRequest` gives about its own: at
+/// this width, `resume` and `session_id` sit side by side and are both string-shaped, so swapping
+/// them is one careless edit that the compiler would let through without a word — and the symptom
+/// would be a conversation quietly resuming the id it was about to mint.
+pub(super) struct TurnLaunch {
+    pub(super) id: i64,
+    pub(super) slot: ChatSlot,
+    pub(super) text: String,
+    /// The pictures this turn carries. Empty for almost every turn.
+    ///
+    /// Carried here rather than fetched later because they decide which door the run goes through:
+    /// bytes only fit on stdin, so a turn with any of these is `steerable` and one without is not.
+    pub(super) images: Vec<crate::execution::runner::Attachment>,
+    /// The session this turn continues, or `None` to start on a fresh context.
+    pub(super) resume: Option<String>,
+    /// The id this turn is recorded under, which is `resume` when there is one.
+    pub(super) session_id: String,
+    pub(super) mcp_path: std::path::PathBuf,
+    pub(super) cwd: Option<std::path::PathBuf>,
+    pub(super) tool_policy: crate::execution::runner::ToolPolicy,
+    /// The configured Telegram doctrine, already resolved against `origin` in `send_message` —
+    /// `Some` only for an `Origin::Channel` turn whose operator configured one, `None` otherwise.
+    ///
+    /// Carried on the struct rather than re-derived where it is used, because `origin` is gone by
+    /// then: this is read inside the task `spawn_assistant_turn` spawns, where `chats::answering`
+    /// is read and the doctrine fills its `system_prompt` only when that is empty — a person's own
+    /// instructions must never be replaced, only completed.
+    pub(super) doctrine: Option<String>,
+    /// The turn came in through a channel, whose conversation already carries the reply; a long
+    /// turn then does not tell the owner a second time. Carried for the same reason as `doctrine`.
+    pub(super) from_channel: bool,
+}
+
+pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
+    let TurnLaunch {
+        id,
+        slot,
+        text,
+        images,
+        resume,
+        session_id,
+        mcp_path,
+        cwd,
+        tool_policy,
+        doctrine,
+        from_channel,
+    } = launch;
+    let started = std::time::Instant::now();
+    let pool = state.pool.clone();
+    let daemon_runner = state.runner.clone();
+    let utility_model = state.utility_model.clone();
+    let assistants = state.assistants.clone();
+    let (run_timeout, progress_timeout) = (state.run_timeout, state.progress_timeout);
+    let control_token = state.token.0.clone();
+    // Built HERE, outside the task, and captured by the async block. A task aborted before its first
+    // poll drops its captured state without ever running a line of the body, so a guard constructed
+    // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
+    let turn = TurnGuard { slot, mcp_path };
+    // Kept for after the turn: the between-turns reader needs the whole state, and
+    // `spawn_registered` takes ownership of it. The chat id is copied for the same reason — it lives
+    // on the guard, which is dropped before the reader starts.
+    let after = state.clone();
+    let drained_chat = turn.slot.chat_id.clone();
+
+    // The turn's stream, mirrored as the CLI writes it and published under the turn's own id — a
+    // turn IS a run, so `GET /runs/{id}/tail` already serves this and needed nothing new.
+    //
+    // Published BEFORE the task is spawned, not inside it. `send_message` answers with this id and
+    // the window starts asking immediately; registering from inside the task would leave a window
+    // in which the tail does not exist yet, and "no live tail" is the same answer the endpoint
+    // gives for a run that finished — so the first poll of every turn would read as already over.
+    //
+    // Taken out by `Registration`'s `Drop`, which `spawn_registered` builds, so completion, failure,
+    // timeout, cancel and panic all remove it without a line here.
+    let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    state
+        .run_tails
+        .lock()
+        .unwrap()
+        .insert(id, std::sync::Arc::clone(&transcript));
+
+    crate::execution::runs::spawn_registered(state, id, async move {
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        {
+            let pool = pool.clone();
+            let chat_id = turn.slot.chat_id.clone();
+            tokio::spawn(async move {
+                if let Some(session_id) = session_rx.recv().await {
+                    // The run takes the id first, and the chat's resumable session is recorded only
+                    // if it did. `get_session` decides whether a session may be resumed by looking
+                    // at the runs that produced it, so the two writes are not independent: a
+                    // session recorded against a run that never took the id has nothing pointing at
+                    // it, and would stay resumable no matter what that turn went on to read.
+                    let stored = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+                        .bind(&session_id)
+                        .bind(id)
+                        .execute(&pool)
+                        .await;
+                    if let Err(error) = stored {
+                        tracing::warn!(
+                            run_id = id,
+                            %error,
+                            "could not record the turn's session id; the chat will start its next turn clean"
+                        );
+                    } else {
+                        let _ = upsert_session(
+                            &pool,
+                            &chat_id,
+                            &session_id,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+
+        // Read here rather than carried in from the request that started the turn: it is a property
+        // of the conversation at the moment it answers, and somebody who moved the selector while
+        // reading the last reply means this turn.
+        //
+        // `unwrap_or(Auto)` and not a refusal, for the reason the fallback exists at all: `Auto` is
+        // what a rooted conversation has always done, so a row that could not be read behaves the
+        // way it behaved before there was a column. It is the safe direction only downward, which
+        // is why the SNAPSHOT this turn writes cannot use it — see the run's own column.
+        let mode = crate::chats::permission_mode_of(&pool, &turn.slot.chat_id)
+            .await
+            .unwrap_or(crate::chats::PermissionMode::Auto);
+        let permission = crate::execution::runner::Permission::for_chat(mode);
+
+        // The turn's SNAPSHOT, written before anything can observe it.
+        //
+        // The read above is a property of the conversation at this instant. The hook reads the same
+        // fact again, once per tool call, minutes later — so it has to be written somewhere a tool
+        // call can find it, and it cannot be the chat's row: moving the selector while a turn is
+        // running would change the rules underneath a turn already running. That is the whole
+        // reason `runs.permission_mode` exists, and what makes it a snapshot rather than a second
+        // copy free to disagree — written once, here, and never read by the selector.
+        //
+        // **The ORDER gives the invariant for free.** This write, then the `RunRequest`, then the
+        // runner. The CLI process does not exist until this row says what it is running under, so
+        // no tool call of a cloud turn can observe a NULL.
+        //
+        // **A failed write refuses the turn.** It does not fall back to `auto`: somebody who chose
+        // `manual` would silently be handed something WIDER than they asked for, and "unknown reads
+        // as auto" is only safe downward. `fresh_chat_key` fails in the same direction and
+        // for the same reason — of the two ways to be wrong here, only one leaves a run acting with
+        // nobody watching.
+        if let Err(error) = sqlx::query("UPDATE runs SET permission_mode = ? WHERE id = ?")
+            .bind(mode.as_str())
+            .bind(id)
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(
+                run_id = id,
+                chat_id = %turn.slot.chat_id,
+                %error,
+                "could not record this turn's permission mode — refusing the turn rather than running it wider than it was asked for"
+            );
+            let failed = sqlx::query(
+                "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(format!(
+                "could not record this turn's permission mode, so it was refused rather than run under a wider one: {error}"
+            ))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await;
+            crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+            // A refused turn ends like a failed one: whatever waited behind it goes next, in
+            // order, rather than staying queued until some later turn's drain sends it after
+            // that turn's own message. The guard goes first, for the reason the end of this
+            // task gives.
+            drop(turn);
+            drain_queued(&after, &drained_chat).await;
+            return;
+        }
+
+        // Who answers this turn, and how hard they are asked to think. Read HERE, beside `planning`
+        // and for its reason: both are properties of the conversation at the moment it answers, and
+        // somebody who changed the model while reading the last reply meant this turn and not the
+        // next one.
+        //
+        // `unwrap_or_default` — `(None, None)` — rather than a refusal. A conversation that never
+        // expressed a preference is the overwhelming majority of them and is not an error, and a
+        // row that could not be read has a configured model to fall back on. Failing a turn over an
+        // unreadable preference would break the chats that have none.
+        let answering = crate::chats::answering(&pool, &turn.slot.chat_id)
+            .await
+            .unwrap_or_default();
+        let config = crate::config::models_config_now();
+        let (runner, cli) = match runner_for_turn(
+            &daemon_runner,
+            assistants.as_ref(),
+            &config,
+            answering.model.as_deref(),
+        ) {
+            Ok(chosen) => chosen,
+            Err(refusal) => {
+                // The chat is bound to an engine that is switched off: fail the turn with the
+                // reason, never answer it with another engine.
+                tracing::warn!(run_id = id, chat_id = %turn.slot.chat_id, %refusal, "refusing the turn");
+                let failed = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(refusal.to_string())
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&pool)
+                .await;
+                crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                // Ends like any failed turn: the guard goes first, then whatever waited behind it.
+                drop(turn);
+                drain_queued(&after, &drained_chat).await;
+                return;
+            }
+        };
+
+        // The policy the answering engine runs under, and the deadlines that follow from it: both
+        // wait for `cli`, which is only known here. An agy chat is never rooted.
+        let tool_policy = tool_policy_for_engine(cli, tool_policy);
+        let deadlines = turn_deadlines(run_timeout, progress_timeout, tool_policy);
+
+        // Which door this turn goes through. Decided once and named, because the two are not
+        // interchangeable and the reason is a security one before it is a speed one.
+        //
+        // A rooted turn carries a key scoped to its CONVERSATION, minted for the process that
+        // carries it (below), which stays true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
+        // safe only because that policy leaves it no Bash, no Read and no Write to look at its own
+        // environment with — and a process holding THAT key, kept alive and idle between turns, is
+        // a different and much worse proposition. So only rooted Claude conversations keep a
+        // process, and the barrier that makes it safe is the same one that earned it the tools. A
+        // Codex turn has no stdin a later turn can arrive on.
+        // The account this turn runs under. With no accounts (or an engine outside the pool) this
+        // is today's turn: no env, no reservation, nothing written.
+        let mut pick = crate::accounts::launch_chat::pick_for_chat_turn(
+            &pool,
+            &crate::accounts::pool::PoolState::global(),
+            &turn.slot.chat_id,
+            cli,
+            resume.as_deref(),
+            chrono::Utc::now(),
+        )
+        .await;
+        if let Some(decision) = pick.blocked.take() {
+            use crate::accounts::choose::Decision;
+            // A pinned account that cannot run, or a session stuck on an exhausted one, fails the
+            // turn with the reason. No candidate at all falls back to today's turn.
+            let reason = match decision {
+                Decision::PinnedBlocked { pinned, why, .. } => Some(format!(
+                    "the pinned account {} cannot take this turn ({why:?})",
+                    pinned.as_str()
+                )),
+                Decision::SessionStuck { current, .. } => Some(format!(
+                    "the account {} holding this session is at its limit",
+                    current.as_str()
+                )),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                tracing::warn!(run_id = id, chat_id = %turn.slot.chat_id, %reason, "refusing the turn");
+                let failed = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&reason)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&pool)
+                .await;
+                crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                drop(turn);
+                drain_queued(&after, &drained_chat).await;
+                return;
+            }
+        }
+        // Held to the end of the turn: dropping it releases the account's slot.
+        let pooled = pick.account_id.take();
+        let reservation = pick.reservation.take();
+        // A kept or warmed process was spawned under one account's credentials and cannot change
+        // them, so a turn on a pooled account always runs one-shot, and a stale kept process of
+        // this chat goes rather than answers.
+        let may_live = may_keep_process(tool_policy, cli) && pooled.is_none();
+        if pooled.is_some() {
+            evict_live(&turn.slot.chat_id);
+        }
+
+        let mut env = chat_key::turn_env(
+            tool_policy,
+            may_live,
+            &pool,
+            &turn.slot.chat_id,
+            id,
+            &control_token,
+        )
+        .await;
+        env.append(&mut pick.env);
+
+        // A turn with no `resume` is a conversation that was deliberately let go of — it read
+        // third-party text, or somebody asked for a fresh context — so a process still holding the
+        // old session has to go rather than be spoken to: answering down it would continue exactly
+        // the conversation that was just ended.
+        //
+        // Pictures used to be here too, because `messages` carried a bare `String` and a later turn
+        // was written with no attachments. `runner::LaterTurn` carries its own, so a screenshot
+        // pasted into the second turn no longer costs the conversation its process.
+        if resume.is_none() {
+            evict_live(&turn.slot.chat_id);
+        }
+
+        // Section 6 gives conversations machine knowledge only. Claude receives it through the
+        // per-invocation system flag so resumed history does not accumulate copies. Codex rejects
+        // that flag, so it receives no block. A conversation is not an outcome, so D15 adds no
+        // briefing trace here.
+        // A turn a kept process will serve never reads the briefing: the block travels as a
+        // per-spawn system flag, which a kept process ignores. Decided HERE, after the eviction
+        // above, so a conversation let go of is never taken for one the process will answer.
+        let fingerprint = spawn_fingerprint(&answering, doctrine.as_deref(), tool_policy);
+        let kept = may_live
+            && kept_process_fits(
+                &turn.slot.chat_id,
+                &fingerprint,
+                cwd.as_deref(),
+                permission,
+                resume.as_deref(),
+            );
+        // A process warmed ahead of this turn was spawned before there was a message to choose a
+        // briefing against (see `UNBRIEFED`): its first turn still asks for one, and when there is
+        // one the warmed process gives way to a process that carries it.
+        let warmed_unbriefed = take_unbriefed(&turn.slot.chat_id);
+        let knowledge = if briefing_wanted(cli, kept && !warmed_unbriefed) {
+            crate::brief::for_prompt(
+                &pool,
+                &crate::knowledge::Context::for_project(None),
+                &text,
+                "assistant",
+            )
+            .await
+            .and_then(|briefing| briefing.block)
+        } else {
+            None
+        };
+        if kept && knowledge.is_some() {
+            evict_live(&turn.slot.chat_id);
+        }
+        // Skipped for the kept process alone: if that process is gone when the turn reaches it, the
+        // turn spawns one, and the spawn reads the briefing the turn did not.
+        let late_briefing: Option<LateBriefing> = (cli == "claude" && kept && !warmed_unbriefed)
+            .then(|| {
+                let pool = pool.clone();
+                let text = text.clone();
+                Box::pin(async move {
+                    crate::brief::for_prompt(
+                        &pool,
+                        &crate::knowledge::Context::for_project(None),
+                        &text,
+                        "assistant",
+                    )
+                    .await
+                    .and_then(|briefing| briefing.block)
+                }) as LateBriefing
+            });
+
+        let mut request = chat_run_request(
+            text,
+            images,
+            env,
+            cwd,
+            permission,
+            resume,
+            session_id,
+            turn.mcp_path.clone(),
+            tool_policy,
+            answering,
+            doctrine,
+            cli,
+            knowledge.as_deref(),
+        );
+
+        // What this turn itself wrote into the model's prompt, priced off the request that is about
+        // to become an argument vector, and priced HERE because `request` is moved into `serve_turn`
+        // on the very next statement and nothing downstream sees these values again.
+        //
+        // This is the launcher the measurement exists for. `runs::spawn_run` records the same thing
+        // and sets `mcp_config: None`, so every row it writes carries a schema cost of zero — a
+        // real zero, and correct, but it means the largest term in the sum was measured against the
+        // one launcher that never pays it. A chat turn carries `--mcp-config` on every single turn,
+        // and the schema block it pays for is the biggest thing the daemon puts in front of the
+        // model.
+        //
+        // Best effort by way of `record_authored_prompt`, which writes nothing on `None` and
+        // swallows its own database error: this is bookkeeping about a turn somebody is waiting
+        // for, and it may not be the reason that turn fails. The runner decides whether there is
+        // anything to say at all — a chat answered by a fake or by the Codex CLI authors no prompt
+        // this daemon can price, and answers `None`, which leaves the column NULL rather than
+        // claiming a zero.
+        crate::execution::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request))
+            .await;
+        // Armed after the permission snapshot and before the runner holds the sender, for that
+        // snapshot's reason: nothing the CLI does can precede what its row says about it.
+        request.request_tx =
+            crate::execution::runs::watch_model_request(&pool, id, runner.as_ref()).await;
+
+        // Dropped with this future, so the follower never outlives the turn (cancel included).
+        let _task_follower = follow_task_events(
+            pool.clone(),
+            turn.slot.chat_id.clone(),
+            id,
+            std::sync::Arc::clone(&transcript),
+        );
+        let result = serve_turn_briefed(
+            &runner,
+            request,
+            session_tx,
+            // The published buffer, so what the window watches is what the CLI is writing.
+            //
+            // Still not the turn's PRODUCT: the reply is what `extract_reply` pulls out of the
+            // `result` event of a completed run, and a turn the turn's deadlines killed has no reply to
+            // salvage. This is the same distinction as before — the stream is transport, the result
+            // is the answer — with the transport now visible while it moves.
+            &transcript,
+            &turn.slot.chat_id,
+            deadlines,
+            may_live,
+            // A rooted turn that may keep a process is re-keyed by `serve_turn` when it spawns one.
+            may_live.then_some(&pool),
+            // What this conversation's process must have been spawned with to serve this turn.
+            &fingerprint,
+            late_briefing,
+        )
+        .await;
+        // Records the cache usage on the account and reads the output for a limit error. A turn
+        // that never produced an outcome records nothing.
+        if let (Some(account), Ok(Ok(o))) = (pooled.as_ref(), &result) {
+            crate::accounts::launch_chat::after_chat_turn(
+                &pool,
+                &turn.slot.chat_id,
+                account,
+                cli,
+                o.cache_creation_tokens.unwrap_or_default(),
+                o.cache_read_tokens.unwrap_or_default(),
+                &o.stdout,
+                &o.stderr,
+                chrono::Utc::now(),
+            )
+            .await;
+        }
+        drop(reservation);
+        // The process this turn kept (if any) learns what it has now served, before anything can
+        // read it between turns.
+        // Only a turn that could have run in the kept process: a one-shot turn never touched it, and
+        // its mode is not one that process served.
+        if may_live {
+            note_served_by_kept(&turn.slot.chat_id, id, mode.as_str(), &pool);
+        }
+        let completed_at = chrono::Utc::now().to_rfc3339();
+
+        // Each terminal write below is guarded on the turn still being `running`. A `/cancel` aborts
+        // this task, but the abort lands only where this future is next dropped — so a cancel that
+        // already wrote its status can still be followed by one last wake-up here, and an unguarded
+        // write would report a completed turn for a CLI that was killed. First writer wins; no rows
+        // means the turn was finalised elsewhere, which is an outcome, not an error.
+        //
+        // What a linked browser agent's completed turn answered, handed to its parent once the slot
+        // below is free. Failed, cancelled and timed-out turns leave it `None`: they deliver nothing.
+        let mut linked_reply: Option<String> = None;
+        // The fill of a turn that completed, for the automatic-compaction trigger once the slot is
+        // free; `None` on every other outcome.
+        let mut auto_fill: Option<i64> = None;
+        match result {
+            // A turn's product is the `result` event, and a CLI that exited without one answered
+            // nothing. That is a failed turn, not a completed one — and emphatically not a turn
+            // whose raw stream can stand in for the reply it never wrote. The stream is transport:
+            // `init` events, session ids, and whatever the `SessionStart` hook injected as
+            // `additionalContext`. Handing it to a chat as the answer published the whole hook body
+            // to Telegram — internal context, delivered under `status = 'completed'`, so nothing
+            // downstream had any reason to treat it as the breakage it was.
+            //
+            // The reader gets the stderr instead, which is where the CLI says why it stopped. When
+            // the tool-policy barrier kills a turn that line names the offending tools, so the chat
+            // shows the actual fault rather than a wall of JSON.
+            Ok(Ok(o)) => match settled_reply(&o.stdout) {
+                Some((status, reply)) => {
+                    // Read out of the same stream the reply came from, and stored beside it. The
+                    // live tail is taken away the instant this turn ends, so without this the
+                    // actions are visible while the turn runs and gone for ever afterwards.
+                    //
+                    // Serialised here rather than kept as rows: it is read only with the turn it
+                    // belongs to, and a table would be a join for something no query ever asks
+                    // about on its own. An empty list is stored as `[]`, which says "acted on
+                    // nothing" — NULL is reserved for turns nobody asked.
+                    let live = crate::execution::runner::live_from_stream(&o.stdout);
+                    let tools_used =
+                        serde_json::to_string(&live.did).unwrap_or_else(|_| "[]".to_string());
+                    // The same argument as the line above, about the other half of the stream. The
+                    // reasoning is discarded with the live tail the instant the turn ends, so
+                    // without a column it is visible only while the turn runs — and a conversation
+                    // reopened tomorrow shows a conclusion with nothing behind it.
+                    let thought =
+                        serde_json::to_string(&live.thought).unwrap_or_else(|_| "[]".to_string());
+                    // And the measurement, which unlike the words is actually there. See
+                    // `0093_runs_thought_tokens.sql` for what the CLI does and does not send.
+                    let thought_tokens = live.thought_tokens;
+                    // Read out of the same stream, and stored here because this is where an
+                    // assistant turn ends. `runs.rs` does the equivalent at its own terminal write,
+                    // and a chat turn never passes through it — so the column stayed null on every
+                    // conversation, and the window meter under each turn had nothing to draw.
+                    //
+                    // Cache-read tokens count as context because they occupy the window exactly as
+                    // fresh input does. A resumed conversation is nearly all cache: reading only
+                    // `input_tokens` would report a session at 96k as sitting at 9k.
+                    let claude_fill = o.stdout.lines().fold(None, |fill, line| {
+                        crate::execution::runner::context_fill_from_line(line, fill)
+                    });
+                    // Codex's `turn.completed` carries the session's running total, not the window, so
+                    // its figure is read from the thread's rollout file. That is synchronous fs work,
+                    // hence `spawn_blocking`; it is skipped for any other engine and whenever the
+                    // Claude stream already gave a figure.
+                    let context_fill = match (claude_fill, o.session_id.clone()) {
+                        (None, Some(thread_id)) if cli == "codex" => {
+                            tokio::task::spawn_blocking(move || {
+                                // Without a resolvable home there is nothing to read: an empty path
+                                // would scan the working directory.
+                                let home = codex_home_now()?;
+                                rotation_fill(None, "", Some(&thread_id), &home)
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                        (claude_fill, _) => claude_fill,
+                    };
+                    // Taken off the outcome and not re-derived from the transcript beside it: on the
+                    // multi-turn path the transcript belongs to a PROCESS that may have served several
+                    // answers, and this is a fact about ONE of them. `RunOutcome` is where the
+                    // splitter already put the right turn's copy.
+                    let compacted = o.compacted;
+                    // What the Chats window needs for its cache countdown and its model label,
+                    // read off the same stream.
+                    let cache_ttl = crate::execution::runner::cache_ttl_from_stream(&o.stdout);
+                    let model = crate::execution::runner::model_from_stream(&o.stdout);
+                    // The tokens and the turn count too, which every other terminal write in the
+                    // core already takes off the outcome and this one did not: a chat turn read back
+                    // "none recorded" under numbers the runner had measured and handed it.
+                    // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
+                    crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
+                        .await;
+                    let completed = sqlx::query(
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, model_requested_at = COALESCE(model_requested_at, CASE WHEN ? THEN ? END), cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(status)
+                    .bind(o.exit_code)
+                    .bind(&reply)
+                    .bind(&o.stderr)
+                    .bind(&o.session_id)
+                    .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
+                    .bind(o.num_turns)
+                    .bind(&tools_used)
+                    .bind(&thought)
+                    .bind(thought_tokens)
+                    .bind(context_fill)
+                    .bind(compacted)
+                    // Repairs a lost marker write: `COALESCE` keeps the recorder's own time.
+                    .bind(o.model_requested)
+                    .bind(&completed_at)
+                    .bind(cache_ttl)
+                    .bind(&model)
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    crate::execution::runs::warn_on_terminal_write_err(&completed, id, status);
+                    if status == "completed"
+                        && completed
+                            .as_ref()
+                            .is_ok_and(|written| written.rows_affected() > 0)
+                    {
+                        linked_reply = reply.clone();
+                        // A turn that finished ends the streak of restart interruptions.
+                        crate::chats::auto_resume::reset(&pool, &turn.slot.chat_id).await;
+                    }
+                    if let Some(session_id) = o.session_id.as_deref() {
+                        // `get_session` would refuse to resume this session anyway, by looking at the
+                        // runs that produced it. Dropping the row here as well closes the one case that
+                        // check cannot see: a session recorded against a run that never took the id has
+                        // nothing pointing at it, so nothing marks it as having read anything.
+                        match crate::execution::runs::read_untrusted_context(&pool, id).await {
+                            Ok(false) => {
+                                let _ = upsert_session(
+                                    &pool,
+                                    &turn.slot.chat_id,
+                                    session_id,
+                                    &completed_at,
+                                )
+                                .await;
+                            }
+                            // Including the error: a turn whose record cannot be read is not a turn
+                            // that can be shown to be clean.
+                            _ => {
+                                let _ = forget_session(&pool, &turn.slot.chat_id).await;
+                            }
+                        }
+                    }
+                    // Invisible root rotation. After the session block on purpose: the upsert above
+                    // would otherwise recreate the session `rotate` just forgot. A completed turn
+                    // only; a cancelled one has not settled anything worth carrying forward. Never
+                    // a compaction turn: its settle consumes the rotation (`consume_older`).
+                    if status == "completed" {
+                        auto_fill = context_fill;
+                        rotate_after_turn(
+                            &pool,
+                            daemon_runner.as_ref(),
+                            utility_model.clone(),
+                            &turn.slot.chat_id,
+                            id,
+                            context_fill,
+                        )
+                        .await;
+                    }
+                }
+                // `stdout` is left NULL rather than filled with the stream: there is no reply, and a
+                // column that says so is honest.
+                //
+                // Nothing is done about the session here, matching the failure and timeout arms
+                // below. Not an omission — the id was already recorded when the CLI announced it,
+                // by the task above, and it stays recorded on every path that does not complete. A
+                // turn killed at the tool-policy barrier died before it could call anything, so the
+                // session it leaves has read nothing and is safe to resume; the read-side check in
+                // `get_session` is what decides that, and it decides it the same way here.
+                //
+                // The measurements are kept for the reason the cost is: a turn that answered nothing
+                // still spent what it spent, and one stopped at its ceiling has read the most.
+                None => {
+                    // A silence kill is a timeout, as `runs.rs` records it.
+                    let status =
+                        if o.exit_code == crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE {
+                            "timed_out"
+                        } else {
+                            "failed"
+                        };
+                    // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
+                    crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
+                        .await;
+                    let failed = sqlx::query(
+                        "UPDATE runs SET status = ?, exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, model_requested_at = COALESCE(model_requested_at, CASE WHEN ? THEN ? END), completed_at = ? WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(status)
+                    .bind(o.exit_code)
+                    // Never empty: a failed turn with no stderr would show the owner no reason.
+                    .bind(failure_text(&o.stderr, Some(o.exit_code)))
+                    .bind(&o.session_id)
+                    .bind(o.cost_usd)
+                    .bind(o.input_tokens)
+                    .bind(o.output_tokens)
+                    .bind(o.cache_read_tokens)
+                    .bind(o.cache_creation_tokens)
+                    .bind(o.num_turns)
+                    .bind(o.model_requested)
+                    .bind(&completed_at)
+                    .bind(&completed_at)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
+                    crate::execution::runs::warn_on_terminal_write_err(&failed, id, status);
+                }
+            },
+            Ok(Err(e)) => {
+                let failed = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(failure_text(&e.to_string(), None))
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await;
+                crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+            }
+            Err(_) => {
+                let timed_out = sqlx::query(
+                    "UPDATE runs SET status = 'timed_out', completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&completed_at)
+                .bind(id)
+                .execute(&pool)
+                .await;
+                crate::execution::runs::warn_on_terminal_write_err(&timed_out, id, "timed_out");
+            }
+        }
+        // After the session upsert, so a done `/compact` forgets the session for good.
+        super::compaction::settle(&pool, id).await;
+
+        // Dropped HERE rather than at the end of the block: dropping the guard releases the chat's
+        // slot, and a slot armed by `drain_on_release` sends what waited from a task of its own, so
+        // the next turn never starts inside this one's registered task (whose handle would still be
+        // in `run_handles` and whose end would cut it short). Draining is the slot's job, not this
+        // task's.
+        // An answer the process began on its own before this turn's message was set aside by
+        // `serve_turn`; it is recorded now, while this turn still holds the slot, so the next turn
+        // cannot set another aside before this one is written.
+        record_set_aside(&after, &drained_chat).await;
+        drop(turn);
+        // The final state is written; a turn that ran long tells an owner who may have walked away.
+        crate::channels::owner_notice::long_turn_ended(
+            &after,
+            &drained_chat,
+            started.elapsed(),
+            from_channel,
+        )
+        .await;
+        // Automatic compaction runs in a task of its own, for the reason given above: the
+        // compaction turn must not start inside this one's registered task.
+        // An unknown fill never fires, so a turn without one needs no task.
+        if auto_fill.is_some() {
+            let (state, chat) = (after.clone(), drained_chat.clone());
+            tokio::spawn(async move {
+                super::compaction::maybe_auto_compact(&state, &chat, id, auto_fill).await;
+            });
+        }
+        // A linked child's answer travels to its parent now that this chat's slot is free. An
+        // unlinked chat costs one read inside `deliver_reply`. A compaction's handoff is a summary
+        // for this chat's own next turn, not an answer. Read here, last, because `start_as` files
+        // the row after spawning the turn.
+        if let Some(reply) = linked_reply
+            && !super::compaction::is_compaction(&pool, id).await
+        {
+            super::linked::deliver_reply(&after, &drained_chat, id, &reply).await;
+        }
+        // The process this turn kept is read from here on, so a background task's own answer is not
+        // left waiting for the next person's turn.
+        watch_between_turns(&after, &drained_chat);
+    });
+}
+
+/// The Codex home of this process: `$CODEX_HOME`, else `<user home>/.codex`, in the order
+/// `model_catalog` uses for its own Codex cache.
+fn codex_home_now() -> Option<std::path::PathBuf> {
+    crate::execution::runner::codex_home_dir(
+        std::env::var("CODEX_HOME").ok(),
+        std::env::var("USERPROFILE")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok()),
+    )
+}
+
+/// The context fill of a CLI turn: the Claude figure when there is one, else Codex's. Codex has no
+/// `assistant` usage events, and its `turn.completed` `usage.input_tokens` is the session's running
+/// total rather than the window, so the figure is the thread's last `token_count` in its rollout
+/// under `codex_home`. `_stdout` is not read: the tests pin the four-argument shape, and their
+/// point is exactly that the stream's cumulative figure must not stand in.
+fn rotation_fill(
+    claude: Option<i64>,
+    _stdout: &str,
+    thread_id: Option<&str>,
+    codex_home: &std::path::Path,
+) -> Option<i64> {
+    claude.or_else(|| {
+        thread_id.and_then(|thread_id| {
+            crate::execution::runner::codex_rollout_fill(codex_home, thread_id)
+        })
+    })
+}
+
+/// Rotates the chat after a completed turn when `rotation::rotate` says so. Never fails, and never
+/// rotates on a compaction turn, whose settle consumes the rotation (`consume_older`).
+async fn rotate_after_turn(
+    pool: &SqlitePool,
+    runner: &dyn crate::execution::runner::CommandRunner,
+    utility_model: Option<String>,
+    chat_id: &str,
+    run_id: i64,
+    fill: Option<i64>,
+) {
+    if super::compaction::is_compaction(pool, run_id).await {
+        return;
+    }
+    // Deterministic unless `NUCLEOS_ROOT_ROTATE_LLM` is on; any failure of the model falls back to
+    // it inside the summarizer.
+    let one_shot = rotation::RunnerModel {
+        runner,
+        model: utility_model,
+    };
+    let summarizer = rotation::LlmSummarizer::new(&one_shot, rotation::llm_enabled());
+    match rotation::rotate(
+        pool,
+        &*rotation::root_nodes(pool),
+        &summarizer,
+        chat_id,
+        run_id,
+        fill,
+    )
+    .await
+    {
+        // The kept process still holds the old session; stop it now rather than rely on the next
+        // turn noticing (it would, through `resume.is_none()`, but a spontaneous answer between
+        // turns would be spoken down it).
+        Ok(true) => evict_live(chat_id),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(%error, run_id, "root rotation failed; the session stays");
+        }
+    }
+}
+
+/// Runs [`after_local_turn`] in a task of its own.
+///
+/// A plain function on purpose, like `spawn_assistant_turn`: a compaction it starts comes back
+/// through `send_message_inner` to `spawn_local_turn`, so spawning that future from inside
+/// `spawn_local_turn`'s own body would make the compiler need that function's future type to prove
+/// its own `Send`, which is a cycle.
+fn spawn_after_local_turn(
+    state: crate::state::AppState,
+    chat_id: String,
+    run_id: i64,
+    fill: Option<i64>,
+) {
+    tokio::spawn(async move {
+        after_local_turn(&state, &chat_id, run_id, fill).await;
+    });
+}
+
+/// What a local/OpenRouter chat turn does once its row is written and its slot released: automatic
+/// compaction on the estimated `fill`. Without a figure it does nothing, because no value is
+/// invented.
+///
+/// It does not rotate. Only the CLI path consumes pending rotations (`take_pending`,
+/// `rotated_prompt`); a local chat resends its own history and has no session to rotate, so a
+/// rotation here would only add a `root_rotations` row and requeue a distillation whose prefix never
+/// reaches the engine.
+pub(super) async fn after_local_turn(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    run_id: i64,
+    fill: Option<i64>,
+) {
+    if fill.is_none() {
+        return;
+    }
+    super::compaction::maybe_auto_compact(state, chat_id, run_id, fill).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::runner::FakeCommandRunner;
+    use crate::state::AppState;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A Codex stream whose `turn.completed` reports the SESSION's running total (130k) while the
+    /// window actually holds far less. The thread id is the one `thread.started` announces.
+    const CODEX_STREAM_CUMULATIVE_130K: &str = concat!(
+        r#"{"type":"thread.started","thread_id":"thread-aaa"}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":130000,"cached_input_tokens":120000,"output_tokens":90}}"#,
+        "\n",
+    );
+
+    /// A rollout holding one `token_count` of the real shape: `total_token_usage` is cumulative,
+    /// `last_token_usage` is the latest round (the window).
+    fn write_codex_rollout(home: &std::path::Path, thread_id: &str, last_input: i64) {
+        let dir = home.join("sessions/2026/10/30");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = format!(
+            r#"{{"timestamp":"2026-10-30T23:13:36.661Z","ordinal":22,"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":130000,"total_tokens":130090}},"last_token_usage":{{"input_tokens":{last_input},"total_tokens":{}}},"model_context_window":475000}}}}}}"#,
+            last_input + 90
+        );
+        std::fs::write(
+            dir.join(format!("rollout-2026-10-30T23-13-31-{thread_id}.jsonl")),
+            line,
+        )
+        .unwrap();
+    }
+
+    /// What `turn.rs` does with the figure after a completed turn: rotation on the root, then
+    /// automatic compaction. `true` for each that would fire at the 120k soft limit.
+    async fn fires(fill: Option<i64>) -> (bool, bool) {
+        struct OneRoot;
+        #[async_trait::async_trait]
+        impl crate::assistant::rotation::RootNodes for OneRoot {
+            async fn active_root_for_chat(&self, _: &str) -> Option<String> {
+                Some("root-1".into())
+            }
+            async fn has_waiting_child(&self, _: &str) -> bool {
+                false
+            }
+            async fn brief_text(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let rotates = crate::assistant::rotation::should_rotate(&OneRoot, "chat", fill, 120_000)
+            .await
+            .is_some();
+        let compacts = crate::assistant::compaction::should_auto_compact(
+            fill,
+            120_000,
+            None,
+            crate::assistant::compaction::AutoCompactGuards::default(),
+        );
+        (rotates, compacts)
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_with_a_130k_session_total_but_a_16k_window_neither_rotates_nor_compacts()
+    {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 16_000);
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, Some(16_000));
+        assert_eq!(fires(fill).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_whose_rollout_says_130k_rotates_and_compacts() {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 130_000);
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, Some(130_000));
+        assert_eq!(fires(fill).await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_without_a_rollout_has_no_figure_and_neither_rotates_nor_compacts() {
+        // An empty home: no rollout for the thread. The 130k in `turn.completed` must not stand in.
+        let home = tempfile::tempdir().unwrap();
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, None);
+        assert_eq!(fires(fill).await, (false, false));
+        // No thread id at all behaves the same.
+        assert_eq!(
+            rotation_fill(None, CODEX_STREAM_CUMULATIVE_130K, None, home.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn rotation_fill_prefers_claude_over_codex() {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 16_000);
+        assert_eq!(
+            rotation_fill(
+                Some(500),
+                CODEX_STREAM_CUMULATIVE_130K,
+                Some("thread-aaa"),
+                home.path()
+            ),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn rotation_fill_is_none_when_no_engine_measured_one() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(rotation_fill(None, "plain text", None, home.path()), None);
+    }
+
+    pub(super) async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
+        AppState {
+            startup_config: Default::default(),
+            token: crate::auth::Token("t".into()),
+            pool: crate::testdb::fresh_pool().await,
+            channels: Default::default(),
+            runner,
+            triage_runner: None,
+            local_triage_disabled: None,
+            utility_model: None,
+            assistants: Arc::new(crate::assistants::NoAssistants),
+            run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
+            fleet: Default::default(),
+            turns: Default::default(),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: Arc::new(crate::state::EmailRuntime::default()),
+            voice: Arc::new(crate::integrations::voice::VoiceRuntime::default()),
+            browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: Arc::new(crate::integrations::web::WebRuntime::disabled()),
+            quota: Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
+            council: Arc::new(crate::council::CouncilRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// A failed turn always carries a reason: the CLI's stderr when it wrote some, else a line
+    /// naming the exit code.
+    #[test]
+    fn a_failed_turn_never_records_an_empty_error() {
+        assert_eq!(
+            failure_text("", Some(137)),
+            "turn failed with no error output (exit 137)"
+        );
+        assert_eq!(
+            failure_text("  \n", Some(1)),
+            "turn failed with no error output (exit 1)"
+        );
+        assert_eq!(failure_text("", None), "turn failed with no error output");
+        assert_eq!(failure_text("boom\n", Some(1)), "boom");
+        let long = format!("{}END", "x".repeat(5000));
+        let kept = failure_text(&long, Some(1));
+        assert!(kept.ends_with("END") && kept.len() < 2100, "{}", kept.len());
+    }
+
+    /// A cancelled turn keeps the words it had said, never the raw stream-json (hook lines and all).
+    #[test]
+    fn a_cancelled_turn_stores_text_not_the_raw_stream() {
+        let stream = concat!(
+            r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:resume"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+        );
+        assert_eq!(settled_reply(stream), Some(("cancelled", None)));
+
+        let said = format!(
+            "{}\n{stream}",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"half an answer"}]}}"#
+        );
+        let (status, reply) = settled_reply(&said).expect("a cancelled turn settles");
+        assert_eq!(status, "cancelled");
+        assert_eq!(reply.as_deref(), Some("half an answer"));
+    }
+
+    /// A linked browser agent's turn that completes hands its answer to its mother, as a relay the
+    /// child's turn sent, once the child's slot is free: no caller has to fetch it.
+    #[tokio::test]
+    async fn finishing_a_linked_childs_turn_delivers_its_reply() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let mother = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let child = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &child, Some("Flights"))
+            .await
+            .unwrap();
+        crate::chats::links::open(&state.pool, &child, Some(&mother), "browser", None)
+            .await
+            .expect("link the child to its mother");
+        let mother_turn: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('find flights', 'completed', 'assistant', ?, 'shell', ?) RETURNING id",
+        )
+        .bind(&mother)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let task_relay: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES (?, ?, ?, 'find flights', 1, ?) RETURNING id",
+        )
+        .bind(&mother)
+        .bind(&child)
+        .bind(mother_turn)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let child_turn = crate::assistant::send_relayed_message(
+            &state,
+            &child,
+            "find flights",
+            crate::assistant::Origin::Shell,
+            task_relay,
+        )
+        .await
+        .unwrap();
+
+        let mut delivered: Option<(i64, String, i64)> = None;
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            delivered = sqlx::query_as(
+                "SELECT r.id, r.prompt, c.sending_run_id
+                   FROM runs r JOIN chat_relays c ON c.id = r.from_relay_id
+                  WHERE r.chat_id = ? AND c.from_chat_id = ?",
+            )
+            .bind(&mother)
+            .bind(&child)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            if delivered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&child);
+        let (parent_turn, prompt, sending_run_id) =
+            delivered.expect("the child's finished turn was never delivered to its mother");
+        assert_eq!(
+            sending_run_id, child_turn,
+            "the relay is sent by the child's turn"
+        );
+        assert_eq!(prompt, "[browser agent · Flights] fake output");
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(parent_turn)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&mother);
+    }
+
+    /// A mother with a live heartbeat (so a delivery would go through) and a browser-agent child
+    /// linked to her, the child with one answered exchange for a compaction to summarise.
+    async fn linked_pair(state: &AppState) -> (String, String) {
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let mother = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let child = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::links::open(&state.pool, &child, Some(&mother), "browser", None)
+            .await
+            .expect("link the child to its mother");
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, stdout, created_at)
+             VALUES ('q', 'completed', 'assistant', ?, 'shell', 'a', ?)",
+        )
+        .bind(&child)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (mother, child)
+    }
+
+    /// Relays the child's turns have sent to anyone, delivered, queued or refused.
+    async fn relays_from(pool: &sqlx::SqlitePool, chat: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays WHERE from_chat_id = ?")
+            .bind(chat)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Compacts the linked child (`auto` is whether the daemon started it), waits for the turn to
+    /// end and for anything it would deliver afterwards, and returns the relays the child sent.
+    async fn relays_after_compacting_a_linked_child(auto: bool) -> i64 {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        let (mother, child) = linked_pair(&state).await;
+
+        let run = crate::assistant::compaction::start_as(&state, &child, "/compact", None, auto)
+            .await
+            .unwrap();
+
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
+                    .bind(run)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            if status != "pending" && !super::super::is_busy(&child) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The delivery, when there is one, runs right after the slot is released.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let sent = relays_from(&state.pool, &child).await;
+        evict_live(&child);
+        evict_live(&mother);
+        sent
+    }
+
+    /// The handoff of a compaction is a summary for the chat's own next turn; delivered to the
+    /// mother it would read as the child's answer to her task.
+    #[tokio::test]
+    async fn a_typed_compact_in_a_linked_child_delivers_nothing_to_the_mother() {
+        assert_eq!(relays_after_compacting_a_linked_child(false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_automatic_compaction_in_a_linked_child_delivers_nothing_to_the_mother() {
+        assert_eq!(relays_after_compacting_a_linked_child(true).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_turn_in_a_linked_child_still_delivers_to_the_mother() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        let (mother, child) = linked_pair(&state).await;
+
+        send_message(&state, &child, "go on", Origin::Shell)
+            .await
+            .unwrap();
+
+        let mut sent = 0;
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            sent = relays_from(&state.pool, &child).await;
+            if sent > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&child);
+        evict_live(&mother);
+        assert_eq!(sent, 1);
+    }
+
+    /// A declined chat is not re-evaluated on every poll: it is left alone for the TTL, and only it.
+    #[test]
+    fn a_declined_prewarm_is_not_re_evaluated_inside_the_ttl() {
+        let mut declined = std::collections::HashMap::new();
+        let at = Instant::now();
+
+        note_declined_in(&mut declined, "declined-chat", at);
+
+        assert!(declined_within(
+            &declined,
+            "declined-chat",
+            at + Duration::from_secs(10)
+        ));
+        assert!(
+            !declined_within(&declined, "another-chat", at + Duration::from_secs(10)),
+            "only the chat that was declined is left alone"
+        );
+        assert!(
+            !declined_within(&declined, "declined-chat", at + DECLINED_TTL),
+            "past the TTL the chat is evaluated again"
+        );
+
+        note_declined_in(&mut declined, "later-chat", at + DECLINED_TTL);
+        assert!(
+            !declined.contains_key("declined-chat"),
+            "an expired entry is dropped rather than kept for ever"
+        );
+    }
+
+    /// A process warmed before there was a message carries no briefing; when the first turn has one
+    /// to give, that turn is answered by a process that carries it instead of losing it.
+    #[tokio::test]
+    async fn a_warmed_process_gives_way_when_the_first_turn_has_a_briefing() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        let chat = "turn-warm-briefed";
+        let root = tempfile::TempDir::new().unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES (?, 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(chat)
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        upsert_session(&state.pool, chat, "sess-briefed", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'memory',
+                     'zanzibar house rule', 'body', 'active',
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let mut warmed = false;
+        // As a transcript's poll does: another test's warm-up holds the one global `WARMING` flag
+        // for a moment, and a call that finds it set does nothing.
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            prewarm_open_chat(&state, chat);
+            warmed = *fake.calls.lock().unwrap() == 1 && has_kept_process(chat);
+            if warmed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(warmed, "opening the chat did not warm its process");
+        let at_warm = fake.last_append_system_prompt.lock().unwrap().clone();
+        assert!(
+            !matches!(at_warm, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
+            "a warmed process has no message to choose a briefing against: {at_warm:?}"
+        );
+
+        let id = send_message(&state, chat, "zanzibar?", Origin::Shell)
+            .await
+            .unwrap();
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the briefed first turn was spoken down the unbriefed warmed process"
+        );
+        let sent = fake.last_append_system_prompt.lock().unwrap().clone();
+        assert!(
+            matches!(sent, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
+            "the first turn after a warm-up lost its briefing: {sent:?}"
+        );
+        evict_live(chat);
+    }
+
+    /// A turn that skipped its briefing because a kept process would serve it, and found that
+    /// process already gone, spawns one that carries the briefing after all.
+    #[tokio::test]
+    async fn a_fallback_spawn_after_a_dead_kept_process_still_carries_the_briefing() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let chat = "turn-dead-kept-briefed";
+
+        // A kept process that fits the turn, and is gone: both ends of its pipes are closed.
+        let (messages, said) =
+            tokio::sync::mpsc::unbounded_channel::<crate::execution::runner::LaterTurn>();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(said);
+        drop(events);
+        let dead = LiveChat::new(
+            messages,
+            events_rx,
+            Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            SpawnShape::blank(),
+            String::new(),
+            None,
+        );
+        relock(&LIVE_CHATS).insert(chat.to_owned(), dead);
+
+        let request = chat_run_request(
+            "zanzibar?".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::execution::runner::Permission::Default,
+            Some("s-1".to_owned()),
+            "s-1".to_owned(),
+            std::env::temp_dir().join("dead-kept-unused.json"),
+            crate::execution::runner::ToolPolicy::Unrestricted,
+            crate::chats::Answering::default(),
+            None,
+            "claude",
+            None,
+        );
+        let late: LateBriefing = Box::pin(async { Some("\n\nzanzibar house rule".to_owned()) });
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> = fake.clone();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_turn_briefed(
+                &runner,
+                request,
+                tx,
+                &transcript,
+                chat,
+                turn_deadlines(
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    crate::execution::runner::ToolPolicy::Unrestricted,
+                ),
+                true,
+                None,
+                "",
+                Some(late),
+            ),
+        )
+        .await;
+
+        let mut sent = None;
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            sent = fake.last_append_system_prompt.lock().unwrap().clone();
+            if sent.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(chat);
+        assert!(
+            matches!(sent, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
+            "the spawn that replaced a dead kept process lost the turn's briefing: {sent:?}"
+        );
+    }
+}
+
+/// A chat bound to agy (plan Node 2, tests 34 and 35). RED: `answering_cli` still returns a bare
+/// `&'static str`, so it can neither refuse nor name `EngineDisabled`.
+///
+/// GREEN contract these tests hold: `answering_cli(&ModelsConfig, Option<&str>) ->
+/// Result<&'static str, EngineDisabled>`, and `EngineDisabled` is a unit-like error implementing
+/// `Debug` and `Display`.
+#[cfg(test)]
+mod agy_chat_tests {
+    use super::*;
+    use crate::assistants::{Assistants, ConfiguredAssistants};
+    use crate::config::{AssistantChoice, ModelsConfig};
+    use crate::engines::agy_test_support::{FakeAgyBin, agy_gate, run_once, run_request};
+    use crate::execution::runner::extract_reply;
+
+    const AGY_MODEL: &str = "agy/gemini-3.8-flash-high";
+
+    #[test]
+    fn chat_bound_to_agy_with_flag_off_is_refused_not_answered_by_claude() {
+        let _gate = agy_gate(false);
+        let config = ModelsConfig::default();
+
+        // Bound by the model id's agy/ prefix.
+        let refused = answering_cli(&config, Some(AGY_MODEL));
+        assert!(matches!(refused, Err(EngineDisabled)), "{refused:?}");
+        assert_eq!(
+            EngineDisabled.to_string(),
+            "this chat uses the agy engine, which is disabled in settings"
+        );
+
+        // Bound by a stored runner on the catalogue row, whatever the model id looks like.
+        let stored = ModelsConfig {
+            assistant_choices: vec![AssistantChoice {
+                id: "some-model".to_string(),
+                label: "Some model".to_string(),
+                brain: "cloud".to_string(),
+                efforts: Vec::new(),
+                runner: Some("agy".to_string()),
+                tools: None,
+                installed: None,
+            }],
+            ..ModelsConfig::default()
+        };
+        let refused = answering_cli(&stored, Some("some-model"));
+        assert!(matches!(refused, Err(EngineDisabled)), "{refused:?}");
+
+        // Nothing else changed: Claude and Codex models are still answered by their own engines.
+        assert!(matches!(
+            answering_cli(&config, Some("claude-opus-4-6")),
+            Ok("claude")
+        ));
+        assert!(matches!(
+            answering_cli(&config, Some("gpt-5.5")),
+            Ok("codex")
+        ));
+        assert!(matches!(answering_cli(&config, None), Ok("claude")));
+    }
+
+    #[tokio::test]
+    async fn chat_on_agy_model_is_answered_by_the_fake_agy_runner() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+
+        let cli = answering_cli(&config, Some(AGY_MODEL));
+        assert!(matches!(cli, Ok("agy")), "{cli:?}");
+
+        let assistants = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            crate::testdb::fresh_pool().await,
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        );
+        let runner = assistants
+            .cli_runner("agy", Some(AGY_MODEL))
+            .expect("an enabled agy row has a runner");
+        let outcome = run_once(runner.as_ref(), "ping")
+            .await
+            .expect("the agy runner spawned the stand-in");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("pong from the fake agy")
+        );
+        assert!(fake.was_launched());
+    }
+
+    /// E16 F5: nothing shows agy honours the PreToolUse hook that makes `Unrestricted` safe, so an agy
+    /// chat is always MCP-only.
+    #[test]
+    fn an_agy_chat_is_never_unrestricted() {
+        use crate::execution::runner::ToolPolicy;
+        assert_eq!(
+            tool_policy_for_engine("agy", ToolPolicy::Unrestricted),
+            ToolPolicy::McpOnly
+        );
+        assert_eq!(
+            tool_policy_for_engine("agy", ToolPolicy::McpOnly),
+            ToolPolicy::McpOnly
+        );
+        for cli in ["claude", "codex"] {
+            for policy in [
+                ToolPolicy::Unrestricted,
+                ToolPolicy::McpOnly,
+                ToolPolicy::None,
+            ] {
+                assert_eq!(tool_policy_for_engine(cli, policy), policy, "{cli}");
+            }
+        }
+    }
+
+    /// E16 F9: if the factory has no runner for agy (the gate closed between two reads), the turn is
+    /// refused, never answered by the daemon's own runner.
+    #[test]
+    fn runner_for_turn_never_answers_agy_with_the_daemon_runner() {
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+        assert_eq!(config.active_runner(), "claude");
+        let daemon: std::sync::Arc<dyn crate::execution::runner::CommandRunner> =
+            std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        // `NoAssistants` answers `None` from `cli_runner`, as a closed gate does.
+        let result = runner_for_turn(
+            &daemon,
+            &crate::assistants::NoAssistants,
+            &config,
+            Some(AGY_MODEL),
+        );
+        assert!(matches!(result, Err(EngineDisabled)));
+        // A claude pin still gets the daemon runner.
+        let claude = runner_for_turn(
+            &daemon,
+            &crate::assistants::NoAssistants,
+            &config,
+            Some("claude-opus-4-6"),
+        );
+        assert!(matches!(claude, Ok((_, "claude"))));
+    }
+
+    /// The chat request for `cli`, as the real caller builds it for an MCP-only chat turn.
+    fn mcp_only_request(cli: &str) -> crate::execution::runner::RunRequest {
+        chat_run_request(
+            "ping".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::execution::runner::Permission::Default,
+            Some("s-1".to_owned()),
+            "s-1".to_owned(),
+            std::env::temp_dir().join("agy-chat-mcp.json"),
+            crate::execution::runner::ToolPolicy::McpOnly,
+            crate::chats::Answering::default(),
+            None,
+            cli,
+            None,
+        )
+    }
+
+    #[test]
+    fn chat_run_request_gives_agy_no_mcp_config_and_keeps_it_for_the_others() {
+        assert!(mcp_only_request("agy").mcp_config.is_none());
+        assert!(mcp_only_request("codex").mcp_config.is_some());
+        assert!(mcp_only_request("claude").mcp_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn real_chat_request_on_agy_reaches_the_runner_in_plan_mode_with_sandbox() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+
+        let assistants = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            crate::testdb::fresh_pool().await,
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        );
+        let runner = assistants
+            .cli_runner("agy", Some(AGY_MODEL))
+            .expect("an enabled agy row has a runner");
+        let request = mcp_only_request("agy");
+        let outcome = run_request(runner.as_ref(), request)
+            .await
+            .expect("the agy runner spawned the stand-in");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("pong from the fake agy")
+        );
+        assert!(fake.was_launched());
+        let args = fake.args();
+        assert!(args.contains("--mode plan"), "{args}");
+        assert!(args.contains("--sandbox"), "{args}");
+    }
+
+    /// E19 F5 at turn level: a rooted chat whose hook is wired would be `Unrestricted` for claude, and
+    /// the turn must still launch agy in plan mode with the sandbox. Driven through `send_message`, so
+    /// it fails if the `tool_policy_for_engine` call in the turn is deleted. A regression guard: the
+    /// override exists today, so this is expected to pass.
+    #[tokio::test]
+    async fn a_rooted_agy_chat_launches_in_plan_mode_with_the_sandbox() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+
+        // A directory whose PreToolUse hook is wired, as `classifier_hook_is_wired` reads it.
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join(crate::governance::autopilot::HOOK_SCRIPT);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "# hook").unwrap();
+        let settings = serde_json::json!({
+            "hooks": {"PreToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!(
+                        "python \"${{CLAUDE_PROJECT_DIR}}/{}\"",
+                        crate::governance::autopilot::HOOK_SCRIPT
+                    ),
+                }]
+            }]}
+        });
+        std::fs::write(
+            root.path().join(".claude/settings.json"),
+            settings.to_string(),
+        )
+        .unwrap();
+        // The premise: for any other engine this chat is `Unrestricted`.
+        assert!(crate::governance::autopilot::classifier_hook_is_wired(
+            root.path()
+        ));
+        assert_eq!(
+            tool_policy_for(
+                Some(&root.path().to_string_lossy()),
+                Origin::Shell,
+                true,
+                crate::relay::Handover::Typed
+            ),
+            crate::execution::runner::ToolPolicy::Unrestricted
+        );
+
+        let mut state = tests::test_state(std::sync::Arc::new(
+            crate::execution::runner::FakeCommandRunner::default(),
+        ))
+        .await;
+        state.assistants = std::sync::Arc::new(ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            state.pool.clone(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        ));
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &chat, Some(AGY_MODEL))
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat, &root.path().to_string_lossy())
+            .await
+            .unwrap();
+
+        let id = crate::assistant::send_message(&state, &chat, "ping", Origin::Shell)
+            .await
+            .expect("the turn was accepted");
+        let mut status = String::new();
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(fake.was_launched(), "agy never ran (status {status})");
+        let args = fake.args();
+        assert!(args.contains("--mode plan"), "{args}");
+        assert!(args.contains("--sandbox"), "{args}");
+    }
+}

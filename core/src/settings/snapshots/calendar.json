@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The calendar's settings.\n\nOnly two things are configurable, because only two things are policy. The zone is what an event\nmeans when the caller does not say; the working window is where a PROPOSAL may land — and it is\nemphatically not when you are busy. Busy comes from real events only, and keeping the two apart\nis what stops \"I do not work Sundays\" from quietly becoming \"tell me nothing on Sundays\".",
+  "properties": {
+    "default_tz": {
+      "default": "",
+      "description": "An IANA name. Empty means \"ask the operating system\", which is right far more often than\nany name written into a default could be.",
+      "type": "string"
+    },
+    "propose_time_for_actions": {
+      "default": false,
+      "description": "Whether an `action`-class message may file a proposal asking for time. Off by default, for\nthe reason spelled out on `calendar::CalendarRuntime::propose_for_actions`.",
+      "type": "boolean"
+    },
+    "working_hours_end": {
+      "default": "18:00",
+      "type": "string"
+    },
+    "working_hours_start": {
+      "default": "09:00",
+      "type": "string"
+    },
+    "working_weekdays": {
+      "default": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri"
+      ],
+      "description": "Lowercase three-letter English day names.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "title": "CalendarConfig",
+  "type": "object"
+}

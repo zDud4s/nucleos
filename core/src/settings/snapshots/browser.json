@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`~/.nucleos/browser.yaml`. The browser pillar's switch and its ceilings (spec §8).\n\nThe site lists are deliberately NOT here, and that omission is the pillar's central invariant:\nthey live in `browser_sites` and grow only when a person finishes a login (spec §5.2). A field in\nthis file would be a way to grant a profile access to a host by editing a gitignored YAML, which\nis exactly the path §5.2 exists to close.\n\nThere is also no field that widens the fence. Spec §6.4: the boundary of §6.2 is not\nconfigurable, because a switch to loosen it is a switch somebody eventually finds a reason to\nflip at 2am.",
+  "properties": {
+    "cache_size_mb": {
+      "default": 100,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "disk_budget_mb": {
+      "default": 3000,
+      "description": "The whole profiles directory, ephemeral included. Reaching it sweeps first and refuses second.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "enabled": {
+      "default": false,
+      "description": "Opt-in, like every pillar that reaches the network. Ships off (spec §14.2).",
+      "type": "boolean"
+    },
+    "load_timeout_seconds": {
+      "default": 30,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_profiles": {
+      "default": 20,
+      "description": "Persistent profiles. Above this the sidecar refuses and names one to forget.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_sessions": {
+      "default": 2,
+      "description": "Live tabs. They compete with the local model for the same card, so this is a ceiling rather\nthan a target.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "title": "BrowserConfig",
+  "type": "object"
+}

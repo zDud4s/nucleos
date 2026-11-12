@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`~/.nucleos/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the\npillar off without comment.",
+  "properties": {
+    "capture_hotkey": {
+      "default": "Ctrl+Alt+N",
+      "description": "Opens the Brain capture box, where the owner types a note into the knowledge store. A chord\nof its own because it neither records nor talks: folding it into one of the other three\nwould make a keystroke that only shows a text box start a microphone.",
+      "type": "string"
+    },
+    "cleanup_prompt": {
+      "default": "Tidy the transcript below. Fix punctuation, capitalisation, and obvious speech-to-text errors. Remove filler words and false starts.\nDo NOT add any information that is not in the transcript.\nDo NOT change the meaning, the tone, or who is asking whom.\nDo NOT answer, summarise, or comment on the content — you are an editor, not a reader.\nDo NOT rephrase or restructure sentences that are already clear, and keep numbers, dates, versions, units and paths exactly as they were said — digits stay digits.\nKeep the original language. Return only the corrected text.",
+      "type": "string"
+    },
+    "closing_words": {
+      "default": [
+        "câmbio"
+      ],
+      "description": "What ends a turn, now that silence does not. A list and not a literal because the spelling a\ntranscriber returns is a measurement, not a decision: `-l auto` picks a language per segment,\nso the same spoken word comes back differently depending on what whisper thought it heard.\nPhase 1 measures those spellings and they are added here.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "confirm_words": {
+      "default": [
+        "sim"
+      ],
+      "description": "What confirms a discard. Throwing away three minutes of thinking on one misheard phrase is\nthe expensive mistake in this pair, so it takes two utterances and not one.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "conversation_hotkey": {
+      "default": "Ctrl+Alt+C",
+      "description": "Toggles hands-free conversation mode. A third chord and not a mode of the first, because the\ntwo do opposite things with the same recording: dictation pastes it into whatever had focus,\nconversation sends it to the agent. A single key that guessed between them would guess wrong\nin the direction that types a question into a terminal.",
+      "type": "string"
+    },
+    "discard_phrase": {
+      "default": "risca isso",
+      "description": "What throws the accumulated turn away. Two tokens, matched as two — `risca` alone is a verb\nsomebody says about code.",
+      "type": "string"
+    },
+    "enabled": {
+      "default": false,
+      "description": "Opt-in, like the email pillar: this one opens a microphone.",
+      "type": "boolean"
+    },
+    "hints": {
+      "default": [],
+      "description": "Terms said often and heard badly. Applied twice on purpose — as decoding bias and as a\ndeterministic pass — so a term is fixed even when the bias was not enough.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "hotkey": {
+      "default": "Ctrl+Alt+Space",
+      "type": "string"
+    },
+    "memo_hotkey": {
+      "default": "Ctrl+Alt+M",
+      "type": "string"
+    },
+    "retain_dictations_days": {
+      "default": 7,
+      "description": "Dictations are a searchable record of everything said, in a pillar whose first requirement is\nprivacy, so they expire. Memos do not: those are documents somebody asked for.",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stt_command": {
+      "default": "",
+      "description": "Split into program + args, with the audio path appended last — the contract the Telegram\nsidecar's transcriber already uses. Whitespace separates; double quotes protect a path that\ncontains spaces, which anything installed under `C:\\Program Files` needs. Empty means there is\nno transcriber, which is indistinguishable from the pillar being off and is treated as such.",
+      "type": "string",
+      "x-widget": "command"
+    },
+    "stt_url": {
+      "default": "",
+      "description": "A resident transcriber on loopback, e.g. `http://127.0.0.1:5018` for whisper.cpp's own\n`whisper-server`.\n\n**Preferred over `stt_command` when both are set**, for the reason `tts_url` is preferred over\n`tts_command`, and by a wider margin than that one. Measured here 2026-09-20 with\n`ggml-small` on an RTX 3060: a 1.3 s clip costs 1250 ms spawned and 96 ms resident, a 5.6 s\nclip 1210 ms against 191 ms. The floor is identical for a one-second clip and a five-second\none because what the spawning path pays for is loading 487 MB of model and waking CUDA, not\ntranscribing. `transcribe.rs` carries the table.\n\nThat floor is why this key exists at all: progressive dictation re-transcribes the sentence\nin flight as it is spoken, and a 1.2 s floor per revision is not progressive.",
+      "type": "string"
+    },
+    "tts_command": {
+      "default": "",
+      "description": "Split into program + args exactly as `stt_command` is, but the text goes on STDIN and a WAV\ncomes back on STDOUT — `speak.rs` explains why the two contracts differ. Empty means the\nnúcleo has no voice, which is a smaller loss than having no transcriber: conversation still\nworks, it just answers in writing.",
+      "type": "string"
+    },
+    "tts_url": {
+      "default": "",
+      "description": "A resident engine on loopback, e.g. `http://127.0.0.1:5017` for Piper's own HTTP server.\n\n**Preferred over `tts_command` when both are set**, because the difference is not marginal:\nmeasured here, spawning costs ~2.8 s of model loading per sentence against ~0.2 s for the\nresident server. `speak.rs` carries the numbers. Somebody who configured both meant the one\nthat works, so this wins rather than erroring — but it says so in the log, because silently\nignoring a line somebody wrote is how a config file stops being believed.",
+      "type": "string"
+    }
+  },
+  "title": "VoiceConfig",
+  "type": "object"
+}

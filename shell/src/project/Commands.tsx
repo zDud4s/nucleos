@@ -1,0 +1,397 @@
+// §spec workspace-de-projeto
+import { useState } from "react";
+import { isApiRefusal } from "../data/client";
+import {
+  outcomeSentence,
+  outcomeTone,
+  useDeclareProjectCommand,
+  useForgetProjectCommand,
+  useProjectCommands,
+  useRunProjectCommand,
+  type ProjectCommand,
+} from "../data/project-commands";
+import {
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  Field,
+  Modal,
+  Quiet,
+  SHORTCUT_HINT,
+  StaleNote,
+  usePaletteGroup,
+  usePaletteOpen,
+} from "../ui";
+import { DAEMON_NAME } from "../copy";
+
+/**
+ * What this project can be asked to do to itself.
+ *
+ * **This is the section a page like this usually dies of**, and §4.6 names the death: a row of
+ * buttons at the foot of the screen with no owner, which is how every dashboard ends up with
+ * fourteen of them. Three rules keep it away, and all three are about *placement* rather than about
+ * restraint:
+ *
+ * 1. **A command that acts on a thing lives in that thing.** Reviewing a run is an action about
+ *    that slot, so it is drawn inside the slot — it is not here and never will be.
+ * 2. **The bar holds the gates.** A gate's last verdict is a fact you want without asking: *is this
+ *    green*. That is what earns a permanent place at the foot of the page.
+ * 3. **Everything else is in the palette.** A verb you go looking for by name does not need to be
+ *    on the screen while you are not looking for it. There is one palette door.
+ *
+ * Nothing lands in the bar by accumulating there. A command is in it because somebody marked it a
+ * gate, which is a claim about what its result means.
+ */
+
+export interface CommandsProps {
+  projectId: string;
+}
+
+export function Commands({ projectId }: CommandsProps) {
+  const commands = useProjectCommands(projectId);
+  const run = useRunProjectCommand();
+  const [managing, setManaging] = useState(false);
+  const openPalette = usePaletteOpen();
+  const rows = commands.data ?? [];
+
+  usePaletteGroup({
+    id: "project-commands",
+    heading: `Run in ${projectId}`,
+    items: rows.map((row) => ({
+      id: `project-command-${row.id}`,
+      label: (
+        <>
+          <span className="text-text">{row.name}</span>
+          <span className="ml-2 font-mono text-xs text-text-faint">{row.command}</span>
+        </>
+      ),
+      match: `${row.name} ${row.command}`,
+      disabled: row.last?.outcome === "running",
+      // The outcome belongs to the palette's own trailing slot and is drawn there ONCE. It
+      // used to be in the label as well, left over from the page-local palette this group
+      // replaced: two `margin-left: auto` spans in one flex row split the free space between
+      // them, so the same sentence appeared twice with a gap torn through the middle.
+      hint: outcomeSentence(row.last),
+      run: () => run.mutate({ projectId, id: row.id }),
+    })),
+  });
+
+  if (commands.data === undefined) {
+    // A read that failed is not a read still coming, and must not keep saying it is.
+    return commands.isError ? (
+      <ErrorNote>The {DAEMON_NAME} did not say which commands this project declares.</ErrorNote>
+    ) : (
+      <p className="text-sm text-text-faint">Reading this project's commands…</p>
+    );
+  }
+
+  /*
+    The last good list, dated. A gate's verdict is the one thing on this bar somebody reads as
+    "is it green now", and a verdict from before the connection dropped must not pass for that.
+  */
+  const stale = commands.isError ? <StaleNote dataUpdatedAt={commands.dataUpdatedAt} /> : null;
+
+  const gates = rows.filter((row) => row.is_gate);
+  const refused = run.isError && isApiRefusal(run.error) ? run.error : null;
+
+  /*
+    A real button, outlined, at the row's trailing edge; the form it opens is a modal over a dimmed
+    page, the owner's call for every control on this page that opens something. It was an
+    underlined word beside the ⓘ, and the form unfolded inside the Setup row.
+  */
+  const declare = (
+    <Button variant="ghost" onClick={() => setManaging(true)}>
+      declare a command
+    </Button>
+  );
+  const manage = (
+    <Modal open={managing} onOpenChange={setManaging} title="Commands" size="md">
+      {managing ? <Manage projectId={projectId} rows={rows} /> : null}
+    </Modal>
+  );
+
+  /*
+    Nothing declared, and nobody halfway through declaring one. The sentence about declaration
+    rather than detection is kept and not cut — "nothing declared yet" on its own reads as a list
+    that failed to load, and this one never fills itself — but it is worth a click rather than a
+    paragraph of every visit. The one gesture that would fill the section stays in front of you.
+  */
+  if (rows.length === 0) {
+    return (
+      <>
+        <Quiet says="none declared" action={declare}>
+          A command is a name, something to run, and whether its result is a verdict on the project:
+          declaration rather than detection, so a list nobody agreed to cannot appear on its own.
+        </Quiet>
+        {stale}
+        {manage}
+      </>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      {stale}
+      {rows.length === 0 ? null : (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            {gates.length === 0 ? (
+              /*
+                No gate is a state, not an empty bar. A project with commands and none of them
+                marked a verdict has nothing to say about being green, and saying nothing is more
+                honest than drawing a bar of verbs that were never claimed to mean anything.
+              */
+              <Quiet
+                says={`No command here is marked a gate, so nothing on this page claims to say whether ${projectId} is green.`}
+              />
+            ) : (
+              gates.map((row) => (
+                <GateButton
+                  key={row.id}
+                  row={row}
+                  disabled={run.isPending}
+                  onRun={() => run.mutate({ projectId, id: row.id })}
+                />
+              ))
+            )}
+            <Button onClick={openPalette}>
+              all {rows.length} · {SHORTCUT_HINT}
+            </Button>
+          </div>
+
+          {refused !== null ? (
+            <p className="text-xs text-tone-danger-fg">
+              {REFUSALS[refused.code] ?? refused.detail}
+            </p>
+          ) : null}
+        </>
+      )}
+
+      <div>{declare}</div>
+      {manage}
+    </div>
+  );
+}
+
+/**
+ * Declaring one, and forgetting one.
+ *
+ * Behind a disclosure rather than on the page, because this is the rarest thing anybody does here —
+ * you declare `gate` once and press it for a year — and a form permanently occupying the foot of
+ * the page would be the drawer by another route.
+ *
+ * **A form and not a text box**, which is the same call `Settings` makes about the same layer: the
+ * app knows the shape, so there is no way to declare a command with no name, and `is_gate` is a
+ * checkbox rather than a word somebody has to spell. What the app does NOT know is whether the
+ * words will spawn — an unbalanced quote, a folder that is not there — and the núcleo answers that
+ * with the reason, which is what `detail` carries.
+ */
+function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[] }) {
+  const declare = useDeclareProjectCommand();
+  const forget = useForgetProjectCommand();
+  const [name, setName] = useState("");
+  const [command, setCommand] = useState("");
+  const [cwd, setCwd] = useState("");
+  const [isGate, setIsGate] = useState(false);
+  const [agentMayRun, setAgentMayRun] = useState(false);
+
+  const refused = declare.isError && isApiRefusal(declare.error) ? declare.error : null;
+  const ready = name.trim() !== "" && command.trim() !== "";
+
+  return (
+    <div className="flex flex-col gap-4">
+      {rows.length > 0 ? (
+        <ul className="flex flex-col gap-1">
+          {rows.map((row) => (
+            <li key={row.id} className="flex flex-wrap items-baseline gap-2 text-sm">
+              <span className="text-text">{row.name}</span>
+              <span className="font-mono text-xs text-text-faint">{row.command}</span>
+              {row.is_gate ? <span className="text-xs text-text-muted">gate</span> : null}
+              {row.runnable_by === "agent" ? (
+                <span className="text-xs text-tone-shadow-fg">agents may run this</span>
+              ) : null}
+              {/*
+                A workflow's command has no forget button, and that is the overlay rather than a
+                missing feature: it belongs to the bundle, and the way to be rid of it is to
+                override it with one of this project's own. Offering a button that refuses would be
+                a worse answer than offering none.
+              */}
+              {row.source === "project" ? (
+                <span className="ml-auto">
+                  <ConfirmButton
+                    label="forget"
+                    confirmLabel={`Forget ${row.name}`}
+                    variant="danger"
+                    disabled={forget.isPending}
+                    onConfirm={() => forget.mutate({ projectId, id: row.id })}
+                  />
+                </span>
+              ) : (
+                <span className="ml-auto text-xs text-text-faint">the workflow's</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      {/*
+        Every field named on screen, not by a placeholder that vanishes on the first keystroke; the
+        name and the folder side by side, the command on its own line because it is the long one.
+      */}
+      <div className="flex flex-col gap-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[10rem_1fr]">
+          <Field label="Command name">
+            <input
+              placeholder="gate"
+              value={name}
+              spellCheck={false}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </Field>
+          <Field label="Folder it runs in">
+            <input
+              placeholder="the project root"
+              value={cwd}
+              spellCheck={false}
+              onChange={(event) => setCwd(event.target.value)}
+              className="font-mono!"
+            />
+          </Field>
+          <div className="sm:col-span-2">
+            <Field label="What it runs">
+              <input
+                placeholder="cargo test"
+                value={command}
+                spellCheck={false}
+                onChange={(event) => setCommand(event.target.value)}
+                className="font-mono!"
+              />
+            </Field>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2 text-sm text-text">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={isGate}
+              onChange={(event) => setIsGate(event.target.checked)}
+            />
+            its result says whether this project is green
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={agentMayRun}
+              onChange={(event) => setAgentMayRun(event.target.checked)}
+            />
+            an agent may run it on its own
+          </label>
+        </div>
+
+        <div className="ws-dialog-actions items-center">
+          <span className="mr-auto text-xs text-text-faint">
+            A name already declared is replaced rather than duplicated.
+          </span>
+          <Button
+            variant="primary"
+            disabled={!ready || declare.isPending}
+            onClick={() =>
+              declare.mutate(
+                {
+                  projectId,
+                  name: name.trim(),
+                  command,
+                  cwd: cwd.trim() === "" ? null : cwd.trim(),
+                  is_gate: isGate,
+                  runnable_by: agentMayRun ? "agent" : "person",
+                },
+                {
+                  // Cleared only on success, so a refused declaration leaves what was typed in
+                  // front of the person who typed it.
+                  onSuccess: () => {
+                    setName("");
+                    setCommand("");
+                    setCwd("");
+                    setIsGate(false);
+                    setAgentMayRun(false);
+                  },
+                },
+              )
+            }
+          >
+            {declare.isPending ? "declaring…" : "declare"}
+          </Button>
+        </div>
+
+        {/* The núcleo's own words for `invalid`, which name the part that was wrong. */}
+        {refused !== null ? (
+          <ErrorNote>{DECLARE_REFUSALS[refused.code] ?? refused.detail}</ErrorNote>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+const DECLARE_REFUSALS: Record<string, string> = {
+  cwd_missing: "that folder is not in this project.",
+  cwd_not_a_folder: "that path names a file, not a folder.",
+  cwd_unsafe: "the folder must be inside the project.",
+  no_project_root: `the ${DAEMON_NAME} has no folder recorded for this project.`,
+  internal: `the ${DAEMON_NAME} hit an error of its own while saving it.`,
+};
+
+/** What each refusal means, in the page's words. */
+const REFUSALS: Record<string, string> = {
+  kill_switch: "the emergency stop is engaged, so nothing here starts a process.",
+  already_running: "that one is already going. One at a time, per command.",
+  no_such_command: `the ${DAEMON_NAME} has no such command for this project any more.`,
+  no_project_root: `the ${DAEMON_NAME} has no folder recorded for this project.`,
+  cwd_missing: "the folder that command runs in is not there.",
+  cwd_not_a_folder: "what that command runs in is a file, not a folder.",
+  person_only: "that command is marked for a person, and this is not one.",
+  internal: `the ${DAEMON_NAME} hit an error of its own trying to start it.`,
+};
+
+/**
+ * One gate, with what it last said.
+ *
+ * The verdict is a dot **and** a sentence in the title, never a colour alone: `failed` and
+ * `errored` are two facts that send somebody to two different places, and a reader who cannot
+ * distinguish red from amber would otherwise be told the tests broke when the measurement did.
+ */
+function GateButton({
+  row,
+  disabled,
+  onRun,
+}: {
+  row: ProjectCommand;
+  disabled: boolean;
+  onRun: () => void;
+}) {
+  const tone = outcomeTone(row.last);
+  const said = outcomeSentence(row.last);
+  const running = row.last?.outcome === "running";
+
+  return (
+    <Button
+      disabled={disabled || running}
+      onClick={onRun}
+      title={`${row.command}: ${said}`}
+      aria-label={`${row.name}, ${said}`}
+    >
+      <span
+        aria-hidden
+        className="h-1.5 w-1.5 rounded-pill"
+        style={{
+          // No tone is the absence of a verdict, drawn as an outline rather than as a colour. A
+          // grey dot would be a fifth state that reads like a sixth opinion.
+          background: tone === null ? "transparent" : `var(--tone-${tone}-fg)`,
+          boxShadow: tone === null ? "inset 0 0 0 1px var(--border-strong)" : undefined,
+        }}
+      />
+      {row.name}
+      <span className="text-xs text-text-faint">{running ? "running…" : said}</span>
+    </Button>
+  );
+}

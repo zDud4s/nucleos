@@ -1,0 +1,1750 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
+vi.mock("../data/client", async (original) => ({
+  ...(await original<typeof import("../data/client")>()),
+  ...daemon,
+}));
+
+import { Autopilot } from "./Autopilot";
+import { ApiRefusal } from "../data/client";
+import type { ClassTally, ScopedKill, ShadowDecision } from "../data/autopilot";
+import type { FeedEntry } from "../data/feed";
+import type { Job } from "../data/fleet";
+import type { AutopilotMode, ProjectSummary, Proposal } from "../data/system";
+import { daemonState, project, proposal, renderApp, renderWithRouter } from "../test/harness";
+import {
+  MODE_MEANING,
+  MODE_SENTENCES,
+  PROMOTION_ACTING,
+  PROMOTION_EARNED,
+  prerequisiteText,
+  promotionBlocker,
+  promotionConsequence,
+} from "../lib/mode";
+
+beforeEach(() => {
+  daemon.apiFetch.mockReset();
+  daemon.apiText.mockReset();
+  daemon.probeHealth.mockReset();
+
+  // Up and authorising, for the one case below that mounts the whole app and so
+  // has to get past the connection gate.
+  daemon.probeHealth.mockResolvedValue(true);
+  daemon.apiText.mockResolvedValue("daemon running");
+  localStorage.clear();
+});
+
+/**
+ * The page inside a real router, and nothing else.
+ *
+ * `renderApp` would mount the gate, the rail and its three live queries around
+ * every one of these assertions — a cost per test that buys nothing here, and
+ * one this machine cannot pay five times over without pushing other suites past
+ * their timeouts. The single case that needs the whole app is the one that
+ * proves the route is registered, and it says so where it does it.
+ */
+function renderCockpit() {
+  return renderWithRouter(<Autopilot />, { initialPath: "/autopilot" });
+}
+
+/** The cockpit with its records opened: the skipped, refused and feed panels sit in a shut disclosure. */
+async function renderRecords() {
+  await renderCockpit();
+  fireEvent.click(await screen.findByRole("button", { name: "Records and feed" }));
+}
+
+/* ------------------------------------------------------------- fixtures -- */
+
+function tally(overrides: Partial<ClassTally> = {}): ClassTally {
+  return {
+    mode: "shadow",
+    action_class: "read-local",
+    total: 12,
+    would_allow: 12,
+    would_pend: 0,
+    would_deny: 0,
+    reviewed: 11,
+    agree: 11,
+    disagree: 0,
+    stricter: 0,
+    looser: 0,
+    unreviewed: 0,
+    reviewed_allow: 0,
+    reviewed_pend: 0,
+    reviewed_deny: 0,
+    oldest_unreviewed_at: null,
+    ...overrides,
+  };
+}
+
+function decision(overrides: Partial<ShadowDecision> = {}): ShadowDecision {
+  return {
+    id: 301,
+    run_id: 44,
+    tool_name: "Bash",
+    tool_input: JSON.stringify({ command: "git push origin main" }),
+    decision: "pending_approval",
+    reason: "pushing is outside what this run was asked to do",
+    action_class: "push-merge-deploy",
+    classifier_version: 7,
+    human_verdict: null,
+    reviewed_at: null,
+    created_at: "2026-08-17T09:00:00Z",
+    ...overrides,
+  };
+}
+
+/* ------------------------------------------------------------ the daemon -- */
+
+interface CockpitWorld {
+  projects: ProjectSummary[];
+  proposals: Proposal[];
+  scopedKills: ScopedKill[];
+  decisions: ShadowDecision[];
+  scoreboard: ClassTally[];
+  jobs: Job[];
+  feed: FeedEntry[];
+  /** The overnight records: what jobs put down, and what the injection barrier refused. */
+  skipped: Proposal[];
+  refused: Proposal[];
+  /** What `POST /autopilot/state` refuses with, when it refuses. */
+  refuseMode: ApiRefusal | null;
+}
+
+function cockpitWorld(overrides: Partial<CockpitWorld> = {}): CockpitWorld {
+  return {
+    projects: [],
+    proposals: [],
+    scopedKills: [],
+    decisions: [],
+    scoreboard: [],
+    jobs: [],
+    feed: [],
+    skipped: [],
+    refused: [],
+    refuseMode: null,
+    ...overrides,
+  };
+}
+
+/**
+ * The cockpit's routes, over mutable state.
+ *
+ * A local switch rather than an edit to `test/harness.tsx`, for the reason the
+ * queue's suite gives: the harness is the shared floor, and a page that teaches
+ * it nine routes of its own makes every other suite carry them.
+ *
+ * The POST arm is the interesting half. `POST /autopilot/state` answers **200
+ * with a body** on success and a **bare 422 with an empty body** when a
+ * prerequisite is missing, and both of those are what the page is built around
+ * — so the responder models both rather than resolving `undefined` for every
+ * write.
+ */
+function cockpitFetch(world: CockpitWorld): (path: string, init?: RequestInit) => Promise<unknown> {
+  const shared = daemonState();
+  return async (path, init) => {
+    if (init?.method === "POST") {
+      if (path === "/autopilot/state") {
+        if (world.refuseMode !== null) throw world.refuseMode;
+        const body = JSON.parse(String(init.body)) as { project_id: string; mode: AutopilotMode };
+        world.projects = world.projects.map((row) =>
+          row.project_id === body.project_id ? { ...row, mode: body.mode } : row,
+        );
+        return { project_id: body.project_id, mode: body.mode };
+      }
+      if (path === "/autopilot/kill/scoped") {
+        const body = JSON.parse(String(init.body)) as ScopedKill;
+        world.scopedKills = [
+          ...world.scopedKills.filter(
+            (row) => !(row.scope_type === body.scope_type && row.scope_id === body.scope_id),
+          ),
+          body,
+        ];
+        return undefined;
+      }
+      // 204 everywhere else on this page — the verdict door included.
+      return undefined;
+    }
+
+    if (path === "/autopilot/kill") return shared.kill;
+    if (path === "/autopilot/budget") return shared.budget;
+    if (path === "/projects") return world.projects;
+    if (path === "/proposals") return world.proposals;
+    if (path === "/proposals/skipped-items") return world.skipped;
+    if (path === "/proposals/refused-actions") return world.refused;
+    if (path === "/autopilot/kill/scoped") return world.scopedKills;
+    if (path.startsWith("/scoreboard")) return world.scoreboard;
+    if (path.startsWith("/shadow-decisions")) return world.decisions;
+    if (path.startsWith("/jobs")) return world.jobs;
+    if (path.startsWith("/feed")) return world.feed;
+    if (path.startsWith("/autopilot/judge-resolve")) {
+      const project = new URLSearchParams(path.split("?")[1] ?? "").get("project_id") ?? "";
+      return { project_id: project, judge_resolve: "off", readiness: { reviewed: 0, agree: 0, less_cautious: 0, ready: false } };
+    }
+    if (path.startsWith("/judge-resolutions/unreviewed")) return [];
+    return undefined;
+  };
+}
+
+/** The list item a named switch belongs to. */
+function switchFor(label: string): HTMLElement {
+  const list = screen.getByRole("list", { name: "Trigger brakes" });
+  const row = within(list).getByText(label).closest("li");
+  if (row === null) throw new Error(`no switch row for ${label}`);
+  return row;
+}
+
+/* ------------------------------------ the carousel: one project at a time -- */
+
+/**
+ * A roster shaped like the preview's, handed over in an order that is NOT the urgent one.
+ *
+ * bravo acts with a full queue (an exception), alpha has earned the third setting, delta is still
+ * short of the bar and charlie is off — so most urgent first is bravo, alpha, delta, charlie, while
+ * the roster itself says alpha, bravo, charlie, delta. A page that drew the roster as it was sent
+ * would open on alpha, and every case that reads the order would say so.
+ */
+function previewRoster(): ProjectSummary[] {
+  return [
+    project({
+      project_id: "alpha",
+      mode: "shadow",
+      project_root: "C:/repos/alpha",
+      promotable: true,
+      classes_ready: 5,
+      classes_total: 5,
+      withheld_classes_ready: 2,
+      open_review_items: 3,
+      wip_limit: 4,
+    }),
+    project({
+      project_id: "bravo",
+      mode: "active",
+      project_root: "C:/repos/bravo",
+      queue_full: true,
+      classes_ready: 3,
+      classes_total: 3,
+      withheld_classes_ready: 1,
+      open_review_items: 4,
+      wip_limit: 4,
+    }),
+    project({ project_id: "charlie", mode: "off", project_root: "C:/repos/charlie" }),
+    project({
+      project_id: "delta",
+      mode: "shadow",
+      project_root: "C:/repos/delta",
+      classes_ready: 2,
+      classes_total: 5,
+      withheld_classes_ready: 0,
+    }),
+  ];
+}
+
+const ROSTER_IDS = ["alpha", "bravo", "charlie", "delta"];
+
+function rowOf(roster: readonly ProjectSummary[], id: string): ProjectSummary {
+  const found = roster.find((row) => row.project_id === id);
+  if (found === undefined) throw new Error(`no fixture row for ${id}`);
+  return found;
+}
+
+/** The roster list's options, in the order they are drawn. */
+function options(): HTMLElement[] {
+  const roster = screen.getByRole("listbox", { name: "All projects by urgency" });
+  return within(roster).getAllByRole("option");
+}
+
+/**
+ * Which project each option names, in order.
+ *
+ * An option's text STARTS with its project's id, whatever the badge and the reading say after it,
+ * so the id is read off the front rather than matched against the whole row.
+ */
+function optionOrder(): string[] {
+  return options().map(
+    (option) =>
+      ROSTER_IDS.find((id) => option.textContent?.startsWith(id) === true) ??
+      `unnamed: ${option.textContent ?? ""}`,
+  );
+}
+
+/** The one selected option — exactly one, or the list is lying about what the panel shows. */
+function selectedOption(): HTMLElement {
+  const chosen = options().filter((option) => option.getAttribute("aria-selected") === "true");
+  expect(chosen).toHaveLength(1);
+  return chosen[0];
+}
+
+/** The focus panel beside the fan: the selected project's setting, and nobody else's. */
+function panel(): HTMLElement {
+  return screen.getByRole("region", { name: /^Setting for / });
+}
+
+/**
+ * The project's mode switch. The Judge panel below carries a switch with the same verbs, so a
+ * bare role query for "Let it act" finds two; the project's is the group named "Autopilot mode".
+ */
+function modeSwitch(): HTMLElement {
+  return screen.getByRole("group", { name: "Autopilot mode" });
+}
+
+/** The panel's gate. Always one, whatever the project's mode. */
+function gate(): HTMLElement {
+  const found = panel().querySelectorAll<HTMLElement>(".ap-fan-gate");
+  expect(found).toHaveLength(1);
+  return found[0];
+}
+
+/** A key pressed on whatever has focus, the way a keyboard presses it. */
+function press(key: string): void {
+  const target = document.activeElement;
+  if (target === null) throw new Error(`nothing has focus to press ${key} on`);
+  fireEvent.keyDown(target, { key });
+}
+
+/**
+ * Focus and selection land together on the option at `index`.
+ *
+ * Selection follows focus in this list: the arrow that moves the ring also moves what the panel
+ * is about, so an option that took focus without being selected would be the one mismatch a
+ * keyboard user could not see from where they are.
+ */
+async function landsOn(index: number): Promise<void> {
+  await waitFor(() => {
+    const all = options();
+    expect(document.activeElement).toBe(all[index]);
+    expect(all[index].getAttribute("aria-selected")).toBe("true");
+    expect(all.map((option) => option.getAttribute("tabindex"))).toEqual(
+      all.map((_, at) => (at === index ? "0" : "-1")),
+    );
+  });
+}
+
+describe("Autopilot - the carousel sets one project at a time, most urgent first", () => {
+  /**
+   * The roster list is the keyboard's way in; the stage never takes focus.
+   *
+   * One tab stop and not four: the selected option is `tabIndex` 0 and every other is -1, so Tab
+   * enters the list once and leaves it on the next press, and the arrows are what walk it — down
+   * and right forward, up and left back. Three projects or more are a ring, so the arrows wrap;
+   * Home and End go to the ends. The fan follows the selection.
+   */
+  it("the roster list is a listbox with one tab stop, and the arrows, home and end walk it", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
+
+    await renderCockpit();
+
+    const roster = await screen.findByRole("listbox", { name: "All projects by urgency" });
+    expect(within(roster).getAllByRole("option")).toHaveLength(4);
+    expect(options().map((option) => option.getAttribute("tabindex"))).toEqual(["0", "-1", "-1", "-1"]);
+    expect(selectedOption()).toBe(options()[0]);
+
+    // The list controls the one panel, and the panel is named for the selected project.
+    expect(panel().id).not.toBe("");
+    expect(roster.getAttribute("aria-controls")).toBe(panel().id);
+    expect(panel().getAttribute("aria-label")).toBe("Setting for bravo");
+
+    options()[0].focus();
+    press("ArrowDown");
+    await landsOn(1);
+    expect(panel().getAttribute("aria-label")).toBe("Setting for alpha");
+    // The fan follows: the card in focus is the selected project's.
+    expect(document.querySelector(".ap-fan-card-focus")?.textContent).toContain("alpha");
+
+    press("ArrowUp");
+    await landsOn(0);
+    press("ArrowRight");
+    await landsOn(1);
+    press("ArrowLeft");
+    await landsOn(0);
+    // A ring: before the first is the last, and after the last is the first again.
+    press("ArrowUp");
+    await landsOn(3);
+    press("ArrowDown");
+    await landsOn(0);
+
+    press("End");
+    await landsOn(3);
+    press("Home");
+    await landsOn(0);
+  });
+
+  it("selects a project with a click on its row, and the fan follows", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
+
+    await renderCockpit();
+
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
+    fireEvent.click(options()[2]);
+    await waitFor(() => {
+      expect(selectedOption().textContent?.startsWith("delta")).toBe(true);
+    });
+    expect(panel().getAttribute("aria-label")).toBe("Setting for delta");
+    expect(document.querySelector(".ap-fan-card-focus")?.textContent).toContain("delta");
+  });
+
+  /**
+   * The fan opens on what needs you, not on whatever the roster happened to list first.
+   *
+   * An exception (a full queue, or a setting the núcleo refused) outranks acting, acting outranks
+   * earned, earned outranks watching, and off comes last — ties keep the roster's order. The card
+   * in focus wears the map's word for its mode: `active`, the daemon's literal, never "acting".
+   */
+  it("orders the roster most urgent first and opens on the most urgent project, whose card wears the map's word", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
+
+    await renderCockpit();
+
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
+    expect(optionOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
+    expect(selectedOption().textContent?.startsWith("bravo")).toBe(true);
+    expect(panel().querySelector(".ap-fan-focus-title strong")?.textContent).toBe("bravo");
+
+    // The stage is drawing, not controls: hidden from assistive technology as a whole, so the
+    // focused card is read off the page by its class and not by any role.
+    const card = document.querySelector(".ap-fan-card-focus");
+    expect(card).not.toBeNull();
+    expect(card?.closest('[aria-hidden="true"]')).not.toBeNull();
+    expect(card?.textContent).toContain("bravo");
+    const cardWords = Array.from(card?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
+    expect(cardWords).toContain("active");
+    expect(cardWords).not.toContain("acting");
+
+    // The list names every project, the focused one selected, with the map's word for its mode
+    // (`active`, the daemon's literal, never "acting").
+    const current = selectedOption();
+    expect(current?.textContent).toContain("bravo");
+    const words = Array.from(current?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
+    expect(words).toContain("active");
+    expect(words).not.toContain("acting");
+
+    // And the panels below follow the project the fan opened on.
+    expect(await screen.findByText("Nothing is waiting for a verdict on bravo.")).toBeDefined();
+  });
+
+  /**
+   * Re-ranking after a change would move the card somebody just acted on out from under them.
+   *
+   * alpha turned off ranks last on a fresh sort; held, it keeps its place and stays selected. And
+   * the change is not confirmed by a new line on screen — that would push the page down under the
+   * hand that made it — only by the pressed segment, and aloud.
+   */
+  it("does not reorder the list after a mode change and says the change only aloud", async () => {
+    const world = cockpitWorld({ projects: previewRoster() });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
+    options()[0].focus();
+    press("ArrowRight");
+    await landsOn(1);
+    expect(selectedOption().textContent?.startsWith("alpha")).toBe(true);
+
+    fireEvent.click(within(panel()).getByRole("button", { name: "Turn off" }));
+
+    await waitFor(() => {
+      expect(
+        within(panel()).getByRole("button", { name: "Turn off" }).getAttribute("aria-pressed"),
+      ).toBe("true");
+    });
+    expect(rowOf(world.projects, "alpha").mode).toBe("off");
+
+    expect(optionOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
+    expect(selectedOption().textContent?.startsWith("alpha")).toBe(true);
+
+    const said = `alpha is now off: ${MODE_MEANING.off}`;
+    await waitFor(() => {
+      const regions = Array.from(document.querySelectorAll('[aria-live="polite"]'));
+      expect(regions.map((region) => region.textContent)).toContain(said);
+    });
+    for (const element of screen.getAllByText(said)) {
+      expect(element.closest(".sr-only")).not.toBeNull();
+    }
+  });
+
+  /**
+   * The gate is a line every project has, so the panel never grows or shrinks by one as the fan
+   * turns. Acting: how to stop it. Earned: that it has. Otherwise: why not, in the núcleo's terms.
+   * Armed: what confirming would do — in the same line, which "Let it act" is described by.
+   */
+  it("states the gate for every project, an acting one included, and shows the consequence in it while armed", async () => {
+    const roster = previewRoster();
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: roster })));
+
+    await renderCockpit();
+
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
+
+    // bravo acts: the gate is passed, and the line says how to take it back.
+    expect(gate().textContent).toBe(PROMOTION_ACTING);
+    expect(gate().className).not.toContain("ap-fan-gate-locked");
+    expect(gate().id).not.toBe("");
+
+    const describedGate = () =>
+      document.getElementById(
+        within(panel()).getByRole("button", { name: "Let it act" }).getAttribute("aria-describedby") ??
+          "",
+      );
+
+    options()[0].focus();
+    press("ArrowRight");
+    await landsOn(1);
+    expect(gate().textContent).toBe(PROMOTION_EARNED);
+    expect(gate().className).not.toContain("ap-fan-gate-locked");
+    expect(describedGate()).toBe(gate());
+
+    press("ArrowRight");
+    await landsOn(2);
+    const delta = rowOf(roster, "delta");
+    expect(gate().textContent).toBe(promotionBlocker(delta, delta.withheld_classes_ready ?? 0));
+    expect(gate().className).toContain("ap-fan-gate-locked");
+    expect(describedGate()).toBe(gate());
+
+    press("ArrowRight");
+    await landsOn(3);
+    const charlie = rowOf(roster, "charlie");
+    expect(gate().textContent).toBe(promotionBlocker(charlie, charlie.withheld_classes_ready ?? 0));
+    expect(gate().className).toContain("ap-fan-gate-locked");
+    expect(describedGate()).toBe(gate());
+
+    // Back to alpha, and arm it: the gate now says what confirming would do. Read through the
+    // description and not by text — while armed the sentence is also in the interlock's live
+    // region, and a text query would fail on the ambiguity rather than on anything being wrong.
+    press("Home");
+    await landsOn(0);
+    press("ArrowRight");
+    await landsOn(1);
+    fireEvent.click(within(panel()).getByRole("button", { name: "Let it act" }));
+
+    const armed = within(panel()).getByRole("button", { name: "Let alpha act" });
+    const described = document.getElementById(armed.getAttribute("aria-describedby") ?? "");
+    expect(described).toBe(gate());
+    expect(gate().textContent).toContain(promotionConsequence(rowOf(roster, "alpha")));
+  });
+
+  /**
+   * Changed from "focusable and inert": activating is never blocked (owner's rule). While the
+   * núcleo says the project is not ready the offer stays live and described by why, and pressing
+   * it warns first; cancelling sends nothing, confirming asks for the mode.
+   */
+  it("keeps let it act live while the núcleo says the project is not ready, and warns before sending", async () => {
+    const beta = project({
+      project_id: "beta",
+      mode: "shadow",
+      project_root: "C:/repos/beta",
+      promotable: false,
+      classes_ready: 0,
+      classes_total: 0,
+      withheld_classes_ready: 0,
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: [beta] })));
+
+    await renderCockpit();
+
+    const offer = within(await screen.findByRole("group", { name: "Autopilot mode" })).getByRole("button", { name: "Let it act" }) as HTMLButtonElement;
+    expect(offer.getAttribute("aria-disabled")).not.toBe("true");
+    expect(offer.disabled).toBe(false);
+    offer.focus();
+    expect(document.activeElement).toBe(offer);
+
+    const why = document.getElementById(offer.getAttribute("aria-describedby") ?? "");
+    expect(why).not.toBeNull();
+    expect(why?.className).toContain("ap-fan-gate");
+    expect(why?.className).toContain("ap-fan-gate-locked");
+    expect(why?.textContent).toBe(promotionBlocker(beta, 0));
+
+    const writes = () =>
+      daemon.apiFetch.mock.calls.filter(
+        ([path, init]) => path === "/autopilot/state" && init?.method === "POST",
+      );
+
+    fireEvent.click(offer);
+    // No hold interlock for the unproven offer: the warning is the confirmation.
+    expect(screen.queryByRole("button", { name: "Let beta act" })).toBeNull();
+    let warning = await screen.findByRole("group", { name: "Not enough shadow evidence" });
+    expect(warning.textContent).toContain(promotionBlocker(beta, 0));
+    expect(writes()).toHaveLength(0);
+
+    fireEvent.click(within(warning).getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Not enough shadow evidence" })).toBeNull(),
+    );
+    expect(writes()).toHaveLength(0);
+
+    fireEvent.click(offer);
+    warning = await screen.findByRole("group", { name: "Not enough shadow evidence" });
+    fireEvent.click(within(warning).getByRole("button", { name: "Activate anyway" }));
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/state", {
+        method: "POST",
+        body: JSON.stringify({ project_id: "beta", mode: "active", project_root: "C:/repos/beta" }),
+      });
+    });
+  });
+
+  /**
+   * The named 422: a project nobody onboarded. The page says so — no workflow path anywhere — and
+   * offers onboarding in place; confirming it sends the gate as shown and asks for the mode again.
+   */
+  it("a project that was not onboarded is offered onboarding, and the change is retried after it", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "off", project_root: "C:/repos/alpha" })],
+      refuseMode: new ApiRefusal(422, "not_onboarded", "not_onboarded"),
+    });
+    const base = cockpitFetch(world);
+    const sent: unknown[] = [];
+    const view = (onboarded: boolean) => ({
+      project_id: "alpha",
+      root: "C:/repos/alpha",
+      onboarded: onboarded
+        ? {
+            onboarded_at: "now",
+            project_root: "C:/repos/alpha",
+            gate_command: "make ci",
+            harnesses: [],
+            hook_installed: true,
+            migrated: false,
+          }
+        : null,
+      marker_path: "~/.nucleos/projects/alpha/onboarded.yaml",
+      harnesses: [{ path: ".claude", what: "skills", files: 3 }],
+      proposed_gate: { command: "make ci", source: "Makefile" },
+      configured_gate: null,
+      hook_wired: onboarded,
+    });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.startsWith("/projects/alpha/onboard")) {
+        if (init?.method === "POST") {
+          sent.push(JSON.parse(String(init.body)));
+          world.refuseMode = null;
+          return view(true);
+        }
+        return view(false);
+      }
+      return base(path, init);
+    });
+
+    await renderCockpit();
+    await screen.findByRole("group", { name: "Autopilot mode" });
+    fireEvent.click(within(modeSwitch()).getByRole("button", { name: "Watch in shadow" }));
+
+    const note = await waitFor(() => {
+      const found = document.querySelector<HTMLElement>(".ap-fan-refusal");
+      expect(found).not.toBeNull();
+      return found as HTMLElement;
+    });
+    expect(note.textContent).toContain("has not been onboarded");
+    expect(note.textContent).not.toMatch(/\.ai\/|workflow\.md/);
+    expect(screen.queryByLabelText("Folder for alpha")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Onboard alpha" }));
+    const gate = (await screen.findByLabelText("Gate command")) as HTMLInputElement;
+    expect(gate.value).toBe("make ci");
+    fireEvent.click(screen.getByRole("button", { name: "onboard it" }));
+
+    await waitFor(() => expect(sent).toEqual([{ project_root: "C:/repos/alpha", gate_command: "make ci" }]));
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/state", {
+        method: "POST",
+        body: JSON.stringify({ project_id: "alpha", mode: "shadow", project_root: "C:/repos/alpha" }),
+      });
+      expect(world.projects[0].mode).toBe("shadow");
+    });
+  });
+
+  /**
+   * The bare 422: three prerequisites share one status with an empty body, so the page lists them
+   * all — each path drawn as a path — and admits it does not know which is missing. Then it hands
+   * focus to the one of them the shell can supply, and the retry sends the refused mode again with
+   * the folder that was typed.
+   */
+  it("a bare 422 lists every prerequisite, moves focus to the folder field, and the retry carries the folder", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({
+          project_id: "alpha",
+          mode: "shadow",
+          project_root: null,
+          promotable: true,
+          classes_ready: 2,
+          classes_total: 2,
+          withheld_classes_ready: 1,
+        }),
+      ],
+      // Exactly what `client.ts` builds out of a 422 with an empty body: the
+      // status text, which is the code spelled with capital letters.
+      refuseMode: new ApiRefusal(422, "unprocessable", "Unprocessable Entity"),
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(screen.queryByLabelText("Folder for alpha")).toBeNull();
+    await screen.findByRole("group", { name: "Autopilot mode" });
+    fireEvent.click(within(modeSwitch()).getByRole("button", { name: "Let it act" }));
+
+    // Clicks inside the 300 ms dwell are swallowed and leave the control armed,
+    // so retrying until it disarms is safe.
+    const ARMED = "Let alpha act";
+    await waitFor(() => {
+      const armed = screen.queryByRole("button", { name: ARMED });
+      if (armed !== null) fireEvent.click(armed);
+      expect(screen.queryByRole("button", { name: ARMED })).toBeNull();
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector(".ap-fan-refusal")).not.toBeNull();
+    });
+    const refusal = document.querySelector<HTMLElement>(".ap-fan-refusal");
+    expect(refusal?.className).toContain("ui-note-refusal");
+    expect(refusal?.getAttribute("role")).toBe("status");
+    expect(refusal?.querySelector(".ui-note-code")?.textContent).toBe("unprocessable");
+    expect(refusal?.textContent).toContain(MODE_SENTENCES.unprocessable.lead);
+    expect(refusal?.textContent).not.toContain("Unprocessable Entity");
+
+    const every = [...MODE_SENTENCES.unprocessable.items, MODE_SENTENCES.unprocessable.plus];
+    const listed = Array.from(refusal?.querySelectorAll("ul.ap-fan-prereqs > li") ?? []);
+    expect(listed.map((item) => item.textContent)).toEqual(every.map(prerequisiteText));
+    expect(
+      Array.from(refusal?.querySelectorAll("ul.ap-fan-prereqs code") ?? []).map((path) => path.textContent),
+    ).toEqual(every.flatMap((item) => (item.path === undefined ? [] : [item.path])));
+
+    const input = screen.getByLabelText("Folder for alpha");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(input);
+    });
+
+    world.refuseMode = null;
+    fireEvent.change(input, { target: { value: "C:/repos/alpha" } });
+    fireEvent.click(screen.getByRole("button", { name: "Try again with this folder" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/state", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "alpha",
+          mode: "active",
+          project_root: "C:/repos/alpha",
+        }),
+      });
+    });
+  });
+
+  it("says 1 project on the roster, not 1 projects", async () => {
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
+
+    await renderCockpit();
+
+    await waitFor(() => {
+      expect(document.querySelector(".ap-headline")?.textContent).toContain("1 watching in shadow");
+    });
+
+    // One project is the whole roster: nothing to choose between, so no list is drawn.
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  /**
+   * Names only for what a glance must find — a full queue, and whatever is acting — and only while
+   * two of them fit; everything else is a count. Acting, shadow and off partition the roster, so
+   * every project is counted once: the full queue and "ready to be let out" are clauses about
+   * projects already counted, never a fourth or fifth group.
+   */
+  it("the headline names the full queue and the acting project and still counts every project once", async () => {
+    const roster = previewRoster();
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: roster })));
+
+    const first = await renderCockpit();
+
+    const said =
+      "bravo’s queue is full; bravo acts on its own; 2 watching in shadow, 1 of them ready to be let out; 1 off";
+    await waitFor(() => {
+      expect(document.querySelector(".ap-headline")?.textContent).toBe(said);
+    });
+    // 1 acting + 2 in shadow + 1 off is every project on the roster, once.
+    expect(1 + 2 + 1).toBe(roster.length);
+    first.unmount();
+
+    // Three acting is more than a sentence carries by name, so they become a count.
+    const many = ["echo", "foxtrot", "golf"].map((id) => project({ project_id: id, mode: "active" }));
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: many })));
+
+    await renderCockpit();
+
+    await waitFor(() => {
+      expect(document.querySelector(".ap-headline")?.textContent).toBe("3 projects act on their own");
+    });
+  });
+
+  it("the page sheet holds the gate, and the headline at two lines", () => {
+    // Read the way `sheet-layout.test.ts` reads a page sheet: comments stripped, one rule's body.
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "autopilot.css"), "utf8").replace(
+      /\/\*[\s\S]*?\*\//g,
+      "",
+    );
+    const body = (rule: RegExp) => rule.exec(css)?.[1] ?? "";
+
+    // The gate is always two lines tall, one sentence or two, so the switch below it never moves
+    // as the fan turns from a short gate to a long one.
+    expect(body(/\.ap-fan-gate\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
+    expect(body(/\.ap-headline\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
+  });
+
+  it("the budget period is a word and not a stem", async () => {
+    const world = cockpitWorld();
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    // The ledger draws the spend as a meter now; its figures ride in the track's label.
+    expect(await screen.findByRole("img", { name: /^Spent this day: .* of \$5\.00/ })).toBeDefined();
+    expect(screen.queryByText(/dai\b/)).toBeNull();
+    expect(screen.queryByRole("img", { name: /dai\b/ })).toBeNull();
+  });
+});
+
+/* ----------------------------------------- A17: the brake nobody reads -- */
+
+describe("Autopilot - the trigger brakes say which of them the núcleo reads", () => {
+  it("offers the team trigger brake as a live switch", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha" })],
+      scopedKills: [{ scope_type: "trigger", scope_id: "scheduled", engaged: false }],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    await screen.findByRole("list", { name: "Trigger brakes" });
+    const team = switchFor("Team triggers");
+
+    // Read now, so a real state rather than the fixed "not read" label — and a
+    // button, where before there was none.
+    expect(within(team).getByText("released")).toBeDefined();
+    expect(within(team).getByRole("button", { name: "Hold team triggers" })).toBeDefined();
+    // The hedge said engaging this brake would stop nothing. It is no longer
+    // true and must no longer be on screen.
+    expect(within(team).queryByText(/nothing in it reads the value/)).toBeNull();
+  });
+
+  /**
+   * A job with a team and a job without one ran the same list line, and they are
+   * not the same thing: one is a queue in a single checkout, the other is a
+   * checkout per item with several moving at once. The ceiling travels with the
+   * name because the name alone does not say what having a team buys.
+   */
+  it("says which jobs in flight a team is directing, and how wide they may go", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha" })],
+      jobs: [
+        {
+          id: 41,
+          project_id: "alpha",
+          rule_name: null,
+          status: "running",
+          node: null,
+          bundle: null,
+          wait_reason: null,
+          max_items: 4,
+          created_at: "2026-08-21T09:00:00Z",
+          completed_at: null,
+          slot: 0,
+          round: 0,
+          max_rounds: 3,
+          team_id: "infra",
+          team_name: "Infra",
+          team_max_parallel: 3,
+        },
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const list = await screen.findByRole("list", { name: "Jobs in flight" });
+    expect(within(list).getByText(/Infra, up to 3 at once/)).toBeDefined();
+  });
+
+  it("lists recent job item retries with a link to the job, and says so when there are none", async () => {
+    const entry = (id: number, kind: string, subject: string | null): FeedEntry => ({
+      id,
+      project_id: "alpha",
+      kind,
+      summary: `summary ${id}`,
+      run_id: null,
+      subject,
+      created_at: "2026-08-21T09:00:00Z",
+    });
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha" })],
+      feed: [entry(1, "job_item_retry", "job:41"), entry(2, "run_finished", "run:9")],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    const first = await renderCockpit();
+
+    const list = await screen.findByRole("list", { name: "Job item retries" });
+    expect(within(list).getByText(/summary 1/)).toBeDefined();
+    expect(within(list).queryByText(/summary 2/)).toBeNull();
+    expect(within(list).getByRole("link", { name: "job 41 in Fleet" }).getAttribute("href")).toBe("/fleet");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/feed?scope=all&kind=job_item_retry&limit=10");
+    first.unmount();
+
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha" })] })));
+    await renderCockpit();
+    expect(await screen.findByText("No job item has been retried lately.")).toBeDefined();
+  });
+
+  it("holds and releases the team trigger scope", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    await screen.findByRole("list", { name: "Trigger brakes" });
+    const team = switchFor("Team triggers");
+    fireEvent.click(within(team).getByRole("button", { name: "Hold team triggers" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/kill/scoped", {
+        method: "POST",
+        body: JSON.stringify({ scope_type: "trigger", scope_id: "team", engaged: true }),
+      });
+    });
+
+    // An absent row means *not engaged*, so the switch had to be able to add one
+    // rather than only patch one — same as the other three scopes.
+    expect(await within(team).findByRole("button", { name: "Release team triggers" })).toBeDefined();
+
+    fireEvent.click(within(team).getByRole("button", { name: "Release team triggers" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/kill/scoped", {
+        method: "POST",
+        body: JSON.stringify({ scope_type: "trigger", scope_id: "team", engaged: false }),
+      });
+    });
+  });
+
+  it("engages a scope that is read, and sends the scope the núcleo checks", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Hold repo triggers" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/kill/scoped", {
+        method: "POST",
+        body: JSON.stringify({ scope_type: "trigger", scope_id: "repo", engaged: true }),
+      });
+    });
+
+    // An absent row means *not engaged*, so the switch had to be able to add one
+    // rather than only patch one — the first engagement is the common case.
+    expect(await screen.findByRole("button", { name: "Release repo triggers" })).toBeDefined();
+  });
+});
+
+/* --------------------------------------------------------- the empty panels -- */
+
+describe("Autopilot - the empty panels", () => {
+  it("names the selected project in both empty sentences", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      decisions: [],
+      scoreboard: [],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("Nothing is waiting for a verdict on alpha.")).toBeDefined();
+    expect(screen.getByText("alpha has recorded no classified decision yet.")).toBeDefined();
+    expect(screen.queryByText(/on this project/)).toBeNull();
+  });
+});
+
+/* --------------------------------------------------- the scoreboard's honesty -- */
+
+describe("Autopilot - the scoreboard is read-only and says what it is not", () => {
+  it("separates shadow evidence from enforced decisions and disclaims its own counts", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow", classes_ready: 1, classes_total: 2 })],
+      decisions: [decision()],
+      scoreboard: [
+        tally({ mode: "shadow", action_class: "read-local" }),
+        tally({ mode: "worktree", action_class: "vcs-local", reviewed: 0, agree: 0 }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByRole("table", { name: "Shadow evidence" })).toBeDefined();
+    expect(screen.getByRole("table", { name: "Enforced decisions" })).toBeDefined();
+
+    // The distinction that makes this panel honest rather than decorative: the
+    // bar counts reviews distinct by tool and arguments, this table counts rows,
+    // and the two are not the same number.
+    expect(screen.getByText(/the count that decides it is not the count below/)).toBeDefined();
+    // The authority stays the daemon's own figure.
+    expect(screen.getByText("1/2 classes ready")).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------- the review quality -- */
+
+describe("Autopilot - the scoreboard reports review quality", () => {
+  it("the scoreboard shows stricter, looser, unreviewed, the oldest unreviewed age and the review rate by severity", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 20,
+          would_allow: 8,
+          would_pend: 4,
+          would_deny: 0,
+          reviewed: 7,
+          agree: 5,
+          disagree: 2,
+          stricter: 2,
+          looser: 0,
+          unreviewed: 13,
+          reviewed_allow: 6,
+          reviewed_pend: 1,
+          reviewed_deny: 0,
+          oldest_unreviewed_at: "2026-10-20T10:00:00Z",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    expect(within(table).getByRole("columnheader", { name: "stricter" })).toBeDefined();
+    expect(within(table).getByRole("columnheader", { name: "looser" })).toBeDefined();
+    expect(within(table).getByRole("columnheader", { name: "unreviewed" })).toBeDefined();
+    expect(within(table).getByRole("columnheader", { name: /oldest/i })).toBeDefined();
+    const row = within(table).getByRole("rowheader", { name: "vcs-local" }).closest("tr")!;
+    // reviewed_allow / would_allow = 6/8 and reviewed_pend / would_pend = 1/4; would_deny is 0, so
+    // that rate is a dash rather than a division by zero.
+    expect(within(row).getByText("75%", { selector: ".ap-rate" })).toBeDefined();
+    expect(within(row).getByText("25%", { selector: ".ap-rate" })).toBeDefined();
+    expect(within(row).getByText("—", { selector: ".ap-rate-none" })).toBeDefined();
+    expect(within(row).queryByText(/NaN|Infinity/)).toBeNull();
+  });
+
+  it("a mixed class notes withheld decisions that were never reviewed", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(
+      await screen.findByText("vcs-local: 3 withheld decisions, none reviewed: this blocks promotion until one is"),
+    ).toBeDefined();
+  });
+
+  it("the unreviewed-withheld note does not claim to block promotion on enforced decisions", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          mode: "worktree",
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("vcs-local: 3 withheld decisions, none reviewed")).toBeDefined();
+    expect(screen.queryByText(/blocks promotion/)).toBeNull();
+  });
+
+  it("a shadow class with withheld decisions and none reviewed does not say ready", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    const row = within(table).getByRole("rowheader", { name: "vcs-local" }).closest("tr")!;
+    expect(within(row).queryByText("ready", { selector: ".ap-agree-verdict" })).toBeNull();
+    expect(within(row).getByText("withheld not reviewed", { selector: ".ap-agree-verdict" })).toBeDefined();
+  });
+
+  it("the unreviewed-withheld note keeps its facts but not the promotion claim when the project is active", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "active" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("vcs-local: 3 withheld decisions, none reviewed")).toBeDefined();
+    expect(screen.queryByText(/blocks promotion/)).toBeNull();
+  });
+
+  it("the unreviewed-withheld note is absent when a pending one was reviewed or nothing was withheld", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 11,
+          agree: 11,
+          unreviewed: 2,
+          reviewed_allow: 10,
+          reviewed_pend: 1,
+        }),
+        tally({ action_class: "read-local", total: 12, would_allow: 12, would_pend: 0, would_deny: 0 }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    await screen.findByRole("table", { name: "Shadow evidence" });
+    expect(screen.queryByText(/none reviewed/)).toBeNull();
+    expect(screen.queryByText(/withheld decisions/)).toBeNull();
+  });
+
+  it("the review-quality wording never says released and labels shadow verdicts as hypothetical", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          oldest_unreviewed_at: "2026-10-20T10:00:00Z",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    // Scoped to the scoreboard panel: elsewhere the page legitimately says a brake is "released".
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    const panel = within(table.closest("section")!);
+    expect(panel.queryByText(/released|libertaste/i)).toBeNull();
+    // In shadow nothing was withheld or released: the verdicts are what the classifier would do.
+    expect(panel.getAllByText(/hypothetical/i).length).toBeGreaterThan(0);
+  });
+});
+
+/* -------------------------------------------------------- the stat cards -- */
+
+describe("Autopilot - the ledger line names what it counts", () => {
+  it("the line names proposals", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "active" }),
+        project({ project_id: "beta", mode: "shadow" }),
+      ],
+      proposals: [1, 2, 3, 4, 5].map((id) => proposal({ id })),
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    // "Waiting on you" is the one queue's phrase, and it belongs to Home and
+    // the rail. This line counts open proposals across the roster, which is a
+    // different number from the queue's six decision lists, so it says which.
+    expect(await screen.findByRole("link", { name: "5 to review across the roster" })).toBeDefined();
+    expect(screen.queryByText("Waiting on you")).toBeNull();
+    expect(screen.queryByRole("article")).toBeNull();
+
+    // The line never promises to BE the queue; the link that actually goes there is untouched.
+    expect(screen.getAllByRole("link", { name: /Go to the queue|to review across the roster/ }).length).toBeGreaterThan(0);
+  });
+
+  it("the ledger names one full queue in the singular", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "active", queue_full: true }),
+        project({ project_id: "beta", mode: "shadow" }),
+      ],
+      proposals: [proposal({ id: 1 })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByRole("link", { name: "1 to review across the roster" })).toBeDefined();
+    expect(document.querySelector(".ap-ledger")?.textContent).toContain(", 1 project's queue full");
+  });
+
+  it("the ledger names several full queues in the plural", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "active", queue_full: true }),
+        project({ project_id: "beta", mode: "active", queue_full: true }),
+      ],
+      proposals: [proposal({ id: 1 })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByRole("link", { name: "1 to review across the roster" })).toBeDefined();
+    const ledger = document.querySelector(".ap-ledger")?.textContent;
+    expect(ledger).toContain(", 2 projects' queues full");
+    expect(ledger).not.toContain("project queue full");
+  });
+});
+
+/* ---------------------------------------------------------- the ask form -- */
+
+describe("Autopilot - the ask form", () => {
+  /**
+   * One label rank above the field, not two.
+   *
+   * "ASK FOR ONE" and "WHAT SHOULD ALPHA DO?" were two 11px uppercase labels on consecutive
+   * lines above one textarea, which makes the reader work out which of them names the box. The
+   * field's label carries the question; the section had nothing of its own to add.
+   */
+  it("the ask form has one label above its field", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    expect(screen.queryByText("ask for one")).toBeNull();
+    const field = screen.getByLabelText(/^What should .+ do\?$/);
+    // Written as the attribute's own serialisation, not a bare string: the id
+    // is also a kebab token from the `ap-` family, and a stray literal reads
+    // to `css-contract.mjs` as a class nobody styled (the same shape of false
+    // positive as `chats-zoom`/`fleet-exclusion`, one abbreviated attribute
+    // reference away from being masked out).
+    expect(field.outerHTML).toContain('id="ap-job-prompt"');
+  });
+});
+
+/* ------------------------------------------- the records that moved here -- */
+
+/**
+ * Skipped items and refused actions used to be sections of the Waiting page. They ask for no
+ * decision — the night and the barrier already settled them — so they are read here, with the
+ * rest of what governance reports back.
+ */
+describe("Autopilot - the overnight and barrier records", () => {
+  it("shows the records as panels once there are rows, and one line while there are none", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderRecords();
+
+    // Empty: one quiet line each, with the reasoning behind "why?".
+    const skipped = await screen.findByRole("region", { name: "Skipped items" });
+    expect(within(skipped).getByText("no job put anything down")).toBeDefined();
+    const refused = screen.getByRole("region", { name: "Refused actions" });
+    expect(within(refused).getByText("the barrier has refused nothing")).toBeDefined();
+  });
+
+  it("posts a skipped item to /dismiss and never to /reject", async () => {
+    const world = cockpitWorld({ skipped: [proposal({ id: 41, kind: "skipped-item" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderRecords();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Put item #41 away" }));
+
+    // Clicks inside the 300 ms dwell are swallowed by design and leave the control armed, so
+    // retrying the click until the control disarms is safe — and it is cheaper than either
+    // sleeping for the dwell or bringing fake timers into a suite that waits on react-query.
+    await waitFor(() => {
+      const armed = screen.queryByRole("button", { name: "I have read it · #41" });
+      if (armed !== null) fireEvent.click(armed);
+      expect(screen.queryByRole("button", { name: "I have read it · #41" })).toBeNull();
+    });
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/41/dismiss", { method: "POST" });
+    });
+
+    // `reject_proposal` guards on `kind = 'action-approval'` and answers 409 for anything else.
+    const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
+    expect(asked.some((path) => path.endsWith("/reject"))).toBe(false);
+  });
+
+  it("heads a skipped item with the job and item and links the run", async () => {
+    const world = cockpitWorld({
+      skipped: [
+        proposal({
+          id: 41,
+          kind: "skipped-item",
+          run_id: 7,
+          tool_name: "Bash",
+          reasoning: "asked",
+          job_id: 27,
+          run_stage: "implement",
+          item_ordinal: 3,
+          item_description: "tidy the imports",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderRecords();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("job 27 \u00B7 item 4")).toBeDefined();
+    expect(within(list).getByText("tidy the imports")).toBeDefined();
+    expect(within(list).getByRole("link", { name: "run 7" }).getAttribute("href")).toContain("/runs/7");
+    expect(within(list).getByText("Bash")).toBeDefined();
+    expect(within(list).getByRole("button", { name: "Put item #41 away" })).toBeDefined();
+  });
+
+  it("names a review node as the job's review", async () => {
+    const world = cockpitWorld({
+      skipped: [
+        proposal({
+          id: 41,
+          kind: "skipped-item",
+          run_id: 7,
+          tool_name: "Bash",
+          reasoning: "asked",
+          job_id: 27,
+          run_stage: "review",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderRecords();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("job 27 \u00B7 the job's review")).toBeDefined();
+  });
+
+  it("falls back without going blank when the run no longer resolves", async () => {
+    const world = cockpitWorld({
+      skipped: [
+        proposal({ id: 41, kind: "skipped-item", run_id: 7, tool_name: "Bash", reasoning: "asked" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderRecords();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("a job this record can no longer trace")).toBeDefined();
+    expect(within(list).getByText("Bash")).toBeDefined();
+  });
+
+  it("gives the refused actions no buttons at all", async () => {
+    const world = cockpitWorld({
+      refused: [
+        proposal({
+          id: 51,
+          kind: "refused-action",
+          tool_name: "send_email",
+          reasoning: "the message asked for it, and the message is not the operator",
+          tool_input: JSON.stringify({ to: "billing@example.com", subject: "March" }),
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderRecords();
+
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+    const panel = list.closest("section");
+    expect(panel).not.toBeNull();
+
+    // Nothing to allow: the turn that reached for this ended long ago, so a control here would
+    // read as "handled" for something nobody handled.
+    expect(within(panel as HTMLElement).queryAllByRole("button")).toEqual([]);
+
+    // It is still a record worth reading — the verb, and what it was going to do, as fields
+    // rather than as a JSON dump.
+    expect(within(list).getByText("send_email")).toBeDefined();
+    expect(within(list).getByText("billing@example.com")).toBeDefined();
+    expect(within(list).queryByText(/[{}]/)).toBeNull();
+  });
+
+  it("says which stranger the turn had read", async () => {
+    const world = cockpitWorld({
+      refused: [
+        proposal({
+          id: 52,
+          kind: "refused-action",
+          tool_name: "send_email",
+          tool_input: JSON.stringify({ to: "billing@example.com" }),
+          read_from: JSON.stringify([
+            {
+              tool: "browser_open",
+              arguments: JSON.stringify({ url: "https://fornecedor.example/fatura" }),
+              at: "2026-08-21T09:00:00Z",
+            },
+          ]),
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderRecords();
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+
+    // The tool that brought the words in, and the url — the half that decides whether this was
+    // the owner's idea or the page's.
+    expect(within(list).getByText("browser_open")).toBeDefined();
+    expect(within(list).getByText("https://fornecedor.example/fatura")).toBeDefined();
+  });
+
+  it("says nothing at all when nothing was recorded", async () => {
+    // `null` covers a refusal that fired on whose work it is rather than on what was read, AND a
+    // recording that failed — indistinguishable from here. Filling the silence with "this turn
+    // read nothing" would be wrong in the second case, in the direction that makes a
+    // contaminated action look clean.
+    const world = cockpitWorld({
+      refused: [proposal({ id: 53, kind: "refused-action", tool_name: "create_run", read_from: null })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderRecords();
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+
+    expect(within(list).getByText("create_run")).toBeDefined();
+    expect(within(list).queryByText(/read nothing|nothing was read/i)).toBeNull();
+    expect(within(list).queryByText("this turn had read")).toBeNull();
+  });
+});
+
+/* --------------------------------------------------------------- the route -- */
+
+describe("Autopilot - the route", () => {
+  it("is registered, so the rail reaches the page and not the placeholder", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    // The whole app here, and only here: a stubbed destination would prove
+    // nothing about whether `/autopilot` is in the real tree.
+    const { router } = await renderApp({ initialPath: "/autopilot" });
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Autopilot" })).toBeDefined();
+    expect(router.state.location.pathname).toBe("/autopilot");
+    expect(screen.queryByText("Autopilot is not built yet")).toBeNull();
+  });
+});
+
+describe("Autopilot - map-authored readings", () => {
+  it("a trigger brake that is not engaged reads released, not running", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha" })], scopedKills: [{ scope_type: "trigger", scope_id: "scheduled", engaged: false }] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    await renderCockpit();
+    const team = switchFor("Team triggers");
+    const reading = within(team).getByText("released");
+    expect(reading.textContent).toBe("released");
+    expect(reading.className).toContain("ui-badge-off");
+    expect(within(team).queryByText("running")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------- the critique's follow-ups -- */
+
+describe("Autopilot - agreement, the project in focus, and the page order", () => {
+  it("shows each class's agreement against the bar, and a dash when nothing is reviewed", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({ action_class: "read-local", reviewed: 20, agree: 20 }),
+        tally({ action_class: "push-merge-deploy", reviewed: 10, agree: 5 }),
+        tally({ action_class: "vcs-local", reviewed: 0, agree: 0 }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    expect(within(table).getByRole("columnheader", { name: "agreement" })).toBeDefined();
+    const rowOf = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!;
+    expect(within(rowOf("read-local")).getByText("100%")).toBeDefined();
+    expect(within(rowOf("read-local")).getByText("ready")).toBeDefined();
+    expect(within(rowOf("push-merge-deploy")).getByText("50%")).toBeDefined();
+    expect(within(rowOf("push-merge-deploy")).getByText("below the bar")).toBeDefined();
+    expect(within(rowOf("vcs-local")).getByText("—", { selector: ".ap-agree-none" })).toBeDefined();
+  });
+
+  it("names the shadow verdict buttons by their verb, with the decision id as the subject", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      decisions: [decision({ id: 301 })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const list = await screen.findByRole("list", { name: "Shadow decisions" });
+    expect(within(list).getByRole("button", { name: "Allow" })).toBeDefined();
+    expect(within(list).getByRole("button", { name: "Block" })).toBeDefined();
+    expect(within(list).queryByText("Allow #301")).toBeNull();
+  });
+
+  it("keeps the project in focus in a bar, and puts the trigger brakes before the evidence", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      decisions: [decision()],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const bar = await screen.findByRole("group", { name: "Project in focus" });
+    expect(within(bar).getByText("alpha")).toBeDefined();
+
+    const brakes = await screen.findByRole("list", { name: "Trigger brakes" });
+    const evidence = await screen.findByRole("list", { name: "Shadow decisions" });
+    // The brakes come first in the document, as the page's own doc-comment promises.
+    expect(brakes.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("draws no project-dependent panel, and no 'choose a project above', when the roster is empty", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("No project is under autopilot")).toBeDefined();
+    expect(screen.queryByText("Choose a project above.")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Project in focus" })).toBeNull();
+  });
+
+  it("lists every project by urgency as options, and can hide the fan", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "shadow" }),
+        project({ project_id: "bravo", mode: "active" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const roster = await screen.findByRole("listbox", { name: "All projects by urgency" });
+    expect(within(roster).getAllByRole("option")).toHaveLength(2);
+
+    // The fan shows by default, with one line under it naming both ways to walk it and the way to
+    // put it away. No strip of markers and no "1 of N" readout: the list is the index.
+    expect(document.querySelector(".ap-fan-stage")).not.toBeNull();
+    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
+    expect(screen.queryByRole("tablist")).toBeNull();
+    const hint = document.querySelector<HTMLElement>(".ap-fan-pane .ap-fan-hint");
+    expect(hint?.textContent).toContain("on the list, or drag the cards");
+    expect(within(hint!).getByRole("button", { name: "Hide the fan" })).toBeDefined();
+
+    // Hidden, the hint goes with the fan: one line heads the list with the way back, and the list
+    // itself stays.
+    fireEvent.click(screen.getByRole("button", { name: "Hide the fan" }));
+    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
+    expect(document.querySelector(".ap-fan-hint")).toBeNull();
+    expect(document.querySelector(".ap-roster-head")?.textContent).toContain("2 projects, most urgent first");
+    expect(
+      within(screen.getByRole("listbox", { name: "All projects by urgency" })).getAllByRole("option"),
+    ).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show the fan" }));
+    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
+    expect(document.querySelector(".ap-roster-head")).toBeNull();
+    expect(screen.getByRole("button", { name: "Hide the fan" })).toBeDefined();
+  });
+
+  it("remembers a hidden fan on the next visit", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "shadow" }),
+        project({ project_id: "bravo", mode: "active" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    localStorage.setItem("nucleos.autopilot.fan", "hidden");
+
+    await renderCockpit();
+
+    expect(await screen.findByRole("button", { name: "Show the fan" })).toBeDefined();
+    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show the fan" }));
+    expect(localStorage.getItem("nucleos.autopilot.fan")).toBeNull();
+  });
+
+  it("shows a single project's card even when the fan was hidden, since there is no toggle to undo it", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    localStorage.setItem("nucleos.autopilot.fan", "hidden");
+
+    await renderCockpit();
+
+    await screen.findByText("alpha", { selector: ".ap-fan-focus-title strong" });
+    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
+    expect(document.querySelector(".ap-fan-card-focus")?.textContent).toContain("alpha");
+    expect(screen.queryByRole("button", { name: /the fan/ })).toBeNull();
+  });
+});
+
+describe("Autopilot - the page map and the advanced panels", () => {
+  it("offers a section nav whose entries land on a heading that says the same thing", async () => {
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
+
+    await renderCockpit();
+
+    const nav = await screen.findByRole("navigation", { name: "Autopilot sections" });
+    const links = within(nav).getAllByRole("link");
+    expect(links.map((link) => link.textContent)).toEqual([
+      "Setting",
+      "Trigger brakes",
+      "Shadow decisions",
+      "Jobs in flight",
+      "Records and feed",
+    ]);
+    for (const link of links) {
+      const id = (link.getAttribute("href") ?? "").replace(/^#/, "");
+      const target = document.getElementById(id);
+      expect(target).not.toBeNull();
+      await waitFor(() => expect(target?.textContent).toContain(link.textContent ?? ""));
+    }
+  });
+
+  it("keeps the records shut until asked, and the judge and resolve panels open from the first view", async () => {
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
+
+    await renderCockpit();
+
+    const records = await screen.findByRole("button", { name: "Records and feed" });
+    expect(records.getAttribute("aria-expanded")).toBe("false");
+    // Which judge rules a project is a decision only the owner makes: never hidden on first view.
+    const advanced = screen.getByRole("button", { name: "Advanced: judge and resolve" });
+    expect(advanced.getAttribute("aria-expanded")).toBe("true");
+    expect(await screen.findByRole("heading", { name: "Judge" })).toBeDefined();
+
+    fireEvent.click(records);
+    expect(records.getAttribute("aria-expanded")).toBe("true");
+    expect(await screen.findByRole("region", { name: "Skipped items" })).toBeDefined();
+  });
+
+  it("puts the trigger brakes in the same group as the ledger", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    const brakes = await screen.findByRole("list", { name: "Trigger brakes" });
+    expect(brakes.closest("#ap-brakes")).not.toBeNull();
+  });
+});
+
+describe("Autopilot - starting a job is one intent", () => {
+  it("retries a failed start under the same idempotency key, and mints a new one after a success", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "active", project_root: "C:/repos/alpha" })] });
+    const base = cockpitFetch(world);
+    let attempts = 0;
+    const keys: string[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/jobs" && init?.method === "POST") {
+        attempts += 1;
+        keys.push(new Headers(init.headers).get("Idempotency-Key") ?? "");
+        if (attempts === 1) throw new Error("connection lost");
+        return { job_id: attempts };
+      }
+      return base(path, init);
+    });
+
+    await renderCockpit();
+    const field = await screen.findByLabelText(/What should alpha do/);
+    fireEvent.change(field, { target: { value: "tidy the logs" } });
+    const start = screen.getByRole("button", { name: "Start a job" });
+
+    fireEvent.click(start);
+    await waitFor(() => expect(attempts).toBe(1));
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(start);
+    await waitFor(() => expect(attempts).toBe(2));
+    expect(keys[0]).not.toBe("");
+    expect(keys[1]).toBe(keys[0]);
+
+    // The success cleared the prompt, so a new prompt is a new intent with a new key.
+    fireEvent.change(field, { target: { value: "tidy the logs again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start a job" }));
+    await waitFor(() => expect(attempts).toBe(3));
+    expect(keys[2]).not.toBe(keys[0]);
+  });
+});

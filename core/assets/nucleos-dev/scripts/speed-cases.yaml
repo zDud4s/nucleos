@@ -1,0 +1,42 @@
+# Shared parity fixture: both resolvers must reproduce every case exactly.
+# Read by test_resolve_speed.py. Test runs are not a speed setting, so no case carries them.
+cases:
+  - name: normal is today for a small low-risk task
+    input: {speed: normal, size: small, elevated: false, tdd_able: false, team_max_parallel: null, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: medium, fast_path_allowed: true, review_required: false, team_max_parallel: null, degraded: []}
+  - name: normal reviews a medium task (rule 6)
+    input: {speed: normal, size: medium, elevated: false, tdd_able: true, team_max_parallel: null, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: medium, fast_path_allowed: true, review_required: true, team_max_parallel: null, degraded: []}
+  - name: normal reviews an elevated small task (rule 6)
+    input: {speed: normal, size: small, elevated: true, tdd_able: false, team_max_parallel: null, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: medium, fast_path_allowed: true, review_required: true, team_max_parallel: null, degraded: []}
+  - name: normal keeps the team value
+    input: {speed: normal, size: small, elevated: false, tdd_able: false, team_max_parallel: 3, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: medium, fast_path_allowed: true, review_required: false, team_max_parallel: 3, degraded: []}
+  - name: fast opens a wave on a medium TDD-able task
+    input: {speed: fast, size: medium, elevated: false, tdd_able: true, team_max_parallel: null, max_workers: 2}
+    expected: {workers: 2, reasoning_effort: low, fast_path_allowed: true, review_required: true, team_max_parallel: null, degraded: []}
+  - name: fast on a task that is not TDD-able says so
+    input: {speed: fast, size: large, elevated: false, tdd_able: false, team_max_parallel: null, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: low, fast_path_allowed: true, review_required: true, team_max_parallel: null, degraded: [task_not_decomposable]}
+  - name: fast on a small task says so
+    input: {speed: fast, size: small, elevated: false, tdd_able: true, team_max_parallel: null, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: low, fast_path_allowed: true, review_required: false, team_max_parallel: null, degraded: [task_not_decomposable]}
+  - name: fast doubles a team
+    input: {speed: fast, size: small, elevated: false, tdd_able: false, team_max_parallel: 3, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: low, fast_path_allowed: true, review_required: false, team_max_parallel: 3, degraded: [task_not_decomposable]}
+  - name: a team value is narrowed to the harness ceiling
+    input: {speed: fast, size: small, elevated: false, tdd_able: false, team_max_parallel: 5, max_workers: 2, parallel_ceiling: 4}
+    expected: {workers: 1, reasoning_effort: low, fast_path_allowed: true, review_required: false, team_max_parallel: 4, degraded: [task_not_decomposable]}
+  - name: wave workers are narrowed to the harness ceiling
+    input: {speed: fast, size: medium, elevated: false, tdd_able: true, team_max_parallel: null, max_workers: 4, parallel_ceiling: 2}
+    expected: {workers: 2, reasoning_effort: low, fast_path_allowed: true, review_required: true, team_max_parallel: null, degraded: []}
+  - name: fast never raises a serial team
+    input: {speed: fast, size: medium, elevated: false, tdd_able: true, team_max_parallel: 1, max_workers: 2}
+    expected: {workers: 2, reasoning_effort: low, fast_path_allowed: true, review_required: true, team_max_parallel: 1, degraded: []}
+  - name: a team value above the ceiling is clamped even under normal
+    input: {speed: normal, size: small, elevated: false, tdd_able: false, team_max_parallel: 99, max_workers: 2, parallel_ceiling: 8}
+    expected: {workers: 1, reasoning_effort: medium, fast_path_allowed: true, review_required: false, team_max_parallel: 8, degraded: []}
+  - name: thorough forbids the fast path and always reviews
+    input: {speed: thorough, size: trivial, elevated: false, tdd_able: false, team_max_parallel: 4, max_workers: 2}
+    expected: {workers: 1, reasoning_effort: high, fast_path_allowed: false, review_required: true, team_max_parallel: 4, degraded: []}

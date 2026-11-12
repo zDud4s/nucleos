@@ -1,0 +1,1025 @@
+import { useId, useState } from "react";
+import { isApiRefusal } from "../data/client";
+import {
+  canTakeASeat,
+  employmentOf,
+  renamed,
+  unemployed,
+  useAgents,
+  useCreateAgent,
+  useDeleteAgent,
+  useUpdateAgent,
+  type Agent,
+  type AgentEngine,
+  type AgentRequest,
+  AGENT_CAPABILITIES,
+  type Employer,
+  type Employment,
+} from "../data/agents";
+import { useTeams } from "../data/teams";
+import { ContextRefs } from "../context/ContextRefs";
+import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
+import { ScopedTools } from "../brain/knowledge/ScopedTools";
+import {
+  Button,
+  ConfirmButton,
+  ErrorNote,
+  ListFilter,
+  PageHeader,
+  Quiet,
+  Modal,
+  Panel,
+  RefusalNote,
+  RelativeTime,
+  Select,
+  Skeleton,
+  StaleNote,
+  Table,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Td,
+  Teach,
+  Th,
+  Tip,
+  toastManager,
+  usePaletteGroup,
+} from "../ui";
+import { usePageKeys } from "../project/pageKeys";
+import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
+import "./agents.css";
+import { LoadoutPreview } from "./LoadoutPreview";
+
+// Ids of the two filter chips: the headline's own counts, made clickable.
+const NO_MODEL = "no-model";
+const NOBODY_USES = "nobody-uses";
+
+/**
+ * Agents — the house catalogue.
+ *
+ * `/teams` answers *how is my organisation doing*. This one answers a question
+ * the console cannot: **who exists, and does each one serve what it is given?**
+ * Aptitude in the columns, consequence beside the button that makes it matter.
+ *
+ * The page this replaced was a CRUD form with a list under it: a create form of
+ * six fields permanently open above a catalogue you had not read, then one
+ * bordered box per agent, each of a different height because the speciality
+ * wrapped, a `<details>` opened, and an inline editor opened under it. Nine
+ * agents were nine documents to read one at a time. It is the same defect the
+ * `/teams` rewrite named in its cards, and it takes the same remedy: a table,
+ * where the columns line up because they are columns.
+ *
+ * **The id is drawn, and that is the point of the page.** `agent::slug`
+ * computes it once, at creation, and `update` never recomputes it — deliberately,
+ * because `teams.director_agent_id`, `team_members`, `team_items`, `job_items`
+ * and `council_seats` all point at it. So after a rename the name and the id
+ * disagree forever, `RosterMatrix` and `Who` draw the **id**, this page used to
+ * draw only the **name**, and nothing anywhere joined the two. Now every row
+ * carries both, and a divergence is marked rather than left to be noticed.
+ *
+ * **Nothing here is a `Badge`.** The seven tones are the app's closed vocabulary
+ * for state, and an engine is not a state — it is identity, like the accent ring
+ * on `Who`. Engine, model and tool policy each get their own form, and each
+ * carries its own consequence: a null model is exactly an agent that can never
+ * take a council seat (`core/src/council.rs:841`), and `none` is an agent with
+ * no tools at all.
+ *
+ * Three readings this page deliberately does not draw:
+ *
+ * - **Who works where.** That is `RosterMatrix` on `/teams`, and it is not
+ *   redrawn here. This page says how MUCH employment an agent has, which is a
+ *   different question and the one that decides whether it can be deleted.
+ * - **Work in flight per agent.** `team_items` and `job_items` carry `agent_id`
+ *   and no route serves them by agent. `GET /team-runs/{id}` would answer one
+ *   run at a time over a list capped at the newest hundred across every
+ *   department — an N+1 over a window that is not the question.
+ * - **Provenance.** The `agents` table has ten columns and none of them records
+ *   a recruitment, and every proposal route is pending-only. The empty state
+ *   says so and says nothing more.
+ */
+export function Agents() {
+  const agents = useAgents();
+  const teams = useTeams();
+  const [creating, setCreating] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [chipsOn, setChipsOn] = useState<readonly string[]>([]);
+
+  const rows = agents.data ?? [];
+  const answered = agents.data !== undefined;
+  const stale = agents.isError && answered;
+
+  /*
+    Departments are read for ONE derived number per row — how much employment an
+    agent has. `GET /teams` already carries every roster and is not polled, so
+    this shares the cache `/teams` and the charter editor fill; arriving from
+    either, the column is populated before the page paints.
+  */
+  const departments: Employer[] = teams.data ?? [];
+  const employmentKnown = teams.data !== undefined;
+
+  /*
+    Derived from the list rather than held as a second copy: deleting the
+    selected agent, or losing it to an edit elsewhere, closes the editor by
+    itself instead of leaving a panel open over a row that is gone.
+  */
+  const chosen = rows.find((row) => row.id === selected) ?? null;
+
+  // The two counts the headline already states, made into filters. A chip that would match
+  // nothing still shows its zero; "nobody uses" exists only once the departments have answered.
+  const seatless = rows.filter((row) => !canTakeASeat(row)).length;
+  const idle = employmentKnown ? rows.filter((row) => unemployed(employmentOf(row.id, departments))).length : 0;
+  const needle = query.trim().toLowerCase();
+  const shown = rows.filter(
+    (row) =>
+      (needle === "" ||
+        row.name.toLowerCase().includes(needle) ||
+        row.id.toLowerCase().includes(needle) ||
+        row.speciality.toLowerCase().includes(needle)) &&
+      (!chipsOn.includes(NO_MODEL) || !canTakeASeat(row)) &&
+      (!chipsOn.includes(NOBODY_USES) || (employmentKnown && unemployed(employmentOf(row.id, departments)))),
+  );
+
+  // #3/#4: the palette's "New agent" and the key it prints.
+  const openCreate = () => setCreating(true);
+  usePaletteGroup({
+    id: "agents-actions",
+    heading: "Quick actions",
+    items: [{ id: "agents-new", label: "New agent", match: "new agent create", shortcut: "N", run: openCreate }],
+  });
+  usePageKeys({ n: openCreate }, !creating);
+
+  return (
+    <>
+      <PageHeader
+        title="Agents"
+        headline={headlineFor(rows, departments, answered, employmentKnown)}
+        actions={
+          <Tip tip="Add an agent to the catalogue" shortcut="N">
+            {({ tipId }) => (
+              <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog" aria-describedby={tipId}>
+                New agent
+              </Button>
+            )}
+          </Tip>
+        }
+      />
+
+      {stale && <StaleNote dataUpdatedAt={agents.dataUpdatedAt} />}
+      {agents.isError && !answered && <ListError error={agents.error} onRetry={() => void agents.refetch()} />}
+
+      {/* Closed by default. The old page opened six fields above a catalogue
+          nobody had read yet — the very thing the console rewrite undid. */}
+      {creating && <NewAgentForm onDone={() => setCreating(false)} />}
+
+      {!answered && !agents.isError && <Skeleton label="Reading the catalogue" variant="row" count={4} />}
+
+      {answered && rows.length === 0 && (
+        <Teach title="No agent has been hired yet">
+          <p>
+            An agent is a name, a speciality a director reads to delegate, a prompt, an engine and a
+            tool policy. Add one to start the catalogue.
+          </p>
+          <p>
+            <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
+              New agent
+            </Button>
+          </p>
+        </Teach>
+      )}
+
+      {rows.length > 0 && (
+        <Panel title="Catalogue">
+          <ListFilter
+            noun="agents"
+            query={query}
+            onQueryChange={setQuery}
+            chips={[
+              { id: NO_MODEL, label: "Without a model", count: seatless },
+              ...(employmentKnown ? [{ id: NOBODY_USES, label: "Nobody uses", count: idle }] : []),
+            ]}
+            selected={chipsOn}
+            onToggleChip={(id) =>
+              setChipsOn((on) => (on.includes(id) ? on.filter((chip) => chip !== id) : [...on, id]))
+            }
+            resultCount={shown.length}
+            onOpenOnly={() => setSelected(shown[0].id)}
+            onClear={() => {
+              setQuery("");
+              setChipsOn([]);
+            }}
+          />
+          {shown.length === 0 && <Quiet says="No agent matches that filter." />}
+          <Catalogue
+            rows={shown}
+            departments={departments}
+            employmentKnown={employmentKnown}
+            selected={chosen?.id ?? null}
+            onSelect={(id) => setSelected((current) => (current === id ? null : id))}
+          />
+        </Panel>
+      )}
+
+      {/*
+        One editor at a time, in a modal opened by selecting a row. `key`
+        remounts it on a change of selection, which is what reseeds the draft;
+        without it a half-typed edit would survive onto a different agent.
+        Closing the modal clears the selection.
+      */}
+      {chosen !== null && (
+        <AgentEditor
+          key={chosen.id}
+          agent={chosen}
+          employment={employmentOf(chosen.id, departments)}
+          employmentKnown={employmentKnown}
+          onClose={() => setSelected(null)}
+        />
+      )}
+    </>
+  );
+}
+
+/* -------------------------------------------------------------- readings -- */
+
+/** One derived sentence about the whole catalogue. */
+function headlineFor(
+  rows: Agent[],
+  departments: Employer[],
+  answered: boolean,
+  employmentKnown: boolean,
+): string | undefined {
+  if (!answered) return undefined;
+  if (rows.length === 0) return "no agent in the catalogue";
+
+  const parts = [plural(rows.length, "agent")];
+
+  const seatless = rows.filter((row) => !canTakeASeat(row)).length;
+  if (seatless > 0) parts.push(`${seatless} without a model`);
+
+  // Only once the departments have answered. An empty list before the call
+  // returns would say every agent is unused, which is the loudest wrong thing
+  // this page could say.
+  if (employmentKnown) {
+    const idle = rows.filter((row) => unemployed(employmentOf(row.id, departments))).length;
+    if (idle > 0) parts.push(`${idle} nobody uses`);
+  }
+
+  return parts.join(" · ");
+}
+
+function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
+  return (
+    <ErrorNote onRetry={onRetry}>the {DAEMON_NAME} is not responding: nothing is known about the catalogue</ErrorNote>
+  );
+}
+
+/**
+ * Why a create or an edit was refused.
+ *
+ * Both routes share one cause per code (`core/src/agent.rs`, `validate` and
+ * the `UNIQUE` on `name`), and every error arm answers a bare `StatusCode`
+ * with an empty body — `client.ts` falls back to `statusText`, which is under
+ * the four-word floor, so this page supplies the sentence for all three codes
+ * rather than showing the daemon's silence back.
+ */
+function SaveRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding: this agent was not saved</ErrorNote>;
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        conflict: "an agent of that name already exists",
+        bad_request: `the ${DAEMON_NAME} refused this: check the name, engine, model and tool policy`,
+        not_found: "this agent no longer exists, it may have been deleted elsewhere",
+      }}
+    />
+  );
+}
+
+/**
+ * Why a delete was refused.
+ *
+ * `409` here has exactly one cause and it is not the create/update one, and it
+ * has **four** grounds rather than the two this page used to name.
+ * `agent::delete` asks one question over four tables before the DELETE:
+ * `teams.director_agent_id`, `team_members`, `team_items` and `job_items`. The
+ * two work tables are there for a stated reason — being on a roster and having
+ * been given work are separate facts, and an agent taken off every team still
+ * owns every item already assigned to it.
+ *
+ * The old sentence here, "a team is standing on this agent", sent somebody who
+ * had already emptied every roster looking for a team that does not exist. That
+ * is precisely the failure `agent::delete` says it exists to prevent.
+ *
+ * A council roster still does not hold an agent back, and this must not claim
+ * that it does.
+ */
+function DeleteRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding: this agent was not deleted</ErrorNote>;
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        conflict:
+          "this agent directs or belongs to a team, or is holding an item of a team run or of a job",
+        not_found: "this agent is already gone",
+      }}
+    />
+  );
+}
+
+/* ------------------------------------------------------------- catalogue -- */
+
+/**
+ * Every agent, one per row.
+ *
+ * A real `<table>`, for the reason `RosterMatrix` is one: an agent is a row, a
+ * reading is a column, and a screen reader landing in a cell is told both.
+ * Built out of `div`s it would be a picture of a table.
+ *
+ * Its own horizontal scroller, so a narrow window slides the table and never
+ * the whole document — which would take the sidebar and the header with it.
+ */
+function Catalogue({
+  rows,
+  departments,
+  employmentKnown,
+  selected,
+  onSelect,
+}: {
+  rows: Agent[];
+  departments: Employer[];
+  employmentKnown: boolean;
+  selected: string | null;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div className="agents-scroller">
+      <Table label="Every agent in the catalogue, what it runs on and how much of it is spoken for">
+        <thead>
+          <tr>
+            <Th>Agent</Th>
+            <Th>Engine</Th>
+            <Th>Model</Th>
+            <Th>Tools</Th>
+            <Th num>Employed</Th>
+            <Th>Changed</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((agent) => (
+            <CatalogueRow
+              key={agent.id}
+              agent={agent}
+              employment={employmentOf(agent.id, departments)}
+              employmentKnown={employmentKnown}
+              open={selected === agent.id}
+              onSelect={() => onSelect(agent.id)}
+            />
+          ))}
+        </tbody>
+      </Table>
+      <p className="agents-key">
+        ◉ directs a team · ● on a team&rsquo;s roster · ■ has tools · □ no tools · ? this shell has no
+        reading for that policy · ≠ renamed since the {DAEMON_NAME} learned its id
+      </p>
+    </div>
+  );
+}
+
+function CatalogueRow({
+  agent,
+  employment,
+  employmentKnown,
+  open,
+  onSelect,
+}: {
+  agent: Agent;
+  employment: Employment;
+  employmentKnown: boolean;
+  open: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <tr className={open ? "agents-row agents-row-open" : "agents-row"}>
+      {/*
+        The open row is marked by `.ui-current` — a 2px inset rule on the leading
+        edge, in `--text` — and by nothing else. It goes on the row header rather
+        than on the `tr` because in a `border-collapse: collapse` table a row is
+        not a box that paints a shadow of its own, while the header cell is, and
+        the header cell IS the row's leading edge. See the comment beside
+        `.agents-row-open` for the fill this replaced and why it went.
+      */}
+      <th scope="row" className={open ? "agents-who ui-current" : "agents-who"}>
+        {/*
+          The name is the control. There is no separate Edit button per row: the
+          row IS the way in, and the editor it opens is the only one on the page.
+        */}
+        <button type="button" className="agents-name" onClick={onSelect} aria-haspopup="dialog">
+          {agent.name}
+        </button>
+        <Called agent={agent} />
+        {/* Prose, so it goes under the name rather than into a column of its
+            own — the treatment a department's remit gets on the console. */}
+        <span className="agents-speciality">{agent.speciality}</span>
+      </th>
+      <td className="agents-engine">{agent.engine}</td>
+      <td>
+        <Model agent={agent} />
+      </td>
+      <td>
+        <Tools agent={agent} />
+      </td>
+      <Td num>
+        <Employed employment={employment} known={employmentKnown} />
+      </Td>
+      <td className="agents-changed">
+        <RelativeTime at={agent.updated_at} />
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * What the machine calls this one.
+ *
+ * Drawn on every row, not only the divergent ones: the id is the address every
+ * other surface in the app uses, and a field that appears only when something is
+ * wrong teaches nobody what it is. Marked when `slugOf(name)` no longer matches,
+ * which is the permanent state of any agent that has been renamed.
+ *
+ * The mark is a `≠` and a sentence. Not the dashed underline the model cell
+ * uses one column over — dashed means "absent" there, and a shape asked to mean
+ * two things stops meaning either. Never colour: renaming is not a state, and
+ * the seven tones are spoken for.
+ */
+function Called({ agent }: { agent: Agent }) {
+  const diverged = renamed(agent);
+  return (
+    <span
+      className={diverged ? "agents-id agents-id-diverged" : "agents-id"}
+      title={
+        diverged
+          ? `the ${DAEMON_NAME} knows this one as ${agent.id}; it has been renamed since, and every roster still points at the id`
+          : `the ${DAEMON_NAME} knows this one as ${agent.id}`
+      }
+    >
+      {/*
+        Says what the second token IS. Everything telling the two apart on
+        screen is spatial — a margin, a mono face, a fainter colour — and none
+        of it survives being read out: `preview-why` dumped this row's text as
+        `tradutortradutor`, and a screen reader gets no better than the same
+        word twice with nothing to say why. The `≠` is left out of this on
+        purpose: it comes from `::before`, so it is never in the accessibility
+        tree, and the sentence below carries that fact in language instead.
+      */}
+      <span className="sr-only">known to the {DAEMON_NAME} as </span>
+      {agent.id}
+      {diverged && (
+        <span className="sr-only">
+          {" "}
+          — renamed since; rosters, team items, job items and council seats all still point at this
+          id
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Which model, and what naming none costs.
+ *
+ * `null` still reads as the engine's default and never as blank — but it is no
+ * longer the end of the sentence. `council::seat_from_spec` refuses an agent
+ * that names no model, because *"a seat records the model it ran"*
+ * (`core/src/council.rs:841`), and every engine this catalogue accepts maps to
+ * a seat kind (`ENGINE_SEAT_KINDS`, total by test). So a null model is exactly
+ * an agent that can never take a council seat, and nothing else is.
+ *
+ * It is still perfectly good for a department, so this says what the null costs
+ * rather than drawing it as a fault.
+ */
+function Model({ agent }: { agent: Agent }) {
+  if (canTakeASeat(agent)) return <span className="agents-model">{agent.model}</span>;
+  return (
+    <span
+      className="agents-model agents-model-default"
+      title="names no model, so it can never take a council seat, because a seat records the model it ran"
+    >
+      the engine&rsquo;s default
+      <span className="sr-only"> (names no model, so it can never take a council seat)</span>
+    </span>
+  );
+}
+
+/** What this shell can read out of `tool_policy`. */
+type ToolsReading = "tools" | "none" | "unmapped";
+
+/**
+ * `tool_policy` is a bare `string` on the wire, so a policy this shell has never
+ * heard of is possible and is its own answer — the treatment `StateBadge` gives
+ * an unmapped state, and the treatment `/teams` gives an unmapped grant mode.
+ * Falling through to "no tools" would be a claim about a barrier this shell
+ * cannot see.
+ */
+function toolsOf(agent: Agent): ToolsReading {
+  if (agent.tool_policy === "mcp_only" || agent.tool_policy === "unrestricted") return "tools";
+  return agent.tool_policy === "none" ? "none" : "unmapped";
+}
+
+const TOOLS_MARK: Record<ToolsReading, string> = { tools: "■", none: "□", unmapped: "?" };
+
+const TOOLS_SAID: Record<ToolsReading, string> = {
+  tools: "has tools",
+  none: "no tools at all",
+  unmapped: "this shell has no reading for that policy",
+};
+
+/**
+ * Whether this agent has any tools.
+ *
+ * A mark and a word, which is the grammar the console uses for a granted power:
+ * filled has, hollow has not, question mark is this shell being behind its
+ * núcleo. The shape carries it, so none of this is colour-only, and the sentence
+ * is beside it for anything that does not render.
+ */
+function Tools({ agent }: { agent: Agent }) {
+  const reading = toolsOf(agent);
+  return (
+    <span className={`agents-tools agents-tools-${reading}`} title={`${agent.tool_policy}: ${TOOLS_SAID[reading]}`}>
+      <span aria-hidden="true">{TOOLS_MARK[reading]}</span>
+      <span aria-hidden="true">{agent.tool_policy}</span>
+      <span className="sr-only">
+        {agent.tool_policy}: {TOOLS_SAID[reading]}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * How much of this agent is spoken for.
+ *
+ * How MUCH, never WHERE. Where is the matrix on `/teams`, it is already drawn,
+ * and a second copy here would be the same relation stated twice. What the
+ * console cannot answer is per-agent: nobody uses this one.
+ *
+ * The glyphs are the matrix's own, with the matrix's meanings — `◉` directs,
+ * `●` on staff — on purpose. Two vocabularies for one relation is how the two
+ * pages start to look like they are about different things. So is two
+ * arithmetics: a department gets ONE standing here, exactly as `standingOf`
+ * gives it one there, which is what makes these two figures add up to the
+ * number of departments the agent is in. Counted the other way, a director who
+ * is also on the roster of the department it directs drew `◉ 1 ● 1` — one
+ * department, read as two by anybody who added them, under a heading that
+ * invites adding them.
+ *
+ * Three arms and not two, because "not known yet" and "nobody" are opposite
+ * answers and only one of them is worth acting on. Until `GET /teams` returns,
+ * this says it does not know.
+ */
+function Employed({ employment, known }: { employment: Employment; known: boolean }) {
+  if (!known) {
+    return (
+      <span className="agents-figure agents-figure-unknown" title="the team list has not answered yet">
+        <span aria-hidden="true">·</span>
+        <span className="sr-only">the team list has not answered, so this is not zero</span>
+      </span>
+    );
+  }
+
+  if (unemployed(employment)) {
+    return (
+      <span className="agents-figure agents-figure-none" title="no team names this one">
+        <span aria-hidden="true">—</span>
+        <span className="sr-only">no team names this one</span>
+      </span>
+    );
+  }
+
+  return (
+    <span className="agents-figure">
+      {employment.directs.length > 0 && (
+        <span className="agents-standing" title={`directs ${employment.directs.join(", ")}`}>
+          <span aria-hidden="true">◉ {employment.directs.length}</span>
+          <span className="sr-only">directs {employment.directs.join(", ")}. </span>
+        </span>
+      )}
+      {employment.staffs.length > 0 && (
+        <span className="agents-standing" title={`on the roster of ${employment.staffs.join(", ")}`}>
+          <span aria-hidden="true">● {employment.staffs.length}</span>
+          <span className="sr-only">on the roster of {employment.staffs.join(", ")}.</span>
+        </span>
+      )}
+    </span>
+  );
+}
+
+/* -------------------------------------------------------------- field set -- */
+
+/** The draft a form edits — `AgentRequest` with `model` as a plain string so a blank input is possible. */
+interface AgentDraft {
+  name: string;
+  speciality: string;
+  prompt: string;
+  engine: AgentEngine;
+  model: string;
+  capabilities: string[];
+}
+
+const EMPTY_DRAFT: AgentDraft = {
+  name: "",
+  speciality: "",
+  prompt: "",
+  engine: "claude",
+  model: "",
+  capabilities: ["mcp.nucleos"],
+};
+
+function draftFromAgent(agent: Agent): AgentDraft {
+  return {
+    name: agent.name,
+    speciality: agent.speciality,
+    prompt: agent.prompt,
+    engine: isAgentEngine(agent.engine) ? agent.engine : "claude",
+    model: agent.model ?? "",
+    capabilities: [...agent.capabilities],
+  };
+}
+
+function isAgentEngine(value: string): value is AgentEngine {
+  return value === "claude" || value === "codex" || value === "local";
+}
+
+/** A `local` engine must name a model — refused client-side before the round trip, per `agent::validate`. */
+function draftIsValid(draft: AgentDraft): boolean {
+  return (
+    draft.name.trim() !== "" &&
+    draft.speciality.trim() !== "" &&
+    (draft.engine !== "local" || draft.model.trim() !== "")
+  );
+}
+
+/** Every field, always — the route replaces the whole row, so an edit sends the unchanged ones too. */
+function requestFromDraft(draft: AgentDraft): AgentRequest {
+  return {
+    name: draft.name.trim(),
+    speciality: draft.speciality.trim(),
+    prompt: draft.prompt.trim(),
+    engine: draft.engine,
+    model: draft.model.trim() === "" ? null : draft.model.trim(),
+    capabilities: draft.capabilities,
+  };
+}
+
+/**
+ * The fields `NewAgentForm` and the editor share.
+ *
+ * One field set for both, so the two cannot answer "what does an `AgentRequest`
+ * need" differently. Labels are plain ("Name", "Engine", …) rather than
+ * disambiguated per instance — only one editor is ever open on this page at a
+ * time, and a caller that needs to tell two apart scopes the query with
+ * `within(...)`.
+ */
+function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: Partial<AgentDraft>) => void }) {
+  const modelRequired = draft.engine === "local";
+  const fieldId = useId();
+
+  return (
+    <>
+      <label className="agents-field">
+        <span>Name</span>
+        <input value={draft.name} onChange={(event) => onChange({ name: event.target.value })} />
+      </label>
+
+      <label className="agents-field agents-field-sentence">
+        <span>Speciality</span>
+        <input
+          value={draft.speciality}
+          onChange={(event) => onChange({ speciality: event.target.value })}
+        />
+      </label>
+
+      <label className="agents-field agents-field-wide">
+        <span>Prompt</span>
+        <textarea
+          rows={5}
+          value={draft.prompt}
+          onChange={(event) => onChange({ prompt: event.target.value })}
+        />
+      </label>
+
+      <label className="agents-field">
+        <span>Engine</span>
+        <Select
+          block
+          value={draft.engine}
+          onChange={(event) => onChange({ engine: event.target.value as AgentEngine })}
+        >
+          <option value="claude">claude</option>
+          <option value="codex">codex</option>
+          <option value="local">local</option>
+        </Select>
+      </label>
+
+      <div className="agents-field agents-field-half">
+        <label htmlFor={`${fieldId}-model`}>
+          <span>Model</span>
+        </label>
+        <input
+          id={`${fieldId}-model`}
+          aria-required={modelRequired}
+          aria-describedby={`${fieldId}-model-hint`}
+          value={draft.model}
+          onChange={(event) => onChange({ model: event.target.value })}
+        />
+        <small className="agents-hint" id={`${fieldId}-model-hint`}>
+          {modelRequired ? "Required for a local engine." : "Blank uses the engine's default."}
+        </small>
+      </div>
+
+      <fieldset className="agents-field agents-field-wide">
+        <legend>Capabilities</legend>
+        {AGENT_CAPABILITIES.map((capability) => (
+          <label key={capability} style={{ display: "inline-flex", gap: 4, marginRight: 12 }}>
+            <input
+              type="checkbox"
+              checked={draft.capabilities.includes(capability)}
+              onChange={(event) =>
+                onChange({
+                  capabilities: event.target.checked
+                    ? [...draft.capabilities, capability]
+                    : draft.capabilities.filter((held) => held !== capability),
+                })
+              }
+            />
+            <span>{capability}</span>
+          </label>
+        ))}
+      </fieldset>
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ create -- */
+
+function NewAgentForm({ onDone }: { onDone: () => void }) {
+  const [draft, setDraft] = useState<AgentDraft>(EMPTY_DRAFT);
+  const create = useCreateAgent();
+  const valid = draftIsValid(draft);
+  const formId = useId();
+
+  function patch(next: Partial<AgentDraft>) {
+    setDraft((current) => ({ ...current, ...next }));
+  }
+
+  return (
+    <Modal
+      open
+      onOpenChange={(open) => {
+        if (!open) onDone();
+      }}
+      title="New agent"
+      size="md"
+      footer={
+        <>
+          <Button variant="ghost" onClick={onDone}>
+            Cancel
+          </Button>
+          <span className="agents-save-status" role="status">
+            {create.isPending ? "Adding…" : !valid ? invalidReason(draft) : ""}
+          </span>
+          <Button type="submit" form={formId} intent="go" disabled={!valid || create.isPending}>
+            {create.isPending ? "Adding…" : "Add agent"}
+          </Button>
+        </>
+      }
+    >
+      <form
+        id={formId}
+        className="agents-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!valid || create.isPending) return;
+          create.mutate(requestFromDraft(draft), {
+            onSuccess: () => {
+              setDraft(EMPTY_DRAFT);
+              onDone();
+            },
+          });
+        }}
+      >
+        <AgentFields draft={draft} onChange={patch} />
+        <p className="agents-aside">
+          The id is taken from the name, once, and never recomputed. Renaming later changes the
+          label and not the address.
+        </p>
+      </form>
+      {create.isError && <SaveRefusal error={create.error} />}
+    </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ editor -- */
+
+/**
+ * The one editor on the page, in a modal opened by selecting a row.
+ *
+ * Not inside the row and not below the table, so opening it never changes the
+ * height of the catalogue — the same move the console made when it lifted live
+ * work out of the cards. "One editor at a time" was already this page's stated
+ * invariant; a modal makes it structural rather than a promise.
+ *
+ * The prompt is read here too. It used to sit behind a per-row `<details>`,
+ * which was a second shape for a thing this panel already shows — and the
+ * textarea is a draft, not a write: nothing leaves until Save.
+ */
+function AgentEditor({
+  agent,
+  employment,
+  employmentKnown,
+  onClose,
+}: {
+  agent: Agent;
+  employment: Employment;
+  employmentKnown: boolean;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState<AgentDraft>(() => draftFromAgent(agent));
+  const [tab, setTab] = useState<EditorTab>("definition");
+  const update = useUpdateAgent();
+  const del = useDeleteAgent();
+  const valid = draftIsValid(draft);
+  const formId = useId();
+  const dirty = JSON.stringify(draft) !== JSON.stringify(draftFromAgent(agent));
+
+  function patch(next: Partial<AgentDraft>) {
+    setDraft((current) => ({ ...current, ...next }));
+  }
+
+  return (
+    <Modal
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+      title={`Editing ${agent.name}`}
+      size="md"
+      footer={
+        tab === "definition" ? (
+          <>
+            <span className="agents-save-status" role="status">
+              {update.isPending
+                ? "Saving…"
+                : !valid
+                  ? invalidReason(draft)
+                  : dirty
+                    ? "Unsaved changes"
+                    : ""}
+            </span>
+            <Button variant="ghost" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button type="submit" form={formId} intent="go" disabled={!valid || update.isPending}>
+              {update.isPending ? "Saving…" : "Save changes"}
+            </Button>
+          </>
+        ) : (
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+        )
+      }
+    >
+      <Tabs value={tab} onValueChange={(next) => setTab(next as EditorTab)}>
+        <TabsList aria-label="Agent sections">
+          {EDITOR_TABS.map(([key, text]) => (
+            <TabsTrigger key={key} value={key}>
+              {text}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent value="definition">
+          <form
+            id={formId}
+            className="agents-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!valid || update.isPending) return;
+              /*
+                Stays open and reseeds from the daemon's answer, the way the charter
+                editor does. Two things come of it: what you see next is what the
+                {DAEMON_NAME} stored rather than what you typed — trimmed, and a blank model
+                turned back into the engine's default — and the row above changes
+                under you, which is the acknowledgement that a form closing itself
+                used to be standing in for. A "saved" toast says so as well, because
+                that row sits behind the overlay.
+              */
+              update.mutate(
+                { id: agent.id, request: requestFromDraft(draft) },
+                {
+                  onSuccess: (savedAgent) => {
+                    setDraft(draftFromAgent(savedAgent));
+                    toastManager.add({ type: "success", title: "Agent saved", description: savedAgent.name });
+                  },
+                },
+              );
+            }}
+          >
+            <AgentFields draft={draft} onChange={patch} />
+            {/*
+              Said here rather than nowhere, because it is the one consequence of
+              this form that is not obvious: `job::persona_for` reads an agent's
+              prompt when an item is DISPATCHED and does not store it on the row,
+              so saving reaches work that was planned before the edit.
+            */}
+            <p className="agents-aside">
+              Saving reaches work that is already queued: an item reads its agent&rsquo;s prompt
+              when it is dispatched, not when it was planned.
+            </p>
+          </form>
+          {update.isError && <SaveRefusal error={update.error} />}
+        </TabsContent>
+
+        <TabsContent value="memory">
+          <ContextRefs ownerKind="agent" ownerId={agent.id} />
+          <ScopedMemory scopeKind="agent" scopeId={agent.id} />
+        </TabsContent>
+
+        <TabsContent value="tools">
+          <ScopedTools ownerKind="agent" ownerId={agent.id} />
+          <LoadoutPreview agentId={agent.id} />
+        </TabsContent>
+
+        {/*
+          The delete, and what this page can see standing on it — before the
+          confirmation rather than after the refusal. Never disabled from that
+          reading: the daemon is the authority, rosters move underneath, and a
+          button greyed out by a stale reading is worse than a refusal that tells
+          the truth.
+        */}
+        <TabsContent value="remove">
+          <div className="agents-remove">
+            <p className="agents-holds">{holdSentence(agent, employment, employmentKnown)}</p>
+            <ConfirmButton
+              label="Delete"
+              confirmLabel={`Delete ${agent.name}`}
+              variant="danger"
+              intent="stop"
+              disabled={del.isPending}
+              onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}
+            />
+          </div>
+          {del.isError && <DeleteRefusal error={del.error} />}
+        </TabsContent>
+      </Tabs>
+    </Modal>
+  );
+}
+
+type EditorTab = "definition" | "memory" | "tools" | "remove";
+
+/** The editor's sections: only the first is "editing the agent"; the rest are what hangs off it. */
+const EDITOR_TABS: readonly (readonly [EditorTab, string])[] = [
+  ["definition", "Definition"],
+  ["memory", "Memory and context"],
+  ["tools", "Tools and loadout"],
+  ["remove", "Remove"],
+];
+
+/** Why Save is not available, in the footer beside it rather than only as a greyed button. */
+function invalidReason(draft: AgentDraft): string {
+  if (draft.name.trim() === "") return "Needs a name";
+  if (draft.speciality.trim() === "") return "Needs a speciality";
+  return "A local engine needs a model";
+}
+
+/**
+ * What is standing on this agent, in words, before you arm the delete.
+ *
+ * Honest about its own reach in every arm. This page sees two of the four
+ * tables `agent::delete` asks about — the director column and the rosters — and
+ * cannot see either work table. So "nobody names this one" is never allowed to
+ * read as "this will delete cleanly".
+ */
+function holdSentence(agent: Agent, employment: Employment, known: boolean): string {
+  const work =
+    `an item of a team run, or of a job, is not something this page can see, and it is the other half of what the ${DAEMON_NAME} checks`;
+
+  if (!known) {
+    return `The team list has not answered, so what stands on ${agent.name} is not known here. The ${DAEMON_NAME} refuses a delete on four grounds: it directs a team, it is on a roster, or it holds an item of a team run or of a job.`;
+  }
+
+  if (unemployed(employment)) {
+    return `No team names ${agent.name}. Work it is already holding: ${work}.`;
+  }
+
+  const standings = [
+    employment.directs.length > 0 ? `directs ${employment.directs.join(", ")}` : null,
+    employment.staffs.length > 0 ? `is on the roster of ${employment.staffs.join(", ")}` : null,
+  ].filter((part) => part !== null);
+
+  return `${agent.name} ${standings.join(" and ")}. The ${DAEMON_NAME} refuses a delete while that is true, and also while ${work}.`;
+}

@@ -1,0 +1,118 @@
+// Command demo-seed delivers a representative mailbox batch to a running NucleOS daemon.
+package main
+
+import (
+	_ "embed"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+
+	"nucleoschannelkit/netguard"
+	"nucleosemail/daemon"
+)
+
+const defaultDaemonURL = "http://127.0.0.1:8791"
+
+//go:embed mailbox.json
+var mailboxJSON []byte
+
+//go:embed sent.json
+var sentJSON []byte
+
+func main() {
+	mailbox := flag.String("mailbox", "INBOX", "mailbox name to seed")
+	sentMailbox := flag.String("sent-mailbox", "Sent", "sent-folder name to seed; empty skips it")
+	dryRun := flag.Bool("dry-run", false, "print the batch without delivering it")
+	flag.Parse()
+
+	batches, err := batchesToSeed(*mailbox, *sentMailbox)
+	if err != nil {
+		log.Fatalf("load embedded mailbox: %v", err)
+	}
+
+	if *dryRun {
+		printJSON(batches)
+		return
+	}
+
+	token := strings.TrimSpace(os.Getenv("NUCLEOS_DAEMON_TOKEN"))
+	if token == "" {
+		log.Fatal("NUCLEOS_DAEMON_TOKEN is required to deliver the demo mailbox")
+	}
+
+	daemonURL, err := daemonURLFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	client := daemon.New(daemonURL, token)
+	for _, batch := range batches {
+		result, err := client.Deliver(batch)
+		if err != nil {
+			log.Fatalf("deliver demo mailbox %q: %v", batch.Mailbox, err)
+		}
+		printJSON(result)
+	}
+}
+
+// daemonURLFromEnv reads NUCLEOS_DAEMON_URL. The bearer token is sent there, so it must stay on this
+// machine: the same loopback check the sidecar's own config applies.
+func daemonURLFromEnv() (string, error) {
+	daemonURL := os.Getenv("NUCLEOS_DAEMON_URL")
+	if daemonURL == "" {
+		daemonURL = defaultDaemonURL
+	}
+	if err := netguard.RequireLoopbackURL(daemonURL); err != nil {
+		return "", fmt.Errorf("NUCLEOS_DAEMON_URL: %w", err)
+	}
+	return daemonURL, nil
+}
+
+// batchesToSeed returns what the demo delivers, in the order it must be delivered.
+func batchesToSeed(mailbox, sentMailbox string) ([]daemon.Batch, error) {
+	inbox, err := seededBatch(mailbox)
+	if err != nil {
+		return nil, err
+	}
+	inbox.Direction = "inbound"
+	if strings.TrimSpace(sentMailbox) == "" {
+		return []daemon.Batch{inbox}, nil
+	}
+
+	sent, err := seededSentBatch(sentMailbox)
+	if err != nil {
+		return nil, err
+	}
+	// Sent mail makes a correspondent known, so it must reach the database before the inbox mail
+	// whose judgement it changes. This ordering is behaviour, not presentation.
+	return []daemon.Batch{sent, inbox}, nil
+}
+
+func seededBatch(mailbox string) (daemon.Batch, error) {
+	var batch daemon.Batch
+	if err := json.Unmarshal(mailboxJSON, &batch); err != nil {
+		return daemon.Batch{}, err
+	}
+	batch.Mailbox = mailbox
+	return batch, nil
+}
+
+func seededSentBatch(mailbox string) (daemon.Batch, error) {
+	var batch daemon.Batch
+	if err := json.Unmarshal(sentJSON, &batch); err != nil {
+		return daemon.Batch{}, err
+	}
+	batch.Mailbox = mailbox
+	return batch, nil
+}
+
+func printJSON(value any) {
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		log.Fatalf("encode result: %v", err)
+	}
+	fmt.Println(string(encoded))
+}

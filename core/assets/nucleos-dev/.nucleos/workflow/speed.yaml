@@ -1,0 +1,61 @@
+# Speed profiles: what `normal`, `fast` and `thorough` buy.
+#
+# Read by <bundle_dir>/scripts/resolve_speed.py, and by nothing else: a harness that runs
+# sessions hands down only the speed's NAME (WORKFLOW_SPEED) and its own capacity
+# (WORKFLOW_PARALLEL_CEILING). What a speed means for process lives here alone.
+#
+# Test runs are NOT a speed setting. There used to be a `tests:` key (per_phase | batched);
+# batched is now the only mode in every profile, so the key (and `test_runs`) is gone:
+# executors run no tests, the controller proves RED once for every packet together, and the
+# final verify is the GREEN proof (workflow.md Rule 3).
+#
+# Invariant (I): speed never switches off review_gate, the single final verification or the
+# merge queue. Nothing ships unverified under any profile.
+# Invariant (II): speed never creates capacity. How much parallel work may run is
+# the harness's number (WORKFLOW_PARALLEL_CEILING); this table can only narrow to it.
+default: normal
+# Autonomy trees (spec B2): a question to the owner may carry a default answer that the sweep
+# applies after the deadline with no reply. Read by the daemon (tree_job/auto_default.rs).
+# auto_default: false switches every default off.
+autonomy:
+  auto_default: true
+  auto_default_deadline_minutes: 120
+  auto_default_per_node: 1
+  auto_default_per_job: 3
+  # false: a leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before
+  # closing (via scripts/heavy.py). true: it may add one `cargo check -p <crate> --tests`.
+  leaf_self_check: false
+# Node trees (hierarchical orchestration). The daemon enforces depth, width and summary size;
+# the budgets are planning targets for the decomposition. subtree_verify: see workflow.md.
+nodes:
+  max_depth: 6
+  max_width: 6
+  leaf_budget: 120000
+  orchestrator_budget: 150000
+  ceiling: 200000
+  subtree_verify: false
+# Orchestration tree (scripts/tree.py). Generic numbers only; what belongs to one project
+# (worktrees_dir, links, heavy, base_branch) lives in <state_dir>/project.yaml under `tree:`.
+tree:
+  floor_gb: 15
+  max_live_branches: 4
+  seed_gb_per_layer: 8
+  lock_wait_minutes: 10
+  stale_minutes: 30
+  report_max_lines: 60
+profiles:
+  normal:
+    reasoning_effort: medium   # codex-safe subset only: low | medium | high | xhigh
+    fast_path: heuristic       # heuristic | forbidden
+    review: rule6              # rule6 | always
+    wave: false
+  fast:
+    reasoning_effort: low
+    fast_path: heuristic       # NOT relaxed: relaxing it buys less verification
+    review: rule6
+    wave: true
+  thorough:
+    reasoning_effort: high
+    fast_path: forbidden
+    review: always
+    wave: false

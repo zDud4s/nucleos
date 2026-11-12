@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The `channels/<id>` settings document. Absent or unreadable = default, never fatal.",
+  "properties": {
+    "doctrine": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "projects": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Project id to `conversation_ref` (a thread in Telegram).",
+      "type": "object"
+    },
+    "stream_edits": {
+      "default": true,
+      "description": "Whether a running turn's ack message is edited with the live text (`channels.stream_edits`\nin the plan). Absent = on; it only ever applies to a channel that declares `edit`.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  },
+  "title": "ChannelConfig",
+  "type": "object"
+}
