@@ -175,7 +175,7 @@ async fn fraction_for_sessions(
 }
 
 /// Appends `<column> IN (?, ?, ...)` with one bound value per item.
-fn push_in(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, column: &str, items: &[String]) {
+fn push_in(qb: &mut sqlx::QueryBuilder, column: &str, items: &[String]) {
     qb.push(column).push(" IN (");
     let mut sep = qb.separated(", ");
     for item in items {
@@ -186,7 +186,7 @@ fn push_in(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, column: &str, items: &[Str
 
 /// Appends the window and project filter shared by both queries of [`fraction_for_window`].
 fn push_window(
-    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    qb: &mut sqlx::QueryBuilder,
     projects: &[String],
     after: &str,
     until: &str,
