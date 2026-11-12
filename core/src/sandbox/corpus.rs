@@ -201,23 +201,25 @@ fn sessions_read_is_capped_and_refuses_links() {
 
 #[test]
 fn file_document_read_refuses_a_hard_linked_file() {
-    let root = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    // The files root is canonical in production; `resolve_within` compares canonical paths.
+    let root = std::fs::canonicalize(root_dir.path()).unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     let secret = elsewhere.path().join("secret.txt");
     std::fs::write(&secret, "owner data").unwrap();
-    std::fs::write(root.path().join("plain.txt"), "fine").unwrap();
+    std::fs::write(root.join("plain.txt"), "fine").unwrap();
     assert_eq!(
-        crate::files::read_document(root.path(), "plain.txt")
+        crate::files::read_document(&root, "plain.txt")
             .unwrap()
             .as_bytes(),
         b"fine"
     );
 
-    if std::fs::hard_link(&secret, root.path().join("planted.txt")).is_err() {
+    if std::fs::hard_link(&secret, root.join("planted.txt")).is_err() {
         skip("file_document_read_refuses_a_hard_linked_file");
         return;
     }
-    let read = crate::files::read_document(root.path(), "planted.txt");
+    let read = crate::files::read_document(&root, "planted.txt");
     assert!(
         matches!(read, Err(crate::files::PathError::Escapes)),
         "{read:?}"
