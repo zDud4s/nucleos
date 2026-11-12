@@ -678,6 +678,8 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     // not open it to lower levels by accident.
     "backlog",
     "calendar",
+    // Read-only status/banner of the OS sandbox; no route changes the switch.
+    "sandbox",
     "capture-requests",
     "contacts",
     "context-refs",
