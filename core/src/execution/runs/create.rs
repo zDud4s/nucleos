@@ -788,6 +788,22 @@ async fn create_run_with_policy(
                 match created {
                     Ok(info) => info,
                     Err(error) => {
+                        // A resolution whose tree cannot be made spends its attempt here, as a
+                        // failed staging does below: the next tick would hit the same wall, and
+                        // without the claim `next_conflict` mints a failed run every minute for
+                        // ever (request 513, a target branch that never existed). Best effort: the
+                        // run is failing either way.
+                        if let Some(resolution) = resolution {
+                            let _ = sqlx::query(
+                                "UPDATE vcs_requests SET resolution_run_id = ?,
+                                        resolution_attempts = resolution_attempts + 1
+                                  WHERE id = ? AND resolution_run_id IS NULL",
+                            )
+                            .bind(id)
+                            .bind(resolution.request_id)
+                            .execute(&state.pool)
+                            .await;
+                        }
                         fail_provisioning(
                             state,
                             id,

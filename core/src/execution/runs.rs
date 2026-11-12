@@ -1105,6 +1105,43 @@ pub mod tests {
         );
     }
 
+    /// A conflict whose worktree cannot be made at all spends its attempt too. Request 513 in the
+    /// field: its target `aut/integ` never existed, `git worktree add` failed before the claim, and
+    /// the resolver minted a failed run every minute because `resolution_run_id` stayed NULL.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflict_whose_worktree_cannot_be_made_spends_its_attempt() {
+        let _env_lock = crate::execution::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        // Only `master` exists here; the resolution's target is a branch nobody ever made.
+        let (_container, repo) = init_contained_repo("nucleos-runs-resolve-no-target-");
+        let state = test_state().await;
+        let request = escalated_merge(&state.pool, &repo).await;
+
+        let refused = create_resolution_run(
+            &state,
+            "resolve it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Resolution {
+                request_id: request,
+                source: "master".to_owned(),
+                target: "aut/no-such-branch".to_owned(),
+            },
+        )
+        .await
+        .expect_err("a worktree cannot be based on a branch that does not exist");
+
+        assert!(
+            matches!(refused, CreateRunError::Worktree(_)),
+            "provisioning is what failed: {refused:?}"
+        );
+        assert!(
+            resolution_run_id_of(&state.pool, request).await.is_some(),
+            "the attempt is spent, so the resolver does not mint the same failure every tick"
+        );
+    }
+
     /// A correction run (F3-4, spec 2026-10-05 §6.2 D4) is born on the `fix/` branch the post-merge
     /// gate prepared, not on wherever the project checkout stands. That branch's first commit is the
     /// revert of the revert, so a run born anywhere else would start without the one thing it is
