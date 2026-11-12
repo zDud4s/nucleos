@@ -682,9 +682,7 @@ pub(super) fn github_caller_is_allowed(scope: &Scope) -> Result<(), StatusCode> 
         | Scope::Service(_)
         | Scope::TeamRun(_)
         | Scope::Assistant
-        | Scope::ApiToken(_) => {
-            Err(StatusCode::FORBIDDEN)
-        }
+        | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
     }
 }
 

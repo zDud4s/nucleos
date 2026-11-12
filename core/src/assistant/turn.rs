@@ -954,14 +954,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             evict_live(&turn.slot.chat_id);
         }
 
-        let mut env = chat_key::turn_env(
-            tool_policy,
-            may_live,
-            &pool,
-            &turn.slot.chat_id,
-            id,
-        )
-        .await;
+        let mut env =
+            chat_key::turn_env(tool_policy, may_live, &pool, &turn.slot.chat_id, id).await;
         env.append(&mut pick.env);
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read
