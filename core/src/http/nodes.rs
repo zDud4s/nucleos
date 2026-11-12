@@ -87,6 +87,8 @@ struct OpenBody {
     title: Option<String>,
     goal: Option<String>,
     owned_paths: Option<Vec<String>>,
+    /// Files to start from; absent is none.
+    pointers: Option<Vec<String>>,
     budget_tokens: Option<i64>,
     task_id: Option<String>,
     session_id: Option<String>,
@@ -176,6 +178,7 @@ async fn post_node(
         title: required("title", body.title)?,
         goal: required("goal", body.goal)?,
         owned_paths: body.owned_paths.unwrap_or_default(),
+        pointers: body.pointers.unwrap_or_default(),
         budget_tokens: body.budget_tokens,
         task_id: present(body.task_id),
         session_id: present(body.session_id),
@@ -240,7 +243,7 @@ async fn post_node(
     Ok(Json(opened))
 }
 
-/// `PATCH /nodes/{id}`: `{status?, decision?, context_peak?, widen_paths?}`; only what is sent
+/// `PATCH /nodes/{id}`: `{status?, decision?, context_peak?, widen_paths?, pointers?}`; only what is sent
 /// changes. A widen refused for a running sibling's path is a 409 naming that sibling.
 async fn patch_node(
     State(state): State<AppState>,
@@ -1287,6 +1290,40 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(root_agent, None);
+    }
+
+    #[tokio::test]
+    async fn node_open_stores_pointers_and_node_tree_returns_them_or_an_empty_list() {
+        let app = app().await;
+        let root = open_root(&app, "s-pointers").await;
+        let (status, with) = call(
+            &app,
+            "POST",
+            "/nodes",
+            Some(json!({
+                "parent_id": root, "kind": "leaf", "title": "With", "goal": "Do a part",
+                "owned_paths": ["core/src/a/**"], "pointers": ["core/src/a/x.rs", "docs/a.md"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{with}");
+        let (status, without) = open_leaf(&app, &root, "Without", &["core/src/b/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{without}");
+
+        let (status, tree) =
+            call(&app, "GET", &format!("/nodes/tree/{root}?view=full"), None).await;
+        assert_eq!(status, StatusCode::OK, "{tree}");
+        let pointers_of = |opened: &Value| {
+            tree["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == opened["id"])
+                .unwrap()["pointers"]
+                .clone()
+        };
+        assert_eq!(pointers_of(&with), json!(["core/src/a/x.rs", "docs/a.md"]));
+        assert_eq!(pointers_of(&without), json!([]));
     }
 
     #[tokio::test]

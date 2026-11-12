@@ -750,6 +750,7 @@ impl NucleosTools {
             node_id,
             kind,
             estimate_tokens,
+            pointers,
         }): Parameters<TreeBranchStartParams>,
     ) -> String {
         json_result(
@@ -766,6 +767,7 @@ impl NucleosTools {
                         "node_id": node_id,
                         "kind": kind,
                         "estimate_tokens": estimate_tokens,
+                        "pointers": pointers,
                     }),
                 )
                 .await,

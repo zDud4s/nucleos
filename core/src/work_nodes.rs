@@ -41,7 +41,7 @@ macro_rules! select_nodes {
     ($tail:literal) => {
         concat!(
             "SELECT id, project_id, root_id, parent_id, depth, kind, title, goal, status, \
-             owned_paths, budget_tokens, context_peak, summary, handoff_path, decisions, run_id, \
+             owned_paths, pointers, budget_tokens, context_peak, summary, handoff_path, decisions, run_id, \
              session_id, chat_id, task_id, created_at, updated_at, closed_at FROM work_nodes ",
             $tail
         )
@@ -206,6 +206,7 @@ struct NodeRow {
     goal: String,
     status: String,
     owned_paths: String,
+    pointers: String,
     budget_tokens: Option<i64>,
     context_peak: Option<i64>,
     summary: Option<String>,
@@ -233,6 +234,8 @@ pub struct Node {
     pub goal: String,
     pub status: String,
     pub owned_paths: Vec<String>,
+    /// Files the parent pointed this node at to start from.
+    pub pointers: Vec<String>,
     pub budget_tokens: Option<i64>,
     pub context_peak: Option<i64>,
     pub summary: Option<String>,
@@ -251,6 +254,7 @@ impl From<NodeRow> for Node {
     fn from(row: NodeRow) -> Self {
         Node {
             owned_paths: serde_json::from_str(&row.owned_paths).unwrap_or_default(),
+            pointers: serde_json::from_str(&row.pointers).unwrap_or_default(),
             decisions: serde_json::from_str(&row.decisions).unwrap_or_default(),
             id: row.id,
             project_id: row.project_id,
@@ -476,6 +480,9 @@ pub struct OpenArgs {
     pub goal: String,
     #[serde(default)]
     pub owned_paths: Vec<String>,
+    /// Files to start from, as paths; stored as given, `[]` when absent.
+    #[serde(default)]
+    pub pointers: Vec<String>,
     #[serde(default)]
     pub budget_tokens: Option<i64>,
     #[serde(default)]
@@ -544,6 +551,7 @@ pub async fn open_linked(
     let id = crate::auth::generate_uuid_v4();
     let now = chrono::Utc::now().to_rfc3339();
     let owned = serde_json::to_string(&args.owned_paths).unwrap_or_else(|_| "[]".to_owned());
+    let pointers = serde_json::to_string(&args.pointers).unwrap_or_else(|_| "[]".to_owned());
 
     let (root_id, depth, project, task_id): (String, i64, Option<String>, Option<String>) =
         match args.parent_id.as_deref() {
@@ -619,9 +627,9 @@ pub async fn open_linked(
     sqlx::query(
         "INSERT INTO work_nodes \
          (id, project_id, root_id, parent_id, depth, kind, title, goal, status, owned_paths, \
-          budget_tokens, run_id, session_id, chat_id, task_id, tree_job_id, continues_node_id, \
+          pointers, budget_tokens, run_id, session_id, chat_id, task_id, tree_job_id, continues_node_id, \
           agent_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project)
@@ -632,6 +640,7 @@ pub async fn open_linked(
     .bind(title)
     .bind(goal)
     .bind(&owned)
+    .bind(&pointers)
     .bind(args.budget_tokens)
     .bind(&args.run_id)
     .bind(&args.session_id)
@@ -662,6 +671,9 @@ pub struct UpdateArgs {
     /// Globs the node needs beyond its `owned_paths`; see [`widen`].
     #[serde(default)]
     pub widen_paths: Option<Vec<String>>,
+    /// Replaces the node's pointers (files to start from) when present.
+    #[serde(default)]
+    pub pointers: Option<Vec<String>>,
 }
 
 /// Changes a node's status, appends a decision, raises its context peak (kept as the max), and/or
@@ -710,12 +722,16 @@ pub async fn update(
     };
     sqlx::query(
         "UPDATE work_nodes SET status = ?, owned_paths = ?, decisions = ?, context_peak = ?, \
-         updated_at = ? WHERE id = ?",
+         pointers = ?, updated_at = ? WHERE id = ?",
     )
     .bind(&status)
     .bind(serde_json::to_string(&owned).unwrap_or_else(|_| "[]".to_owned()))
     .bind(serde_json::to_string(&decisions).unwrap_or_else(|_| "[]".to_owned()))
     .bind(peak)
+    .bind(
+        serde_json::to_string(args.pointers.as_ref().unwrap_or(&node.pointers))
+            .unwrap_or_else(|_| "[]".to_owned()),
+    )
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
     .execute(pool)
@@ -1001,6 +1017,7 @@ pub struct TreeNode {
     pub status: String,
     pub summary: Option<String>,
     pub owned_paths: Vec<String>,
+    pub pointers: Vec<String>,
     pub updated_at: String,
 }
 
@@ -1070,6 +1087,7 @@ pub async fn tree(pool: &SqlitePool, root_id: &str, view: View) -> Result<Tree, 
                 status: node.status.clone(),
                 summary: node.summary.clone(),
                 owned_paths: node.owned_paths.clone(),
+                pointers: node.pointers.clone(),
                 updated_at: node.updated_at.clone(),
             })
             .collect(),
@@ -1224,6 +1242,7 @@ mod tests {
             goal: "the goal".into(),
             status: status.into(),
             owned_paths: vec![],
+            pointers: vec![],
             budget_tokens: None,
             context_peak: None,
             summary,
@@ -1992,6 +2011,7 @@ mod tests {
             decision: Some(decision.to_owned()),
             context_peak: Some(peak),
             widen_paths: None,
+            pointers: None,
         };
         update(&pool, &root.id, &limits, &up(500, "first"))
             .await
@@ -2245,6 +2265,54 @@ mod tests {
             vec!["core/src/a.rs".to_string()]
         );
         assert!(!built.nodes[1].updated_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_node_opened_with_pointers_stores_them_and_the_tree_returns_them() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let mut with = child_args(&root.id, "leaf", "With", &["core/src/a.rs"]);
+        with.pointers = vec!["core/src/a.rs".to_owned(), "core/src/b.rs".to_owned()];
+        let with = open(&pool, None, &limits, &with).await.unwrap();
+        let without = child_args(&root.id, "leaf", "Without", &["core/src/c.rs"]);
+        let without = open(&pool, None, &limits, &without).await.unwrap();
+
+        let stored = get(&pool, &with.id).await.unwrap();
+        assert_eq!(stored.pointers, strings(&["core/src/a.rs", "core/src/b.rs"]));
+        assert!(get(&pool, &without.id).await.unwrap().pointers.is_empty());
+
+        let built = tree(&pool, &root.id, View::Brief).await.unwrap();
+        let of = |id: &str| built.nodes.iter().find(|node| node.id == id).unwrap();
+        assert_eq!(
+            of(&with.id).pointers,
+            strings(&["core/src/a.rs", "core/src/b.rs"])
+        );
+        assert_eq!(of(&without.id).pointers, Vec::<String>::new());
+        assert_eq!(of(&root.id).pointers, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn update_replaces_pointers_only_when_given() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let mut args = child_args(&root.id, "leaf", "Leaf", &["core/src/a.rs"]);
+        args.pointers = strings(&["core/src/a.rs"]);
+        let leaf = open(&pool, None, &limits, &args).await.unwrap();
+
+        let untouched = UpdateArgs {
+            decision: Some("noted".to_owned()),
+            ..UpdateArgs::default()
+        };
+        let node = update(&pool, &leaf.id, &limits, &untouched).await.unwrap();
+        assert_eq!(node.pointers, strings(&["core/src/a.rs"]));
+        let replaced = UpdateArgs {
+            pointers: Some(strings(&["docs/x.md"])),
+            ..UpdateArgs::default()
+        };
+        let node = update(&pool, &leaf.id, &limits, &replaced).await.unwrap();
+        assert_eq!(node.pointers, strings(&["docs/x.md"]));
     }
 
     #[tokio::test]
