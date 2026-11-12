@@ -663,8 +663,6 @@ pub fn wire_classifier_hook_keeping_script(dir: &Path) -> Result<(), String> {
 /// The placeholder every hook entry is built with; `wire_hook` swaps it for the unit config dir.
 const PROJECT_CLAUDE_PREFIX: &str = "${CLAUDE_PROJECT_DIR}/.claude/";
 
-/// The stop timer's script, written into the config dir beside the hook script.
-
 /// Where the hook, its settings and the stop timer live for the unit working in `dir`: the unit's
 /// own config dir, outside the tree (sandbox plan D4, D12). Written through the crossing with the
 /// config dir as the only grant, so a unit never holds a hook it could rewrite.
