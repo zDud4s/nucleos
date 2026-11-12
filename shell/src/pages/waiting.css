@@ -496,6 +496,57 @@
   gap: var(--space-1);
 }
 
+/* The segment that stopped the command, led with, and the command split with it marked. */
+.waiting-culprit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.waiting-culprit-segment {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.waiting-culprit-reason {
+  margin: 0;
+  color: var(--text);
+}
+
+.waiting-segments {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.waiting-segment {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.waiting-segment[data-culprit="true"] {
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.waiting-segment-flag {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
 .waiting-input-line {
   display: grid;
   grid-template-columns: minmax(4rem, 8rem) minmax(0, 1fr);
