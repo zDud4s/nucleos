@@ -1148,7 +1148,7 @@ async fn landing_step(
         if let landing::LandSettlement::NotLanded { reason } = &settled {
             tracing::warn!(job = %job.id, %reason, "the queue did not land the job");
         }
-        return super::retry::after_settle(pool, job, settled, parks).await;
+        return super::retry::after_settle(state, job, settled, parks).await;
     }
     if !root_is_done(pool, &job.root_node_id).await? {
         return Ok(());

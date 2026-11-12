@@ -15,8 +15,10 @@ use super::driver::{GateVerdict, NotMeasured, Park, RESOLVER_GRACE};
 use super::final_verify::{FINAL_FIX_KEY, is_gate_red};
 use super::ladder::{self, Kind, Spent, Step};
 use super::landing::{LandSettlement, apply_gate_verdict, claim_land};
+use super::model::JOB_TERMINAL_STATE;
 use super::store::{self, TreeJob};
 use crate::gate::GateOutcome;
+use crate::state::AppState;
 use crate::verify::ScopeVerdict;
 
 /// Gates of one branch in a row that may end without measuring anything before the owner is asked:
@@ -509,15 +511,17 @@ fn overdue(since: &str, grace: Duration) -> bool {
 /// escalated landing keeps its id for the conflict resolver: the wait is stamped, and past
 /// [`RESOLVER_GRACE`] the request is claimed (so a late resolver never spends on it), the
 /// allowance is spent and the owner is asked. A landing still pending (a resolution running)
-/// clears the stamp, so the grace starts again once it ends.
+/// clears the stamp, so the grace starts again once it ends. A job that ends here landed writes the
+/// `Estado:` line of its specs from what `settle_land` recorded (F6 option (a)).
 pub(super) async fn after_settle(
-    pool: &SqlitePool,
+    state: &AppState,
     job: &mut TreeJob,
     settled: LandSettlement,
     parks: &mut Vec<Park>,
 ) -> Result<(), String> {
+    let pool = &state.pool;
     let waiting = job.manifest.extra.contains_key("land_id");
-    match settled {
+    let outcome = match settled {
         LandSettlement::NotLanded { reason } if waiting => {
             let since = job
                 .manifest
@@ -569,7 +573,12 @@ pub(super) async fn after_settle(
             Ok(())
         }
         LandSettlement::Finished { .. } => Ok(()),
+    };
+    if job.state == JOB_TERMINAL_STATE {
+        let machine_root = state.machine_config_root.as_deref();
+        crate::spec_backlog::estado::write_landed_files(pool, machine_root, &job.id).await;
     }
+    outcome
 }
 
 // ---- a green branch on a base that does not merge ----------------------------------------------
