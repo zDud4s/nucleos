@@ -13,8 +13,8 @@ pub(super) const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
 /// `state.token` for every run, which handed a `shadow` run — a mode that has Bash and whose
 /// classifier calls `echo $NUCLEOS_DAEMON_TOKEN` a `read-local` action — the key that approves
 /// proposals and disengages the kill switch. Autonomous runs now get their own scoped key
-/// (`auth::mint_run_token`); only orchestrator turns still carry the control token, and only
-/// because `ToolPolicy::McpOnly` leaves them nothing to read it with.
+/// (`auth::mint_run_token`), and orchestrator turns get an `assistant:` key
+/// (`sandbox::assistant_routes::mint_assistant_token`). No caller of this function holds the control token.
 ///
 /// `artifacts` is the directory a job's nodes hand work to each other through, and is `Some` only
 /// for a node of a job. An ordinary run has no successor to write to, and handing it the variable
