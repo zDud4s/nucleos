@@ -121,6 +121,11 @@ pub enum Scope {
     ///
     /// `String` and not `i64` because `team_runs.id` is TEXT.
     TeamRun(String),
+    /// An orchestrator turn's key (`assistant:<chat>.<secret>`), good for `ASSISTANT_ROUTES` only.
+    ///
+    /// It replaces the daemon's control token in an orchestrator turn's environment (sandbox spec
+    /// D5), so a turn that is compromised cannot approve a proposal, land, or touch the kill switch.
+    Assistant,
     /// A durable caller key, limited to the access level chosen when it was minted.
     ApiToken(ApiTokenLevel),
 }
@@ -605,6 +610,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
         Scope::Service(Service::Channel(_)) => listed(CHANNEL_ROUTES),
         Scope::Service(Service::Remote) => listed(REMOTE_GATEWAY_ROUTES),
         Scope::TeamRun(_) => listed(TEAM_ROUTES),
+        Scope::Assistant => listed(crate::sandbox::assistant_routes::ASSISTANT_ROUTES),
         Scope::ApiToken(ApiTokenLevel::ReadOnly) => listed(READ_ONLY_ROUTES),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
             listed(READ_ONLY_ROUTES) || listed(RUN_CREATING_ROUTES)
@@ -672,6 +678,8 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     // not open it to lower levels by accident.
     "backlog",
     "calendar",
+    // Read-only status/banner of the OS sandbox; no route changes the switch.
+    "sandbox",
     "capture-requests",
     "contacts",
     "context-refs",
@@ -975,6 +983,9 @@ const COUNCIL_ROUTES: &[(Method, &str)] = &[
 /// to the turn that called it"; `permits` answers "what does this key reach". Deriving one from the
 /// other would hand a department more reach than `ApiTokenLevel::ReadOnly` has — the kill switch,
 /// the budget and the blocking `wait` would all arrive.
+///
+/// `ASSISTANT_ROUTES` (below) is the sibling for an orchestrator turn: what the daemon's MCP tools
+/// reach with a key that is NOT the control token. Sandbox spec D5.
 const TEAM_ROUTES: &[(Method, &str)] = &[
     // The run's own folder, and the only route of the teams design that this scope opens. Which
     // folder is decided by the token, never by an argument — see `team.rs`.
@@ -1388,7 +1399,12 @@ async fn try_resolve(state: &AppState, presented: &str) -> Result<Option<Scope>,
     // secret is `mint_secret`'s `nos_<kind>_` plus alphanumerics (or, for a key minted before the
     // prefix, the alphanumerics alone) and can never hold a dot, so the last one is
     // always the separator.
-    if let Some(rest) = presented.strip_prefix("chat:") {
+    // `assistant:` shares the conversation's stored secret with `chat:` and stops at the match.
+    let assistant = presented.starts_with("assistant:");
+    if let Some(rest) = presented
+        .strip_prefix("chat:")
+        .or_else(|| presented.strip_prefix("assistant:"))
+    {
         let Some((chat_id, secret)) = rest.rsplit_once('.') else {
             return Ok(None);
         };
@@ -1397,15 +1413,15 @@ async fn try_resolve(state: &AppState, presented: &str) -> Result<Option<Scope>,
                 .bind(chat_id)
                 .fetch_optional(&state.pool)
                 .await?;
-        let Some(stored) = stored else {
-            return Ok(None);
-        };
         // The secret first, and the conversation's state only after it matches. Resolving the run
         // first would answer a caller holding no secret at all — whether this conversation is
         // busy — by how long the refusal took. The task lookup below is chat state too, so it also
         // comes after the secret.
-        if !bool::from(secret.as_bytes().ct_eq(stored.as_bytes())) {
+        if !stored.is_some_and(|s| bool::from(secret.as_bytes().ct_eq(s.as_bytes()))) {
             return Ok(None);
+        }
+        if assistant {
+            return Ok(Some(Scope::Assistant));
         }
         // Resolved when presented rather than when minted, which is the whole reason this family
         // exists. A CLI kept alive across turns is handed its environment once, at spawn, so a key
@@ -7510,6 +7526,100 @@ mod tests {
                 manifest.id
             );
             assert!(!manifest.id.contains([':', '.']));
+        }
+    }
+
+    use crate::sandbox::assistant_routes::ASSISTANT_ROUTES;
+
+    /// Every route the owner alone may use: approving, landing, the brake and configuration.
+    const OWNER_ONLY: &[(Method, &str)] = &[
+        (Method::POST, "/proposals/{id}/approve"),
+        (Method::POST, "/proposals/{id}/reject"),
+        (Method::POST, "/autopilot/kill"),
+        (Method::POST, "/vcs/requests/{id}/approve"),
+        (Method::POST, "/vcs/requests/{id}/refuse"),
+        (Method::POST, "/land"),
+        (Method::GET, "/config/secrets"),
+        (Method::PUT, "/config/secrets/{name}"),
+        (Method::POST, "/config/machine"),
+        (Method::POST, "/config/capture"),
+        (Method::PUT, "/settings/{scope}/{name}"),
+    ];
+
+    #[tokio::test]
+    async fn the_assistant_scope_reaches_only_its_listed_routes() {
+        let state = test_state("control-token").await;
+        let key = crate::sandbox::assistant_routes::mint_assistant_token(&state.pool, "chat-a")
+            .await
+            .expect("mint the assistant key");
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Assistant));
+        // The same secret under the `chat:` family is another scope, and a wrong secret nothing.
+        assert_eq!(
+            resolve(&state, "assistant:chat-a.nope").await,
+            None,
+            "a wrong secret authenticates nothing"
+        );
+        assert_eq!(
+            resolve(&state, "assistant:other-chat.nope").await,
+            None,
+            "an unknown conversation authenticates nothing"
+        );
+
+        for (method, route) in ASSISTANT_ROUTES {
+            assert!(
+                permits_route(&Scope::Assistant, method, route),
+                "{method} {route} is listed and must be reachable"
+            );
+        }
+        for (method, route) in [
+            (Method::POST, "/hooks/pretooluse-decision"),
+            (Method::GET, "/status"),
+            (Method::DELETE, "/runs/{id}"),
+            (Method::GET, "/config/secrets"),
+        ] {
+            assert!(
+                !permits_route(&Scope::Assistant, &method, route),
+                "{method} {route} is not listed and must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_sandbox_scope_reaches_land_approve_killswitch_or_config_routes() {
+        let sandboxed = [
+            Scope::Assistant,
+            Scope::TeamRun("team-1".to_owned()),
+            Scope::Run(1),
+            Scope::Service(Service::Council),
+            Scope::Service(Service::Email),
+        ];
+        for scope in &sandboxed {
+            for (method, route) in OWNER_ONLY {
+                assert!(
+                    !permits_route(scope, method, route) && !permits(scope, method, route),
+                    "{scope:?} reaches {method} {route}"
+                );
+            }
+        }
+        // Walking the table itself: nothing in it names an owner-only stem.
+        for (method, route) in ASSISTANT_ROUTES {
+            for stem in [
+                "approve",
+                "reject",
+                "land",
+                "/config",
+                "/settings",
+                "secrets",
+            ] {
+                assert!(
+                    !route.contains(stem),
+                    "ASSISTANT_ROUTES lists {method} {route}, which matches the owner-only stem {stem}"
+                );
+            }
+            assert!(
+                !(method == Method::POST && route.contains("kill")),
+                "the kill switch is not the assistant's to set"
+            );
         }
     }
 }

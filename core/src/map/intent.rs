@@ -464,7 +464,7 @@ pub async fn ask_once_with_model(
         // Nothing to reach, so nothing to carry. A run with no tools cannot spend a token, and one
         // handed a key it has no door for is a key that leaked for no reason.
         env: Vec::new(),
-        cwd: None,
+        cwd: crate::sandbox::empty_dir::unique_empty_run_dir("map-intent"),
         permission: crate::execution::runner::Permission::Default,
         resume_session_id: None,
         mcp_config: None,
@@ -605,6 +605,15 @@ pub fn spec_slug(path: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn a_map_intent_question_starts_in_an_empty_folder_of_its_own() {
+        let dir = crate::sandbox::empty_dir::unique_empty_run_dir("map-intent")
+            .expect("the folder should be made");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert_ne!(Some(dir.clone()), std::env::current_dir().ok());
+        crate::sandbox::empty_dir::remove_run_dir(&dir);
+    }
 
     /// A toy tree, so no test depends on the shape of the real repository.
     fn scratch(name: &str) -> std::path::PathBuf {

@@ -63,6 +63,7 @@ mod remote;
 mod repo;
 mod restart;
 mod run_queue;
+mod sandbox;
 mod settings;
 mod stepup;
 mod tasks;
@@ -161,6 +162,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(stepup::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
+        .merge(sandbox::routes())
         .merge(engines::routes())
         .merge(settings::routes())
         .merge(workflow_params::routes())
@@ -4694,7 +4696,11 @@ mod tests {
         )
         .await
         .unwrap();
-        std::fs::remove_file(bare.path().join(".claude/hooks/ask_daemon.py")).unwrap();
+        // Onboarding wires the hook in the unit's config dir now, outside the tree (sandbox D12).
+        std::fs::remove_file(crate::engines::unit_config::hook_script(
+            &crate::governance::autopilot::unit_config_dir(bare.path()),
+        ))
+        .unwrap();
         let (status, body) = workflow_call(
             state,
             "POST",

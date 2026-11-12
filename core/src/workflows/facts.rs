@@ -103,9 +103,13 @@ pub fn read_emission_with(
     opaque: &[&str],
 ) -> Result<Emission, String> {
     let path = emission_path(worktree, node_id)?;
-    match std::fs::read(&path) {
-        Ok(bytes) => parse_emission(node_id, Some(&bytes), opaque),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Emission::NotEmitted),
+    match crate::sandbox::artifacts::read_in(
+        &path,
+        worktree,
+        crate::sandbox::artifacts::ARTIFACT_CAP,
+    ) {
+        Ok(Some(bytes)) => parse_emission(node_id, Some(bytes.as_bytes()), opaque),
+        Ok(None) => Ok(Emission::NotEmitted),
         Err(e) => Err(format!(
             "node `{node_id}`: cannot read {ARTIFACTS_DIR}/{node_id}.json: {e}"
         )),

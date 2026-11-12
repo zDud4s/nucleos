@@ -163,41 +163,20 @@ fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
             other => safe.push_str(&format!("%{other:02x}")),
         }
     }
-    std::env::temp_dir().join(format!("nucleos-mcp-{}-{safe}.json", std::process::id()))
+    // The chat's own config dir, outside the tree and outside `%TEMP%` (sandbox plan D12): the
+    // per-chat directory is what keeps two processes' configs apart, as the pid did in the name.
+    let config = crate::engines::unit_config::chat_config_dir(chat_id);
+    crate::engines::unit_config::mcp_file(&config, &format!("{safe}.json"))
 }
 
 /// Writes a turn's MCP config where only this user can read it: the file carries the env values
 /// of the chat's registry servers, which are secrets (spec §8.2).
 ///
-/// On unix the file is created `0600` under a sibling name and renamed over `path`, so it is never
-/// readable by anyone else, not even for an instant, and a reader never sees half of it. Elsewhere
-/// `write_atomic` is enough: on Windows `%TEMP%` lives under the user profile, whose ACL already
-/// admits only this user (and the administrators).
+/// The file goes through the crossing (temp file, rename, no reparse points) with the chat's config
+/// dir as the only grant. That dir is under the daemon's data dir, which only this user can read.
 fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(config).map_err(std::io::Error::other)?;
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".nucleos-tmp");
-        let temp = path.with_file_name(name);
-        // A temporary left by a crash would make `create_new` fail for good.
-        let _ = std::fs::remove_file(&temp);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temp, path)
-    }
-    #[cfg(not(unix))]
-    {
-        crate::storage::write_atomic(path, &bytes)
-    }
+    crate::engines::unit_config::write_mcp(path, &bytes).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
@@ -2253,11 +2232,26 @@ mod tests {
     }
 
     #[test]
-    fn a_hostile_chat_id_cannot_escape_the_temp_directory() {
+    fn the_mcp_config_is_written_in_the_chat_config_dir_not_temp() {
+        let chat_id = format!("cfgdir-{}", crate::auth::generate_uuid_v4());
+        let path = mcp_config_path(&chat_id);
+        let config = crate::engines::unit_config::chat_config_dir(&chat_id);
+        assert!(path.starts_with(&config), "{path:?} is not in {config:?}");
+        assert_ne!(
+            path.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the config must not sit loose in the temp directory"
+        );
+        write_mcp_config(&path, &serde_json::json!({"mcpServers": {}})).unwrap();
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    #[test]
+    fn a_hostile_chat_id_cannot_escape_the_chat_config_dir() {
         // `chat_id` arrives from a sidecar and is opaque to us. Interpolated raw it reached
         // `Path::join`, which DISCARDS the base when the joined component is absolute — so the
         // config landed on an arbitrary path, and `TurnGuard::drop` then deleted whatever was there.
-        let temp = std::env::temp_dir();
         for chat_id in [
             "C:/Windows/System32/nucleos",
             r"C:\Windows\System32\nucleos",
@@ -2267,10 +2261,11 @@ mod tests {
             r"\\server\share\evil",
         ] {
             let path = mcp_config_path(chat_id);
+            let config = crate::engines::unit_config::chat_config_dir(chat_id);
             assert_eq!(
                 path.parent(),
-                Some(temp.as_path()),
-                "{chat_id:?} escaped the temp directory"
+                Some(config.join("mcp").as_path()),
+                "{chat_id:?} escaped the chat config dir"
             );
         }
     }
@@ -2288,11 +2283,7 @@ mod tests {
         // this process's pid, which is a different number every run.
         let readable = mcp_config_path("-1001234567890");
         let readable = readable.to_string_lossy();
-        assert!(readable.ends_with("--1001234567890.json"), "got {readable}");
-        assert!(
-            readable.contains(&format!("nucleos-mcp-{}-", std::process::id())),
-            "the config has to be this process's, or two suites share one file: {readable}"
-        );
+        assert!(readable.ends_with("-1001234567890.json"), "got {readable}");
     }
 
     #[tokio::test]

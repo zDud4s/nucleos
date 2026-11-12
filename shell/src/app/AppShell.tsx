@@ -24,6 +24,7 @@ import { QuotaNotch } from "./QuotaNotch";
 import { useNotchMode, useSetNotchMode } from "./notch-mode";
 import { useScreenLine } from "./screen-line";
 import { useNotchPlace } from "./notch-place";
+import { SandboxBanner } from "./SandboxBanner";
 import { Sidebar } from "./Sidebar";
 import { UpdateNotice } from "./UpdateNotice";
 import { NAV_ITEMS } from "./nav";
@@ -182,6 +183,7 @@ function Frame() {
           the strip is empty — and on a maximised window it is still where the floating notch sits.
         */}
         <main className="app-main app-main-notched">
+          <SandboxBanner />
           {/*
             The notch, contained. Against the right edge of the window rather than inside the page,
             because it is about the machine and not about whatever page is open — and because that

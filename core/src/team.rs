@@ -474,6 +474,15 @@ mod tests {
     use crate::auth::Scope;
     use crate::speed::Speed;
 
+    #[test]
+    fn a_team_run_starts_in_an_empty_folder_of_its_own() {
+        let dir = crate::sandbox::empty_dir::empty_run_dir("team", "tr-cwd-test")
+            .expect("the folder should be made");
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_ne!(Some(dir), std::env::current_dir().ok());
+    }
+
     #[tokio::test]
     async fn an_idle_pass_reports_no_work_and_the_loop_waits_longer() {
         let (state, _root) = state_with_root().await;

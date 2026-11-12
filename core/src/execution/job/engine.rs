@@ -26,9 +26,14 @@ pub(super) async fn read_emission_bytes(
             PLAN_READS.with(|reads| reads.set(reads.get() + 1));
         }
     }
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    // Through the D12 crossing: a link planted at `.nucleos` or at the file is refused, not read.
+    // The grant is the worktree, so a junction at `.nucleos` itself resolves outside it.
+    match crate::sandbox::artifacts::read_in(
+        &path,
+        worktree,
+        crate::sandbox::artifacts::ARTIFACT_CAP,
+    ) {
+        Ok(found) => Ok(found.map(crate::sandbox::Untrusted::into_bytes)),
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
 }
@@ -175,9 +180,13 @@ pub(super) fn facts_from_rows(
         let emission = if node.id == "plan" {
             // The queue is not a flat emission; see `plan_emission`.
             let path = facts::emission_path(worktree, &node.id)?;
-            match std::fs::read(&path) {
-                Ok(bytes) => plan_emission(Some(&bytes))?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Emission::NotEmitted,
+            match crate::sandbox::artifacts::read_in(
+                &path,
+                worktree,
+                crate::sandbox::artifacts::ARTIFACT_CAP,
+            ) {
+                Ok(Some(bytes)) => plan_emission(Some(bytes.as_bytes()))?,
+                Ok(None) => Emission::NotEmitted,
                 Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
             }
         } else {

@@ -201,6 +201,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/sandbox/status",
+        purpose: "How the OS sandbox stands, with the banner the shell shows.",
+        body: Body::None,
+        handler: "get_sandbox_status",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/scoreboard",
         purpose: "Get scoreboard.",
         body: Body::None,

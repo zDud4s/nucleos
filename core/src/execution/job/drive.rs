@@ -246,8 +246,12 @@ pub(super) async fn council_before_review(
         return unadvised;
     };
 
-    let path = std::path::Path::new(artifacts).join(COUNCIL_FILE);
-    if let Err(error) = tokio::fs::write(&path, synthesis.as_bytes()).await {
+    // Through the D12 crossing, granted the worktree (the artifacts directory's parent): a link
+    // planted at `.nucleos` or at `council.md` lands nowhere outside the tree.
+    let directory = std::path::Path::new(artifacts);
+    let path = directory.join(COUNCIL_FILE);
+    let grant = directory.parent().unwrap_or(directory);
+    if let Err(error) = crate::sandbox::artifacts::write_in(&path, grant, synthesis.as_bytes()) {
         tracing::warn!(
             job_id = job.id,
             council_id,

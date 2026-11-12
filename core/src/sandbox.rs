@@ -13,11 +13,18 @@
 //! - The `sandbox: off` switch is a file in the daemon's config directory. No HTTP route reads or
 //!   changes it, and a test (`sandbox/guard.rs`) fails if another module names the file.
 //!
-//! In the no-backend state a profile is computed but not enforced, and `Profile::env` is *not*
-//! applied to the child: today's runners keep the environment they build themselves until the wiring
-//! branch moves them behind the door.
+//! In the no-backend state a profile is computed but not enforced. `Profile::env` is applied to the
+//! child (cleared, then exactly that list, never the control token) only when the profile says
+//! `env_applied`: today's runners keep the environment they build themselves until their wiring
+//! turns it on.
 
+pub mod artifacts;
+pub mod assistant_routes;
+#[cfg(test)]
+mod corpus;
 mod crossing;
+pub mod empty_dir;
+pub mod gate;
 #[cfg(test)]
 mod guard;
 
@@ -37,6 +44,10 @@ pub use crossing::{
 
 /// The one environment variable a sandbox never receives: the daemon's control token (D5).
 const CONTROL_TOKEN_VAR: &str = "NUCLEOS_DAEMON_TOKEN";
+
+/// Points git's global config at an empty file inside the unit, so the owner's `~/.gitconfig`
+/// (credential helpers, aliases, hooks path) never reaches a contained child.
+const GIT_CONFIG_GLOBAL_VAR: &str = "GIT_CONFIG_GLOBAL";
 
 /// Name of the switch file inside the daemon's config directory.
 const SWITCH_FILE: &str = "sandbox.conf";
@@ -58,6 +69,18 @@ pub struct Profile {
     pub egress: Egress,
     /// The clean environment of the unit (D5), built from an allow-list. A sandbox never inherits.
     pub env: BTreeMap<String, String>,
+    /// Whether [`spawn`] / [`spawn_prepared`] give the child exactly `env` and nothing else. Off in
+    /// [`profile_for`]: a runner that builds its own environment keeps it until its wiring turns
+    /// this on with [`Profile::with_env_applied`].
+    pub env_applied: bool,
+}
+
+impl Profile {
+    /// The same profile, with its `env` applied to the child.
+    pub fn with_env_applied(mut self) -> Self {
+        self.env_applied = true;
+        self
+    }
 }
 
 /// The kind of unit being started: the row of the D4 table, independent of the engine behind it.
@@ -140,6 +163,21 @@ fn clean_env(scope: &RunScope) -> BTreeMap<String, String> {
     ] {
         env.insert(key.to_owned(), inside(folder));
     }
+    // macOS/Linux read `TMPDIR`; Windows keeps `TEMP`/`TMP` above. Same folder, same contract.
+    env.insert("TMPDIR".to_owned(), inside("tmp"));
+    env.insert(GIT_CONFIG_GLOBAL_VAR.to_owned(), inside("home/.gitconfig"));
+    // The unit's cache and toolchain folders, named by what the tree granted as caches.
+    for cache in &scope.tree_caches {
+        let var = match cache.file_name().and_then(|name| name.to_str()) {
+            Some("target") => "CARGO_TARGET_DIR",
+            Some("cargo-home") => "CARGO_HOME",
+            Some("rustup") => "RUSTUP_HOME",
+            Some("gomodcache") => "GOMODCACHE",
+            Some("npm-cache") => "npm_config_cache",
+            _ => continue,
+        };
+        env.insert(var.to_owned(), cache.display().to_string());
+    }
     env.insert("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned());
     let git_config = [
         ("gc.auto", "0".to_owned()),
@@ -214,6 +252,7 @@ pub fn profile_for(scope: &RunScope) -> Profile {
             Egress::Allow(domains)
         },
         env: clean_env(scope),
+        env_applied: false,
     }
 }
 
@@ -316,8 +355,38 @@ impl Contained {
     }
 }
 
-/// The one launch every spawn goes through. With no backend the profile is not enforced.
-fn launch(mut command: Command, _profile: &Profile) -> io::Result<Contained> {
+/// Gives `command` exactly the profile's environment: everything else is cleared, and the control
+/// token is dropped even if the caller had set it. Folders the env names (home, temp) and the empty
+/// global git config are created here, best effort, because the scope itself creates nothing (D13).
+fn apply_profile_env(command: &mut Command, profile: &Profile) {
+    for key in ["HOME", "TEMP", "TMPDIR"] {
+        if let Some(dir) = profile.env.get(key) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+    if let Some(file) = profile.env.get(GIT_CONFIG_GLOBAL_VAR)
+        && !Path::new(file).exists()
+    {
+        if let Some(parent) = Path::new(file).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(file, "");
+    }
+    // `env_clear` also discards what the caller set on the command, so the list is re-applied whole.
+    command.env_clear();
+    for (key, value) in &profile.env {
+        if key != CONTROL_TOKEN_VAR {
+            command.env(key, value);
+        }
+    }
+}
+
+/// The one launch every spawn goes through. With no backend the profile is not enforced; its env is
+/// applied only when the profile asks for it ([`Profile::env_applied`]).
+fn launch(mut command: Command, profile: &Profile) -> io::Result<Contained> {
+    if profile.env_applied {
+        apply_profile_env(&mut command, profile);
+    }
     spawn_in_own_group(&mut command);
     command.kill_on_drop(true);
     let child = command.spawn()?;
@@ -619,6 +688,97 @@ mod tests {
         let profile = profile_for(&scope(RunMode::Scratch));
         let argv = vec!["nucleos-no-such-program-xyz".to_owned()];
         assert!(spawn(&argv, dir.path(), &profile).is_err());
+    }
+
+    /// Argv that prints variable `name` (empty when unset), on either platform.
+    fn print_var(name: &str) -> Vec<String> {
+        if cfg!(windows) {
+            ["cmd", "/C", &format!("echo [%{name}%]")]
+                .map(String::from)
+                .to_vec()
+        } else {
+            ["sh", "-c", &format!("echo \"[${{{name}}}]\"")]
+                .map(String::from)
+                .to_vec()
+        }
+    }
+
+    async fn output_of(profile: &Profile, argv: &[String], set: &[(&str, &str)]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::piped());
+        for (key, value) in set {
+            command.env(key, value);
+        }
+        let contained = spawn_prepared(command, profile).unwrap();
+        let out = contained.child.wait_with_output().await.unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    async fn launch_applies_the_profile_env_and_clears_the_rest() {
+        let unit = tempfile::tempdir().unwrap();
+        let mut s = scope(RunMode::Worktree);
+        s.unit_dir = unit.path().to_path_buf();
+        s.tree_caches = vec![unit.path().join("target")];
+        // The shell the test starts needs its own lookup path and Windows root, which the caller
+        // hands over through `inherit` and the toolchain, as every real scope does.
+        s.toolchain.clear();
+        for key in ["PATH", "SystemRoot", "windir", "ComSpec"] {
+            if let Ok(value) = std::env::var(key) {
+                s.inherit.insert(key.to_owned(), value);
+            }
+        }
+        let profile = profile_for(&s).with_env_applied();
+
+        let home = output_of(&profile, &print_var("HOME"), &[]).await;
+        assert!(home.contains("home"), "HOME is the unit's: {home}");
+        let target = output_of(&profile, &print_var("CARGO_TARGET_DIR"), &[]).await;
+        assert!(target.contains("target"), "{target}");
+        let git = output_of(&profile, &print_var("GIT_CONFIG_GLOBAL"), &[]).await;
+        assert!(git.contains(".gitconfig"), "{git}");
+        assert_eq!(
+            std::fs::read_to_string(unit.path().join("home/.gitconfig")).unwrap(),
+            "",
+            "the global git config is an empty file"
+        );
+        // What the caller set on the command, and the daemon's own environment, is cleared.
+        let stray = output_of(&profile, &print_var("STRAY_VAR"), &[("STRAY_VAR", "x")]).await;
+        assert!(
+            !stray.contains('x'),
+            "a caller-set variable survived: {stray}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_never_sees_the_control_token_even_if_the_daemon_has_it() {
+        let unit = tempfile::tempdir().unwrap();
+        let mut s = scope(RunMode::Worktree);
+        s.unit_dir = unit.path().to_path_buf();
+        for key in ["PATH", "SystemRoot", "windir", "ComSpec"] {
+            if let Ok(value) = std::env::var(key) {
+                s.inherit.insert(key.to_owned(), value);
+            }
+        }
+        s.toolchain.clear();
+        // Even a profile whose env carries the token (a caller bug) does not hand it over.
+        let mut profile = profile_for(&s).with_env_applied();
+        profile
+            .env
+            .insert(CONTROL_TOKEN_VAR.to_owned(), "secret".to_owned());
+        let seen = output_of(
+            &profile,
+            &print_var(CONTROL_TOKEN_VAR),
+            &[(CONTROL_TOKEN_VAR, "secret")],
+        )
+        .await;
+        assert!(
+            !seen.contains("secret"),
+            "the token reached the child: {seen}"
+        );
     }
 
     #[tokio::test]

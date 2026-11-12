@@ -38,6 +38,14 @@
   background: var(--bg);
 }
 
+/* The permanent sandbox line: a quiet strip at the top of the page column, never a modal. */
+.sandbox-banner {
+  padding: var(--space-2) var(--space-6);
+  font-size: 0.8125rem;
+  color: var(--text-muted, inherit);
+  border-bottom: 1px solid var(--border, currentColor);
+}
+
 /**
  * The notch: how much of each assistant's usage window is gone, hanging off the right edge.
  *

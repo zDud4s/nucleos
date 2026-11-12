@@ -466,6 +466,7 @@ pub(super) async fn spawn_agent(
     };
 
     let mcp_team_run = mcp_guard.as_ref().map(|_| run_id);
+    let seat_dir = crate::sandbox::empty_dir::empty_run_dir("team", &run.id);
     // A closure, because the same request is built twice when an answer fails its output shape:
     // `RunRequest` owns channel ends and is not `Clone`.
     let build =
@@ -478,9 +479,9 @@ pub(super) async fn spawn_agent(
             prompt,
             // The RUN's own key, never `state.token`. `auth::TEAM_ROUTES` is what it reaches.
             env: crate::execution::runs::run_env(&token, run_id, None, capacity),
-            // No working directory, exactly as a council seat has none — which is also why the
-            // `PreToolUse` hook may never fire and why the route table has to hold alone.
-            cwd: None,
+            // An empty folder of the run's own: no project, so the `PreToolUse` hook may never fire
+            // and the route table has to hold alone, but never the daemon's checkout either.
+            cwd: seat_dir.clone(),
             permission: crate::execution::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: mcp_config.clone(),

@@ -4,19 +4,14 @@
 //! A text scan, because there is no type that stops a module from calling `Command::new`. It looks
 //! for the primitives that start a tracked child (`spawn_in_own_group`, `TreeKiller::new`) and for
 //! a `Command::new` naming an engine CLI. The sites that have not moved behind the door yet sit in
-//! [`PENDING_MIGRATION`]; the branch that wires them (sbx1-wire) empties that list, and the stale
-//! check below fails the day an entry stops spawning, so the list can only shrink.
+//! [`PENDING_MIGRATION`], which is now empty; the stale check below fails the day an entry stops
+//! spawning, so the list can only shrink.
 
 use crate::source_scan;
 
-/// Agent and gate spawn sites still outside the door. Each one is deleted by sbx1-wire.
-const PENDING_MIGRATION: &[(&str, &str)] = &[
-    ("execution/runner/claude.rs", "ClaudeCliRunner"),
-    ("execution/runner/codex.rs", "CodexCliRunner"),
-    // Not named in the spec, found by this scan: the third CLI runner spawns the same way.
-    ("execution/runner/agy.rs", "agy runner"),
-    ("gate.rs", "gate::run_gate"),
-];
+/// Agent and gate spawn sites still outside the door. The CLI runners and the gate are through it
+/// (the gate runner takes its launcher from `sandbox/gate.rs`), so nothing is pending.
+const PENDING_MIGRATION: &[(&str, &str)] = &[];
 
 /// Users of the same primitives that start neither an agent nor a gate: git and `gh` transport, and
 /// a kill-only sweep. They stay outside the door on purpose.

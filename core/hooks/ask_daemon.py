@@ -447,7 +447,7 @@ def run_token():
 
 
 def read_control_token(cwd: str, git_timeout=10, print_timeout=20, total_timeout=None):
-    """`(token, why)`: the token or None, and why none (`"repo"` or `"token"`).
+    """`(token, why)`: the token or None, and why none (`"repo"`, `"token"` or `"sandbox"`).
 
     Raises nothing and never denies, so a caller that must stay silent (the follow-up that
     reports a settled request) can use it; `control_token` turns the failure into its denials.
@@ -460,6 +460,12 @@ def read_control_token(cwd: str, git_timeout=10, print_timeout=20, total_timeout
     from_run = run_token()
     if from_run:
         return from_run, None
+
+    # A sandbox account has no business asking the daemon binary for its control token: the
+    # interactive search runs `git` and the daemon's own `--print-token` from inside the sandbox.
+    # The spawn sets this variable (sandbox plan D4); a run without its own key gets none.
+    if os.environ.get("NUCLEOS_SANDBOX_ACCOUNT"):
+        return None, "sandbox"
 
     deadline = None if total_timeout is None else time.monotonic() + total_timeout
 
