@@ -773,6 +773,12 @@
   border-radius: 50%;
 }
 
+/* The bench and the lectern are rectangles: the base radius already fits them. */
+.council-court-hit-judge,
+.council-court-hit-lectern {
+  border-radius: var(--radius-md);
+}
+
 .council-court-hit:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
