@@ -42,6 +42,9 @@ struct DepRequest {
 #[derive(Debug, Deserialize)]
 struct DecisionRequest {
     answer: String,
+    /// For a decision a fence refusal opened: the paths the owner widens the branch by, exactly.
+    #[serde(default)]
+    widen_paths: Option<Vec<String>>,
 }
 
 type Answer = (StatusCode, Json<Value>);
@@ -396,11 +399,12 @@ async fn post_decision(
         };
     }
     if id.starts_with("d-") {
-        return match crate::tree_job::open::answer_and_relaunch(
+        return match crate::tree_job::open::answer_and_relaunch_widening(
             &state,
             &id,
             &request.answer,
             "shell",
+            request.widen_paths.as_deref(),
         )
         .await
         {
@@ -415,6 +419,9 @@ async fn post_decision(
                 StatusCode::CONFLICT,
                 format!("decision {id} is already decided"),
             ),
+            Err(DecisionError::Invalid(reason)) => {
+                refuse(StatusCode::BAD_REQUEST, format!("invalid answer: {reason}"))
+            }
             Err(DecisionError::Db(error)) => failed("could not answer the decision", error),
             Err(error) => failed("could not answer the decision", error),
         };

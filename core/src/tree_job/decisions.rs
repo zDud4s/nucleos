@@ -50,6 +50,9 @@ pub enum DecisionError {
     AlreadyDecided(String),
     /// The tree or node given to `park` has no branch to park.
     NoBranch(String),
+    /// The answer asks for something this decision cannot do, such as widening the paths of a
+    /// branch that is not parked on a fence refusal. Nothing was written.
+    Invalid(String),
     Engine(engine::EngineError),
     Store(StoreError),
     Db(sqlx::Error),
@@ -61,6 +64,7 @@ impl fmt::Display for DecisionError {
             DecisionError::NotFound(id) => write!(f, "decision {id} not found"),
             DecisionError::AlreadyDecided(id) => write!(f, "decision {id} is already answered"),
             DecisionError::NoBranch(reason) => write!(f, "no branch to park: {reason}"),
+            DecisionError::Invalid(reason) => write!(f, "invalid answer: {reason}"),
             DecisionError::Engine(error) => write!(f, "{error}"),
             DecisionError::Store(error) => write!(f, "{error}"),
             DecisionError::Db(error) => write!(f, "database error: {error}"),
@@ -157,8 +161,23 @@ pub async fn park(
     };
     let prev_state = branch.state.clone();
     apply_transition(branch, PARKED)?;
+    // A fence refusal the owner already answered once asks again on the same decision.
+    let reused = match branch
+        .extra
+        .get(super::path_fence::DECISION)
+        .and_then(Value::as_str)
+    {
+        Some(id) => {
+            let row: Option<Decision> = sqlx::query_as(select_decisions!("WHERE id = ?"))
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+            row.map(|row| row.id)
+        }
+        None => None,
+    };
     let decision = Decision {
-        id: new_id(),
+        id: reused.clone().unwrap_or_else(new_id),
         tree_id: Some(tree_id.to_owned()),
         node_id: Some(node_id.to_owned()),
         question: question.to_owned(),
@@ -177,20 +196,34 @@ pub async fn park(
 
     // Nothing below may ask the pool for a connection while `tx` holds one.
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&decision.id)
-    .bind(&decision.tree_id)
-    .bind(&decision.node_id)
-    .bind(&decision.question)
-    .bind(&decision.answer)
-    .bind(&decision.origin)
-    .bind(&decision.at)
-    .bind(&decision.status)
-    .execute(&mut *tx)
-    .await?;
+    if reused.is_some() {
+        sqlx::query(
+            "UPDATE decisions SET question = ?, answer = NULL, origin = ?, at = ?, status = ?
+             WHERE id = ?",
+        )
+        .bind(&decision.question)
+        .bind(&decision.origin)
+        .bind(&decision.at)
+        .bind(&decision.status)
+        .bind(&decision.id)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&decision.id)
+        .bind(&decision.tree_id)
+        .bind(&decision.node_id)
+        .bind(&decision.question)
+        .bind(&decision.answer)
+        .bind(&decision.origin)
+        .bind(&decision.at)
+        .bind(&decision.status)
+        .execute(&mut *tx)
+        .await?;
+    }
     write_manifest(&mut tx, tree_id, &manifest, &decision.at).await?;
     crate::feed::append_on(
         &mut tx,
@@ -458,6 +491,24 @@ pub async fn answer(
     text: &str,
     origin: &str,
 ) -> Result<Decision, DecisionError> {
+    answer_widening(pool, decision_id, text, origin, None)
+        .await
+        .map(|(decision, _)| decision)
+}
+
+/// [`answer`] for a decision that may be a path-fence refusal. When the branch waits on a fence
+/// refusal and the owner widens (`widen` lists the paths to add, or the text starts with `widen`,
+/// which adds exactly the files the refusal names), the branch's paths grow by those and the
+/// refusal is cleared; the second element is then the paths added. Any other answer to a fence
+/// refusal widens nothing and remembers the decision, so a repeated refusal reuses its id.
+/// `widen` on a decision that is not a fence refusal is refused with nothing written.
+pub async fn answer_widening(
+    pool: &SqlitePool,
+    decision_id: &str,
+    text: &str,
+    origin: &str,
+    widen: Option<&[String]>,
+) -> Result<(Decision, Option<Vec<String>>), DecisionError> {
     let found: Option<Decision> = sqlx::query_as(select_decisions!("WHERE id = ?"))
         .bind(decision_id)
         .fetch_optional(pool)
@@ -475,8 +526,8 @@ pub async fn answer(
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
-    let resumed = resumed_manifest(pool, &decision).await?;
     let at = now();
+    let (resumed, widened) = resumed_manifest(pool, &decision, text, origin, widen, &at).await?;
 
     // Nothing below may ask the pool for a connection while `tx` holds one.
     let mut tx = pool.begin().await?;
@@ -508,30 +559,143 @@ pub async fn answer(
     decision.origin = Some(origin.to_owned());
     decision.at = at;
     decision.status = STATUS_ANSWERED.to_owned();
-    Ok(decision)
+    Ok((decision, widened))
 }
 
-/// The manifest to write once `decision` is answered, or `None` when no branch waits on it.
+/// What `text` asks of a fence park: widen by the files the refusal names (`None` when it asks for
+/// nothing of the kind).
+fn widens_by_text(text: &str) -> bool {
+    text.trim()
+        .get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case("widen"))
+}
+
+/// The paths to add to a branch parked on the fence refusal `refusal`, or `None` when this answer
+/// does not widen. An explicit list is exactly what the owner sent; the text form is exactly the
+/// files the refusal names. Never more.
+fn paths_to_widen(
+    widen: Option<&[String]>,
+    text: &str,
+    refusal: &str,
+) -> Result<Option<Vec<String>>, DecisionError> {
+    let named: Vec<String> = match widen {
+        Some(list) => {
+            let mut named: Vec<String> = Vec::new();
+            for path in list {
+                let path = path.trim();
+                if path.is_empty() {
+                    return Err(DecisionError::Invalid(
+                        "widen_paths has an empty path".to_owned(),
+                    ));
+                }
+                if !named.iter().any(|seen| seen == path) {
+                    named.push(path.to_owned());
+                }
+            }
+            if named.is_empty() {
+                return Err(DecisionError::Invalid("widen_paths is empty".to_owned()));
+            }
+            named
+        }
+        None if widens_by_text(text) => super::path_fence::files_named_in(refusal),
+        None => return Ok(None),
+    };
+    Ok((!named.is_empty()).then_some(named))
+}
+
+/// The manifest to write once `decision` is answered, or `None` when no branch waits on it, with
+/// the paths the answer widened the branch by.
 async fn resumed_manifest(
     pool: &SqlitePool,
     decision: &Decision,
-) -> Result<Option<String>, DecisionError> {
+    text: &str,
+    origin: &str,
+    widen: Option<&[String]>,
+    at: &str,
+) -> Result<(Option<String>, Option<Vec<String>>), DecisionError> {
+    let nothing = |widen: Option<&[String]>| {
+        match widen {
+        Some(_) => Err(DecisionError::Invalid(
+            "no branch is parked on a fence refusal for this decision, so there is nothing to widen"
+                .to_owned(),
+        )),
+        None => Ok((None, None)),
+    }
+    };
     let (Some(tree_id), Some(node_id)) = (decision.tree_id.as_deref(), decision.node_id.as_deref())
     else {
-        return Ok(None);
+        return nothing(widen);
     };
     let Some(mut job) = store::load(pool, tree_id).await? else {
-        return Ok(None);
+        return nothing(widen);
     };
     let Some(branch) = branch_of_node(&mut job.manifest, node_id) else {
-        return Ok(None);
+        return nothing(widen);
     };
     let Some(record) = branch.park.as_ref().filter(|_| branch.state == PARKED) else {
-        return Ok(None);
+        return nothing(widen);
     };
     if record.get("decision_id").and_then(Value::as_str) != Some(decision.id.as_str()) {
-        return Ok(None);
+        return nothing(widen);
     }
+    let refusal = branch
+        .extra
+        .get(super::path_fence::REFUSAL)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut widened = None;
+    match &refusal {
+        None if widen.is_some() => {
+            return Err(DecisionError::Invalid(
+                "widen_paths only applies to a branch parked on a fence refusal".to_owned(),
+            ));
+        }
+        None => {}
+        Some(refusal) => {
+            // A branch with no declared paths is not restricted, so there is nothing to widen.
+            let added = if branch.paths.is_empty() {
+                None
+            } else {
+                paths_to_widen(widen, text, refusal)?
+            };
+            branch.extra.remove(super::path_fence::REFUSAL);
+            match &added {
+                Some(added) => {
+                    for path in added {
+                        if !branch.paths.contains(path) {
+                            branch.paths.push(path.clone());
+                        }
+                    }
+                    let entry = json!({
+                        "at": at,
+                        "by": origin,
+                        "paths": added,
+                        "answer": text,
+                        "decision": decision.id,
+                    });
+                    let log = branch
+                        .extra
+                        .entry("widened".to_owned())
+                        .or_insert_with(|| json!([]));
+                    if let Some(log) = log.as_array_mut() {
+                        log.push(entry);
+                    }
+                    branch.extra.remove(super::path_fence::DECISION);
+                    branch.extra.remove(super::path_fence::HEAD);
+                }
+                None => {
+                    // Not a widen: the merge is retried on the current head, and a refusal again
+                    // reopens this very decision.
+                    branch.extra.insert(
+                        super::path_fence::DECISION.to_owned(),
+                        Value::from(decision.id.clone()),
+                    );
+                }
+            }
+            widened = added;
+        }
+    }
+    let record = branch.park.clone().unwrap_or_default();
     // A record without a `prev_state` names no state to go back to, which the engine refuses.
     let prev_state = record
         .get("prev_state")
@@ -541,7 +705,7 @@ async fn resumed_manifest(
     apply_transition(branch, &prev_state)?;
     branch.park = None;
     let manifest = serde_json::to_string(&job.manifest).map_err(StoreError::from)?;
-    Ok(Some(manifest))
+    Ok((Some(manifest), widened))
 }
 
 /// Every decision, open or answered, oldest first.
@@ -1210,5 +1374,210 @@ mod tests {
         assert_eq!(lines[0].0, FEED_KIND);
         assert!(lines[0].1.contains("d-ticket-7") && lines[0].1.contains(QUESTION));
         assert_eq!(open(&pool).await.unwrap(), [first]);
+    }
+
+    // ----- a fence park: the owner's answer can widen the branch's paths -----
+
+    const REFUSAL: &str = "Branch api cannot merge into feat/tree: it changed files outside its declared paths [core/src/api.rs]: core/src/hooks/pretool.rs, core/src/hooks/other.rs. Move that change to the branch that owns those paths, or have the parent widen this branch's paths.";
+
+    /// A green branch the path fence refused: its refusal is recorded and its node is parked.
+    async fn fence_parked(pool: &SqlitePool) -> Decision {
+        seed_one_branch(pool, "green").await;
+        let mut held = job(pool).await;
+        held.manifest
+            .branches
+            .get_mut(BRANCH)
+            .unwrap()
+            .extra
+            .insert("fence_refusal".to_owned(), json!(REFUSAL));
+        store::update(pool, &held).await.unwrap();
+        park(pool, TREE, NODE, REFUSAL).await.unwrap()
+    }
+
+    fn paths(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_structured_widen_adds_exactly_the_paths_the_owner_sent() {
+        let pool = crate::testdb::fresh_pool().await;
+        let parked = fence_parked(&pool).await;
+
+        let (_, widened) = answer_widening(
+            &pool,
+            &parked.id,
+            "yes, it is the same change",
+            CHANNEL,
+            Some(&paths(&["core/src/hooks/pretool.rs"])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(widened, Some(paths(&["core/src/hooks/pretool.rs"])));
+        let branch = branch_of(&pool, BRANCH).await;
+        assert_eq!(
+            branch.paths,
+            paths(&["core/src/api.rs", "core/src/hooks/pretool.rs"]),
+            "the second named file was not asked for"
+        );
+        assert_eq!(branch.state, "green");
+        assert_eq!(branch.park, None);
+        assert!(!branch.extra.contains_key("fence_refusal"));
+        assert!(!branch.extra.contains_key("fence_decision_id"));
+        assert_eq!(stored(&pool, &parked.id).await.status, STATUS_ANSWERED);
+    }
+
+    #[tokio::test]
+    async fn a_widen_text_widens_by_the_files_the_refusal_names() {
+        let pool = crate::testdb::fresh_pool().await;
+        let parked = fence_parked(&pool).await;
+
+        let (_, widened) = answer_widening(&pool, &parked.id, "Widen paths", CHANNEL, None)
+            .await
+            .unwrap();
+
+        let named = paths(&["core/src/hooks/pretool.rs", "core/src/hooks/other.rs"]);
+        assert_eq!(widened, Some(named.clone()));
+        let branch = branch_of(&pool, BRANCH).await;
+        assert_eq!(branch.paths[0], "core/src/api.rs");
+        assert_eq!(branch.paths[1..], named[..]);
+        assert_eq!(branch.state, "green");
+        assert!(!branch.extra.contains_key("fence_refusal"));
+    }
+
+    #[tokio::test]
+    async fn a_widen_records_who_widened_what_and_why() {
+        let pool = crate::testdb::fresh_pool().await;
+        let parked = fence_parked(&pool).await;
+
+        answer_widening(&pool, &parked.id, "widen", CHANNEL, None)
+            .await
+            .unwrap();
+
+        let record = &branch_of(&pool, BRANCH).await.extra["widened"][0];
+        assert_eq!(record["by"], json!(CHANNEL));
+        assert_eq!(record["decision"], json!(parked.id));
+        assert_eq!(record["answer"], json!("widen"));
+        assert_eq!(
+            record["paths"],
+            json!(["core/src/hooks/pretool.rs", "core/src/hooks/other.rs"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_widen_needs_no_live_parent() {
+        let pool = crate::testdb::fresh_pool().await;
+        let parked = fence_parked(&pool).await;
+        sqlx::query("UPDATE work_nodes SET status = 'dropped' WHERE id = ?")
+            .bind(ROOT)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        answer_widening(&pool, &parked.id, "widen", CHANNEL, None)
+            .await
+            .unwrap();
+
+        let branch = branch_of(&pool, BRANCH).await;
+        assert_eq!(branch.state, "green");
+        assert_eq!(branch.paths.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_widen_never_adds_a_path_nobody_named() {
+        let pool = crate::testdb::fresh_pool().await;
+        let parked = fence_parked(&pool).await;
+
+        let (_, widened) = answer_widening(
+            &pool,
+            &parked.id,
+            "widen everything",
+            CHANNEL,
+            Some(&paths(&[
+                "core/src/hooks/pretool.rs",
+                "core/src/hooks/pretool.rs",
+            ])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(widened, Some(paths(&["core/src/hooks/pretool.rs"])));
+        assert_eq!(
+            branch_of(&pool, BRANCH).await.paths,
+            paths(&["core/src/api.rs", "core/src/hooks/pretool.rs"]),
+            "an explicit list beats the text and is not padded by the refusal's files"
+        );
+    }
+
+    #[tokio::test]
+    async fn widen_paths_on_a_park_that_is_not_a_fence_refusal_is_refused() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+
+        let error = answer_widening(
+            &pool,
+            &parked.id,
+            ANSWER,
+            CHANNEL,
+            Some(&paths(&["core/src/x.rs"])),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DecisionError::Invalid(_)), "{error:?}");
+        assert_eq!(stored(&pool, &parked.id).await.status, STATUS_OPEN);
+        assert_eq!(branch_of(&pool, BRANCH).await.state, "parked");
+    }
+
+    #[tokio::test]
+    async fn an_empty_widen_path_is_refused() {
+        let pool = crate::testdb::fresh_pool().await;
+        let parked = fence_parked(&pool).await;
+
+        let error = answer_widening(&pool, &parked.id, "widen", CHANNEL, Some(&paths(&["  "])))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DecisionError::Invalid(_)), "{error:?}");
+        assert_eq!(stored(&pool, &parked.id).await.status, STATUS_OPEN);
+    }
+
+    #[tokio::test]
+    async fn another_answer_to_a_fence_park_widens_nothing_and_remembers_the_decision() {
+        let pool = crate::testdb::fresh_pool().await;
+        let parked = fence_parked(&pool).await;
+
+        let (_, widened) = answer_widening(&pool, &parked.id, "split it up", CHANNEL, None)
+            .await
+            .unwrap();
+
+        assert_eq!(widened, None);
+        let branch = branch_of(&pool, BRANCH).await;
+        assert_eq!(branch.paths, paths(&["core/src/api.rs"]));
+        assert_eq!(branch.state, "green");
+        assert_eq!(branch.extra["fence_decision_id"], json!(parked.id));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_refusal_reuses_the_decision_id() {
+        let pool = crate::testdb::fresh_pool().await;
+        let first = fence_parked(&pool).await;
+        answer(&pool, &first.id, "split it up", CHANNEL)
+            .await
+            .unwrap();
+        let again = "Branch api cannot merge into feat/tree: it changed files outside its declared paths [core/src/api.rs]: core/src/hooks/third.rs. Move that change";
+
+        let second = park(&pool, TREE, NODE, again).await.unwrap();
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(decision_rows(&pool).await, 1);
+        let row = stored(&pool, &first.id).await;
+        assert_eq!(row.status, STATUS_OPEN);
+        assert_eq!(row.answer, None);
+        assert_eq!(row.question, again);
+        let branch = branch_of(&pool, BRANCH).await;
+        assert_eq!(branch.state, "parked");
+        assert_eq!(branch.park.unwrap()["decision_id"], json!(first.id));
     }
 }
