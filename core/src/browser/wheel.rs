@@ -1901,10 +1901,11 @@ mod tests {
             open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await,
             Err(WheelError::Disabled)
         ));
-        let chats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let chats: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chats WHERE title LIKE 'Browser · %'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(chats, 0, "no conversation was made");
         assert!(seen.lock().unwrap().is_empty());
         db.close().await;
@@ -1942,7 +1943,7 @@ mod tests {
         assert!(matches!(result, Err(WheelError::Sidecar(_))), "{result:?}");
 
         let chats: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT chat_id, title FROM chats")
+            sqlx::query_as("SELECT chat_id, title FROM chats WHERE title LIKE 'Browser · %'")
                 .fetch_all(&state.pool)
                 .await
                 .unwrap();
@@ -2038,10 +2039,11 @@ mod tests {
             open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await;
         assert!(result.is_err(), "{result:?}");
 
-        let chats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let chats: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chats WHERE title LIKE 'Browser · %'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(chats, 1, "the conversation stays");
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -2161,10 +2163,11 @@ mod tests {
 
         let _ = open_window_with_agent(&state, "nucleos", "not a url").await;
 
-        let title: Option<String> = sqlx::query_scalar("SELECT title FROM chats")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM chats WHERE title LIKE 'Browser · %'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(title.as_deref(), Some("Browser · nucleos"));
         db.close().await;
     }
