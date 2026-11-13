@@ -22,7 +22,7 @@
 //! The capability *vocabulary* is wider than what any role checks today — tool calling and vision
 //! are here for a later packet's model picker — but the three roles this packet governs declare
 //! only the context window they already enforce. Adding a requirement they do not check today would
-//! be a behaviour change no configuration asked for; `nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela`
+//! be a behaviour change no configuration asked for; `none_of_the_three_roles_requires_more_than_the_window_today`
 //! below is the guard against that happening by accident.
 //!
 //! Every decision function here is PURE — no network, no async runtime, testable with neither —
@@ -163,7 +163,7 @@ pub fn local_assistant_posture(missing: &[MissingCapability]) -> Posture {
 /// When a context-window gap is among `missing`, this is `runner::local_triage_decision`'s own
 /// wording for the underlying `ModelError` — never a second copy of it, per this module's own doc.
 /// Otherwise it names the missing capabilities directly: no role checks anything but the window
-/// today (`nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela` is the guard), so this branch
+/// today (`none_of_the_three_roles_requires_more_than_the_window_today` is the guard), so this branch
 /// exists only for the wider vocabulary a later packet's model picker will exercise.
 fn missing_reason(missing: &[MissingCapability]) -> String {
     let context_error = missing.iter().find_map(|capability| match capability {
@@ -250,7 +250,7 @@ pub fn picker_refusal(missing: &[MissingCapability]) -> Option<String> {
 /// Scoped to the non-test build, for the same reason `discover_openai_compatible` below is: every
 /// production call site now goes through `discover_ollama_as` directly so it can pass its own
 /// probe label, which leaves this four-argument wrapper with no caller but its own tests —
-/// `a_descoberta_le_a_janela_de_uma_resposta_do_api_show` and its siblings below exercise it, and
+/// `discovery_reads_the_window_from_an_api_show_response` and its siblings below exercise it, and
 /// the frozen 22 keep it from being deleted.
 pub async fn discover_ollama(
     client: &reqwest::Client,
@@ -593,8 +593,8 @@ pub async fn discover_openai_compatible(
 /// Documented shape: `{"models": [{"name": "...", "model": "...", ...}, ...]}`, each entry's
 /// `name` read and every other field ignored. **UNVERIFIED against a real Ollama on this
 /// machine** -- Ollama was not running when this was written; see
-/// `um_ollama_real_lista_os_modelos_que_esta_maquina_tem` below, `#[ignore]`d for the same reason
-/// `um_ollama_real_declara_um_array_de_capacidades` is.
+/// `a_real_ollama_lists_the_models_this_machine_has` below, `#[ignore]`d for the same reason
+/// `a_real_ollama_declares_a_capabilities_array` is.
 ///
 /// A body this crate cannot parse as JSON, or one with no top-level `models` array, produces an
 /// EMPTY list -- never an error and never a partial guess -- matching the fail-closed posture
@@ -992,7 +992,7 @@ pub async fn pull_local_model(
 ///
 /// Scoped to the non-test build, for the same reason `discover_openai_compatible` above is: no production
 /// caller until the model picker packet, exercised under `cfg(test)` by
-/// `uma_cli_declara_as_suas_capacidades_sem_tocar_na_rede` in the meantime.
+/// `a_cli_declares_its_capabilities_without_touching_the_network` in the meantime.
 pub fn declared_for_cli() -> Declared {
     Declared {
         context: Ok(()),
@@ -1091,7 +1091,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[test]
-    fn um_requisito_satisfeito_nao_nomeia_capacidade_nenhuma() {
+    fn a_satisfied_requirement_names_no_capability() {
         let missing = missing_capabilities(&satisfied_requirement(), &fully_declared());
         assert!(
             missing.is_empty(),
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_janela_pequena_demais_e_nomeada_com_o_que_ha_e_o_que_e_preciso() {
+    fn a_window_too_small_is_named_with_what_there_is_and_what_is_needed() {
         let requirement = Requirement {
             context_tokens: 8192,
             tools: false,
@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn um_modelo_que_nao_declara_ferramentas_e_recusado_para_quem_as_exige() {
+    fn a_model_that_does_not_declare_tools_is_refused_for_whoever_requires_them() {
         let requirement = Requirement {
             context_tokens: 0,
             tools: true,
@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn um_modelo_que_nao_declara_visao_e_recusado_para_quem_a_exige() {
+    fn a_model_that_does_not_declare_vision_is_refused_for_whoever_requires_it() {
         let requirement = Requirement {
             context_tokens: 0,
             tools: false,
@@ -1182,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn todas_as_capacidades_em_falta_sao_nomeadas_e_nao_so_a_primeira() {
+    fn all_the_missing_capabilities_are_named_and_not_just_the_first() {
         let requirement = satisfied_requirement();
         let declared = Declared {
             context: Err(context_too_small(100, 8192)),
@@ -1206,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn o_que_a_fonte_nao_declara_conta_como_ausente_e_nao_como_presente() {
+    fn what_the_source_does_not_declare_counts_as_absent_and_not_as_present() {
         // `context_tokens: 0` -> the window is not under test here; only the three booleans a
         // source can simply omit saying anything about.
         let requirement = Requirement {
@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_descoberta_le_a_janela_de_uma_resposta_do_api_show() {
+    async fn discovery_reads_the_window_from_an_api_show_response() {
         let base_url = stub_ollama_show(serde_json::json!({
             "model_info": {
                 "general.architecture": "qwen2",
@@ -1311,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_descoberta_le_as_ferramentas_do_array_de_capacidades_do_ollama() {
+    async fn discovery_reads_the_tools_from_the_ollama_capabilities_array() {
         let base_url = stub_ollama_show(serde_json::json!({
             "model_info": {
                 "general.architecture": "qwen2",
@@ -1335,7 +1335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_descoberta_le_a_janela_e_as_ferramentas_do_catalogo_do_openrouter() {
+    async fn discovery_reads_the_window_and_the_tools_from_the_openrouter_catalogue() {
         let base_url = stub_openrouter_models(serde_json::json!({
             "id": "anthropic/claude-sonnet-4.5",
             "context_length": 200000,
@@ -1370,7 +1370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uma_cli_declara_as_suas_capacidades_sem_tocar_na_rede() {
+    async fn a_cli_declares_its_capabilities_without_touching_the_network() {
         // No listener bound, no client passed in: `declared_for_cli` must not need either.
         let declared = declared_for_cli();
 
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uma_resposta_ilegivel_nao_declara_capacidade_nenhuma() {
+    async fn an_unreadable_response_declares_no_capability() {
         let base_url = stub_ollama_show_unreadable().await;
         let client = reqwest::Client::new();
 
@@ -1418,7 +1418,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn a_descoberta_corre_uma_vez_por_modelo_e_nao_uma_vez_por_utilizacao() {
+    async fn discovery_runs_once_per_model_and_not_once_per_use() {
         let base_url = stub_ollama_show(serde_json::json!({
             "model_info": {
                 "general.architecture": "qwen2",
@@ -1451,7 +1451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dois_modelos_sao_descobertos_um_de_cada_vez_e_nao_partilham_resposta() {
+    async fn two_models_are_discovered_one_at_a_time_and_do_not_share_a_response() {
         let base_url = stub_ollama_show_by_model().await;
         let client = reqwest::Client::new();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1519,7 +1519,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[test]
-    fn a_triagem_desliga_por_completo_e_diz_porque() {
+    fn triage_switches_off_completely_and_says_why() {
         let error = context_too_small(2048, triage::LOCAL_NUM_CTX);
         let missing = vec![MissingCapability::ContextWindow(error.clone())];
 
@@ -1537,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn a_voz_desliga_o_polimento_e_o_ditado_segue_em_cru() {
+    fn voice_switches_off_the_polish_and_dictation_carries_on_raw() {
         let error = context_too_small(1024, voice::CLEANUP_NUM_CTX);
         let missing = vec![MissingCapability::ContextWindow(error)];
 
@@ -1550,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn a_conversa_local_cai_para_a_cli_em_vez_de_desligar() {
+    fn the_local_conversation_falls_back_to_the_cli_instead_of_switching_off() {
         let error = context_too_small(4096, local_agent::TURN_NUM_CTX);
         let missing = vec![MissingCapability::ContextWindow(error)];
 
@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn as_tres_posturas_sao_distintas_e_nenhuma_herda_a_do_vizinho() {
+    fn the_three_postures_are_distinct_and_none_inherits_its_neighbours() {
         // The SAME failure, handed to all three roles.
         let error = context_too_small(512, 8192);
         let missing = vec![MissingCapability::ContextWindow(error)];
@@ -1584,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn um_requisito_cumprido_deixa_os_tres_papeis_exactamente_como_estavam() {
+    fn a_met_requirement_leaves_the_three_roles_exactly_as_they_were() {
         let missing: Vec<MissingCapability> = Vec::new();
 
         assert_eq!(triage_posture(&missing), Posture::Unaffected);
@@ -1597,7 +1597,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[test]
-    fn a_triagem_exige_a_janela_que_o_triage_rs_ja_fixava() {
+    fn triage_requires_the_window_triage_rs_already_pinned() {
         assert_eq!(
             triage::CAPABILITY_REQUIREMENT.context_tokens,
             triage::LOCAL_NUM_CTX,
@@ -1606,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn a_voz_exige_a_janela_que_o_voice_rs_ja_fixava() {
+    fn voice_requires_the_window_voice_rs_already_pinned() {
         assert_eq!(
             voice::CAPABILITY_REQUIREMENT.context_tokens,
             voice::CLEANUP_NUM_CTX,
@@ -1615,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn a_conversa_local_exige_a_janela_que_o_local_agent_rs_ja_fixava() {
+    fn the_local_conversation_requires_the_window_local_agent_rs_already_pinned() {
         assert_eq!(
             local_agent::CAPABILITY_REQUIREMENT.context_tokens,
             local_agent::TURN_NUM_CTX,
@@ -1624,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela() {
+    fn none_of_the_three_roles_requires_more_than_the_window_today() {
         // The guard: if a future change adds a requirement to any of the three roles beyond the
         // window they already enforce, THIS test must fail and make that change say so out loud,
         // instead of the model picker silently starting to disable local models it did not used to.
@@ -1672,10 +1672,10 @@ mod tests {
     /// twenty against a double.
     ///
     /// Run it deliberately, from the repository root, with Ollama already running:
-    ///   cargo test -p nucleos-core -- --ignored --nocapture capabilities::tests::um_ollama_real_declara_um_array_de_capacidades
+    ///   cargo test -p nucleos-core -- --ignored --nocapture capabilities::tests::a_real_ollama_declares_a_capabilities_array
     #[tokio::test]
     #[ignore = "needs a running Ollama at runner::OLLAMA_BASE_URL with the configured local model pulled"]
-    async fn um_ollama_real_declara_um_array_de_capacidades() {
+    async fn a_real_ollama_declares_a_capabilities_array() {
         // The file the daemon reads, on purpose: the question is about THIS machine's model.
         let root = crate::machine_config::root().expect("this machine must have a home directory");
         let models =
@@ -1718,7 +1718,7 @@ mod tests {
     /// the reqwest error branch none of the tests above reach (`uma_resposta_ilegivel_...` gets a
     /// response and fails on its *body*; this one never gets a response at all).
     #[tokio::test]
-    async fn uma_falha_de_ligacao_nao_declara_capacidade_nenhuma() {
+    async fn a_connection_failure_declares_no_capability() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -1779,7 +1779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cada_papel_se_nomeia_a_si_proprio_quando_a_resposta_nao_pode_ser_lida() {
+    async fn each_role_names_itself_when_the_response_cannot_be_read() {
         // The exact three labels `main.rs` passes at its three call sites — this is the send-back
         // this test exists to close: a unification that goes back to one shared string here would
         // fail this loop on whichever label it collapsed into the others, instead of shipping a
@@ -1833,7 +1833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_leitura_do_api_tags_devolve_os_nomes_dos_modelos_instalados() {
+    async fn reading_api_tags_returns_the_names_of_the_installed_models() {
         let base_url = stub_ollama_tags(&["qwen3.5:4b", "llama3.2:3b"]).await;
         let client = reqwest::Client::new();
 
@@ -1853,7 +1853,7 @@ mod tests {
     /// guess -- not JSON at all, JSON with no `models` key, and a `models` key that is not an
     /// array.
     #[test]
-    fn um_api_tags_ilegivel_nao_declara_modelo_nenhum() {
+    fn an_unreadable_api_tags_declares_no_model() {
         for body in [
             "not json, not anything",
             "{}",
@@ -1869,11 +1869,11 @@ mod tests {
         }
     }
 
-    /// The same connect-failure shape `uma_falha_de_ligacao_nao_declara_capacidade_nenhuma` above
+    /// The same connect-failure shape `a_connection_failure_declares_no_capability` above
     /// exercises for `/api/show`: a loopback port claimed and released before the read ever dials
     /// it, so there is nobody there to answer at all.
     #[tokio::test]
-    async fn um_ollama_inalcancavel_nao_declara_modelo_nenhum() {
+    async fn an_unreachable_ollama_declares_no_model() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -1892,13 +1892,13 @@ mod tests {
     /// The one thing every fixture above could not check on this machine: whether a real
     /// `/api/tags` really answers with the documented `{"models": [{"name": ...}]}` shape. Ollama
     /// was not running here when this module was written. `#[ignore]`, exactly like
-    /// `um_ollama_real_declara_um_array_de_capacidades` above and for the same reason.
+    /// `a_real_ollama_declares_a_capabilities_array` above and for the same reason.
     ///
     /// Run it deliberately, from the repository root, with Ollama already running:
-    ///   cargo test -p nucleos-core -- --ignored --nocapture capabilities::tests::um_ollama_real_lista_os_modelos_que_esta_maquina_tem
+    ///   cargo test -p nucleos-core -- --ignored --nocapture capabilities::tests::a_real_ollama_lists_the_models_this_machine_has
     #[tokio::test]
     #[ignore = "needs a running Ollama at runner::OLLAMA_BASE_URL"]
-    async fn um_ollama_real_lista_os_modelos_que_esta_maquina_tem() {
+    async fn a_real_ollama_lists_the_models_this_machine_has() {
         let client = reqwest::Client::new();
 
         let installed = installed_local_models(&client, runner::OLLAMA_BASE_URL).await;
@@ -1914,7 +1914,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[test]
-    fn um_modelo_que_serve_nao_da_recusa_nenhuma_no_picker() {
+    fn a_model_that_serves_gives_no_refusal_in_the_picker() {
         let missing: Vec<MissingCapability> = Vec::new();
 
         assert_eq!(
@@ -1925,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_janela_pequena_demais_e_recusada_no_picker_com_os_dois_numeros() {
+    fn a_window_too_small_is_refused_in_the_picker_with_both_numbers() {
         let missing = vec![MissingCapability::ContextWindow(context_too_small(
             2048, 8192,
         ))];
@@ -1944,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recusa_do_picker_nomeia_todas_as_capacidades_em_falta_e_nao_so_a_primeira() {
+    fn the_pickers_refusal_names_all_the_missing_capabilities_and_not_just_the_first() {
         let requirement = satisfied_requirement();
         let declared = Declared {
             context: Err(context_too_small(100, 8192)),
@@ -2224,7 +2224,7 @@ mod tests {
     ///
     /// Asks for a model this machine already has, deliberately — Ollama answers such a pull in
     /// milliseconds with the same frames, so the check costs no bandwidth and downloads nothing.
-    /// `#[ignore]`, exactly like `um_ollama_real_lista_os_modelos_que_esta_maquina_tem` above and
+    /// `#[ignore]`, exactly like `a_real_ollama_lists_the_models_this_machine_has` above and
     /// for the same reason: Ollama is not running on every machine this suite runs on.
     #[tokio::test]
     #[ignore = "needs a running Ollama at runner::OLLAMA_BASE_URL with at least one model pulled"]

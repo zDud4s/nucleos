@@ -472,7 +472,7 @@ mod tests {
     /// those projects refuses to start new work forever, because nothing will ever present those
     /// rows for a human to clear.
     #[tokio::test]
-    async fn uma_decisao_aplicada_em_worktree_nao_e_fila_de_revisao() {
+    async fn an_enforced_worktree_decision_is_not_a_review_backlog() {
         let pool = test_pool().await;
         add_project(&pool, "project-a").await;
         add_unreviewed_decisions_in_mode(&pool, "project-a", "worktree", 50).await;
@@ -493,7 +493,7 @@ mod tests {
     /// piling up review work faster than a human clears it. Restricting the term to `shadow` mode
     /// must not simply switch the brake off — it must keep braking on the mode it was built for.
     #[tokio::test]
-    async fn uma_decisao_em_modo_shadow_continua_a_travar() {
+    async fn a_shadow_mode_decision_still_brakes() {
         let pool = test_pool().await;
         add_project(&pool, "project-a").await;
         add_unreviewed_decisions_in_mode(&pool, "project-a", "shadow", 5).await;
@@ -512,7 +512,7 @@ mod tests {
     /// `skipped-item` / `fleet-exclusion` exclusions argued at length above still hold. Only the
     /// SECOND term (`shadow_decisions`) gained a mode filter.
     #[tokio::test]
-    async fn as_propostas_continuam_a_contar_e_as_excecoes_continuam_fora() {
+    async fn proposals_still_count_and_the_exclusions_stay_out() {
         let pool = test_pool().await;
         add_project(&pool, "project-a").await;
         add_pending_proposals(&pool, "project-a", 2).await;

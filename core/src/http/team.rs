@@ -33,9 +33,9 @@ pub(super) fn routes() -> Router<AppState> {
             get(crate::team::list_team_run_actions),
         )
         .route("/team-files/read", post(crate::team::post_read_file))
-        // `/team-pressure` e nao `/teams/pressure`: os irmaos que colhem sobre todas as equipas
-        // chamam-se `/team-runs`, `/team-files`, `/team-actions`, e sob `/teams/` o segmento
-        // estatico ficaria a sombrear o `/teams/{id}` para uma equipa que se chamasse `pressure`.
+        // `/team-pressure` and not `/teams/pressure`: the siblings that collect across all teams
+        // are called `/team-runs`, `/team-files`, `/team-actions`, and under `/teams/` the static
+        // segment would shadow `/teams/{id}` for a team that happened to be named `pressure`.
         .route("/team-pressure", get(get_team_pressure))
         // Two callers, two methods, two scopes. A department POSTs what it would like done; only
         // the owner reads the queue of them. `auth::TEAM_ROUTES` lists the POST and not the GET, and
@@ -93,19 +93,19 @@ pub(super) fn routes() -> Router<AppState> {
 
 #[derive(Deserialize)]
 pub(super) struct PressureQuery {
-    /// A equipa, por nome. Resolve para o job mais recente dela.
+    /// The team, by name. Resolves to its most recent job.
     pub(super) team: Option<String>,
-    /// Ou um job em concreto, por `team_runs.id`. Ganha ao nome quando ambos vem.
+    /// Or one specific job, by `team_runs.id`. Wins over the name when both are given.
     pub(super) job: Option<String>,
 }
 
-/// Quanta janela custou a cada agente da equipa, por round.
+/// How much window each agent of the team cost, per round.
 ///
-/// `protected` e nao publica: e telemetria da maquina de agentes, e nomeia agentes, rounds e
-/// quanto contexto cada um gastou.
+/// `protected` and not public: it is telemetry of the agent machine, and it names agents, rounds and
+/// how much context each one spent.
 ///
-/// Nenhum dos dois parametros por omissao. Adivinhar uma equipa daria uma resposta sobre a equipa
-/// errada, que e pior do que nenhuma -- e quem pergunta nao teria como notar.
+/// Neither parameter has a default. Guessing a team would give an answer about the wrong team,
+/// which is worse than none -- and whoever asks would have no way to notice.
 pub(super) async fn get_team_pressure(
     State(state): State<AppState>,
     Query(query): Query<PressureQuery>,

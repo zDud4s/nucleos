@@ -8947,7 +8947,7 @@ tests:
     /// readable. `off` refuses with 422 before the row exists; `shadow` reaches 400 and complains
     /// about the missing field, which is the door letting it through.
     #[tokio::test]
-    async fn uma_run_nao_vigiada_e_recusada_a_um_projecto_desligado() {
+    async fn an_unwatched_run_is_refused_to_a_switched_off_project() {
         let state = test_state().await;
         project_in_mode(&state.pool, "proj", "off").await;
 
@@ -8994,7 +8994,7 @@ tests:
     /// until a project is deliberately activated. If this test ever has to change, that is the
     /// decision being revisited, and it should be revisited out loud.
     #[tokio::test]
-    async fn um_projecto_em_shadow_ainda_pode_pedir_uma_run_de_worktree() {
+    async fn a_project_in_shadow_can_still_ask_for_a_worktree_run() {
         let state = test_state().await;
         project_in_mode(&state.pool, "proj", "shadow").await;
 
@@ -9038,7 +9038,7 @@ tests:
     /// narrowing is a line of code nothing defends, and the first person to "make it consistent"
     /// takes the shell's default mode away with it.
     #[tokio::test]
-    async fn uma_run_vigiada_nao_e_travada_por_um_projecto_desligado() {
+    async fn a_watched_run_is_not_blocked_by_a_switched_off_project() {
         let state = test_state().await;
         project_in_mode(&state.pool, "proj", "off").await;
 

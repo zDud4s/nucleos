@@ -1088,7 +1088,7 @@ mod tests {
     /// A sidecar that answers the driver's verbs and the two wheel ones, and records every call.
     ///
     /// It answers `/wheel/return` with a chain the test chooses, because the chain is the only thing
-    /// a handover produces that outlives it â€” everything else here is a window that closes.
+    /// a handover produces that outlives it — everything else here is a window that closes.
     async fn stub_sidecar(
         chain: Vec<&'static str>,
         take_fails: bool,
@@ -1354,8 +1354,8 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§4.4 rule 3, and the first half of rule 1. Asking raises a proposal â€” the daemon runs
-    /// without a shell, so the request has to survive the window being closed â€” and the session
+    /// Spec §4.4 rule 3, and the first half of rule 1. Asking raises a proposal — the daemon runs
+    /// without a shell, so the request has to survive the window being closed — and the session
     /// leaves the agent's hands in the same breath.
     #[tokio::test]
     async fn asking_for_the_wheel_raises_a_proposal_and_takes_the_session_off_the_agent() {
@@ -1382,7 +1382,7 @@ mod tests {
         assert_eq!(raised.project_id.as_deref(), Some("acme"));
         assert_eq!(raised.run_id, Some(7));
 
-        // Spec Â§5.2 measure 1: the dialogue is given the complete, literal origin â€” with its port,
+        // Spec §5.2 measure 1: the dialogue is given the complete, literal origin — with its port,
         // in the punycode form the policy stores. Prettifying it is the attack.
         let input: serde_json::Value =
             serde_json::from_str(raised.tool_input.as_deref().unwrap()).unwrap();
@@ -1400,8 +1400,8 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§4.5 and Â§4.2 together, which is the whole point of the handover: the agent was in a
-    /// throwaway, and the person is sent to the PROJECT's profile â€” the one that is not deleted with
+    /// Spec §4.5 and §4.2 together, which is the whole point of the handover: the agent was in a
+    /// throwaway, and the person is sent to the PROJECT's profile — the one that is not deleted with
     /// the run, and therefore the only one where a login is worth making.
     #[tokio::test]
     async fn accepting_opens_the_project_profile_and_not_the_throwaway() {
@@ -1426,7 +1426,7 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§4.4a. The window does not open, and the wheel does NOT go back to the agent â€” a failure
+    /// Spec §4.4a. The window does not open, and the wheel does NOT go back to the agent — a failure
     /// of ours is not a reason to let it drive again. The proposal carries the reason, so the person
     /// can retry or give up.
     #[tokio::test]
@@ -1461,7 +1461,7 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§5.2 and Â§5.3a, end to end: the wheel comes back with the chain, and NOTHING is granted
+    /// Spec §5.2 and §5.3a, end to end: the wheel comes back with the chain, and NOTHING is granted
     /// until a person answers. The two steps are separate because the person has to see the set
     /// before agreeing to it.
     #[tokio::test]

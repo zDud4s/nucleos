@@ -922,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_virgula_num_nome_nao_separa_dois_destinatarios() {
+    fn a_comma_in_a_name_does_not_split_two_recipients() {
         let normalized =
             split_address_list(r#""Silva, Maria" <maria@example.com>, oncall@example.com"#)
                 .into_iter()
@@ -933,21 +933,21 @@ mod tests {
     }
 
     #[test]
-    fn uma_virgula_dentro_dos_angulares_nao_separa() {
+    fn a_comma_inside_the_angle_brackets_does_not_split() {
         let recipients = split_address_list("Maria <maria,alias@example.com>");
 
         assert_eq!(recipients.len(), 1);
     }
 
     #[test]
-    fn uma_aspa_escapada_nao_fecha_o_nome() {
+    fn an_escaped_quote_does_not_close_the_name() {
         let recipients = split_address_list(r#""Silva\", Maria" <maria@example.com>"#);
 
         assert_eq!(recipients.len(), 1);
     }
 
     #[tokio::test]
-    async fn os_factos_sobrevivem_ao_prune() {
+    async fn the_facts_survive_the_prune() {
         let pool = test_pool().await;
         let address = "alice@example.com";
         let now = Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap();
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_nome_sobrevive_ao_prune() {
+    async fn the_name_survives_the_prune() {
         let pool = test_pool().await;
         let address = "helena@example.com";
         let display_name = "Helena Costa";
@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_nome_segue_a_mensagem_mais_recente() {
+    async fn the_name_follows_the_most_recent_message() {
         let pool = test_pool().await;
         let address = "helena@example.com";
         let earlier = "2026-07-20T09:00:00+00:00";
@@ -1112,7 +1112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_nome_escrito_por_uma_pessoa_ganha() {
+    async fn a_name_written_by_a_person_wins() {
         let pool = test_pool().await;
         let address = "helena@example.com";
         let received_at = "2026-07-24T09:00:00+00:00";
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_acumulacao_e_monotonica() {
+    async fn accumulation_is_monotonic() {
         let pool = test_pool().await;
         let address = "bob@example.com";
         let earlier = "2026-07-20T09:00:00+00:00";
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_insert_e_a_acumulacao_sao_atomicos() {
+    async fn the_insert_and_the_accumulation_are_atomic() {
         let pool = test_pool().await;
         let address = "carol@example.com";
         let received_at = "2026-07-29T10:00:00+00:00";
@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_perfil_de_uma_pessoa_soma_os_enderecos() {
+    async fn a_persons_profile_sums_the_addresses() {
         let pool = test_pool().await;
         let keep_address = "ana@example.com";
         let absorbed_address = "ana@work.example";
@@ -1364,7 +1364,7 @@ mod tests {
     /// person's instruction became an unreadable orphan row while their mail silently started
     /// obeying the other person's decision — two failures with no error between them.
     #[tokio::test]
-    async fn fundir_carrega_a_decisao_de_quem_e_absorvido() {
+    async fn merging_carries_the_decision_of_whoever_is_absorbed() {
         let pool = test_pool().await;
         let (_keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
         pin(&pool, &absorbed, "mute").await;
@@ -1391,7 +1391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fundir_recusa_quando_as_duas_decisoes_se_contradizem() {
+    async fn merging_refuses_when_the_two_decisions_contradict_each_other() {
         let pool = test_pool().await;
         let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
         pin(&pool, &keep, "pin").await;
@@ -1427,7 +1427,7 @@ mod tests {
     /// address was governed by that verdict right up to the split, and the address someone would
     /// look at to check is precisely the one that would have lost it.
     #[tokio::test]
-    async fn desfundir_nao_retira_a_decisao_do_endereco_separado() {
+    async fn unmerging_does_not_withdraw_the_decision_of_the_split_address() {
         let pool = test_pool().await;
         let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
         pin(&pool, &keep, "pin").await;
@@ -1453,7 +1453,7 @@ mod tests {
 
     /// The whole point of wiring the endpoint: approving used to answer 409 and merge nothing.
     #[tokio::test]
-    async fn aprovar_uma_proposta_funde_e_decide_a_proposta() {
+    async fn approving_a_proposal_merges_and_decides_the_proposal() {
         let pool = test_pool().await;
         let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
         let proposal_id =
@@ -1487,7 +1487,7 @@ mod tests {
     /// A refusal leaves the proposal answerable: withdraw one of the two pins and approve the same
     /// suggestion. Marking it decided would make the person wait for the heuristic to ask again.
     #[tokio::test]
-    async fn uma_recusa_por_contradicao_deixa_a_proposta_por_responder() {
+    async fn a_refusal_for_contradiction_leaves_the_proposal_unanswered() {
         let pool = test_pool().await;
         let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
         pin(&pool, &keep, "pin").await;
@@ -1519,7 +1519,7 @@ mod tests {
     /// The suggestion has to be answerable by a person, and nobody can answer "are 4 and 7 the
     /// same person" — the addresses are the question.
     #[tokio::test]
-    async fn as_sugestoes_pendentes_trazem_os_enderecos_e_as_decisoes() {
+    async fn the_pending_suggestions_bring_the_addresses_and_the_decisions() {
         let pool = test_pool().await;
         let (keep, keep_id, absorbed, absorb_id) = two_contacts(&pool).await;
         pin(&pool, &absorbed, "pin").await;
@@ -1538,7 +1538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fundir_e_desfundir_e_exacto() {
+    async fn merging_and_unmerging_is_exact() {
         let pool = test_pool().await;
         let keep_address = "bruno@example.com";
         let absorbed_address = "bruna@example.com";
@@ -1699,7 +1699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fundir_nao_move_contadores() {
+    async fn merging_does_not_move_counters() {
         let pool = test_pool().await;
         let keep_address = "carlos@example.com";
         let absorbed_address = "carla@example.com";
@@ -1785,7 +1785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_heuristica_propoe_e_nao_funde() {
+    async fn the_heuristic_proposes_and_does_not_merge() {
         let pool = test_pool().await;
         let first_address = "ana@example.com";
         let second_address = "ana@work.example";
@@ -1884,7 +1884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn um_par_recusado_nao_volta() {
+    async fn a_refused_pair_does_not_come_back() {
         let pool = test_pool().await;
         let first_address = "helena@example.com";
         let second_address = "helena@work.example";
@@ -1960,7 +1960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_heuristica_exige_evidencia_de_conhecimento() {
+    async fn the_heuristic_requires_evidence_of_acquaintance() {
         let pool = test_pool().await;
         let first_address = "info@first.example";
         let second_address = "info@second.example";

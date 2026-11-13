@@ -2852,7 +2852,7 @@ mod tests {
     /// owner's machine has 15.8 GB of RAM, a frontier MoE's expert pool does not fit in it, and so
     /// the server this test dials cannot be started here at all. That is a fact about this desk
     /// rather than about this crate — the same kind of caveat
-    /// `capabilities::um_ollama_real_declara_um_array_de_capacidades` carries for its own live
+    /// `capabilities::a_real_ollama_declares_a_capabilities_array` carries for its own live
     /// Ollama — so the body below is written as a test that WOULD pass the day the hardware
     /// exists, never as a `todo!()` standing in for one.
     ///

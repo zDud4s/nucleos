@@ -747,7 +747,7 @@ pub mod tests {
     /// And nothing is reverted anywhere, because nothing was ever published: the measurement happens
     /// on the computed merge while the target has not moved.
     #[tokio::test]
-    async fn um_merge_que_o_gate_recusa_nao_e_publicado() {
+    async fn a_merge_the_gate_refuses_is_not_published() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-red-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -782,7 +782,7 @@ pub mod tests {
     /// The green half. Without it the test above passes just as well for a repository where merging
     /// never worked at all.
     #[tokio::test]
-    async fn um_merge_que_o_gate_aceita_e_publicado() {
+    async fn a_merge_the_gate_accepts_is_published() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-green-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -801,7 +801,7 @@ pub mod tests {
 
     /// A gated merge leaves its measurement in `verify_runs`, under the request that asked for it.
     #[tokio::test]
-    async fn o_gate_de_um_merge_fica_em_verify_runs() {
+    async fn a_merges_gate_is_recorded_in_verify_runs() {
         use crate::execution::vcs::VcsExecutor;
 
         let _lock = crate::execution::worktree::test_env_lock();
@@ -859,7 +859,7 @@ gate_command: git --version
     /// stronger statement than "the default is false", because it is measured through the same door
     /// the two tests above go through.
     #[tokio::test]
-    async fn sem_a_chave_o_gate_nem_sequer_corre() {
+    async fn without_the_key_the_gate_does_not_even_run() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-off-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -880,7 +880,7 @@ gate_command: git --version
     /// unmeasured while the file says it does not, and a brake that reads as engaged and is not is
     /// worse than no brake — it is the one nobody thinks to check.
     #[tokio::test]
-    async fn pedir_medida_sem_gate_command_e_recusado() {
+    async fn asking_for_a_measurement_without_a_gate_command_is_refused() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-nocmd-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");

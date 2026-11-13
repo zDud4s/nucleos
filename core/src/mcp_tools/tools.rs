@@ -137,7 +137,7 @@ impl NucleosTools {
     // control that must not be self-served: every other brake (`budget`, the WIP ceiling, the kill
     // switch) is a limit ON an active project, and this is the gate INTO being one. The reasoning
     // is `LOCAL_TOOLS`'s, applied where it matters most — approvals "stay where the person can see
-    // what they are agreeing to". `o_veredicto_do_shadow_nao_e_uma_ferramenta` is what pins it.
+    // what they are agreeing to". `the_shadow_verdict_is_not_a_tool` is what pins it.
 
     #[tool(
         description = "The shadow scoreboard for one project: for each action class, what the \
