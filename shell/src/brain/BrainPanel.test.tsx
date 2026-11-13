@@ -181,6 +181,31 @@ describe("BrainPanel", () => {
     expect(list.textContent).toContain("gone");
   });
 
+  it("a job target reads 'job #N — first line' and links to the job", async () => {
+    serve(
+      detail({
+        links_out: [
+          {
+            id: 10,
+            note_id: 4,
+            link_type: "relates",
+            target_kind: "job",
+            target_ref: "42",
+            created_at: "2026-09-01T09:00:00+00:00",
+          },
+        ],
+      }),
+    );
+    await panel({
+      ...graph,
+      targets: [{ kind: "job", ref: "42", label: "job #42 — Nightly run", missing: false }],
+    });
+    const list = await screen.findByRole("list", { name: "Links out" });
+    const link = list.querySelector("a");
+    expect(link?.textContent).toBe("job #42 — Nightly run");
+    expect(link?.getAttribute("href")).toContain("/fleet");
+  });
+
   it("teaching a note posts the chosen kind and points to the Brain", async () => {
     serve(detail(), (path, init) =>
       path === "/owner-notes/4/teach" && init?.method === "POST"

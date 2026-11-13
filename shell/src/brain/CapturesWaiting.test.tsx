@@ -35,7 +35,7 @@ function serve(rows: CaptureRequest[]) {
   daemon.apiFetch.mockImplementation((path: string) => {
     if (path === "/capture-requests") return Promise.resolve(rows.filter((r) => r.state === "open"));
     if (path === "/capture-requests?state=all") return Promise.resolve(rows);
-    return Promise.resolve({ note_id: 1, requeued: true });
+    return Promise.resolve({ note_id: 1, released: true });
   });
 }
 
