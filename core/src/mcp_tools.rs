@@ -2465,6 +2465,7 @@ mod tests {
             (LOCAL_TOOLS, "LOCAL_TOOLS"),
             (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
             (TEAM_TOOLS, "TEAM_TOOLS"),
+            (JOB_NODE_TOOLS, "JOB_NODE_TOOLS"),
         ] {
             assert!(
                 !list.contains(&"send_to_chat"),

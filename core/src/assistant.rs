@@ -3787,6 +3787,110 @@ mod tests {
         );
     }
 
+    /// The third brake, asked again at the drain: the chain a queued relay belongs to had room when
+    /// `admit` granted the hop and spent its ceiling while the message waited. The owner is present
+    /// and the destination exists, so the budget is the only thing that can have stopped it.
+    #[tokio::test]
+    async fn the_drain_refuses_a_relay_born_turn_when_its_chain_has_spent_its_ceiling() {
+        let state = test_state().await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        // A real chain: a turn a person typed in `typed-chat`, one hop into `mid-chat` (which
+        // spent past the default ceiling), and the hop under test from `mid-chat` into `chat_id`.
+        let now = chrono::Utc::now().to_rfc3339();
+        let root: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, created_at, chat_id) VALUES ('hi', 'completed', ?, 'typed-chat') RETURNING id",
+        )
+        .bind(&now)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let first_hop: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('typed-chat', 'mid-chat', ?, 'x', 1, ?) RETURNING id",
+        )
+        .bind(root)
+        .bind(&now)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let mid_run: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, created_at, chat_id, from_relay_id, cost_usd)
+             VALUES ('x', 'completed', ?, 'mid-chat', ?, 100.0) RETURNING id",
+        )
+        .bind(&now)
+        .bind(first_hop)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let relay_id: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('mid-chat', ?, ?, 'y', 2, ?) RETURNING id",
+        )
+        .bind(&chat_id)
+        .bind(mid_run)
+        .bind(&now)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        crate::chats::enqueue_relayed(
+            &state.pool,
+            &chat_id,
+            "mensagem retransmitida",
+            "shell",
+            "[]",
+            relay_id,
+        )
+        .await
+        .unwrap();
+
+        let chain_root = crate::relay::root_of_relay(&state.pool, relay_id)
+            .await
+            .unwrap();
+        assert_eq!(chain_root, root);
+        assert!(matches!(
+            crate::relay::chain_has_room(&state.pool, chain_root, chrono::Utc::now()).await,
+            Err(crate::relay::Refusal::ChainOverBudget { .. })
+        ));
+
+        drain_queued(&state, &chat_id).await;
+
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            turns, 0,
+            "no turn should have started: the chain has no budget left"
+        );
+        assert!(
+            crate::chats::queued(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dropped, not retried"
+        );
+
+        // The same chain with a higher ceiling has room again, so it was the budget that refused.
+        crate::governance::budget::set_relay_chain_limit(&state.pool, 1000.0)
+            .await
+            .unwrap();
+        assert!(
+            crate::relay::chain_has_room(&state.pool, chain_root, chrono::Utc::now())
+                .await
+                .is_ok()
+        );
+    }
+
     /// The other half of the same expiry: the owner is still present, but the destination `admit`
     /// checked no longer exists by the time the drain would spend a turn on it — archived while the
     /// message sat waiting, exactly the gap between deciding and spending the whole re-check exists
