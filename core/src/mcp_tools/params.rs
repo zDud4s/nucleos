@@ -6,6 +6,8 @@ use super::*;
 pub(super) struct RunParams {
     pub(super) project_id: String,
     pub(super) prompt: String,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
 }
 
 /// The body of `POST /trees`, field for field (`TreeBody` in `tree_job/http.rs`).
@@ -23,6 +25,8 @@ pub(super) struct TreeLaunchParams {
     /// `integration` (the default here) lands the finished work into the project's integration
     /// branch; `hold` leaves it on `feature_branch` for the owner to land.
     pub(super) land: Option<String>,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
 }
 
 /// What `tree_launch` sends when the caller names no landing mode. Owner, 2026-11-04: a tree must
@@ -46,6 +50,7 @@ impl TreeLaunchParams {
             "contract": self.contract,
             "dirty_owner_files": self.dirty_owner_files,
             "land": land,
+            "launching_session_id": self.session_id,
         })
     }
 }

@@ -535,6 +535,7 @@ pub async fn create_run_route(
     let pool = state.pool.clone();
     let created = create_run(State(state), Json(req)).await?;
     tag_launching_chat(&pool, created.0.id, &headers).await;
+    tag_launching_session(&pool, created.0.id, &headers).await;
     tag_origin(&pool, created.0.id, &headers).await;
     Ok(created)
 }
@@ -720,6 +721,36 @@ pub(super) async fn tag_launching_chat(
     .await;
     if let Err(error) = tagged {
         tracing::warn!(%error, id, speaking, "the run was created but not tagged with the chat that asked for it");
+    }
+}
+
+/// Records on run `id` the Claude Code session that launched it, from `LAUNCH_SESSION_HEADER`.
+///
+/// The header is sent by the MCP server from the `session_id` the session's hook stamped into the
+/// `create_run` call. A value that is not a plain session id tags nothing, and a run that already
+/// has one keeps it. Best effort after the INSERT, like `tag_launching_chat`: a label, so a run
+/// left untagged is still a run.
+pub(super) async fn tag_launching_session(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    headers: &axum::http::HeaderMap,
+) {
+    let Some(session) = headers
+        .get(crate::daemon_client::LAUNCH_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| crate::daemon_client::valid_session_id(value))
+    else {
+        return;
+    };
+    let tagged = sqlx::query(
+        "UPDATE runs SET launching_session_id = ? WHERE id = ? AND launching_session_id IS NULL",
+    )
+    .bind(session)
+    .bind(id)
+    .execute(pool)
+    .await;
+    if let Err(error) = tagged {
+        tracing::warn!(%error, id, "the run was created but not tagged with the session that launched it");
     }
 }
 

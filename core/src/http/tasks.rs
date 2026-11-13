@@ -185,10 +185,7 @@ const SESSION_REFRESH_WAIT: Duration = Duration::from_millis(500);
 
 /// The shape the hook also checks (`SESSION_ID_SHAPE` in `ask_daemon.py`).
 fn valid_session_id(id: &str) -> bool {
-    (1..=128).contains(&id.len())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    crate::daemon_client::valid_session_id(id)
 }
 
 /// Who the caller is, as a claim holder. The run's identity comes from the key's scope, the
