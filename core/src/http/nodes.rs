@@ -413,6 +413,12 @@ async fn announce_close(pool: &sqlx::SqlitePool, node: &work_nodes::Node) {
     let Some((kind, summary)) = work_nodes::feed_line(&root_title, node) else {
         return;
     };
+    // A root parked again on the same open decision is not news: skip the repeat line.
+    if kind == "work_tree_parked"
+        && work_nodes::repeats_latest_park(pool, &root_title, node, &summary).await
+    {
+        return;
+    }
     if let Err(error) =
         crate::feed::append(pool, node.project_id.as_deref(), kind, &summary, None, None).await
     {
