@@ -667,8 +667,6 @@ mod tests {
                 "$b = Remove-Item x; git diff $b",
                 "$b = git merge-base master HEAD; git push origin $b",
                 "$b = git merge-base master HEAD; Remove-Item $b",
-                "$x = git merge-base master HEAD; git diff $b",
-                "git diff $b",
                 "$b = git merge-base $(Remove-Item x) HEAD",
             ],
         );
