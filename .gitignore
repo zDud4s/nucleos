@@ -72,6 +72,8 @@ sidecars/**/*.exe
 # `scripts/build-sidecars.sh` names them `nucleos-<name>`, and a bare `go build` inside a sidecar
 # names its output after the last element of that module's path (each `sidecars/*/go.mod`).
 sidecars/*/*-sidecar
+# Generated per build by scripts/build-sidecars.sh (Windows version resource).
+sidecars/*/*.syso
 sidecars/*/nucleos-browser
 sidecars/*/nucleos-echo
 sidecars/*/nucleos-email
