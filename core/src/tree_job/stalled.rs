@@ -15,6 +15,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::json;
 
+use super::auto_resolve;
 use super::decisions;
 use super::http::job_lock;
 use super::ladder::{self, Kind, Spent, Step};
@@ -29,6 +30,9 @@ use crate::state::AppState;
 pub(super) const STALL_SECS: i64 = 30 * 60;
 /// The record of the rungs spent, on `manifest.extra`: `{"nudges": n, "at": <updated_at it wrote>}`.
 const RECORD_KEY: &str = "stalled";
+/// Marks the episode already announced on the feed: `{"at": <updated_at the check left>}`. While the
+/// job still carries that `updated_at` nobody but the detector has touched it, so the episode goes on.
+const ANNOUNCED_KEY: &str = "stalled_announced";
 
 /// Whether the job has been quiet for [`STALL_SECS`] at `now`.
 fn quiet(job: &TreeJob, now: DateTime<Utc>) -> bool {
@@ -46,6 +50,23 @@ fn nudges_spent(job: &TreeJob) -> i64 {
         return 0;
     }
     record["nudges"].as_i64().unwrap_or(0)
+}
+
+/// Whether this stall episode already has its feed line: the job has not changed since the detector
+/// last wrote it. Any other change is progress and ends the episode.
+fn announced(job: &TreeJob) -> bool {
+    job.manifest
+        .extra
+        .get(ANNOUNCED_KEY)
+        .is_some_and(|mark| mark["at"].as_str() == Some(job.updated_at.as_str()))
+}
+
+/// Marks the episode announced, at the `updated_at` the job now carries.
+fn mark_announced(job: &mut TreeJob) {
+    let at = job.updated_at.clone();
+    job.manifest
+        .extra
+        .insert(ANNOUNCED_KEY.to_owned(), json!({ "at": at }));
 }
 
 /// The node the job waits for: the first branch still in play, else the root.
@@ -121,7 +142,7 @@ pub(super) async fn check_job(state: &AppState, job_id: &str) {
     }
 }
 
-async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+pub(super) async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(), String> {
     let pool = &state.pool;
     let park = {
         let lock = job_lock(job_id);
@@ -140,23 +161,26 @@ async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(),
         let spent = nudges_spent(&job);
         let node = subject_node(&job);
         let minutes = STALL_SECS / 60;
-        let line = format!(
-            "{}: the tree has not moved for {minutes} minutes: nothing runs and nobody is asked (rung {})",
-            job.goal,
-            spent + 1
-        );
-        if let Err(error) = crate::feed::append(
-            pool,
-            job.project_id.as_deref(),
-            "work_tree_stalled",
-            &line,
-            None,
-            None,
-        )
-        .await
-        {
-            tracing::warn!(job = job_id, %error, "could not announce the stalled tree");
+        // One feed line per stall episode, not one per rung.
+        if !announced(&job) {
+            let line = format!(
+                "{}: the tree has not moved for {minutes} minutes: nothing runs and nobody is asked",
+                job.goal
+            );
+            if let Err(error) = crate::feed::append(
+                pool,
+                job.project_id.as_deref(),
+                "work_tree_stalled",
+                &line,
+                None,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(job = job_id, %error, "could not announce the stalled tree");
+            }
         }
+        let decides_itself = auto_resolve::Config::load(&job.manifest.project_root).enabled;
         let step = ladder::next_step(
             Kind::Stalled,
             Spent {
@@ -173,7 +197,9 @@ async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(),
                 }
                 record(&mut job, spent + 1, now);
             }
-            Step::Diagnose if rescue_started(state, &node, minutes).await? => {
+            Step::Diagnose
+                if rescue_started(state, &job.id, &node, minutes, decides_itself).await? =>
+            {
                 record(&mut job, spent + 1, now);
             }
             Step::Diagnose | Step::Park => {
@@ -185,6 +211,7 @@ async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(),
                 job.updated_at = now.to_rfc3339_opts(SecondsFormat::Secs, false);
             }
         }
+        mark_announced(&mut job);
         store::update(pool, &job).await.map_err(|e| e.to_string())?;
         question.map(|question| (node, question))
     };
@@ -194,6 +221,38 @@ async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(),
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Appended to a stalled tree's diagnose run when the tree decides itself: it settles what the tree
+/// waits for from the state and the original mandate, instead of leaving it to the owner.
+const DECISION_RUN_SUFFIX: &str = "\n\nYou are the tree's own decision run: whatever the tree is waiting for, decide it yourself from the current state and the original mandate and act on it. Only a governance file, a path widening, a budget raise or a ticket's owner is left to the owner; say so in your handoff if that is what blocks the tree.";
+
+/// Whether the tree may still request a decision run for `node`: the flag is on and the per-node and
+/// per-job caps (`decision_runs_per_node`, `decision_runs_per_job`) leave room.
+async fn decision_run_allowed(state: &AppState, job_id: &str, node: &str) -> Result<bool, String> {
+    let Some(job) = store::load(&state.pool, job_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+    let config = auto_resolve::Config::load(&job.manifest.project_root);
+    let mut counts = [0_i64; 2];
+    for (slot, column) in counts.iter_mut().zip(["node_id", "tree_id"]) {
+        let value = if column == "node_id" { node } else { job_id };
+        // `AssertSqlSafe`: `column` is one of two literal names, and the value is bound.
+        *slot = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM decisions WHERE origin IN ('auto', 'driver') AND {column} = ?"
+        )))
+        .bind(value)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(
+        auto_resolve::verdict(&config, "ordinary", counts[0], counts[1])
+            == auto_resolve::Verdict::Resolve,
+    )
 }
 
 /// Stamps the job with the rungs spent, so the next stall can tell it is the same one.
@@ -207,7 +266,20 @@ fn record(job: &mut TreeJob, nudges: i64, now: DateTime<Utc>) {
 
 /// The rescue run of the node the job waits for. `false` when the node has no run to follow, the
 /// allowance is spent, or the run cannot be started: the owner is asked instead.
-async fn rescue_started(state: &AppState, node: &str, minutes: i64) -> Result<bool, String> {
+///
+/// With `autonomy.tree_decides_itself` on, the run is the tree's own decision run
+/// ([`DECISION_RUN_SUFFIX`]), requested only while the caps allow one more; the owner
+/// is asked after it failed to move the tree. Off, it is the plain diagnose run.
+async fn rescue_started(
+    state: &AppState,
+    job_id: &str,
+    node: &str,
+    minutes: i64,
+    decides_itself: bool,
+) -> Result<bool, String> {
+    if decides_itself && !decision_run_allowed(state, job_id, node).await? {
+        return Ok(false);
+    }
     let dead_run: Option<Option<String>> =
         sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
             .bind(node)
@@ -217,9 +289,12 @@ async fn rescue_started(state: &AppState, node: &str, minutes: i64) -> Result<bo
     let Some(dead_run) = dead_run.flatten() else {
         return Ok(false);
     };
-    let suffix = format!(
+    let mut suffix = format!(
         "\n\nThe tree this node belongs to has not moved for {minutes} minutes: nothing runs and nobody is asked. This is a diagnose run: find out what the tree is waiting for (a branch, a merge, a gate, a landing), fix it if you can, and finish the node, or say in your handoff what blocks it."
     );
+    if decides_itself {
+        suffix.push_str(DECISION_RUN_SUFFIX);
+    }
     match rescue::attempt(state, node, &dead_run, &suffix).await {
         Ok(started) => Ok(started),
         Err(error) => {
@@ -228,6 +303,11 @@ async fn rescue_started(state: &AppState, node: &str, minutes: i64) -> Result<bo
         }
     }
 }
+
+// `tree_job/mod.rs` is shared and not ours to edit here, so the episode tests hang off this module.
+#[cfg(test)]
+#[path = "stalled_episode_tests.rs"]
+mod episode_tests;
 
 #[cfg(test)]
 mod tests {
@@ -396,7 +476,7 @@ mod tests {
         }
         assert_eq!(fx.launches("stall-api", "rescue-").await, 1);
         assert_eq!(fx.open_questions(JOB, "stall-api").await.len(), 1);
-        assert!(feed_lines(&fx).await >= 6);
+        assert_eq!(feed_lines(&fx).await, 1, "one line for the whole episode");
     }
 
     #[tokio::test]
