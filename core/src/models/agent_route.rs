@@ -101,21 +101,34 @@ pub fn rung_of_model_id(id: &str) -> Option<Rung> {
 const HAIKU_TYPES: &[&str] = &["Explore", "researcher"];
 
 /// Read-only location and search words (whole words, lowercase).
-const SEARCH_WORDS: &[&str] = &[
-    "find", "locate", "search", "list", "read", "grep", "lookup",
-];
+const SEARCH_WORDS: &[&str] = &["find", "locate", "search", "list", "read", "grep", "lookup"];
 
 /// Multi-word search phrases.
 const SEARCH_PHRASES: &[&str] = &["where is", "which files"];
 
 /// Git and housekeeping routine (whole words, lowercase).
 const OPS_WORDS: &[&str] = &[
-    "commit", "rebase", "merge", "cherry-pick", "cleanup", "prune", "worktree",
+    "commit",
+    "rebase",
+    "merge",
+    "cherry-pick",
+    "cleanup",
+    "prune",
+    "worktree",
 ];
 
 /// Words that mean the task changes code; they keep it off the cheap rung.
 const WORK_WORDS: &[&str] = &[
-    "implement", "fix", "write", "add", "refactor", "build", "create", "change", "update", "design",
+    "implement",
+    "fix",
+    "write",
+    "add",
+    "refactor",
+    "build",
+    "create",
+    "change",
+    "update",
+    "design",
     "debug",
 ];
 
@@ -175,13 +188,22 @@ mod tests {
 
     #[test]
     fn git_ops_descriptions_are_haiku() {
-        assert_eq!(classify("worker", "rebase and merge the branch"), Rung::Haiku);
-        assert_eq!(classify("worker", "Prune stale worktree entries"), Rung::Haiku);
+        assert_eq!(
+            classify("worker", "rebase and merge the branch"),
+            Rung::Haiku
+        );
+        assert_eq!(
+            classify("worker", "Prune stale worktree entries"),
+            Rung::Haiku
+        );
     }
 
     #[test]
     fn implementation_work_is_sonnet() {
-        assert_eq!(classify("coder", "implement the retry in resolve"), Rung::Sonnet);
+        assert_eq!(
+            classify("coder", "implement the retry in resolve"),
+            Rung::Sonnet
+        );
         assert_eq!(classify("worker", "find the bug and fix it"), Rung::Sonnet);
     }
 
@@ -197,8 +219,23 @@ mod tests {
 
     #[test]
     fn the_ladder_never_picks_opus_on_its_own() {
-        for ty in ["Explore", "researcher", "worker", "coder", "wf-reviewer", "zzz", ""] {
-            for d in ["", "find x", "rebase", "implement y", "review the design", "ünïcode ✓"] {
+        for ty in [
+            "Explore",
+            "researcher",
+            "worker",
+            "coder",
+            "wf-reviewer",
+            "zzz",
+            "",
+        ] {
+            for d in [
+                "",
+                "find x",
+                "rebase",
+                "implement y",
+                "review the design",
+                "ünïcode ✓",
+            ] {
                 assert_ne!(classify(ty, d), Rung::Opus, "{ty}/{d}");
             }
         }
@@ -208,7 +245,10 @@ mod tests {
     fn escalate_steps_one_rung_and_caps_at_opus() {
         assert_eq!(escalate(Rung::Haiku, &[Rung::Haiku]), Rung::Sonnet);
         assert_eq!(escalate(Rung::Sonnet, &[Rung::Sonnet]), Rung::Opus);
-        assert_eq!(escalate(Rung::Sonnet, &[Rung::Sonnet, Rung::Opus]), Rung::Opus);
+        assert_eq!(
+            escalate(Rung::Sonnet, &[Rung::Sonnet, Rung::Opus]),
+            Rung::Opus
+        );
         assert_eq!(escalate(Rung::Sonnet, &[]), Rung::Sonnet);
     }
 
