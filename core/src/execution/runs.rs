@@ -1147,10 +1147,7 @@ pub mod tests {
                 .fetch_one(&state.pool)
                 .await
                 .expect("read the attempts back");
-        assert_eq!(
-            attempts, 1,
-            "the failure counts as the attempt"
-        );
+        assert_eq!(attempts, 1, "the failure counts as the attempt");
     }
 
     /// A correction run (F3-4, spec 2026-10-05 §6.2 D4) is born on the `fix/` branch the post-merge

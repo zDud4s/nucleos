@@ -106,10 +106,7 @@ struct ConflictGroup {
 /// not from a resolution, unsettled, and with no later success of the same request. A run is live
 /// as `next_conflict` reads it: `running` or `awaiting_approval`. Returns how many tickets were
 /// opened or reported.
-pub async fn open_conflict_tickets(
-    pool: &SqlitePool,
-    now: DateTime<Utc>,
-) -> sqlx::Result<u64> {
+pub async fn open_conflict_tickets(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
     let rows: Vec<EscalatedMerge> = sqlx::query_as(
         "SELECT conflict.id, conflict.project_id, conflict.op, conflict.args,
                 conflict.resolution_attempts,
