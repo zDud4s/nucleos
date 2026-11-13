@@ -210,17 +210,19 @@ describe("Brain", () => {
     daemon.apiFetch.mockImplementation(daemonWith());
     const { router } = await renderWithRouter(<Brain />, { initialPath: "/brain?view=graph" });
     await screen.findByRole("list", { name: "Graph nodes" });
-    const before = router.history.length;
+    // The harness types the router as only what most tests assert on; the memory history is there.
+    const entries = () => (router as unknown as { history: { length: number } }).history.length;
+    const before = entries();
 
     fireEvent.click(screen.getByRole("button", { name: "List" }));
     await waitFor(() => expect(router.state.location.search).toEqual({}));
-    expect(router.history.length).toBe(before);
+    expect(entries()).toBe(before);
 
     fireEvent.click(screen.getByRole("button", { name: "Graph" }));
     await screen.findByRole("list", { name: "Graph nodes" });
     fireEvent.click(screen.getByRole("button", { name: "n:1" }));
     await waitFor(() => expect(router.state.location.search).toEqual({ view: "graph", item: "note:1" }));
-    expect(router.history.length).toBe(before + 1);
+    expect(entries()).toBe(before + 1);
   });
 
   it("clicking a note in the graph puts it in the address and opens it", async () => {
