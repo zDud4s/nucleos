@@ -562,6 +562,24 @@ mod tests {
         crate::testdb::fresh_pool().await
     }
 
+    /// Spec §10: finding the runs a relay produced (`runs.from_relay_id = ?`) is an index search,
+    /// not a scan of `runs`. Migration 0154 rebuilt `runs` and had to recreate the index; this
+    /// fails if a later rebuild drops it again.
+    #[tokio::test]
+    async fn runs_born_of_a_relay_are_found_by_index() {
+        let pool = test_pool().await;
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as("EXPLAIN QUERY PLAN SELECT id FROM runs WHERE from_relay_id = ?")
+                .bind(1_i64)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            plan.iter().any(|row| row.3.contains("idx_runs_from_relay")),
+            "runs.from_relay_id lookup must use idx_runs_from_relay: {plan:?}"
+        );
+    }
+
     /// Pins every case the semantics distinguish: the plain grant, refusing a conversation that
     /// would relay to itself, a cycle closing at two different depths, and the `TooDeep` boundary
     /// on both sides — a chain three relays deep still admitted, a fourth refused. Table-shaped
