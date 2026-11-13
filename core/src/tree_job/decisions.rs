@@ -1468,7 +1468,7 @@ mod tests {
     async fn a_widen_needs_no_live_parent() {
         let pool = crate::testdb::fresh_pool().await;
         let parked = fence_parked(&pool).await;
-        sqlx::query("UPDATE work_nodes SET status = 'dropped' WHERE id = ?")
+        sqlx::query("UPDATE work_nodes SET status = 'failed' WHERE id = ?")
             .bind(ROOT)
             .execute(&pool)
             .await
