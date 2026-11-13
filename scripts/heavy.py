@@ -1155,9 +1155,14 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                                 since = time.time() - max(f.stat().st_mtime for f, _ in held_ents)
                             except (OSError, ValueError):
                                 since = float("inf")
+                            # Held records at weight 1 are past their compile (test phase):
+                            # their predicted share is no longer pending.
+                            held_pred = sum(float(r["pred_cores"]) for r in held_recs
+                                            if hc._num(r.get("pred_cores"))
+                                            and int(r.get("weight") or 1) > 1)
                             fit, adm = hc.dynamic_fit(len(held_recs), pr, since,
                                                       hc.dynamic_max_jobs(pr), static_fit,
-                                                      disk=dk)
+                                                      disk=dk, held_pred_cores=held_pred)
                         except Exception:
                             fit, adm = static_fit, None
                         # Why the head is waiting, for the 30 s stderr line below.

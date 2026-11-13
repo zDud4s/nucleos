@@ -231,6 +231,22 @@ async fn post_node(
     let opened = work_nodes::open(&state.pool, None, &limits, &args)
         .await
         .map_err(refused)?;
+    // The Claude Code session that opened the node (its hook stamps `session_id` into the call), kept
+    // apart from the `session_id` binding `node_active` reads. A label: failing to write it does not
+    // fail the open.
+    if let Some(session) = args
+        .session_id
+        .as_deref()
+        .filter(|session| crate::daemon_client::valid_session_id(session))
+        && let Err(error) =
+            sqlx::query("UPDATE work_nodes SET launching_session_id = ? WHERE id = ?")
+                .bind(session)
+                .bind(&opened.id)
+                .execute(&state.pool)
+                .await
+    {
+        tracing::warn!(%error, node = %opened.id, "could not record the session that opened the node");
+    }
     if let Some(root_id) = root_id.as_deref()
         && let Err(error) =
             budget::report_soft_threshold(&state.pool, root_id, chrono::Utc::now()).await
@@ -837,6 +853,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(nodes_after, nodes_before, "a refused child opens no node");
+    }
+
+    /// A node opened with a `session_id` also records it as `launching_session_id`, apart from the
+    /// `session_id` binding; one opened without a session, or with a malformed one, records none.
+    #[tokio::test]
+    async fn node_open_records_the_launching_session() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-launch").await;
+        let (_, anonymous) = call(
+            &app,
+            "POST",
+            "/nodes",
+            Some(json!({
+                "parent_id": root, "kind": "leaf", "title": "L", "goal": "Do one part",
+                "owned_paths": ["a.txt"], "budget_tokens": null,
+            })),
+        )
+        .await;
+        let (_, odd) = call(
+            &app,
+            "POST",
+            "/nodes",
+            Some(json!({
+                "kind": "root", "title": "Odd", "goal": "g", "session_id": "bad session!",
+            })),
+        )
+        .await;
+
+        let stored = |id: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT launching_session_id FROM work_nodes WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(stored(root).await.as_deref(), Some("s-launch"));
+        assert_eq!(
+            stored(anonymous["id"].as_str().unwrap().to_owned()).await,
+            None
+        );
+        assert_eq!(stored(odd["id"].as_str().unwrap().to_owned()).await, None);
     }
 
     #[tokio::test]
