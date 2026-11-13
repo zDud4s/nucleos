@@ -1322,7 +1322,7 @@ async fn settle_missing_target(
     }
     let mut settled_any = false;
     for id in ids {
-        settled_any |= crate::execution::vcs::tickets::settle(&state.pool, id, "target-gone")
+        settled_any |= crate::execution::vcs::settle(&state.pool, id, "target-gone")
             .await
             .unwrap_or(false);
     }
