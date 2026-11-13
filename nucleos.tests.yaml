@@ -70,6 +70,8 @@ tests:
         # tests/file_size.rs stay the authority.
         - scripts/check_invariants.py
         - scripts/test-check-invariants.py
+        - scripts/check-landing-branch-literal.py
+        - scripts/test-check-landing-branch-literal.py
       command: bash scripts/gates.sh hooks
     broker:
       # The machine-wide build broker, its classifier and hook, and their tests.
