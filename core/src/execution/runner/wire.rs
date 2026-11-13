@@ -232,7 +232,10 @@ pub fn failed_on_rate_limit(stdout: &str) -> bool {
 /// from the text after "resets": an optional `Mon D` date or weekday, a `H[:MM]am|pm` time and an
 /// optional `(Zone)` (UTC when absent). A time without a date is the first such time after `now`,
 /// which callers pass as the moment the run ended, so the answer does not drift as the clock does.
-pub fn weekly_limit_reset(
+///
+/// Any subscription usage limit counts, whatever its window: "weekly limit", "5-hour limit", or the
+/// generic "You've hit your ... limit". The CLI writes none of them with an `api_error_status`.
+pub fn usage_limit_reset(
     stdout: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
@@ -245,7 +248,9 @@ pub fn weekly_limit_reset(
         return None;
     }
     let text = result.get("result").and_then(|text| text.as_str())?;
-    if !text.to_ascii_lowercase().contains("weekly limit") {
+    let lower = text.to_ascii_lowercase();
+    let hit_a_limit = lower.contains("hit your") && lower.contains(" limit");
+    if !(lower.contains("weekly limit") || lower.contains("5-hour limit") || hit_a_limit) {
         return None;
     }
     Some(parse_reset(text, now))
