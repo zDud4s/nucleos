@@ -133,23 +133,6 @@ pub mod workflow_records;
 pub mod workflows;
 pub mod write_pool;
 
-// The module-map check only reads files, so it runs inside this library's test binary. As an
-// integration test under `tests/` it made every `cargo test` build the daemon executable too, a
-// second full compile of `http.rs` that no test used.
-#[cfg(test)]
-#[path = "../tests/module_map.rs"]
-mod module_map;
-
-// Same reason, same place: the size check only reads files.
-#[cfg(test)]
-#[path = "../tests/file_size.rs"]
-mod file_size;
-
-// The phase-4 guards only read files too: no v1 Telegram plumbing left, shared routes still used.
-#[cfg(test)]
-#[path = "../tests/no_legacy_telegram.rs"]
-mod no_legacy_telegram;
-
-#[cfg(test)]
-#[path = "../tests/routes_still_used.rs"]
-mod routes_still_used;
+// The file-reading guards under `core/tests/` (module map, file size, no legacy Telegram, shared
+// routes) are compiled into the daemon binary's unit tests, in `main.rs`, not here: they read every
+// crate's sources, and only the daemon is gated on every core diff.

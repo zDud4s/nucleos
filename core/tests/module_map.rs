@@ -38,6 +38,19 @@ fn package_root() -> PathBuf {
     running_in
 }
 
+/// `core/`, the directory the map and every source root hang from, checked by [`package_root`].
+///
+/// This file compiles into the `nucleos-daemon` binary's unit tests (see `src/main.rs`), whose
+/// package is `core/crates/nucleos-daemon`, two levels below `core/`.
+fn core_root() -> PathBuf {
+    let package = package_root();
+    package
+        .parent()
+        .and_then(Path::parent)
+        .expect("the daemon package sits two levels below core/")
+        .to_path_buf()
+}
+
 /// Every directory of top-level modules in this package, each with the prefix its files carry in
 /// the map: `src/` bare (`runs.rs`), and each crate under `crates/` by its path from here
 /// (`crates/nucleos-base/src/storage.rs`), so two crate roots both called `lib.rs` stay two rows.
@@ -91,7 +104,7 @@ fn rust_files(dir: &Path) -> Vec<(String, PathBuf)> {
 
 #[test]
 fn the_module_map_matches_the_files_on_disk() {
-    let manifest_dir = package_root();
+    let manifest_dir = core_root();
     let map_path = manifest_dir.join("MODULE_MAP.md");
 
     // No early return for an absent map any more, and its removal is the point rather than tidying.
@@ -182,7 +195,7 @@ fn nothing_sets_the_worktree_root_without_restoring_it() {
     // so this test would not have gone red on a binary built elsewhere — it would have read the
     // other checkout's modules and reported on those. Quieter than the map check's failure and the
     // same defect.
-    let files = source_dirs(&package_root())
+    let files = source_dirs(&core_root())
         .into_iter()
         .flat_map(|(_, dir)| rust_files(&dir))
         .collect::<Vec<_>>();
