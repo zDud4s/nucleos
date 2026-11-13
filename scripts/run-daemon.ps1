@@ -119,7 +119,7 @@ if ((Test-Path -LiteralPath $RunDir) -and -not $Stage) {
         try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
     }
     $candidates = @(Get-ChildItem -LiteralPath $RunDir -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ieq 'nucleos-core.exe' -or $_.Name -like 'nucleos-*.exe' -and $_.Name -notlike 'nucleos-core.*' -or $_.Name -like '*-sidecar.exe' })
+        Where-Object { $_.Name -ieq 'nucleos-core.exe' -or $_.Name -like 'nucleos-*.exe' -or $_.Name -like '*-sidecar.exe' })
     foreach ($f in $candidates) {
         try {
             $h = [IO.File]::Open($f.FullName, 'Open', 'ReadWrite', 'None')
