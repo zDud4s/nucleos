@@ -420,6 +420,13 @@ pub(super) async fn pretooluse_decision_from(
         return decision;
     }
 
+    // A node's own handoff report lives in the state dir, outside its worktree: allow exactly that
+    // path, at any fill, before the classifier (which refuses writes outside the cwd) and the
+    // node scope fence.
+    if let Some(decision) = node_context::own_report_decision(&state, &payload, run_id).await {
+        return decision;
+    }
+
     // The retired `.ai/` layout takes no new writes from any run: its material lives under
     // `<state_dir>` now. Before the docs rule, so a docs run is told where to write instead.
     if let Some(decision) =
