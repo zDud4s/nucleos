@@ -801,6 +801,41 @@ impl NucleosTools {
     }
 
     #[tool(
+        description = "Answer an open tree decision (`d-…`), the same way the shell does: the \
+                       parked branch resumes, or its node is relaunched with your answer. The \
+                       answer is recorded with origin `conductor`. Owner-level: refused from a \
+                       run of a tree job. Unknown id is 404, an already answered decision 409."
+    )]
+    pub(super) async fn decision_answer(
+        &self,
+        Parameters(DecisionAnswerParams { id, answer }): Parameters<DecisionAnswerParams>,
+    ) -> String {
+        if let Some(refusal) = tree_run_decision_refusal(&self.served) {
+            return json_result::<serde_json::Value>(Err(refusal));
+        }
+        json_result(self.client.decision_answer(&id, &answer).await)
+    }
+
+    #[tool(
+        description = "List tree decisions: [{id, tree, node, branch, question, status}]. Only \
+                       open ones by default; `status` is `open`, `answered` or `all`, `tree_id` \
+                       narrows to one tree job. Owner-level: refused from a run of a tree job."
+    )]
+    pub(super) async fn decision_list(
+        &self,
+        Parameters(DecisionListParams { tree_id, status }): Parameters<DecisionListParams>,
+    ) -> String {
+        if let Some(refusal) = tree_run_decision_refusal(&self.served) {
+            return json_result::<serde_json::Value>(Err(refusal));
+        }
+        json_result(
+            self.client
+                .decision_list(tree_id.as_deref(), status.as_deref())
+                .await,
+        )
+    }
+
+    #[tool(
         description = "Read one tree job by the id it was launched with: its state, root node \
                        and progress. `nodes[]` lists each branch's node with `nodes[].depth`, \
                        its parent and `nodes[].descent.reason` (why it became an orchestrator, \
