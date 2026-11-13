@@ -968,6 +968,11 @@ async fn merge(
     if parked_as_no_change(pool, job, name, parks).await? {
         return Ok(());
     }
+    // An owner's answer to a fence refusal retries the merge on the head that was refused: when the
+    // head moved meanwhile, it is gated again first.
+    if super::path_fence::regate_if_moved(pool, job, name).await? {
+        return Ok(());
+    }
     if super::path_fence::parked_by_fence(pool, job, name, node, parks).await? {
         return Ok(());
     }
