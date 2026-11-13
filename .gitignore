@@ -169,3 +169,12 @@ __pycache__/
 /core/crates/*/http-land-*/
 /core/crates/*/http-land-claims-*/
 /core/http-land-*/
+# More prefixes the gate checkpoint committed before the base moved to the dev home (2026-11-08):
+# branch-start- (tree_branch_start tests), spec-audit- (spec_backlog audit tests) and
+# hook-session-never-allow (a file, not a directory, under the app crate).
+/core/branch-start-*/
+/core/spec-audit-*/
+/core/crates/*/hook-session-*
+# A leaf that writes its node report beside the code instead of `<state_dir>/nodes/` leaves a
+# `.handoff-<label>.md` there, and the gate checkpoint commits it (three branches, 2026-11-13).
+.handoff-*.md
