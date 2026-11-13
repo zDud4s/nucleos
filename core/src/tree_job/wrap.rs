@@ -317,7 +317,7 @@ pub(super) async fn quota_resume_at(
         return Ok(None);
     };
     let ended = run_ended_at(pool, run_id).await;
-    let Some(reset) = crate::execution::runner::weekly_limit_reset(&stdout, ended) else {
+    let Some(reset) = crate::execution::runner::usage_limit_reset(&stdout, ended) else {
         return Ok(None);
     };
     Ok(Some(match reset {
