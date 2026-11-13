@@ -69,9 +69,16 @@ node_modules/
 *.db-journal
 sidecars/**/*.exe
 # The same binaries off Windows, where Go writes no extension (`go env GOEXE` is empty):
-# `scripts/build-sidecars.sh` names them `<name>-sidecar`, and a bare `go build` inside a sidecar
+# `scripts/build-sidecars.sh` names them `nucleos-<name>`, and a bare `go build` inside a sidecar
 # names its output after the last element of that module's path (each `sidecars/*/go.mod`).
 sidecars/*/*-sidecar
+sidecars/*/nucleos-browser
+sidecars/*/nucleos-echo
+sidecars/*/nucleos-email
+sidecars/*/nucleos-quota
+sidecars/*/nucleos-remote
+sidecars/*/nucleos-telegram
+sidecars/*/nucleos-web
 /sidecars/browser/nucleosbrowser
 /sidecars/echo/echo
 /sidecars/email/nucleosemail

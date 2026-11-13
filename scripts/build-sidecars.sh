@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build every Go sidecar next to the daemon exe so the núcleo's supervisor finds it.
 #
-# core/src/sidecar.rs resolves each sidecar as `<dir-of-nucleos-core>/<name>-sidecar<GOEXE>`
-# (i.e. target/<profile>/<name>-sidecar<GOEXE>), or as `$NUCLEOS_SIDECAR_DIR/<name>-sidecar<GOEXE>`
+# core/src/sidecar.rs resolves each sidecar as `<dir-of-nucleos-core>/nucleos-<name><GOEXE>`
+# (i.e. target/<profile>/nucleos-<name><GOEXE>), or as `$NUCLEOS_SIDECAR_DIR/nucleos-<name><GOEXE>`
 # when that variable is set. `<GOEXE>` is `go env GOEXE`: `.exe` on Windows and empty elsewhere,
 # the same suffix `sidecar::binary_file_name` takes from Rust's `std::env::consts::EXE_SUFFIX`.
 # This script compiles each `sidecars/*/` Go module
@@ -28,7 +28,7 @@ for gomod in "$repo_root"/sidecars/*/go.mod; do
   dir="$(dirname "$gomod")"
   name="$(basename "$dir")"
   exe="$(cd "$dir" && go env GOEXE)"
-  out="$out_dir/$name-sidecar$exe"
+  out="$out_dir/nucleos-$name$exe"
   printf 'building %-10s -> %s\n' "$name" "$out"
   ( cd "$dir" && go build -o "$out" . )
   built=$((built + 1))

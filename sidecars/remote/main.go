@@ -1,4 +1,4 @@
-// Command remote-sidecar is the browser-facing gateway for remote access to the núcleo.
+// Command nucleos-remote is the browser-facing gateway for remote access to the núcleo.
 //
 // It holds no state and opens no database. It authenticates nothing itself: it carries a browser's
 // session cookie to the daemon, which decides, and it holds only the daemon's `remote` service key,
@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	log.SetPrefix("remote-sidecar: ")
+	log.SetPrefix("nucleos-remote: ")
 	// Stateless, so the orderly shutdown when the daemon is gone is to exit.
 	watchLifeline(os.Getenv, os.Stdin, func() { os.Exit(0) })
 	cfg, err := config.Load()

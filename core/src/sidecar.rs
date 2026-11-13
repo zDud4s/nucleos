@@ -289,13 +289,18 @@ where
 /// The variable that says where the sidecar binaries are, for a daemon that does not sit beside them.
 pub const SIDECAR_DIR_VAR: &str = "NUCLEOS_SIDECAR_DIR";
 
-/// The file name of the sidecar called `name`: `<name>-sidecar` plus this platform's executable
+/// The file name of the sidecar called `name`: `nucleos-<name>` plus this platform's executable
 /// suffix, so `.exe` on Windows and nothing on macOS or Linux.
 ///
 /// The one place that name is spelled. `scripts/build-sidecars.sh` writes the same name with
 /// `go env GOEXE`, which is `.exe` on Windows and empty elsewhere; the two change together.
 pub fn binary_file_name(name: &str) -> String {
-    format!("{name}-sidecar{}", std::env::consts::EXE_SUFFIX)
+    binary_file_name_with(name, std::env::consts::EXE_SUFFIX)
+}
+
+/// PURE: [`binary_file_name`], given the executable suffix.
+fn binary_file_name_with(name: &str, exe_suffix: &str) -> String {
+    format!("nucleos-{name}{exe_suffix}")
 }
 
 /// Where the sidecar called `name` ([`ECHO`], [`BROWSER`], ...) is, for this daemon.
@@ -1246,20 +1251,20 @@ mod tests {
     #[test]
     fn a_sidecar_is_found_beside_the_daemon_unless_told_otherwise() {
         let exe = Path::new("C:/Projects/.cargo-target-branch/debug/nucleos-core.exe");
-        let beside = Path::new("C:/Projects/.cargo-target-branch/debug/echo-sidecar.exe");
+        let beside = Path::new("C:/Projects/.cargo-target-branch/debug/nucleos-echo.exe");
 
-        assert_eq!(binary_in(None, exe, "echo-sidecar.exe"), beside);
+        assert_eq!(binary_in(None, exe, "nucleos-echo.exe"), beside);
         assert_eq!(
-            binary_in(Some(std::ffi::OsStr::new("")), exe, "echo-sidecar.exe"),
+            binary_in(Some(std::ffi::OsStr::new("")), exe, "nucleos-echo.exe"),
             beside
         );
         assert_eq!(
             binary_in(
                 Some(std::ffi::OsStr::new("C:/Projects/.cargo-target/debug")),
                 exe,
-                "echo-sidecar.exe"
+                "nucleos-echo.exe"
             ),
-            Path::new("C:/Projects/.cargo-target/debug/echo-sidecar.exe")
+            Path::new("C:/Projects/.cargo-target/debug/nucleos-echo.exe")
         );
     }
 
@@ -1269,15 +1274,22 @@ mod tests {
     #[test]
     fn a_sidecar_binary_carries_this_platforms_executable_suffix() {
         let expected = if cfg!(windows) {
-            "echo-sidecar.exe"
+            "nucleos-echo.exe"
         } else {
-            "echo-sidecar"
+            "nucleos-echo"
         };
         assert_eq!(binary_file_name(ECHO), expected);
         assert_eq!(
             binary_file_name(BROWSER),
-            format!("browser-sidecar{}", std::env::consts::EXE_SUFFIX)
+            format!("nucleos-browser{}", std::env::consts::EXE_SUFFIX)
         );
+    }
+
+    /// The name is `nucleos-<name>` and the suffix is appended verbatim.
+    #[test]
+    fn the_sidecar_file_name_is_nucleos_prefixed() {
+        assert_eq!(binary_file_name_with("echo", ".exe"), "nucleos-echo.exe");
+        assert_eq!(binary_file_name_with("web", ""), "nucleos-web");
     }
 
     /// The failure a missing sidecar records names the file it looked for, and the two ways out.
@@ -1285,12 +1297,12 @@ mod tests {
     fn a_sidecar_that_cannot_start_says_where_it_looked() {
         let missing = io::Error::from(io::ErrorKind::NotFound);
 
-        let said = spawn_failure(Path::new("C:/x/debug/echo-sidecar.exe"), &missing);
+        let said = spawn_failure(Path::new("C:/x/debug/nucleos-echo.exe"), &missing);
 
-        assert!(said.contains("C:/x/debug/echo-sidecar.exe"), "{said}");
+        assert!(said.contains("C:/x/debug/nucleos-echo.exe"), "{said}");
         assert!(said.contains(SIDECAR_DIR_VAR), "{said}");
         let refused = spawn_failure(
-            Path::new("C:/x/debug/echo-sidecar.exe"),
+            Path::new("C:/x/debug/nucleos-echo.exe"),
             &io::Error::from(io::ErrorKind::PermissionDenied),
         );
         assert!(!refused.contains(SIDECAR_DIR_VAR), "{refused}");
