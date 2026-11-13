@@ -52,5 +52,12 @@ windows-sys = { version = "0.61.2", features = [
 libc = "0.2"
 
 [dev-dependencies]
+# This crate's own `testkit`, on for its own tests, so `cargo test -p nucleos-base` alone and the
+# gate's combined invocation build it with the same features and share the artifact (see
+# `nucleos-core`'s manifest).
+nucleos-base = { path = ".", features = ["testkit"] }
 tempfile = "3.27.0"
 sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
+# Not used by this crate's tests: here so tokio is built with the same features whichever crate's
+# tests are selected (see `nucleos-core`'s manifest).
+tokio = { version = "1.53.0", features = ["test-util"] }
