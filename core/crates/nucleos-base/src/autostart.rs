@@ -1374,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn o_xml_da_tarefa_e_escrito_por_inteiro() {
+    fn the_task_xml_is_written_in_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("task.xml");
         let short_xml = "<a/>";

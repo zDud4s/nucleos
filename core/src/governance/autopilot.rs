@@ -2415,7 +2415,7 @@ pub mod tests {
     /// text must MEAN: the absolute `2` below is what breaks when the filters themselves change,
     /// in either copy or in the one text behind both.
     #[tokio::test]
-    async fn o_roster_e_o_portao_contam_o_mesmo() {
+    async fn the_roster_and_the_gate_count_the_same() {
         let pool = test_pool().await;
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode) VALUES ('project-a', 'active')",

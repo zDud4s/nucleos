@@ -1640,8 +1640,8 @@ mod tests {
     fn a_command_line_without_land_names_no_target() {
         let args = [
             "nucleos-core".to_owned(),
-            "--pressao".to_owned(),
-            "--equipa".to_owned(),
+            "--pressure".to_owned(),
+            "--team".to_owned(),
             "NucleOS".to_owned(),
         ];
         assert_eq!(land_target_from(&args), None);

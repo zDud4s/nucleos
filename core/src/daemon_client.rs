@@ -416,7 +416,7 @@ impl DaemonClient {
     // sibling routes in `http.rs` that answer both questions. Every interpolated segment and every
     // query value goes through `urlencoding_encode`, because a path or a query string chosen by
     // whoever wrote the request that reaches here must travel as ONE value and never rewrite the
-    // request around it — `um_caminho_com_e_comercial_viaja_codificado` is what pins that.
+    // request around it — `a_path_with_an_ampersand_travels_encoded` is what pins that.
     //
     // `project_ls` and `project_grep` answer `Value` rather than a typed shape (`inspect::Entry`,
     // `inspect::Match`), and that is deliberate rather than lazy: a recording test-daemon answers
@@ -1366,7 +1366,7 @@ mod tests {
     ///
     /// No network in either direction: both are pure functions over a roster.
     #[test]
-    fn resolver_um_job_nao_e_resolver_um_run() {
+    fn resolving_a_job_is_not_resolving_a_run() {
         let projects = vec![
             summary_for("shadow-project", Mode::Shadow, Some("C:/projects/shadow")),
             summary_for("live-project", Mode::Active, Some("C:/projects/live")),
@@ -1631,7 +1631,7 @@ mod tests {
     /// this change exists to end, and it is a state whose only symptom is work running sequentially
     /// while reporting `completed`.
     #[tokio::test]
-    async fn uma_equipa_pedida_viaja_ate_ao_corpo_do_pedido() {
+    async fn a_requested_team_travels_into_the_request_body() {
         let (url, seen) = job_recording_daemon().await;
         let client = DaemonClient::new(url, "test-token".to_string());
 
@@ -1664,7 +1664,7 @@ mod tests {
     /// would pass for both an omitted field and a `null` one — the exact confusion the test is here
     /// to rule out.
     #[tokio::test]
-    async fn sem_equipa_o_corpo_sai_como_sempre_saiu() {
+    async fn without_a_team_the_body_goes_out_as_it_always_did() {
         let (url, seen) = job_recording_daemon().await;
         let client = DaemonClient::new(url, "test-token".to_string());
 
@@ -1774,7 +1774,7 @@ mod tests {
     /// guard this test wants is not "no `..` reaches the daemon" but "it never reaches the daemon
     /// as anything other than part of the one `path` value".
     #[tokio::test]
-    async fn um_caminho_com_e_comercial_viaja_codificado() {
+    async fn a_path_with_an_ampersand_travels_encoded() {
         let (url, seen) = recording_daemon().await;
         let client = DaemonClient::new(url, "test-token".to_string());
 
@@ -1949,7 +1949,7 @@ mod tests {
     /// what catches the future rewrite that drops it (`format!("/scoreboard?project_id={id}")`
     /// reads perfectly well and is wrong).
     #[tokio::test]
-    async fn um_projeto_com_e_comercial_viaja_codificado_nas_leituras_de_shadow() {
+    async fn a_project_with_an_ampersand_travels_encoded_in_the_shadow_reads() {
         for (label, call) in [("shadow_scoreboard", 0usize), ("shadow_queue", 1usize)] {
             let (url, seen) = recording_daemon().await;
             let client = DaemonClient::new(url, "test-token".to_string());
@@ -1993,7 +1993,7 @@ mod tests {
     /// a `live=` the route has to parse as an `Option<bool>`, which it is not — so "list
     /// everything" has to come out as a bare path.
     #[tokio::test]
-    async fn a_lista_de_jobs_monta_a_sua_query_sem_separador_a_solta() {
+    async fn the_job_list_builds_its_query_without_a_stray_separator() {
         let (url, seen) = recording_daemon().await;
         let client = DaemonClient::new(url, "test-token".to_string());
 

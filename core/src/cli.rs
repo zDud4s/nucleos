@@ -523,7 +523,7 @@ async fn verify() -> bool {
     false
 }
 
-// `nucleos-core --pressao --equipa NucleOS`: how much window it cost each agent of the team.
+// `nucleos-core --pressure --team NucleOS`: how much window it cost each agent of the team.
 //
 // A thin client in the mould of `--land` above, and for the same reason: the pool is open in the
 // daemon, and opening SQLite in parallel from the CLI would go against the house design. Here the
@@ -533,7 +533,7 @@ async fn verify() -> bool {
 // agent, splitting a speciality, or just trimming the prompt -- is made between jobs, and there
 // is nothing worth watching while one runs.
 
-async fn pressao() {
+async fn pressure_report() {
     let args: Vec<String> = std::env::args().collect();
     let value_of = |flag: &str| -> Option<String> {
         args.iter()
@@ -542,17 +542,17 @@ async fn pressao() {
             .cloned()
     };
     let job = value_of("--job");
-    let equipa = value_of("--equipa");
+    let team_name = value_of("--team");
     // No guessing by default: an answer about the wrong team is worse than none.
     // Encoded by the same escaper as `daemon_client`, and not by a second one: the owner's
     // argument comes from a command line and a name with `&` would be another request.
-    let query = match (job, equipa) {
+    let query = match (job, team_name) {
         (Some(job), _) => format!("job={}", daemon_client::urlencoding_encode(&job)),
-        (None, Some(equipa)) => {
-            format!("team={}", daemon_client::urlencoding_encode(&equipa))
+        (None, Some(team_name)) => {
+            format!("team={}", daemon_client::urlencoding_encode(&team_name))
         }
         (None, None) => {
-            eprintln!("say whose: --equipa <name> or --job <team_run_id>");
+            eprintln!("say whose: --team <name> or --job <team_run_id>");
             std::process::exit(1);
         }
     };
@@ -952,8 +952,8 @@ pub(super) async fn run_subcommand() -> bool {
     if verify().await {
         return true;
     }
-    if std::env::args().any(|a| a == "--pressao") {
-        pressao().await;
+    if std::env::args().any(|a| a == "--pressure") {
+        pressure_report().await;
         return true;
     }
     if std::env::args().any(|a| a == "--set-github-token") {

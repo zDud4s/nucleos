@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_escrita_por_confirmar_nao_toca_no_destino() {
+    fn an_uncommitted_write_leaves_the_destination_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("estado");
         std::fs::write(&path, b"antigo").unwrap();
@@ -1250,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_escrita_atomica_substitui_o_ficheiro_por_inteiro() {
+    fn an_atomic_write_replaces_the_file_in_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("estado");
 
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_escrita_atomica_cria_o_que_ainda_nao_existe() {
+    fn an_atomic_write_creates_what_does_not_exist_yet() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("novo");
 
@@ -1271,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_escrita_atomica_nao_deixa_temporarios() {
+    fn an_atomic_write_leaves_no_temporaries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("estado");
 
