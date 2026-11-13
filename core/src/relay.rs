@@ -575,8 +575,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(
-            plan.iter()
-                .any(|row| row.3.contains("idx_runs_from_relay")),
+            plan.iter().any(|row| row.3.contains("idx_runs_from_relay")),
             "runs.from_relay_id lookup must use idx_runs_from_relay: {plan:?}"
         );
     }
