@@ -796,7 +796,23 @@ async fn create_run_with_policy(
                         // the cap and then goes to a person through the conflict ticket, instead
                         // of minting a failed run every minute for ever. Best effort: the run is
                         // failing either way.
-                        if let Some(resolution) = resolution {
+                        //
+                        // A target that is positively absent is neither: no retry can make the
+                        // branch appear, and the cap above only bounds ONE request. The same merge
+                        // asked again arrives as a fresh row with fresh attempts, which is how 39
+                        // `invalid reference: aut/integ` failures piled up. So that case settles the
+                        // request, and every open twin of it, and nothing retries.
+                        if let Some(resolution) = resolution
+                            && settle_missing_target(
+                                state,
+                                project_id.as_deref(),
+                                project_root,
+                                resolution,
+                            )
+                            .await
+                        {
+                            // Settled: the counting update below is moot.
+                        } else if let Some(resolution) = resolution {
                             let _ = sqlx::query(
                                 "UPDATE vcs_requests
                                     SET resolution_attempts = resolution_attempts + 1
@@ -1264,6 +1280,60 @@ fn worktree_completion_summary(branch: &str, resolution: bool) -> String {
     } else {
         format!("worktree run completed on {branch}")
     }
+}
+
+/// Settles a conflict whose resolution tree cannot be born because its TARGET branch does not exist.
+///
+/// Returns whether it did. Only a ref git positively says is absent counts (exit 1 of
+/// `rev-parse --verify`); a git that could not be asked leaves the failure transient, counted by
+/// the caller. The request and every open twin of it (same project, same stored operation) are
+/// settled with reason `target-gone` (the resolver's own word for it), so the merge asked again does not buy a fresh set of
+/// attempts, and `next_conflict` skips settled rows.
+async fn settle_missing_target(
+    state: &AppState,
+    project_id: Option<&str>,
+    project_root: &str,
+    resolution: &Resolution,
+) -> bool {
+    let missing = crate::execution::worktree::git()
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{}^{{commit}}", resolution.target))
+        .output()
+        .await
+        .is_ok_and(|output| output.status.code() == Some(1));
+    if !missing {
+        return false;
+    }
+    let twins: Vec<i64> = sqlx::query_scalar(
+        "SELECT twin.id FROM vcs_requests AS twin
+           JOIN vcs_requests AS asked ON asked.id = ?
+          WHERE twin.project_id = asked.project_id AND twin.args = asked.args
+            AND twin.status = 'escalated' AND twin.settled_at IS NULL",
+    )
+    .bind(resolution.request_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    let mut ids = twins;
+    if !ids.contains(&resolution.request_id) {
+        ids.push(resolution.request_id);
+    }
+    let mut settled_any = false;
+    for id in ids {
+        settled_any |= crate::execution::vcs::settle(&state.pool, id, "target-gone")
+            .await
+            .unwrap_or(false);
+    }
+    if !settled_any {
+        tracing::warn!(
+            vcs_request_id = resolution.request_id,
+            project_id = project_id.unwrap_or(""),
+            "resolver: target branch is missing but no request could be settled"
+        );
+    }
+    settled_any
 }
 
 #[cfg(test)]
