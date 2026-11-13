@@ -142,7 +142,11 @@ pub(super) async fn check_job(state: &AppState, job_id: &str) {
     }
 }
 
-pub(super) async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+pub(super) async fn check(
+    state: &AppState,
+    job_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
     let pool = &state.pool;
     let park = {
         let lock = job_lock(job_id);
