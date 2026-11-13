@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   answerableCount,
+  fenceParkFiles,
   isAnswerable,
   useAnswerOwnerDecision,
   useOwnerDecisions,
@@ -53,7 +54,8 @@ function DecisionRow({ decision }: { decision: OwnerDecision }) {
   const [text, setText] = useState("");
   const answer = useAnswerOwnerDecision();
   const answerable = isAnswerable(decision);
-  const where = [decision.tree_id, decision.node_id].filter((x) => x !== null).join(" / ");
+  const widenFiles = answerable ? fenceParkFiles(decision.question) : null;
+  const where =[decision.tree_id, decision.node_id].filter((x) => x !== null).join(" / ");
 
   return (
     <div className={answerable ? "flex flex-col gap-2" : "flex flex-col gap-2 opacity-60"}>
@@ -74,7 +76,17 @@ function DecisionRow({ decision }: { decision: OwnerDecision }) {
             onChange={(event) => setText(event.target.value)}
           />
           {answer.isError ? <ErrorNote>The answer could not be sent.</ErrorNote> : null}
-          <div>
+          <div className="flex gap-2">
+            {widenFiles === null ? null : (
+              <Button
+                disabled={answer.isPending}
+                onClick={() =>
+                  answer.mutate({ id: decision.id, answer: "widen", widen_paths: widenFiles })
+                }
+              >
+                Widen paths
+              </Button>
+            )}
             <Button
               variant="primary"
               disabled={text.trim() === "" || answer.isPending}
