@@ -33,6 +33,7 @@ import {
   type FeedSeen,
 } from "../data/feed";
 import { buildSequences, type FeedSequence } from "../lib/sequences";
+import { feedGravityCounts } from "../ui/lanes";
 import { clockText } from "../lib/when";
 import {
   QUIET_GAP,
@@ -397,7 +398,7 @@ export function Feed() {
 
   const now = useFeedNow(searching ? found.data : timeline.data);
   const lookedAt = lookedAtOf(snapshot);
-  const counts = gravityCounts(entries);
+  const counts = feedGravityCounts(entries);
 
   const headline = searching
     ? searchHeadline(found.data, filters)
@@ -1418,12 +1419,6 @@ function spokenSpan(ms: number): string {
 function ownsLine(entry: FeedEntry, project: string | undefined): boolean {
   if (project !== undefined) return entry.project_id === project;
   return true;
-}
-
-function gravityCounts(entries: FeedEntry[]): Record<FeedGravity, number> {
-  const counts: Record<FeedGravity, number> = { wrong: 0, held: 0, asks: 0, routine: 0 };
-  for (const entry of entries) counts[feedGravityOf(entry.kind)] += 1;
-  return counts;
 }
 
 /**
