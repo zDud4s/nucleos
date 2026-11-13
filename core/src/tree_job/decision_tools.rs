@@ -261,7 +261,7 @@ mod tests {
         decisions::ask_ownerless(&state.pool, "d-1", QUESTION)
             .await
             .unwrap();
-        answer(&state, "d-1", "first").await.unwrap();
+        let _ = answer(&state, "d-1", "first").await.unwrap();
 
         let (status, Json(body)) = answer(&state, "d-1", "second").await.unwrap_err();
 
@@ -306,7 +306,7 @@ mod tests {
         decisions::ask_ownerless(&state.pool, "d-done", "done question")
             .await
             .unwrap();
-        answer(&state, "d-done", "ok").await.unwrap();
+        let _ = answer(&state, "d-done", "ok").await.unwrap();
 
         let open = list(&state, None, None).await;
         let ids: Vec<&str> = open.iter().map(|d| d["id"].as_str().unwrap()).collect();
