@@ -83,6 +83,9 @@ struct EscalatedMerge {
     args: String,
     resolution_attempts: i64,
     live: bool,
+    /// The one attempt is spent: a resolution run was claimed for the row, or an attempt was
+    /// counted (a worktree that could not be made).
+    spent: bool,
 }
 
 /// The escalated merges of one `(project, source, target)`.
@@ -91,12 +94,13 @@ struct ConflictGroup {
     request_ids: Vec<i64>,
     attempts: i64,
     any_live: bool,
+    any_spent: bool,
 }
 
 /// Opens (or reports again) `conflict:<source>-><target>` for every escalated merge the resolver
 /// has given up on, one ticket per `(project, source, target)` per call. A conflict qualifies when
-/// its attempts are spent (`resolution_attempts >= max_attempts`) and no resolution run of it is
-/// live, or when the same request was escalated twice or more, whatever the count.
+/// its one attempt is spent (`resolution_run_id` set, or `resolution_attempts >= 1`) and no
+/// resolution run of it is live, or when the same request was escalated twice or more, whatever the count.
 ///
 /// The rows are the ones `next_conflict` in `resolver.rs` would consider: `escalated`, `merge`,
 /// not from a resolution, unsettled, and with no later success of the same request. A run is live
@@ -104,7 +108,6 @@ struct ConflictGroup {
 /// opened or reported.
 pub async fn open_conflict_tickets(
     pool: &SqlitePool,
-    max_attempts: i64,
     now: DateTime<Utc>,
 ) -> sqlx::Result<u64> {
     let rows: Vec<EscalatedMerge> = sqlx::query_as(
@@ -114,7 +117,9 @@ pub async fn open_conflict_tickets(
                     SELECT 1 FROM runs
                      WHERE runs.id = conflict.resolution_run_id
                        AND runs.status IN ('running', 'awaiting_approval')
-                ) AS live
+                ) AS live,
+                (conflict.resolution_run_id IS NOT NULL
+                 OR conflict.resolution_attempts >= 1) AS spent
            FROM vcs_requests AS conflict
           WHERE conflict.status = 'escalated'
             AND conflict.op = 'merge'
@@ -146,10 +151,11 @@ pub async fn open_conflict_tickets(
         group.request_ids.push(row.id);
         group.attempts = group.attempts.max(row.resolution_attempts);
         group.any_live |= row.live;
+        group.any_spent |= row.spent;
     }
     let mut reported = 0;
     for ((project_id, source, target), group) in groups {
-        let exhausted = group.attempts >= max_attempts && !group.any_live;
+        let exhausted = group.any_spent && !group.any_live;
         let repeated = group.request_ids.len() >= 2;
         if !exhausted && !repeated {
             continue;
@@ -484,7 +490,7 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let request = escalated(&pool, "feat/x", "master", MAX).await;
         resolved_by(&pool, request, 1, "cancelled").await;
-        let opened = open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        let opened = open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         assert_eq!(opened, 1);
         let ticket = live_conflict(&pool, "feat/x", "master")
             .await
@@ -499,10 +505,10 @@ mod tests {
     #[tokio::test]
     async fn a_conflict_still_being_attempted_opens_nothing() {
         let pool = crate::testdb::fresh_pool().await;
-        escalated(&pool, "feat/below", "master", MAX - 1).await;
+        escalated(&pool, "feat/below", "master", 0).await;
         let running = escalated(&pool, "feat/running", "master", MAX).await;
         resolved_by(&pool, running, 1, "running").await;
-        let opened = open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        let opened = open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         assert_eq!(opened, 0);
         assert_eq!(ticket_count(&pool).await, 0);
     }
@@ -517,17 +523,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let opened = open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        let opened = open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         assert_eq!(opened, 0);
         assert_eq!(ticket_count(&pool).await, 0);
     }
 
     #[tokio::test]
-    async fn the_same_args_escalated_twice_opens_the_ticket_even_below_the_cap() {
+    async fn the_same_args_escalated_twice_opens_the_ticket_even_while_unspent() {
         let pool = crate::testdb::fresh_pool().await;
         let first = escalated(&pool, "feat/x", "master", 1).await;
         let again = escalated(&pool, "feat/x", "master", 1).await;
-        let opened = open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        let opened = open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         assert_eq!(opened, 1);
         let ticket = live_conflict(&pool, "feat/x", "master")
             .await
@@ -540,8 +546,8 @@ mod tests {
     async fn two_ticks_open_one_ticket_with_two_reports() {
         let pool = crate::testdb::fresh_pool().await;
         escalated(&pool, "feat/x", "master", MAX).await;
-        open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
-        open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        open_conflict_tickets(&pool, Utc::now()).await.unwrap();
+        open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         assert_eq!(ticket_count(&pool).await, 1);
         let ticket = live_conflict(&pool, "feat/x", "master")
             .await
@@ -560,7 +566,7 @@ mod tests {
     async fn closing_a_conflict_ticket_needs_a_successful_merge_with_the_same_source_and_target() {
         let pool = crate::testdb::fresh_pool().await;
         escalated(&pool, "feat/x", "master", MAX).await;
-        open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         let other_source = close_conflict(&pool, "proj", "feat/y", "master", Utc::now()).await;
         assert!(!other_source.unwrap());
         let other_target = close_conflict(&pool, "proj", "feat/x", "develop", Utc::now()).await;
@@ -608,7 +614,7 @@ mod tests {
     async fn a_new_conflict_after_the_close_is_a_new_ticket() {
         let pool = crate::testdb::fresh_pool().await;
         escalated(&pool, "feat/x", "master", MAX).await;
-        open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         let first = live_conflict(&pool, "feat/x", "master").await.unwrap();
         let closed = close_conflict(&pool, "proj", "feat/x", "master", Utc::now()).await;
         assert!(closed.unwrap());
@@ -619,7 +625,7 @@ mod tests {
             .await
             .unwrap();
         escalated(&pool, "feat/x", "master", MAX).await;
-        let opened = open_conflict_tickets(&pool, MAX, Utc::now()).await.unwrap();
+        let opened = open_conflict_tickets(&pool, Utc::now()).await.unwrap();
         assert_eq!(opened, 1);
         let second = live_conflict(&pool, "feat/x", "master").await.unwrap();
         assert_ne!(first.id, second.id);

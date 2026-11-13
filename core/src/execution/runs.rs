@@ -1105,13 +1105,12 @@ pub mod tests {
         );
     }
 
-    /// A conflict whose worktree cannot be made counts an attempt but stays unclaimed, so the
-    /// resolver retries it while attempts remain: a transient failure (index.lock, a timeout) gets
-    /// another go. Request 513 in the field: its target `aut/integ` never existed, and with nothing
-    /// counted the resolver minted a failed run every minute; now it spends at most
-    /// `MAX_RESOLUTION_ATTEMPTS` and then goes to a person through the conflict ticket.
+    /// A conflict whose worktree cannot be made still spends its one attempt: the row is claimed by
+    /// the failing run, so no tick mints a second one and a person gets the conflict ticket. Request
+    /// 513 in the field: its target `aut/integ` never existed, and the resolver minted a failed run
+    /// every minute.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_conflict_whose_worktree_cannot_be_made_counts_an_attempt_and_stays_retryable() {
+    async fn a_conflict_whose_worktree_cannot_be_made_spends_its_one_attempt() {
         let _env_lock = crate::execution::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
@@ -1138,10 +1137,9 @@ pub mod tests {
             matches!(refused, CreateRunError::Worktree(_)),
             "provisioning is what failed: {refused:?}"
         );
-        assert_eq!(
-            resolution_run_id_of(&state.pool, request).await,
-            None,
-            "the row stays unclaimed so the resolver can retry it"
+        assert!(
+            resolution_run_id_of(&state.pool, request).await.is_some(),
+            "the row is claimed by the failed run, so no second agent is ever minted"
         );
         let (attempts,): (i64,) =
             sqlx::query_as("SELECT resolution_attempts FROM vcs_requests WHERE id = ?")
@@ -1151,7 +1149,7 @@ pub mod tests {
                 .expect("read the attempts back");
         assert_eq!(
             attempts, 1,
-            "the failure counts toward the cap, so a permanent one cannot retry for ever"
+            "the failure counts as the attempt"
         );
     }
 
