@@ -2,6 +2,41 @@
 
 use super::*;
 
+/// What a checkpoint commit says about the item it covers: the item's row id and description, its
+/// run, and the job it belongs to. Falls back to the ordinal and an empty title if the row cannot
+/// be read: a checkpoint is never refused over its own label.
+async fn item_checkpoint_context(
+    pool: &SqlitePool,
+    job: &JobRow,
+    ordinal: usize,
+    gated: bool,
+) -> crate::execution::worktree::CheckpointContext {
+    let row: Option<(i64, String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, description, run_id FROM job_nodes WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (id, title, run_id) = match row {
+        Some((id, description, run_id)) => (id.to_string(), description, run_id),
+        None => (
+            format!("job{}-item{}", job.id, ordinal + 1),
+            String::new(),
+            None,
+        ),
+    };
+    crate::execution::worktree::CheckpointContext {
+        id,
+        title,
+        run_id,
+        tree_id: Some(format!("job {}", job.id)),
+        gated,
+    }
+}
+
 /// Runs the gate for one item and records its verdict on that item.
 /// Brings one item's branch into the job's, in the job's own checkout.
 ///
@@ -79,7 +114,11 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
         );
         return Pass::Stopped;
     };
-    if let Err(error) = crate::execution::worktree::checkpoint(Path::new(&item_tree)).await {
+    // Taken before the item's gate runs, so no gate has measured it yet.
+    let ctx = item_checkpoint_context(pool, job, ordinal, false).await;
+    if let Err(error) =
+        crate::execution::worktree::checkpoint_for(Path::new(&item_tree), &ctx).await
+    {
         // Fatal here, where the same failure is survivable in `record_gate`. There the work is
         // already on the branch and what is lost is the next item's footing; here the work exists
         // only in a working tree, and merging without it would put a green gate on a branch that is
@@ -659,7 +698,7 @@ pub(super) async fn queue_the_verdict(
 /// per item, gated or not.
 ///
 /// The concern behind the old comment is kept, not dropped: the commit is labelled
-/// [`crate::execution::worktree::UNGATED_CHECKPOINT`] instead of "a gate agreed with", and
+/// a `Nucleos-Checkpoint: ungated` trailer ("no gate measured this") instead of "a gate agreed with", and
 /// `gate_status` stays NULL, so neither the history nor the row claims a measurement that never
 /// happened. The final gate still runs and still judges the whole job.
 ///
@@ -680,8 +719,8 @@ pub(super) async fn pass_ungated_with_checkpoint(
     let worktree = job_worktree(pool, job.id).await.ok().flatten();
     let mut checkpoint_sha = None;
     if let Some((worktree, _)) = &worktree {
-        let message = crate::execution::worktree::UNGATED_CHECKPOINT;
-        match crate::execution::worktree::checkpoint_with_message(worktree, message).await {
+        let ctx = item_checkpoint_context(pool, job, ordinal, false).await;
+        match crate::execution::worktree::checkpoint_for(worktree, &ctx).await {
             Ok(sha) => checkpoint_sha = Some(sha),
             Err(error) => {
                 tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint an ungated item");
@@ -772,7 +811,8 @@ pub(super) async fn pass_unmeasured_with_checkpoint(
     ordinal: usize,
     worktree: &Path,
 ) -> Pass {
-    let checkpoint_sha = match crate::execution::worktree::checkpoint(worktree).await {
+    let ctx = item_checkpoint_context(pool, job, ordinal, false).await;
+    let checkpoint_sha = match crate::execution::worktree::checkpoint_for(worktree, &ctx).await {
         Ok(sha) => Some(sha),
         Err(error) => {
             tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint an unmeasured last item");
@@ -851,7 +891,8 @@ pub(super) async fn record_gate(
     if matches!(outcome, crate::gate::GateOutcome::Passed) {
         match job_worktree(pool, job.id).await {
             Ok(Some((worktree, _))) => {
-                match crate::execution::worktree::checkpoint(&worktree).await {
+                let ctx = item_checkpoint_context(pool, job, ordinal, true).await;
+                match crate::execution::worktree::checkpoint_for(&worktree, &ctx).await {
                     Ok(sha) => checkpoint_sha = Some(sha),
                     Err(error) => {
                         tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint a green item");
