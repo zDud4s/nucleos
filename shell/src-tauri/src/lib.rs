@@ -543,7 +543,10 @@ mod tests {
                 // The pre-rename name stays killed and deleted so an upgrade leaves no orphan.
                 let old = format!("{name}-sidecar.exe");
                 let old_kill = format!("\"$SYSDIR\\taskkill.exe\" /F /T /IM {old}");
-                assert!(hooks.contains(&old_kill), "hooks.nsh never runs: {old_kill}");
+                assert!(
+                    hooks.contains(&old_kill),
+                    "hooks.nsh never runs: {old_kill}"
+                );
                 assert!(
                     hooks.contains(&format!("Delete \"$INSTDIR\\{old}\"")),
                     "hooks.nsh never deletes the leftover {old}"
