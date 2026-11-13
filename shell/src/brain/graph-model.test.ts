@@ -120,15 +120,11 @@ describe("buildModel note links", () => {
     expect(bare.nodes.find((n) => n.id === "file:f")).toMatchObject({ label: "f", missing: false });
   });
 
-  it("draws a job link target as its own job:<id> node with an edge from the note", () => {
-    const g = graph([note(1)], [link(1, "job", "42")], [{ kind: "job", ref: "42", label: "Nightly run", missing: false }]);
+  it("draws no node or edge for a job link target — it shows only in the note panel", () => {
+    const g = graph([note(1)], [link(1, "job", "42")], [{ kind: "job", ref: "42", label: "job #42 — Nightly run", missing: false }]);
     const m = buildModel(g, [], [], filters());
-    expect(m.nodes.find((n) => n.id === "job:42")).toMatchObject({
-      kind: "job", ref: "42", label: "Nightly run", bucket: "in_force", missing: false, degree: 1,
-    });
-    expect(m.edges.map((e) => e.id)).toEqual(["relates|n:1|job:42"]);
-    const bare = buildModel(graph([note(1)], [link(1, "job", "7")]), [], [], filters());
-    expect(bare.nodes.find((n) => n.id === "job:7")).toMatchObject({ label: "7" });
+    expect(m.nodes.some((n) => n.id === "job:42" || n.kind === "job")).toBe(false);
+    expect(m.edges).toEqual([]);
   });
 
   it("leaves job nodes out when the job kind is filtered off", () => {
