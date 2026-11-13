@@ -470,14 +470,8 @@ impl Executor {
         }
     }
 
-    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate, its flake recheck, its bisect probes or
-    /// the daemon's probe requested; empty for any other unit.
-    ///
-    /// The flake recheck and the bisect probes run in the same `postgate-<project>` worktree, so
-    /// without a base they gated nothing either and a real red was cleared as a "flake". A bisect
-    /// probe needs no base of its own: `postgate_gate_base` reads the newest green ancestor of the
-    /// worktree's `HEAD`, which at an intermediate commit is still the last green, so the probe
-    /// measures the range up to that commit.
+    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate or the daemon's probe requested; empty
+    /// for any other unit.
     ///
     /// The gate runs in a worktree at the target's tip, where `gate-diff.sh` defaults its base to
     /// the merge base with `master` — `HEAD` itself — and so gates nothing. A probe runs at the
@@ -485,13 +479,8 @@ impl Executor {
     /// Computed here, from the stored state, rather than when the unit is queued: crash recovery
     /// and bisect probes run units the tick that queued them never saw.
     async fn gate_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
-        let (
-            verify_runs::REQUESTED_BY_POSTGATE
-            | verify_runs::REQUESTED_BY_PROBE
-            | verify_runs::REQUESTED_BY_FLAKE_CHECK
-            | verify_runs::REQUESTED_BY_BISECT,
-            Some(project),
-        ) = (claimed.requested_by.as_str(), claimed.project_id.as_deref())
+        let (verify_runs::REQUESTED_BY_POSTGATE | verify_runs::REQUESTED_BY_PROBE, Some(project)) =
+            (claimed.requested_by.as_str(), claimed.project_id.as_deref())
         else {
             return Vec::new();
         };
@@ -1530,23 +1519,6 @@ mod tests {
         let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_PROBE);
         let env = ex.gate_env(&claimed).await;
         assert_eq!(gate_base(&env), Some(shas[1].as_str()));
-    }
-
-    #[tokio::test]
-    async fn a_flake_check_and_a_bisect_unit_diff_from_the_last_green_too() {
-        let (repo, shas) = history();
-        let root = tempfile::tempdir().unwrap();
-        let ex = executor(4, root.path()).await;
-        store_postgate(&ex.pool, Some(&shas[1]), None).await;
-        // Both run in the postgate worktree, so without a base they would gate nothing.
-        for requester in [
-            verify_runs::REQUESTED_BY_FLAKE_CHECK,
-            verify_runs::REQUESTED_BY_BISECT,
-        ] {
-            let claimed = claimed_in(repo.path(), requester);
-            let env = ex.gate_env(&claimed).await;
-            assert_eq!(gate_base(&env), Some(shas[1].as_str()), "{requester}");
-        }
     }
 
     #[tokio::test]
