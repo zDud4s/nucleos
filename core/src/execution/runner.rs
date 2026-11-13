@@ -2459,14 +2459,32 @@ mod tests {
             "You've hit your weekly limit · resets Nov 14, 9am (Europe/Lisbon)",
         );
         assert_eq!(
-            weekly_limit_reset(&stdout, now),
+            usage_limit_reset(&stdout, now),
             Some(Some(utc(2026, 11, 14, 9, 0)))
         );
         let session = weekly_limit_stdout("5-hour limit reached · resets 3pm");
-        assert_eq!(weekly_limit_reset(&session, now), None);
+        assert_eq!(
+            usage_limit_reset(&session, now),
+            Some(Some(utc(2026, 11, 10, 15, 0)))
+        );
+        let other = weekly_limit_stdout("Something went wrong · resets 3pm");
+        assert_eq!(usage_limit_reset(&other, now), None);
         let fine = r#"{"type":"result","is_error":false,"result":"weekly limit is a topic"}"#;
-        assert_eq!(weekly_limit_reset(fine, now), None);
-        assert_eq!(weekly_limit_reset("", now), None);
+        assert_eq!(usage_limit_reset(fine, now), None);
+        assert_eq!(usage_limit_reset("", now), None);
+    }
+
+    /// The line a run that hit the subscription's 5-hour limit really ends on (no `api_error_status`,
+    /// exit 1): it is a usage limit with a reset, so it waits instead of being relaunched at once.
+    #[test]
+    fn a_five_hour_limit_result_is_read_with_its_reset_time() {
+        let stdout = r#"{"type":"result","is_error":true,"result":"You've hit your 5-hour limit · resets 5:50am"}"#;
+        assert_eq!(
+            usage_limit_reset(stdout, utc(2026, 11, 13, 3, 0)),
+            Some(Some(utc(2026, 11, 13, 5, 50)))
+        );
+        let generic = r#"{"type":"result","is_error":true,"result":"You've hit your Opus limit · resets 5:50am"}"#;
+        assert!(usage_limit_reset(generic, utc(2026, 11, 13, 3, 0)).is_some());
     }
 
     /// A time with no date is the next such time after the run ended; a weekday names the day.
@@ -2475,17 +2493,17 @@ mod tests {
         let now = utc(2026, 11, 10, 12, 0); // a Tuesday
         let today = weekly_limit_stdout("You've hit your weekly limit · resets 3:30pm (UTC)");
         assert_eq!(
-            weekly_limit_reset(&today, now),
+            usage_limit_reset(&today, now),
             Some(Some(utc(2026, 11, 10, 15, 30)))
         );
         let tomorrow = weekly_limit_stdout("You've hit your weekly limit · resets 9am (UTC)");
         assert_eq!(
-            weekly_limit_reset(&tomorrow, now),
+            usage_limit_reset(&tomorrow, now),
             Some(Some(utc(2026, 11, 11, 9, 0)))
         );
         let friday = weekly_limit_stdout("You've hit your weekly limit · resets Fri 10am (UTC)");
         assert_eq!(
-            weekly_limit_reset(&friday, now),
+            usage_limit_reset(&friday, now),
             Some(Some(utc(2026, 11, 13, 10, 0)))
         );
     }
@@ -2495,7 +2513,7 @@ mod tests {
     fn a_weekly_limit_with_an_unreadable_reset_has_none() {
         let stdout = weekly_limit_stdout("You've hit your weekly limit.");
         assert_eq!(
-            weekly_limit_reset(&stdout, utc(2026, 11, 10, 12, 0)),
+            usage_limit_reset(&stdout, utc(2026, 11, 10, 12, 0)),
             Some(None)
         );
     }
