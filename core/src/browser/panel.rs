@@ -722,6 +722,65 @@ mod tests {
         db.close().await;
     }
 
+    /// When both name a chat and they differ, the session's own `owner_chat_id` wins over the chat of
+    /// the run that opened it — the order `auth.rs` relies on.
+    #[tokio::test]
+    async fn owner_chat_id_is_preferred_over_the_runs_chat() {
+        let db = TempDb::new().await;
+        a_chat(&db.pool, "from-run").await;
+        a_chat(&db.pool, "from-column").await;
+        run_seven(&db.pool, "running", Some("from-run")).await;
+        let row = session_of(&db.pool, Some(7)).await;
+        assert_eq!(
+            owner_of(&db.pool, &row).await,
+            Owner::Chat("from-run".into())
+        );
+        crate::browser::set_owner_chat(&db.pool, row.id, "from-column")
+            .await
+            .expect("set owner");
+        let row = crate::browser::session_row(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner_of(&db.pool, &row).await,
+            Owner::Chat("from-column".into())
+        );
+        db.close().await;
+    }
+
+    /// A run-less session (opened from the Web page) is delivered to its chat with the page's url in
+    /// the prefix — the text is what tells the agent which session the person means.
+    #[tokio::test]
+    async fn a_runless_sessions_panel_text_reaches_its_chat_with_the_url_prefix() {
+        let db = TempDb::new().await;
+        let state = state_over(db.pool.clone(), BrowserRuntime::disabled());
+        let turns = crate::assistant_types::RecordingTurns::install(&state);
+        a_chat(&db.pool, "web-chat").await;
+        let row = session_of(&db.pool, None).await;
+        crate::browser::set_owner_chat(&db.pool, row.id, "web-chat")
+            .await
+            .unwrap();
+        let row = crate::browser::session_row(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        deliver(&state, &row, "look at this").await.expect("sent");
+
+        let calls = turns.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "web-chat");
+        assert_eq!(
+            calls[0].1,
+            format!(
+                "[browser panel · session {} · https://jira.example.org/login] look at this",
+                row.id
+            )
+        );
+        db.close().await;
+    }
+
     /// One open session opened by run 7 (or by no run), as the row the panel code receives.
     async fn session_of(pool: &sqlx::SqlitePool, run_id: Option<i64>) -> SessionRow {
         let id = sqlx::query(

@@ -1880,6 +1880,112 @@ mod tests {
         db.close().await;
     }
 
+    /// Pillar off: the first gate. No conversation, no row, no call.
+    #[tokio::test]
+    async fn a_disabled_browser_gets_no_chat_and_no_window_with_the_agent() {
+        let (db, mut state, seen) = wheeled(vec![], false).await;
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime::disabled());
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await,
+            Err(WheelError::Disabled)
+        ));
+        let chats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(chats, 0, "no conversation was made");
+        assert!(seen.lock().unwrap().is_empty());
+        db.close().await;
+    }
+
+    /// The sidecar cannot open (down, or its profile is taken): the row closes `open-failed`, the
+    /// caller gets the error, and the empty conversation stays — undoing it is one more step that
+    /// can fail (spec §3.2).
+    #[tokio::test]
+    async fn a_sidecar_that_cannot_open_closes_the_row_and_leaves_an_empty_chat() {
+        let (db, mut state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        // A port nobody listens on.
+        let dead = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&dead.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
+        });
+
+        let result =
+            open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await;
+        assert!(matches!(result, Err(WheelError::Sidecar(_))), "{result:?}");
+
+        let chats: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT chat_id, title FROM chats")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(chats.len(), 1, "the conversation stays");
+        assert_eq!(chats[0].1.as_deref(), Some("Browser · jira.example.org"));
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let reasons: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT closed_reason FROM browser_sessions")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(reasons, vec![Some("open-failed".to_string())]);
+        assert!(
+            browser::open_sessions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.close().await;
+    }
+
+    /// An address with no host names the conversation after the project instead.
+    #[tokio::test]
+    async fn a_url_without_a_host_names_the_chat_after_the_project() {
+        let (db, state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let _ = open_window_with_agent(&state, "nucleos", "not a url").await;
+
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM chats")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("Browser · nucleos"));
+        db.close().await;
+    }
+
     /// One open row for project `acme` on sidecar id `s1`, in the given mode and seat.
     async fn volante_row(
         state: &AppState,
