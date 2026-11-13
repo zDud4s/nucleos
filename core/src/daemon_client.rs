@@ -30,6 +30,19 @@ pub use delivery::*;
 /// authenticated, so a stale or foreign value resolves to nobody rather than to somebody else.
 pub const RUN_ID_HEADER: &str = "x-nucleos-run-id";
 
+/// The Claude Code session that asked for a run, sent by `create_run_in_session` from the id the
+/// session's hook stamped into the tool call. Recorded as `runs.launching_session_id`.
+pub const LAUNCH_SESSION_HEADER: &str = "x-nucleos-launch-session";
+
+/// Whether `id` has the shape of a Claude Code session id. The hook checks the same shape
+/// (`SESSION_ID_SHAPE` in `ask_daemon.py`).
+pub fn valid_session_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// The port a NucleOS daemon binds when nothing says otherwise.
 ///
 /// It lived as a literal in nine places, which was honest while a machine ran exactly one daemon.
@@ -232,10 +245,23 @@ impl DaemonClient {
     }
 
     pub async fn create_run(&self, project_id: &str, prompt: &str) -> Result<i64, String> {
+        self.create_run_in_session(project_id, prompt, None).await
+    }
+
+    /// `create_run` that also names the Claude Code session launching it, when there is one.
+    pub async fn create_run_in_session(
+        &self,
+        project_id: &str,
+        prompt: &str,
+        session_id: Option<&str>,
+    ) -> Result<i64, String> {
         let projects = self.list_projects().await?;
         let body = resolve_run_request(&projects, project_id, prompt)?;
-        let response: Value = self
-            .request(reqwest::Method::POST, "/runs")
+        let mut request = self.request(reqwest::Method::POST, "/runs");
+        if let Some(session) = session_id.filter(|s| valid_session_id(s)) {
+            request = request.header(LAUNCH_SESSION_HEADER, session);
+        }
+        let response: Value = request
             .json(&body)
             .send()
             .await

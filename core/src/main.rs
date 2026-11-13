@@ -7,6 +7,29 @@ mod startup;
 #[cfg(windows)]
 mod supervisor;
 
+// The file-reading guards under `core/tests/`. They only read files, so they run inside a unit-test
+// binary rather than as integration tests (which made every `cargo test` build this executable a
+// second time). They live in THIS crate's tests and not in `nucleos-core`'s because they read the
+// sources of every crate (base, core, app and this binary): the gate narrows its crates to the ones
+// a diff reaches, and this one is the only crate every core diff reaches, so an app- or daemon-only
+// change still runs them. Their paths are computed from `core/`, two levels above this package.
+#[cfg(test)]
+#[path = "../tests/module_map.rs"]
+mod module_map;
+
+#[cfg(test)]
+#[path = "../tests/file_size.rs"]
+mod file_size;
+
+// The phase-4 guards: no v1 Telegram plumbing left, shared routes still used.
+#[cfg(test)]
+#[path = "../tests/no_legacy_telegram.rs"]
+mod no_legacy_telegram;
+
+#[cfg(test)]
+#[path = "../tests/routes_still_used.rs"]
+mod routes_still_used;
+
 use nucleos_app::*;
 use nucleos_core::*;
 // Both crates have a `channels`; the app's is the lib's plus ingest, media and commands, so name it

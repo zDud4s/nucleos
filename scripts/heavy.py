@@ -1155,9 +1155,14 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                                 since = time.time() - max(f.stat().st_mtime for f, _ in held_ents)
                             except (OSError, ValueError):
                                 since = float("inf")
+                            # Held records at weight 1 are past their compile (test phase):
+                            # their predicted share is no longer pending.
+                            held_pred = sum(float(r["pred_cores"]) for r in held_recs
+                                            if hc._num(r.get("pred_cores"))
+                                            and int(r.get("weight") or 1) > 1)
                             fit, adm = hc.dynamic_fit(len(held_recs), pr, since,
                                                       hc.dynamic_max_jobs(pr), static_fit,
-                                                      disk=dk)
+                                                      disk=dk, held_pred_cores=held_pred)
                         except Exception:
                             fit, adm = static_fit, None
                         # Why the head is waiting, for the 30 s stderr line below.
@@ -2381,6 +2386,38 @@ _TD_SUBCOMMANDS = {"build", "b", "check", "c", "test", "t", "clippy", "doc", "d"
                    "run", "r", "rustc", "rustdoc", "clean", "fix"}
 _TD_NEXTEST = {"run", "r", "list", "archive"}
 
+# Cargo subcommands that never read or write a target dir, so they lease no pool slot: no
+# owner-change clean, no `last_worktree` taken over, nothing injected. WHY: a tree leaf runs
+# `cargo fmt -p <crate>` through the broker before closing; leasing for it made the next build
+# of the slot's real owner (the main checkout) `cargo clean -p` every workspace member and
+# rebuild them (~7 min each, seen 2026-11-12 in log.jsonl). Each entry only reads manifests,
+# the lockfile or the registry: `fmt` runs rustfmt on sources, `update`/`generate-lockfile`
+# write Cargo.lock, `search` asks the registry, the rest print. "" is a cargo with no
+# subcommand (`--version`, `--list`, `--help`). Anything not listed (`clean`, `install`,
+# `package`, `publish`, `vendor`, `fetch`, plugins, aliases) keeps the lease.
+_NO_TD_SUBCOMMANDS = {"", "fmt", "metadata", "tree", "locate-project", "pkgid",
+                      "verify-project", "version", "help", "search", "update",
+                      "generate-lockfile"}
+
+
+def _cargo_subcommand(argv: list[str]) -> str | None:
+    """The subcommand of a direct cargo argv, read the way `with_target_dir` reads it (a
+    `+toolchain`, then flags with their values): "" when there is none, None when argv is
+    not cargo. A `--` before any subcommand is returned as is, so no exemption matches it."""
+    if not _is_cargo(argv):
+        return None
+    for i, a in enumerate(argv[1:], 1):
+        if i == 1 and a.startswith("+"):
+            continue
+        if a == "--":
+            return a
+        if a.startswith("-"):
+            continue
+        if i > 1 and argv[i - 1] in _VALUE_FLAGS | {"-C"}:
+            continue  # the value of the flag before it
+        return a
+    return ""
+
 
 def with_target_dir(argv: list[str], td: str) -> list[str] | None:
     """argv with `--target-dir <td>` right after its subcommand, or None when argv is not a
@@ -2564,6 +2601,8 @@ def injected_target_dir(argv: list[str], root: str, cwd: str | None = None) -> s
     (`lease_slot`), not here."""
     if os.environ.get("NUCLEOS_HEAVY_TARGET") == "0" or not _is_cargo(argv):
         return None
+    if _cargo_subcommand(argv) in _NO_TD_SUBCOMMANDS:
+        return None  # it never touches a target dir: leasing one only cleans it for nothing
     if os.environ.get("CARGO_TARGET_DIR") or os.environ.get("CARGO_BUILD_TARGET_DIR"):
         return None
     if _flag_values(_cargo_args(argv), "--target-dir"):

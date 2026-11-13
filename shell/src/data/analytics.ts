@@ -243,7 +243,7 @@ export function validateAnalyticsSearch(search: Record<string, unknown>): {
 }
 
 /** The sections the Analytics view draws, one at a time; the first is the one it opens on. */
-export const SECTIONS = ["summary", "pipeline", "devtime"] as const;
+export const SECTIONS = ["summary", "pipeline", "devtime", "context-fit"] as const;
 export type AnalyticsSection = (typeof SECTIONS)[number];
 
 export function parseSection(value: unknown): AnalyticsSection | undefined {

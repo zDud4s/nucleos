@@ -227,9 +227,17 @@ impl NucleosTools {
     #[tool(description = "Create a NucleOS run for a project")]
     pub(super) async fn create_run(
         &self,
-        Parameters(RunParams { project_id, prompt }): Parameters<RunParams>,
+        Parameters(RunParams {
+            project_id,
+            prompt,
+            session_id,
+        }): Parameters<RunParams>,
     ) -> String {
-        match self.client.create_run(&project_id, &prompt).await {
+        match self
+            .client
+            .create_run_in_session(&project_id, &prompt, session_id.as_deref())
+            .await
+        {
             Ok(id) => serde_json::json!({"run_id": id}).to_string(),
             Err(msg) => error_json(msg),
         }
@@ -750,6 +758,7 @@ impl NucleosTools {
             node_id,
             kind,
             estimate_tokens,
+            pointers,
         }): Parameters<TreeBranchStartParams>,
     ) -> String {
         json_result(
@@ -766,6 +775,7 @@ impl NucleosTools {
                         "node_id": node_id,
                         "kind": kind,
                         "estimate_tokens": estimate_tokens,
+                        "pointers": pointers,
                     }),
                 )
                 .await,

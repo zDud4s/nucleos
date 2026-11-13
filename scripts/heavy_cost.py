@@ -851,7 +851,8 @@ def dynamic_probe() -> dict | None:
 
 
 def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
-                static_fit: bool, disk: dict | None = None) -> tuple[bool, dict]:
+                static_fit: bool, disk: dict | None = None,
+                held_pred_cores: float = 0.0) -> tuple[bool, dict]:
     """Dynamic admission decision for the head of the queue. Returns (ok, adm); `adm` is the
     record kept with the admission (it is meaningful on a denial too, the caller ignores it).
 
@@ -874,7 +875,11 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
         b = p.get("busy_cores")
         lg = p.get("logical")
         if usable and _num(b) and _num(lg):
-            idle = float(lg) - float(b)
+            # Held jobs still compiling have not ramped up: the probe shows their room as idle.
+            # Subtract the not-yet-used share of their predicted cores (prediction minus what the
+            # machine already shows busy), so idle = logical - max(busy, held prediction).
+            unused = max(0.0, float(held_pred_cores or 0.0) - float(b))
+            idle = float(lg) - float(b) - unused
 
     def adm(rule: str) -> dict:
         return {

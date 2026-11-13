@@ -2976,4 +2976,129 @@ mod tests {
         let next = next_conflict(&pool).await.unwrap().map(|c| c.id);
         assert_eq!(next, Some(open));
     }
+
+    async fn attempts_of(pool: &sqlx::SqlitePool, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT resolution_attempts FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the attempts")
+    }
+
+    async fn resolution_run_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT resolution_run_id FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read the resolution run")
+    }
+
+    /// A real `AppState` for `launch_once`, with worktrees provisioned under a root of the test's
+    /// own. Field order matters on drop: the env override and the lock go last.
+    struct LaunchFixture {
+        state: AppState,
+        _worktrees: tempfile::TempDir,
+        _env: crate::execution::runs::tests::WorktreeRootEnv,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// The env lock first, then the rules gate (taken inside `test_state_with_runner`): the order
+    /// `worktree::test_env_lock` insists on.
+    async fn launch_fixture(prefix: &str) -> LaunchFixture {
+        let env_lock = crate::execution::worktree::test_env_lock();
+        let worktrees = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
+        let env = crate::execution::runs::tests::WorktreeRootEnv::set(worktrees.path());
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            None,
+            crate::state::DEFAULT_RUN_TIMEOUT,
+        )
+        .await;
+        LaunchFixture {
+            state,
+            _worktrees: worktrees,
+            _env: env,
+            _env_lock: env_lock,
+        }
+    }
+
+    /// `create_resolution_run` refuses before its claim when `git worktree add` cannot find the
+    /// base — the live `fatal: invalid reference: aut/integ`. `settle_moot` is deliberately not run:
+    /// this is about the launcher, which must count a failed hand-off as spent so that
+    /// `MAX_RESOLUTION_ATTEMPTS` bounds it, rather than retrying the same row every tick for ever.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_that_fails_before_the_claim_still_spends_an_attempt() {
+        let fixture = launch_fixture("nucleos-resolver-spend-wt-").await;
+        let pool = &fixture.state.pool;
+        let (_container, repo) = moot_repo("nucleos-resolver-spend-");
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        let unlaunchable = escalated_merge_into(pool, "feat/x", "aut/integ", false).await;
+        rooted_at(pool, unlaunchable, &repo).await;
+
+        let started = launch_once(&fixture.state).await;
+        assert_eq!(
+            started, None,
+            "a merge into a missing branch starts no agent"
+        );
+        assert_eq!(
+            attempts_of(pool, unlaunchable).await,
+            1,
+            "a hand-off that failed is an attempt spent, not an attempt kept"
+        );
+
+        for _ in 1..MAX_RESOLUTION_ATTEMPTS {
+            let _ = launch_once(&fixture.state).await;
+        }
+        assert_eq!(
+            attempts_of(pool, unlaunchable).await,
+            MAX_RESOLUTION_ATTEMPTS
+        );
+        assert_eq!(
+            next_conflict(pool).await.unwrap().map(|c| c.id),
+            None,
+            "a conflict whose attempts are spent is no longer a candidate"
+        );
+    }
+
+    /// The head-of-line block itself: `next_conflict` takes the oldest row, so an oldest row that
+    /// can never be launched must stop being the oldest candidate, or every escalation behind it
+    /// waits for ever.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_unlaunchable_conflict_does_not_starve_the_ones_behind_it() {
+        let fixture = launch_fixture("nucleos-resolver-starve-wt-").await;
+        let pool = &fixture.state.pool;
+        let (_container, repo) = moot_repo("nucleos-resolver-starve-");
+        // The younger row is a real conflict: `feat/y` and `master` change the same line.
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/y"]));
+        commit_file(&repo, "theirs\n", "theirs");
+        assert!(git_at(&repo, &["checkout", "-q", "master"]));
+        commit_file(&repo, "ours\n", "ours");
+
+        let older = escalated_merge_into(pool, "feat/x", "aut/integ", false).await;
+        let younger = escalated_merge_into(pool, "feat/y", "master", false).await;
+        rooted_at(pool, older, &repo).await;
+        rooted_at(pool, younger, &repo).await;
+        assert!(
+            older < younger,
+            "the unlaunchable row has to be first in line"
+        );
+
+        // Enough ticks to spend the older row's attempts and then reach the next one.
+        for _ in 0..=MAX_RESOLUTION_ATTEMPTS {
+            let _ = launch_once(&fixture.state).await;
+            if resolution_run_of(pool, younger).await.is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            resolution_run_of(pool, younger).await.is_some(),
+            "the conflict behind an unlaunchable one is handed to an agent"
+        );
+        assert_eq!(attempts_of(pool, younger).await, 1);
+    }
 }
