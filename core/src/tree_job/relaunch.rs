@@ -714,9 +714,29 @@ pub async fn answer_and_relaunch(
     text: &str,
     origin: &str,
 ) -> Result<Answered, DecisionError> {
+    answer_and_relaunch_widening(state, decision_id, text, origin, None).await
+}
+
+/// [`answer_and_relaunch`] for an answer that may also widen the paths of a fence-parked branch
+/// (`widen_paths` on the HTTP body, or a text starting with `widen`). A widening answer does not
+/// relaunch the node: the branch goes back to `green` and the driver retries the merge.
+pub async fn answer_and_relaunch_widening(
+    state: &AppState,
+    decision_id: &str,
+    text: &str,
+    origin: &str,
+    widen: Option<&[String]>,
+) -> Result<Answered, DecisionError> {
     let pool = &state.pool;
     let waiting = node_waiting_on(pool, decision_id).await;
-    let decision = decisions::answer(pool, decision_id, text, origin).await?;
+    let (decision, widened) =
+        decisions::answer_widening(pool, decision_id, text, origin, widen).await?;
+    if widened.is_some() {
+        return Ok(Answered {
+            decision,
+            relaunched: None,
+        });
+    }
     let Some(node) = waiting else {
         return Ok(Answered {
             decision,
