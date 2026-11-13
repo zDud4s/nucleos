@@ -836,6 +836,9 @@ mod tests {
             ("default_action", 0, 0),
             ("default_due", 0, 0),
             ("default_evidence", 0, 0),
+            // Migration 0305: when it was answered, and why it went obsolete.
+            ("answered_at", 0, 0),
+            ("obsolete_reason", 0, 0),
         ]
         .into_iter()
         .map(|(name, not_null, pk)| (name.to_owned(), "TEXT".to_owned(), not_null, pk))
