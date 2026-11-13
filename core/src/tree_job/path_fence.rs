@@ -140,9 +140,12 @@ pub(super) async fn parked_by_fence(
         Ok(None) => {
             // The diff is inside the paths now: whatever an earlier refusal left is over.
             let cleared = job.manifest.branches.get_mut(name).is_some_and(|held| {
+                // Every key is removed: `any` would short-circuit, so count instead.
                 [REFUSAL, DECISION, HEAD]
                     .iter()
-                    .fold(false, |any, key| held.extra.remove(*key).is_some() || any)
+                    .filter(|key| held.extra.remove(**key).is_some())
+                    .count()
+                    > 0
             });
             if cleared {
                 persist(pool, job).await?;
