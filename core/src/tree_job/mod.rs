@@ -32,6 +32,7 @@ pub mod nesting;
 mod nesting_e2e;
 mod no_change;
 pub mod node_run;
+pub mod obsolete;
 pub mod open;
 pub mod partition;
 mod path_fence;

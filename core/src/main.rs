@@ -246,6 +246,8 @@ async fn daemon_main() -> std::process::ExitCode {
             None
         }
     };
+    // Decisions orphaned while the daemon was down (tree ended, branch moved on) close now.
+    tree_job::obsolete::sweep_logged(&pool).await;
     // Projects wired by an older daemon keep its hook script and its timeout until rewritten.
     match governance::autopilot::rewire_wired_projects(&pool).await {
         Ok(count) => tracing::info!("rewired the classifier hook in {count} project(s)"),

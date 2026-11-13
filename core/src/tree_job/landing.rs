@@ -892,6 +892,8 @@ pub async fn settle_land(
                 job.manifest.extra.insert("land_sha".to_owned(), json!(sha));
             }
             persist(pool, job).await?;
+            super::obsolete::close_tree_logged(pool, &job.id, &super::obsolete::tree_end_reason(job))
+                .await;
             // The specs this tree was opened for record that it landed (F6 option (a)).
             crate::spec_backlog::estado::record_landed(pool, &job.id, sha.as_deref()).await;
             Ok(LandSettlement::Finished { sha })

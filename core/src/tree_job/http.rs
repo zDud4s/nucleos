@@ -713,6 +713,8 @@ async fn post_abandon(
     store::update(&state.pool, &job)
         .await
         .map_err(store_refusal)?;
+    super::obsolete::close_tree_logged(&state.pool, &id, &super::obsolete::tree_end_reason(&job))
+        .await;
     Ok(Json(json!({
         "id": id, "state": job.state, "finish": finish,
         "dropped_branches": dropped, "dropped_pending_starts": pending,
@@ -995,6 +997,7 @@ async fn post_transition(
         ));
     };
     let from = branch.state.clone();
+    let park_before = branch.park.clone();
     apply_transition(branch, &transition)
         .map_err(|error| refuse(StatusCode::CONFLICT, error.to_string()))?;
     if transition == "parked" {
@@ -1016,6 +1019,15 @@ async fn post_transition(
     store::update(&state.pool, &job)
         .await
         .map_err(store_refusal)?;
+    if from == "parked" && transition != "parked" {
+        // The branch left its park: the decision it waited on can no longer act on an answer.
+        super::obsolete::close_parked_decision_logged(
+            &state.pool,
+            park_before.as_ref(),
+            &format!("branch {name} left the park ({transition})"),
+        )
+        .await;
+    }
     let applied = node_run::apply(&state.pool, &node, &transition, &key, &transition)
         .await
         .map_err(run_refusal)?;
