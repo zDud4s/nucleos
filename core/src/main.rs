@@ -1499,10 +1499,10 @@ mod tests {
         assert!(runs_scheduled_routine(&machine));
     }
 
-    /// Uma equipa que nunca correu nao se desenha como uma tabela vazia.
+    /// A team that never ran is not drawn as an empty table.
     ///
-    /// Este e o caso de hoje -- `team_runs` esta a zero -- e uma tabela de zeros lia-se como
-    /// aprovacao. Nada foi aprovado: nada aconteceu.
+    /// This is today's case -- `team_runs` is at zero -- and a table of zeros read as
+    /// approval. Nothing was approved: nothing happened.
     #[test]
     fn a_team_that_never_ran_is_drawn_as_that_and_not_as_an_empty_table() {
         let drawn = render_pressure(&serde_json::json!({
@@ -1510,7 +1510,7 @@ mod tests {
             "team": "NucleOS",
         }));
 
-        assert_eq!(drawn, "equipa NucleOS · nunca correu");
+        assert_eq!(drawn, "team NucleOS · never ran");
     }
 
     /// O que nao foi medido escreve-se `—`, nunca `0`.

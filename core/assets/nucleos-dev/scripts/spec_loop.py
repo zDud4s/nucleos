@@ -44,10 +44,10 @@ LET_GO_FEED_KIND = "spec_loop_let_go"
 FEED_TIMEOUT_SECS = 2
 REPORT_HEADINGS = ("Feito", "Falta", "Verificação", "Próximo passo")
 REPORT_TEMPLATE = (
-    "## Feito\n- <item> — <evidência: ficheiro, commit ou teste>\n"
-    "## Falta\n- <item aberto ou bloqueado> (ou: nada)\n"
-    "## Verificação\n<comando corrido> → <resultado>\n"
-    "## Próximo passo\n<o que acontece a seguir, ou a decisão que precisas do dono>"
+    "## Feito\n- <item> — <evidence: file, commit or test>\n"
+    "## Falta\n- <open or blocked item> (or: nothing)\n"
+    "## Verificação\n<command run> → <result>\n"
+    "## Próximo passo\n<what happens next, or the decision you need from the owner>"
 )
 _ITEM = re.compile(r"^\s*[-*]\s+\[( |x|X|!)\]\s+(.+?)\s*$", re.MULTILINE)
 _STATUS = re.compile(r"^status:\s*([A-Za-z]+)", re.MULTILINE)

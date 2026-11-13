@@ -60,7 +60,7 @@ func TestPortAReplyGoesBackToTheTopicItCameFrom(t *testing.T) {
 		t.Fatalf("inbound dropped or without conversation: %+v", ev)
 	}
 	bot := &fakeSendBot{}
-	s := contract.Send{ID: 9, Conversation: *ev.Conversation.Ref, Parts: []contract.OutPart{{Type: contract.OutText, Text: "resposta"}}}
+	s := contract.Send{ID: 9, Conversation: *ev.Conversation.Ref, Parts: []contract.OutPart{{Type: contract.OutText, Text: "reply"}}}
 	if _, err := New(bot, nil).Execute(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}

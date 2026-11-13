@@ -1,29 +1,30 @@
-//! Quanta janela custou a cada agente, por round, e o que isso diz da forma da equipa.
+//! How much window each agent cost, per round, and what that says about the shape of the team.
 //!
-//! Leitura pura: este módulo não escreve nada, em lado nenhum. Vive à parte de `runs.rs` porque
-//! aquele é sobre ESCREVER o ciclo de vida de uma run e este é sobre LER o que ficou escrito — e
-//! porque `runs.rs` já passa das cinco mil linhas.
+//! Pure reading: this module writes nothing, anywhere. It lives apart from `runs.rs` because
+//! that one is about WRITING a run's lifecycle and this one is about READING what was left behind —
+//! and because `runs.rs` already runs past five thousand lines.
 //!
-//! O que NÃO faz, de propósito: não é um sinal vivo (a decisão que informa toma-se entre jobs, não
-//! durante um), não reparte agentes, não altera equipas. Dá a evidência; a decisão é do dono.
+//! What it deliberately does NOT do: it is not a live signal (the decision it informs is taken
+//! between jobs, not during one), it does not split agents, it does not change teams. It gives the
+//! evidence; the decision is the owner's.
 
 use sqlx::SqlitePool;
 
-/// O que se está a medir.
+/// What is being measured.
 pub enum Scope {
-    /// O job mais recente desta equipa, por nome.
+    /// The most recent job of this team, by name.
     Team(String),
-    /// Um job em concreto, por `team_runs.id`.
+    /// One specific job, by `team_runs.id`.
     Job(String),
 }
 
-/// Internamente etiquetado para que `never_ran` chegue a quem le como um valor de `outcome`, e
-/// nao como a ausencia de campos. Um relatorio vazio que se le como aprovacao e pior do que nao
-/// existir, e a rota e onde essa distincao mais facilmente se achata.
+/// Internally tagged so that `never_ran` reaches the reader as an `outcome` value, and
+/// not as the absence of fields. An empty report that reads as approval is worse than none at
+/// all, and the route is where that distinction is most easily flattened.
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Report {
-    /// A equipa existe e nunca correu nada. Não é o mesmo que correr e não ter problemas.
+    /// The team exists and has never run anything. Not the same as running and having no problems.
     NeverRan {
         team: String,
     },
@@ -36,21 +37,21 @@ pub struct Measured {
     pub job: String,
     pub rounds: i64,
     pub items_measured: usize,
-    /// Itens planeados que nunca chegaram a ter run.
+    /// Planned items that never got a run.
     pub items_without_run: usize,
-    /// Itens com run mas sem `tools_used` nem `num_turns` — entram na ocupação, ficam fora do
-    /// ajuste.
+    /// Items with a run but neither `tools_used` nor `num_turns` — they count towards occupancy,
+    /// stay out of the fit.
     pub items_without_steps: usize,
     pub rollups: Vec<AgentRollup>,
 }
 
-/// Uma linha por item planeado, com o que a sua run gastou — ou nada, se nunca correu.
+/// One row per planned item, with what its run spent — or nothing, if it never ran.
 #[derive(Debug)]
 pub struct Item {
     pub round: i64,
     pub agent_id: String,
     pub agent_name: String,
-    /// `None` quando o item foi planeado e nunca chegou a ter run.
+    /// `None` when the item was planned and never got a run.
     pub run_id: Option<i64>,
     pub context_peak: Option<i64>,
     pub compacted: bool,
@@ -58,8 +59,8 @@ pub struct Item {
     pub num_turns: Option<i64>,
 }
 
-/// Uma linha da colheita, tal como o SQLite a devolve. Nomeada porque clippy conta os braços do
-/// tuplo, e oito é mais do que ele tolera anónimo.
+/// One row of the harvest, as SQLite returns it. Named because clippy counts the arms of the
+/// tuple, and eight is more than it tolerates anonymous.
 type HarvestedRow = (
     i64,
     String,
@@ -71,10 +72,10 @@ type HarvestedRow = (
     Option<i64>,
 );
 
-/// `LEFT JOIN` e não `JOIN`: um item pode não ter chegado a correr, e isso é um estado real. Um
-/// `JOIN` deitava-o fora em silêncio e o relatório dizia que a layer teve menos trabalho do que
-/// teve.
-const COLHEITA: &str = "\
+/// `LEFT JOIN` and not `JOIN`: an item may not have got to run, and that is a real state. A
+/// `JOIN` dropped it silently and the report said the layer had less work than it
+/// did.
+const HARVEST_SQL: &str = "\
 SELECT ti.round, ti.agent_id, a.name AS agent_name, r.id AS run_id,
        r.context_peak, COALESCE(r.compacted, 0) AS compacted, r.tools_used, r.num_turns
 FROM team_items ti
@@ -84,7 +85,10 @@ WHERE ti.team_run_id = ?
 ORDER BY ti.round, ti.ordinal";
 
 async fn harvest(pool: &SqlitePool, job: &str) -> sqlx::Result<Vec<Item>> {
-    let rows: Vec<HarvestedRow> = sqlx::query_as(COLHEITA).bind(job).fetch_all(pool).await?;
+    let rows: Vec<HarvestedRow> = sqlx::query_as(HARVEST_SQL)
+        .bind(job)
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -112,11 +116,11 @@ async fn harvest(pool: &SqlitePool, job: &str) -> sqlx::Result<Vec<Item>> {
         .collect())
 }
 
-/// A única porta do módulo. Resolve o âmbito, colhe, e monta o relatório.
+/// The module's only door. Resolves the scope, harvests, and builds the report.
 ///
-/// `Scope::Team` resolve para o `team_run` mais recente dessa equipa. Uma equipa que existe e não
-/// tem nenhum dá `NeverRan`; um nome que não existe dá erro, porque são coisas diferentes e quem
-/// escreveu mal o nome tem direito a saber.
+/// `Scope::Team` resolves to that team's most recent `team_run`. A team that exists and has
+/// none gives `NeverRan`; a name that does not exist gives an error, because they are different
+/// things and whoever misspelled the name has a right to know.
 pub async fn measure(pool: &SqlitePool, scope: Scope) -> sqlx::Result<Report> {
     let (team, job) = match scope {
         Scope::Team(name) => {
@@ -173,14 +177,14 @@ pub async fn measure(pool: &SqlitePool, scope: Scope) -> sqlx::Result<Report> {
     }))
 }
 
-/// Quantos passos deu este item. `tools_used` primeiro, `num_turns` em recurso.
+/// How many steps this item took. `tools_used` first, `num_turns` as a fallback.
 ///
-/// A ordem não é arbitrária: um turno com doze ferramentas e um turno com uma contam igual em
-/// `num_turns`. Recorrer a ele é perder resolução, e `Measured::items_without_steps` diz quantas
-/// vezes foi preciso.
+/// The order is not arbitrary: a turn with twelve tools and a turn with one count the same in
+/// `num_turns`. Falling back to it loses resolution, and `Measured::items_without_steps` says how
+/// many times that was needed.
 ///
-/// Uma lista malformada conta como ausente e nunca como zero: lixo não é a afirmação «não usou
-/// ferramentas», e tratá-lo como tal punha um ponto falso no ajuste.
+/// A malformed list counts as absent and never as zero: garbage is not the statement «used no
+/// tools», and treating it as such put a false point in the fit.
 fn steps_of(tools_used: Option<&str>, num_turns: Option<i64>) -> Option<i64> {
     if let Some(raw) = tools_used
         && let Ok(serde_json::Value::Array(calls)) = serde_json::from_str::<serde_json::Value>(raw)
@@ -193,9 +197,9 @@ fn steps_of(tools_used: Option<&str>, num_turns: Option<i64>) -> Option<i64> {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fit {
-    /// Menos de três pontos, ou todos no mesmo x. Não há recta que se possa afirmar.
+    /// Fewer than three points, or all at the same x. There is no line that can be asserted.
     ///
-    /// Devolver zeros seria afirmar «arranque 0, declive 0» — uma leitura, e falsa.
+    /// Returning zeros would assert «startup 0, slope 0» — a reading, and a false one.
     Insufficient,
     Line {
         intercept: f64,
@@ -216,15 +220,15 @@ pub struct AgentRollup {
     pub peak_p90: Option<i64>,
     pub steps_median: Option<i64>,
     pub fit: Fit,
-    /// Preenchido por `judge`, nunca por `roll_up`.
+    /// Filled in by `judge`, never by `roll_up`.
     pub verdicts: Vec<Verdict>,
 }
 
-/// Uma linha por `(round, agent_id)`, na ordem dos rounds.
+/// One row per `(round, agent_id)`, in round order.
 ///
-/// Aritmética e mais nada — não julga. Dois dos quatro veredictos não são propriedade de um rollup
-/// isolado: um compara o agente com os outros do mesmo round, outro compara-o consigo próprio
-/// noutros rounds. Quem julga recebe a fatia inteira, e chega a seguir.
+/// Arithmetic and nothing else — it does not judge. Two of the four verdicts are not the property
+/// of a single rollup: one compares the agent with the others of the same round, another compares
+/// it with itself in other rounds. Whoever judges receives the whole slice, and comes next.
 fn roll_up(items: &[Item]) -> Vec<AgentRollup> {
     let mut order: Vec<(i64, String)> = Vec::new();
     for item in items {
@@ -247,8 +251,8 @@ fn roll_up(items: &[Item]) -> Vec<AgentRollup> {
                 .filter_map(|item| steps_of(item.tools_used.as_deref(), item.num_turns))
                 .collect();
             steps.sort_unstable();
-            // Só os itens que têm as DUAS coisas entram no ajuste: um ponto com um eixo em falta não
-            // é meio ponto, é nenhum.
+            // Only items that have BOTH things enter the fit: a point with a missing axis is not
+            // half a point, it is none.
             let points: Vec<(f64, f64)> = group
                 .iter()
                 .filter_map(|item| {
@@ -281,53 +285,55 @@ fn roll_up(items: &[Item]) -> Vec<AgentRollup> {
         .collect()
 }
 
-/// Calibracao das leituras. Primeiros palpites, deliberadamente conservadores.
+/// Calibration of the readings. First guesses, deliberately conservative.
 ///
-/// Nenhum destes numeros foi medido: `team_runs` estava vazia quando isto se escreveu, logo nao
-/// havia contra o que calibrar. Estao aqui juntos e com nome para serem revistos depois dos
-/// primeiros jobs a serio, e e ISSO que se espera que aconteca -- nao que fiquem.
-mod calibracao {
-    /// Quantas vezes acima da mediana dos pares do round conta como carregar o round sozinho.
-    pub const DESEQUILIBRIO: f64 = 2.0;
-    /// Abaixo disto, "mais itens que os pares" e ruido e nao sinal.
-    pub const ITENS_MINIMOS: usize = 3;
-    /// Subida do primeiro ao ultimo round, em fraccao, para o handoff contar como pesado.
-    pub const SUBIDA_ENTRE_ROUNDS: f64 = 0.25;
-    /// Que fatia da ocupacao tipica ja la esta antes do agente fazer nada.
-    pub const ARRANQUE_DOMINANTE: f64 = 0.5;
-    /// Acima disto o arranque amortiza-se e deixa de ser o problema.
-    pub const PASSOS_QUE_AMORTIZAM: i64 = 10;
+/// None of these numbers was measured: `team_runs` was empty when this was written, so there was
+/// nothing to calibrate against. They are here together and named so they can be revised after the
+/// first real jobs, and THAT is what is expected to happen -- not that they stay.
+mod calibration {
+    /// How many times above the median of the round's peers counts as carrying the round alone.
+    pub const IMBALANCE: f64 = 2.0;
+    /// Below this, "more items than the peers" is noise and not signal.
+    pub const MIN_ITEMS: usize = 3;
+    /// Rise from the first to the last round, as a fraction, for the handoff to count as heavy.
+    pub const ROUND_CLIMB: f64 = 0.25;
+    /// What share of typical occupancy is already there before the agent does anything.
+    pub const DOMINANT_STARTUP: f64 = 0.5;
+    /// Above this the startup amortises and stops being the problem.
+    pub const AMORTIZING_STEPS: i64 = 10;
 }
 
-/// O que a evidencia sugere fazer a forma da equipa. Nunca e feito automaticamente.
+/// What the evidence suggests doing to the shape of the team. Never done automatically.
 ///
-/// Nao sao exclusivos: um agente pode disparar `SplitSpeciality` e `TrimPrompt` ao mesmo tempo, e
-/// isso e informacao -- enche cedo E trabalha pouco, logo o problema esta quase todo no briefing.
+/// They are not exclusive: an agent can fire `SplitSpeciality` and `TrimPrompt` at the same time,
+/// and that is information -- it fills up early AND does little work, so the problem is almost all
+/// in the briefing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    /// Os itens deste agente compactaram: a especialidade cobre superficie a mais.
+    /// This agent's items compacted: the speciality covers too much surface.
     SplitSpeciality,
-    /// Carrega o round quase sozinho: falta gente nesta layer.
+    /// Carries the round almost alone: this layer is short of people.
     MoreAgents,
-    /// O contexto sobe de round para round: o handoff entre layers traz de mais.
+    /// Context climbs from round to round: the handoff between layers carries too much.
     MoreLayers,
-    /// Nasce caro e trabalha pouco. Repartir aqui PIORA -- cada metade volta a pagar o arranque.
+    /// Born expensive and does little work. Splitting here makes it WORSE -- each half pays the
+    /// startup again.
     TrimPrompt,
 }
 
-/// Preenche `verdicts` em cada rollup da fatia.
+/// Fills in `verdicts` on every rollup of the slice.
 ///
-/// Recebe a fatia inteira e nao um rollup porque metade das leituras sao comparacoes:
-/// `MoreAgents` mede um agente contra os outros do mesmo round, `MoreLayers` mede-o contra si
-/// proprio noutros rounds. Um julgador de um so rollup nao teria como as ver.
+/// Takes the whole slice and not one rollup because half of the readings are comparisons:
+/// `MoreAgents` measures an agent against the others of the same round, `MoreLayers` measures it
+/// against itself in other rounds. A single-rollup judge would have no way to see them.
 ///
-/// **Nenhuma das quatro usa um limiar absoluto em tokens.** A janela do modelo nao e conhecida por
-/// run -- `runner.rs::window_env` so a passa quando a pergunta a traz, e uma run de agente nao traz
-/// -- portanto todas comparam o agente consigo proprio ou com os pares.
+/// **None of the four uses an absolute token threshold.** The model's window is not known per
+/// run -- `runner.rs::window_env` only passes it when the question brings it, and an agent run
+/// does not -- so all of them compare the agent with itself or with its peers.
 fn judge(rollups: &mut [AgentRollup]) {
-    // Uma copia dos tres campos que as comparacoes leem, tirada antes de se escrever em qualquer
-    // rollup: um julgamento tem de ver a fatia como ela chegou, nao meio-escrita.
+    // A copy of the three fields the comparisons read, taken before writing to any
+    // rollup: a judgement has to see the slice as it arrived, not half-written.
     let seen: Vec<(i64, String, usize, Option<i64>)> = rollups
         .iter()
         .map(|rollup| {
@@ -343,7 +349,7 @@ fn judge(rollups: &mut [AgentRollup]) {
     for rollup in rollups.iter_mut() {
         let mut verdicts = Vec::new();
 
-        // Verdade-terreno da propria CLI: nao coube. Uma vez basta.
+        // Ground truth from the CLI itself: it did not fit. Once is enough.
         if rollup.compacted_items >= 1 {
             verdicts.push(Verdict::SplitSpeciality);
         }
@@ -353,13 +359,13 @@ fn judge(rollups: &mut [AgentRollup]) {
             .filter(|(round, agent, ..)| *round == rollup.round && *agent != rollup.agent_id)
             .map(|(_, _, items, _)| *items as i64)
             .collect();
-        if !peers.is_empty() && rollup.items >= calibracao::ITENS_MINIMOS {
+        if !peers.is_empty() && rollup.items >= calibration::MIN_ITEMS {
             let mut sorted = peers;
             sorted.sort_unstable();
-            // O piso de 1 impede que uma layer onde os pares nao fizeram nada divida por zero e
-            // declare desequilibrio infinito.
+            // The floor of 1 stops a layer where the peers did nothing from dividing by zero and
+            // declaring infinite imbalance.
             let baseline = percentile(&sorted, 0.5).unwrap_or(1).max(1) as f64;
-            if rollup.items as f64 >= calibracao::DESEQUILIBRIO * baseline {
+            if rollup.items as f64 >= calibration::IMBALANCE * baseline {
                 verdicts.push(Verdict::MoreAgents);
             }
         }
@@ -370,8 +376,8 @@ fn judge(rollups: &mut [AgentRollup]) {
             .map(|(round, _, _, p50)| (*round, *p50))
             .collect();
         mine.sort_by_key(|(round, _)| *round);
-        // Prende-se ao ULTIMO round em que o agente aparece, que e onde a subida ja e visivel
-        // inteira.
+        // Anchored to the LAST round in which the agent appears, which is where the rise is already
+        // fully visible.
         if mine.len() >= 2
             && mine.last().map(|(round, _)| *round) == Some(rollup.round)
             && let Some(peaks) = mine
@@ -381,7 +387,7 @@ fn judge(rollups: &mut [AgentRollup]) {
             && peaks.windows(2).all(|pair| pair[1] > pair[0])
             && peaks[0] > 0
             && (peaks[peaks.len() - 1] - peaks[0]) as f64 / peaks[0] as f64
-                >= calibracao::SUBIDA_ENTRE_ROUNDS
+                >= calibration::ROUND_CLIMB
         {
             verdicts.push(Verdict::MoreLayers);
         }
@@ -389,8 +395,8 @@ fn judge(rollups: &mut [AgentRollup]) {
         if let Fit::Line { intercept, .. } = &rollup.fit
             && let Some(p50) = rollup.peak_p50
             && let Some(steps) = rollup.steps_median
-            && *intercept >= calibracao::ARRANQUE_DOMINANTE * p50 as f64
-            && steps <= calibracao::PASSOS_QUE_AMORTIZAM
+            && *intercept >= calibration::DOMINANT_STARTUP * p50 as f64
+            && steps <= calibration::AMORTIZING_STEPS
         {
             verdicts.push(Verdict::TrimPrompt);
         }
@@ -399,14 +405,14 @@ fn judge(rollups: &mut [AgentRollup]) {
     }
 }
 
-/// Percentil por interpolação linear sobre os valores presentes, ordenados.
+/// Percentile by linear interpolation over the values present, sorted.
 ///
-/// Escrito à mão e não trazido de uma dependência: são sete linhas e o repositório não tem nenhuma
-/// crate de estatística. Com dois valores o p50 é a média dos dois, e não o menor — as duas
-/// respostas são defensáveis e esta é a que está aqui.
+/// Written by hand and not pulled from a dependency: it is seven lines and the repository has no
+/// statistics crate. With two values the p50 is the mean of the two, and not the lower — both
+/// answers are defensible and this is the one that is here.
 fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
     if sorted.is_empty() {
-        // Nenhum valor não é o valor zero.
+        // No value is not the value zero.
         return None;
     }
     let rank = p * (sorted.len() - 1) as f64;
@@ -419,11 +425,11 @@ fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
     Some((sorted[low] as f64 + (sorted[high] - sorted[low]) as f64 * frac).round() as i64)
 }
 
-/// Mínimos quadrados a uma variável, com R² ao lado.
+/// Least squares in one variable, with R² alongside.
 ///
-/// O R² sai junto e não à parte porque, com uma variável e tarefas heterogéneas, isto é
-/// diagnóstico populacional e não previsor de um item. Um arranque sem o R² ao lado lê-se com uma
-/// confiança que não tem.
+/// R² comes out together and not apart because, with one variable and heterogeneous tasks, this is
+/// population diagnosis and not a predictor for one item. A startup without the R² alongside reads
+/// with a confidence it does not have.
 fn fit(points: &[(f64, f64)]) -> Fit {
     if points.len() < 3 {
         return Fit::Insufficient;
@@ -446,7 +452,7 @@ fn fit(points: &[(f64, f64)]) -> Fit {
     Fit::Line {
         intercept,
         slope,
-        // Sem variação em y não há nada por explicar, e a recta explica-o todo.
+        // Without variation in y there is nothing left to explain, and the line explains it all.
         r2: if sst == 0.0 { 1.0 } else { 1.0 - sse / sst },
     }
 }
@@ -459,14 +465,14 @@ mod tests {
         crate::testdb::fresh_pool().await
     }
 
-    /// Um item a semear: em que round, de que agente, e com que run — ou nenhuma.
+    /// An item to seed: in which round, of which agent, and with which run — or none.
     struct Seed {
         round: i64,
         agent: &'static str,
         run: Option<RunSeed>,
     }
 
-    /// O que a `runs` desse item vai ter. `Default` é uma run saudável e sem nada a assinalar.
+    /// What that item's `runs` row will have. `Default` is a healthy run with nothing to flag.
     #[derive(Default)]
     struct RunSeed {
         context_peak: Option<i64>,
@@ -474,10 +480,10 @@ mod tests {
         tools: usize,
     }
 
-    /// Insere um agente com o nome dado, se ainda não existir.
+    /// Inserts an agent with the given name, if it does not exist yet.
     ///
-    /// A especialidade é de fachada: nada neste módulo a lê, e um teste que a inventasse estaria a
-    /// sugerir que sim.
+    /// The speciality is a facade: nothing in this module reads it, and a test that invented one
+    /// would be suggesting otherwise.
     async fn seed_agent(pool: &SqlitePool, name: &str) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents (id, name, speciality, prompt, engine,
@@ -492,7 +498,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Insere equipa, director e membros. Devolve o `teams.id`.
+    /// Inserts team, director and members. Returns the `teams.id`.
     async fn seed_team(pool: &SqlitePool, name: &str, members: &[&str]) -> String {
         seed_agent(pool, "director").await;
         for member in members {
@@ -521,8 +527,8 @@ mod tests {
         team_id
     }
 
-    /// Insere um `team_run` sobre a equipa `NucleOS` e os itens pedidos, criando as `runs` onde há
-    /// `RunSeed`. Devolve o `team_runs.id`.
+    /// Inserts a `team_run` over the `NucleOS` team and the requested items, creating the `runs`
+    /// where there is a `RunSeed`. Returns the `team_runs.id`.
     async fn seed_job(pool: &SqlitePool, items: &[Seed]) -> String {
         let mut members: Vec<&str> = items.iter().map(|seed| seed.agent).collect();
         members.sort_unstable();
@@ -590,8 +596,8 @@ mod tests {
         let pool = test_pool().await;
         seed_team(&pool, "NucleOS", &["Nucleo", "Concha"]).await;
 
-        // Um relatório verde e vazio lê-se como aprovação. Não é o que aconteceu: não aconteceu
-        // nada.
+        // A green, empty report reads as approval. That is not what happened: nothing
+        // happened.
         assert!(matches!(
             measure(&pool, Scope::Team("NucleOS".into())).await.unwrap(),
             Report::NeverRan { .. }
@@ -609,7 +615,7 @@ mod tests {
                     agent: "Nucleo",
                     run: Some(RunSeed::default()),
                 },
-                // Planeado, nunca correu.
+                // Planned, never ran.
                 Seed {
                     round: 1,
                     agent: "Concha",
@@ -620,16 +626,16 @@ mod tests {
         .await;
 
         let Report::Measured(m) = measure(&pool, Scope::Job(job)).await.unwrap() else {
-            panic!("um job semeado mede-se")
+            panic!("a seeded job is measurable")
         };
         assert_eq!(m.items_measured, 1);
         assert_eq!(
             m.items_without_run, 1,
-            "não corridos contam-se; deitá-los fora seria dizer que a layer teve menos trabalho do que teve"
+            "items that never ran are counted; dropping them would be saying the layer had less work than it did"
         );
     }
 
-    /// Um `Item` com o que os testes de rollup precisam de dizer, e nada mais.
+    /// An `Item` with what the rollup tests need to say, and nothing more.
     fn item(round: i64, agent: &str, peak: Option<i64>, compacted: bool, tools: usize) -> Item {
         Item {
             round,
@@ -638,7 +644,7 @@ mod tests {
             run_id: Some(1),
             context_peak: peak,
             compacted,
-            // Uma lista com `tools` chamadas — o conteúdo não importa, o comprimento sim.
+            // A list with `tools` calls — the content does not matter, the length does.
             tools_used: Some(
                 serde_json::to_string(&vec![serde_json::json!({"name": "Bash"}); tools]).unwrap(),
             ),
@@ -646,9 +652,9 @@ mod tests {
         }
     }
 
-    /// Um rollup no estado neutro: nada compactou, ocupacao tipica, passos que amortizam, sem
-    /// ajuste. Cada teste mexe so no campo que lhe interessa, e o resto fica explicitamente
-    /// inofensivo.
+    /// A rollup in the neutral state: nothing compacted, typical occupancy, amortising steps, no
+    /// fit. Each test touches only the field it cares about, and the rest stays explicitly
+    /// harmless.
     fn r(round: i64, agent: &str, items: usize) -> AgentRollup {
         AgentRollup {
             round,
@@ -665,20 +671,20 @@ mod tests {
         }
     }
 
-    /// Julga a fatia e devolve os veredictos de um agente num round.
+    /// Judges the slice and returns one agent's verdicts in one round.
     fn verdicts_of(rollups: &mut [AgentRollup], agent: &str, round: i64) -> Vec<Verdict> {
         judge(rollups);
         rollups
             .iter()
             .find(|x| x.agent_name == agent && x.round == round)
-            .expect("o rollup pedido existe")
+            .expect("the requested rollup exists")
             .verdicts
             .clone()
     }
 
     #[test]
     fn an_agent_whose_items_compact_is_told_to_split() {
-        // Uma compactacao basta. Nao e um limiar: e a CLI a dizer que nao coube.
+        // One compaction is enough. It is not a threshold: it is the CLI saying it did not fit.
         let mut rs = vec![r(1, "Nucleo", 3)];
         rs[0].compacted_items = 1;
         assert!(verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::SplitSpeciality));
@@ -686,8 +692,8 @@ mod tests {
 
     #[test]
     fn a_high_peak_that_never_compacted_is_slack_and_not_pressure() {
-        // 180k sem compactacao e folga. E a distincao inteira que o veredicto guarda, e a razao de
-        // o sinal ser `compacted` e nao uma contagem de tokens.
+        // 180k without compaction is slack. It is the whole distinction the verdict keeps, and the
+        // reason the signal is `compacted` and not a token count.
         let mut rs = vec![r(1, "Nucleo", 3)];
         rs[0].peak_p90 = Some(180_000);
         assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::SplitSpeciality));
@@ -695,7 +701,7 @@ mod tests {
 
     #[test]
     fn an_agent_carrying_the_round_alone_wants_company() {
-        // 4 itens contra pares com 1: 4 >= 2 x max(1, mediana 1).
+        // 4 items against peers with 1: 4 >= 2 x max(1, median 1).
         let mut rs = vec![r(1, "Nucleo", 4), r(1, "Concha", 1), r(1, "Portao", 1)];
         assert!(verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::MoreAgents));
     }
@@ -708,22 +714,22 @@ mod tests {
 
     #[test]
     fn two_items_against_one_is_noise_and_not_imbalance() {
-        // 2 >= 2 x 1 e verdade, mas 2 < ITENS_MINIMOS. O piso existe exactamente para este caso.
+        // 2 >= 2 x 1 is true, but 2 < MIN_ITEMS. The floor exists exactly for this case.
         let mut rs = vec![r(1, "Nucleo", 2), r(1, "Concha", 1)];
         assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::MoreAgents));
     }
 
     #[test]
     fn an_agent_alone_in_its_round_is_not_called_imbalanced() {
-        // Sem pares nao ha desequilibrio possivel -- so uma layer de um. Guarda contra o
-        // `max(1, ...)` transformar "nao ha mediana" em "a mediana e 1".
+        // Without peers there is no possible imbalance -- only a layer of one. Guards against
+        // `max(1, ...)` turning "there is no median" into "the median is 1".
         let mut rs = vec![r(1, "Nucleo", 5)];
         assert!(!verdicts_of(&mut rs, "Nucleo", 1).contains(&Verdict::MoreAgents));
     }
 
     #[test]
     fn context_climbing_across_rounds_asks_for_a_layer() {
-        // 100k -> 150k: +50%, acima de SUBIDA_ENTRE_ROUNDS. O veredicto prende-se ao ultimo round.
+        // 100k -> 150k: +50%, above ROUND_CLIMB. The verdict anchors to the last round.
         let mut rs = vec![r(1, "Nucleo", 2), r(2, "Nucleo", 2)];
         rs[0].peak_p50 = Some(100_000);
         rs[1].peak_p50 = Some(150_000);
@@ -734,15 +740,15 @@ mod tests {
     fn context_that_holds_steady_does_not() {
         let mut rs = vec![r(1, "Nucleo", 2), r(2, "Nucleo", 2)];
         rs[0].peak_p50 = Some(100_000);
-        // +5%, ruido.
+        // +5%, noise.
         rs[1].peak_p50 = Some(105_000);
         assert!(!verdicts_of(&mut rs, "Nucleo", 2).contains(&Verdict::MoreLayers));
     }
 
     #[test]
     fn a_high_start_with_little_work_is_a_prompt_problem() {
-        // Arranque de 60k numa ocupacao tipica de 100k, e mediana de 4 passos: nasce caro e faz
-        // pouco.
+        // Startup of 60k in a typical occupancy of 100k, and a median of 4 steps: born expensive
+        // and does little.
         let mut rs = vec![r(1, "Nucleo", 3)];
         rs[0].fit = Fit::Line {
             intercept: 60_000.0,
@@ -755,8 +761,8 @@ mod tests {
 
     #[test]
     fn a_high_start_that_does_a_lot_of_work_is_not() {
-        // O mesmo arranque, 40 passos: amortiza-se. Repartir aqui pagava-o outra vez, e e o erro
-        // que este veredicto existe para impedir.
+        // The same startup, 40 steps: it amortises. Splitting here would pay it again, and that is
+        // the mistake this verdict exists to prevent.
         let mut rs = vec![r(1, "Nucleo", 3)];
         rs[0].fit = Fit::Line {
             intercept: 60_000.0,
@@ -769,8 +775,8 @@ mod tests {
 
     #[test]
     fn a_rollup_keeps_rounds_apart() {
-        // O mesmo agente em dois rounds dá duas linhas, nunca uma soma. Somar apagaria a subida
-        // entre rounds, que é precisamente o terceiro veredicto.
+        // The same agent in two rounds gives two rows, never a sum. Summing would erase the rise
+        // between rounds, which is precisely the third verdict.
         let rollups = roll_up(&[
             item(1, "Nucleo", Some(100_000), false, 10),
             item(2, "Nucleo", Some(150_000), false, 10),
@@ -784,21 +790,21 @@ mod tests {
     fn percentiles_come_from_the_items_that_have_a_peak() {
         let rollups = roll_up(&[
             item(1, "Nucleo", Some(100_000), false, 5),
-            // Sem pico: conta para `items`, não para o p50.
+            // No peak: counts towards `items`, not towards the p50.
             item(1, "Nucleo", None, false, 5),
             item(1, "Nucleo", Some(200_000), false, 5),
         ]);
         let r = &rollups[0];
         assert_eq!(
             r.items, 3,
-            "o item sem pico continua a ser um item da layer"
+            "the item without a peak is still an item of the layer"
         );
-        assert_eq!(r.peak_p50, Some(150_000), "mediana de [100k, 200k]");
+        assert_eq!(r.peak_p50, Some(150_000), "median of [100k, 200k]");
     }
 
     #[test]
     fn an_agent_with_no_peaks_at_all_has_no_percentiles() {
-        // Nenhum pico não é pico zero. Zero seria uma afirmação, e falsa.
+        // No peak is not a zero peak. Zero would be a claim, and a false one.
         let rollups = roll_up(&[item(1, "Nucleo", None, false, 5)]);
         assert_eq!(rollups[0].peak_p50, None);
         assert_eq!(rollups[0].peak_p90, None);
@@ -806,8 +812,8 @@ mod tests {
 
     #[test]
     fn compacted_items_are_counted_and_not_just_flagged() {
-        // O primeiro veredicto conta-os; saber que «algum» compactou não chega para o relatório
-        // dizer quantos dos quantos.
+        // The first verdict counts them; knowing that «some» compacted is not enough for the
+        // report to say how many out of how many.
         let rollups = roll_up(&[
             item(1, "Nucleo", Some(100_000), true, 5),
             item(1, "Nucleo", Some(100_000), false, 5),
@@ -828,25 +834,25 @@ mod tests {
 
     #[test]
     fn an_empty_tool_list_is_zero_steps_and_not_a_fallback() {
-        // `[]` é uma afirmação: «não usou ferramentas». Não é ausência.
+        // `[]` is a claim: «used no tools». It is not absence.
         assert_eq!(steps_of(Some("[]"), Some(7)), Some(0));
     }
 
     #[test]
     fn a_malformed_tool_list_is_absent_and_never_zero() {
-        // Lixo não é uma afirmação. Recorre-se aos turnos.
-        assert_eq!(steps_of(Some("{isto nao e uma lista"), Some(4)), Some(4));
-        assert_eq!(steps_of(Some("{isto nao e uma lista"), None), None);
+        // Garbage is not a claim. Fall back to the turns.
+        assert_eq!(steps_of(Some("{this is not a list"), Some(4)), Some(4));
+        assert_eq!(steps_of(Some("{this is not a list"), None), None);
     }
 
     #[test]
     fn the_fit_needs_spread_and_says_so_when_it_has_none() {
-        // Três itens todos com 10 passos: não há declive que se possa afirmar.
+        // Three items all with 10 steps: there is no slope that can be asserted.
         assert!(matches!(
             fit(&[(10.0, 100_000.0), (10.0, 110_000.0), (10.0, 105_000.0)]),
             Fit::Insufficient
         ));
-        // Dois pontos são uma recta trivial, não uma medição.
+        // Two points are a trivial line, not a measurement.
         assert!(matches!(
             fit(&[(10.0, 100_000.0), (20.0, 120_000.0)]),
             Fit::Insufficient
@@ -855,14 +861,14 @@ mod tests {
 
     #[test]
     fn the_fit_recovers_a_line_it_was_given() {
-        // arranque 50k, declive 1 400/passo, exacto.
+        // startup 50k, slope 1 400/step, exact.
         let Fit::Line {
             intercept,
             slope,
             r2,
         } = fit(&[(10.0, 64_000.0), (20.0, 78_000.0), (30.0, 92_000.0)])
         else {
-            panic!("devia ajustar")
+            panic!("should have fitted")
         };
         assert!((intercept - 50_000.0).abs() < 1.0);
         assert!((slope - 1_400.0).abs() < 0.1);

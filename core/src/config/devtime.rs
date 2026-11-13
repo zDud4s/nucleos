@@ -354,7 +354,7 @@ pub struct DevtimePrecisionConfig {
 impl Default for DevtimePrecisionConfig {
     fn default() -> Self {
         let mut priors = BTreeMap::new();
-        // Spec §5: C2 "arranca com precisão baixa".
+        // Spec §5: C2 "starts with low precision".
         priors.insert("C2".to_string(), 0.2);
         Self {
             floor: 0.8,

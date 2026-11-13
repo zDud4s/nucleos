@@ -290,7 +290,7 @@ describe("the nodes that do not match", () => {
   /**
    * §14: a decision whose code somebody wrote down does not sit in *declared, with no code*.
    *
-   * **The two rows are identical to the júnction — both `silent`, both with no modules — and
+   * **The two rows are identical to the junction — both `silent`, both with no modules — and
    * they are not the same fact.** One is work still to do. The other is an anchor a rewrite
    * deleted, and the files are known. Drawing them alike is exactly the confusion this feature
    * exists to end, so the test asserts the SEPARATION rather than the presence: the recorded
