@@ -1,4 +1,4 @@
-// Command telegram is the Telegram sidecar on the channel kit (built as telegram-sidecar).
+// Command telegram is the Telegram sidecar on the channel kit (built as nucleos-telegram).
 package main
 
 import (

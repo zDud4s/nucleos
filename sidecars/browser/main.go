@@ -1,6 +1,6 @@
 // §spec pilar-de-browser
 
-// Command browser-sidecar drives a real browser on the núcleo's behalf.
+// Command nucleos-browser drives a real browser on the núcleo's behalf.
 //
 // It is the only process in NucleOS that renders somebody else's HTML and runs their JavaScript. It
 // holds no state, opens no database, and decides no trust: which profile a session runs in, and
@@ -30,7 +30,7 @@ import (
 )
 
 func main() {
-	log.SetPrefix("browser-sidecar: ")
+	log.SetPrefix("nucleos-browser: ")
 	cfg, err := config.Load()
 	if err != nil {
 		// The daemon only starts this process once the pillar is enabled, so a missing variable is
