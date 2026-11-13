@@ -3,6 +3,21 @@
 
 use super::*;
 use crate::conductor::context::{Fill, allowed_for_node, handoff_path};
+
+mod loop_warning;
+
+/// Everything a node run is told on an allowed call: the warn-band hint, then the loop warning
+/// (live mode only; in shadow it only records). Fail-open: what cannot be read is not said.
+pub(super) async fn hints(
+    state: &AppState,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Vec<String> {
+    let mut parts: Vec<String> = warn_hint(state, run_id).await.into_iter().collect();
+    parts.extend(loop_warning::loop_advisory(state, run_id, tool_name, tool_input).await);
+    parts
+}
 /// The context verdict of the node a run works for, `None` for a run without a node and when the
 /// verdict cannot be read (fail open: a read error must not stop a run, and the next call asks
 /// again). The limits come from the run's own `speed.yaml`; the model-window cap is not applied
@@ -516,6 +531,57 @@ fn docs_clean_path(path: &str) -> Option<String> {
         }
     }
     (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// How much of each string of a refused call's input the fence keeps in `shadow_decisions`.
+const FENCE_INPUT_CHARS: usize = 2048;
+
+/// The `reason` a fence refusal is stored under: the marker, not the sentence the run was told.
+pub(super) const NODE_SCOPE_REASON: &str = "node_scope";
+
+fn capped_for_fence(value: &Value) -> Value {
+    match value {
+        Value::String(text) => {
+            Value::String(crate::judge::trim_two_thirds(text, FENCE_INPUT_CHARS))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(capped_for_fence).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), capped_for_fence(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Records the call the node scope fence refused as a `deny` row of `shadow_decisions`, so the
+/// refusal is read back with the call that caused it. Fail-open: a write error is logged and
+/// changes nothing about the answer the hook gives.
+pub(super) async fn record_fence_refusal(
+    state: &AppState,
+    run_id: i64,
+    payload: &PreToolUsePayload,
+) {
+    let classification = crate::governance::classifier::Classification {
+        decision: Decision {
+            decision: "deny".to_owned(),
+            reason: NODE_SCOPE_REASON.to_owned(),
+        },
+        action_class: "node-scope",
+        reason: NODE_SCOPE_REASON.to_owned(),
+    };
+    if let Err(error) = crate::governance::shadow::record_decision(
+        &state.pool,
+        run_id,
+        &payload.tool_name,
+        &capped_for_fence(&payload.tool_input),
+        &classification,
+        state.github.policy.digest(),
+    )
+    .await
+    {
+        tracing::warn!(run_id, %error, "pretooluse-decision: failed to record the fence refusal");
+    }
 }
 
 #[cfg(test)]

@@ -68,6 +68,8 @@ struct StartBody {
     kind: Option<String>,
     /// What the branch is estimated to take to build, in tokens.
     estimate_tokens: Option<i64>,
+    /// Files the branch's agent should start from; stored on its node. Absent is none.
+    pointers: Option<Vec<String>>,
 }
 
 /// The kind a start asks for: `leaf` when left out, else `leaf` or `orchestrator`.
@@ -271,6 +273,7 @@ async fn find_or_open_node(
     name: &str,
     goal: &str,
     paths: &[String],
+    pointers: &[String],
     kind: Kind,
 ) -> Result<(String, bool), Refusal> {
     let lock = job_lock(job_id);
@@ -296,6 +299,7 @@ async fn find_or_open_node(
             title: name.to_owned(),
             goal: goal.to_owned(),
             owned_paths: paths.to_vec(),
+            pointers: pointers.to_vec(),
             ..OpenArgs::default()
         },
         links,
@@ -326,6 +330,7 @@ struct PendingStart<'a> {
     goal: &'a str,
     prompt: &'a str,
     paths: &'a [String],
+    pointers: &'a [String],
     layer: &'a str,
     base: Option<&'a str>,
     /// Set when the start waits for this base branch to merge rather than for the disk.
@@ -389,6 +394,7 @@ async fn remember_pending_start(
         "goal": pending.goal,
         "prompt": pending.prompt,
         "paths": pending.paths,
+        "pointers": pending.pointers,
         "layer": pending.layer,
         "base": pending.base,
         "waits_for_base": pending.waits_for_base,
@@ -571,6 +577,8 @@ pub(super) async fn start_pending_status(
         "goal": record["goal"],
         "prompt": record["prompt"],
         "owned_paths": record["paths"],
+        // Records written before pointers carry none.
+        "pointers": record["pointers"],
         "layer": record["layer"],
         "base": record["base"],
         "node_id": record["caller"],
@@ -667,6 +675,7 @@ async fn start_branch(
     let paths = body
         .owned_paths
         .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "owned_paths is required"))?;
+    let pointers = body.pointers.unwrap_or_default();
     let layer = body
         .layer
         .filter(|layer| !layer.trim().is_empty())
@@ -897,6 +906,7 @@ async fn start_branch(
                     goal: &goal,
                     prompt: &prompt,
                     paths: &paths,
+                    pointers: &pointers,
                     layer: &layer,
                     base: base.as_deref(),
                     waits_for_base: None,
@@ -936,6 +946,7 @@ async fn start_branch(
             goal: &goal,
             prompt: &prompt,
             paths: &paths,
+            pointers: &pointers,
             layer: &layer,
             base: Some(base),
             waits_for_base: Some(base),
@@ -983,6 +994,7 @@ async fn start_branch(
                 &name,
                 &goal,
                 &paths,
+                &pointers,
                 kind,
             )
             .await?;
@@ -1192,6 +1204,35 @@ mod tests {
             .unwrap();
         let branch = &job.manifest.branches["notes"];
         assert_eq!(branch.node_id.as_deref(), response["node_id"].as_str());
+    }
+
+    #[tokio::test]
+    async fn branch_start_stores_the_pointers_on_the_node_and_none_when_absent() {
+        let (state, app, caller, _repo) = tree().await;
+        let pointed = with(
+            code_body(&caller, "pointed", "Pointed", &["core/p/**"]),
+            "pointers",
+            json!(["core/p/a.rs", "core/p/b.rs"]),
+        );
+        let (status, response) = post(&app, &uri(), pointed).await;
+        assert_eq!(status, StatusCode::OK, "{response:?}");
+        let plain_body = code_body(&caller, "plain", "Plain", &["core/q/**"]);
+        let (status, plain) = post(&app, &uri(), plain_body).await;
+        assert_eq!(status, StatusCode::OK, "{plain:?}");
+
+        let stored = |response: &Value| {
+            let node = response["node_id"].as_str().unwrap().to_owned();
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT pointers FROM work_nodes WHERE id = ?")
+                    .bind(node)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(stored(&response).await, r#"["core/p/a.rs","core/p/b.rs"]"#);
+        assert_eq!(stored(&plain).await, "[]");
     }
 
     /// A docs branch works in the main checkout with no worktree, and its write guard lives in the
@@ -1852,6 +1893,7 @@ mod tests {
             goal: "Build the x half",
             prompt: "Build api-x.",
             paths: &["core/x/**".to_owned()],
+            pointers: &[],
             layer: "core",
             base: None,
             waits_for_base: Some("api"),

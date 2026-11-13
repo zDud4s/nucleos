@@ -7,6 +7,7 @@ use crate::search::{escape_like, fts_query};
 use crate::state::AppState;
 
 pub mod api;
+mod context_given;
 mod create;
 mod handoff;
 mod lifecycle;
@@ -12148,6 +12149,8 @@ tests:
             cache_read_tokens: Some(20_000),
             num_turns: Some(3),
             context_fill: None,
+            initial_context: None,
+            tools_given: None,
             steerable: false,
             successor_run_id: None,
             chat_id: None,

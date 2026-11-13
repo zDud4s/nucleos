@@ -55,6 +55,8 @@ export const keys = {
     /** Pipeline blocks (spec analytics-pipeline §5.2). No `global` in it: F1's stale refetch matches on that word. */
     pipeline: (days: number) => ["analytics", "pipeline", days] as const,
     devtime: (days: number) => ["analytics", "devtime", days] as const,
+    /** Context fit per tree node (global only). */
+    contextFit: (days: number) => ["analytics", "context-fit", days] as const,
     devtimeFindings: (days: number, order: string, cursor: string) =>
       ["analytics", "devtime-findings", days, order, cursor] as const,
     /** The automatic actions' pairs with their promotion reports (not windowed by `days`). */

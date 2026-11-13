@@ -42,6 +42,7 @@ mod chat_turns;
 mod chats;
 mod commands;
 mod common;
+mod context_fit;
 mod email;
 mod engines;
 mod files;
@@ -141,6 +142,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(chat_turns::routes())
         .merge(chats::routes())
         .merge(commands::routes())
+        .merge(context_fit::routes())
         .merge(email::routes())
         .merge(files::routes())
         .merge(fleet::routes())

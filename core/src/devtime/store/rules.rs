@@ -146,8 +146,10 @@ pub(super) async fn insert_finding(
         "INSERT INTO devtime_findings
             (finding_key, project_id, session_id, scope, rule_id, rule_version, level, waste, lever,
              confidence, lane, started_at, ended_at, cost_ms, count, attempt_ids, sessions,
-             rules_version, parser_version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             rules_version, parser_version, run_id, node_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 (SELECT run_id FROM devtime_sessions WHERE session_id = ?),
+                 (SELECT node_id FROM devtime_sessions WHERE session_id = ?))
          ON CONFLICT(finding_key) DO NOTHING",
     )
     .bind(&row.finding_key)
@@ -169,6 +171,9 @@ pub(super) async fn insert_finding(
     .bind(json_or_empty(&row.sessions))
     .bind(&row.rules_version)
     .bind(row.parser_version)
+    // A tree-node session's findings carry its run and node (migration 0305).
+    .bind(&row.session_id)
+    .bind(&row.session_id)
     .execute(&mut *conn)
     .await?;
     Ok(())

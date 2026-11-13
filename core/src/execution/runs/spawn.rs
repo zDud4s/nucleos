@@ -763,6 +763,7 @@ pub(super) fn spawn_run(
                     // more exact of the two.
                     let context_peak = peak_of(&o.stdout);
                     append_run_events(&pool, id, &o.stdout).await;
+                    super::context_given::record(&pool, id, &o.stdout).await;
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
@@ -1164,6 +1165,7 @@ pub(super) fn spawn_run(
                     let context_peak = peak_of(&seen);
                     let tools_used = tools_of(&seen);
                     append_run_events(&pool, id, &seen).await;
+                    super::context_given::record(&pool, id, &seen).await;
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let timed_out = sqlx::query(
                         "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?, context_peak = ?, tools_used = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",

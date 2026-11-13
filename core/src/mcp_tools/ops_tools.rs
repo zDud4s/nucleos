@@ -499,7 +499,8 @@ impl NucleosTools {
                        (6 by default), at most 6 open siblings, and owned_paths may not overlap a running sibling. The \
                        owned_paths of a child must be contained in its parent's; `..` is \
                        refused. A violation \
-                       is refused with the reason. Returns {id, root_id, depth}."
+                       is refused with the reason. `pointers` are optional files the node starts from. \
+                       Returns {id, root_id, depth}."
     )]
     pub(super) async fn node_open(
         &self,
@@ -509,6 +510,7 @@ impl NucleosTools {
             title,
             goal,
             owned_paths,
+            pointers,
             budget_tokens,
             task_id,
             session_id,
@@ -524,6 +526,7 @@ impl NucleosTools {
                     "title": title,
                     "goal": goal,
                     "owned_paths": owned_paths,
+                    "pointers": pointers,
                     "budget_tokens": budget_tokens,
                     "task_id": task_id,
                     "session_id": session_id,
@@ -547,6 +550,7 @@ impl NucleosTools {
             decision,
             context_peak,
             widen_paths,
+            pointers,
         }): Parameters<NodeUpdateParams>,
     ) -> String {
         json_result(
@@ -558,6 +562,7 @@ impl NucleosTools {
                         "decision": decision,
                         "context_peak": context_peak,
                         "widen_paths": widen_paths,
+                        "pointers": pointers,
                     }),
                 )
                 .await,
