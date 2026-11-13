@@ -1153,11 +1153,15 @@ mod tests {
             )
             .route(
                 "/{verb}",
-                post(move |Path(verb): Path<String>, _body: axum::body::Bytes| {
+                post(move |Path(verb): Path<String>, body: axum::body::Bytes| {
                     let recorder = verb_recorder.clone();
                     async move {
                         recorder.lock().unwrap().push(verb.clone());
                         if verb == "open" {
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(format!("open-body {}", String::from_utf8_lossy(&body)));
                             return axum::Json(serde_json::json!({
                                 "id": "s1",
                                 "mode": "agent",
@@ -1961,6 +1965,185 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        db.close().await;
+    }
+
+    /// A project root on record that is not a folder on disk gives the conversation no directory.
+    #[tokio::test]
+    async fn a_project_root_that_is_not_a_folder_gives_the_chat_no_cwd() {
+        let (db, state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('nucleos', 'off', ?)",
+        )
+        .bind("Z:\\no\\such\\folder\\anywhere")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+
+        let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM chats WHERE chat_id = ?")
+            .bind(&opened.chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(cwd, None);
+        db.close().await;
+    }
+
+    /// A profile already in use (the sidecar answers 409 to the open) is an open failure like any
+    /// other: the row closes `open-failed`, the conversation stays empty, the caller gets an error.
+    #[tokio::test]
+    async fn a_busy_profile_closes_the_row_and_leaves_an_empty_chat() {
+        use axum::response::IntoResponse as _;
+
+        let (db, mut state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let app = axum::Router::new().route(
+            "/{verb}",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::CONFLICT, "profile busy").into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&address.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
+        });
+
+        let result =
+            open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await;
+        assert!(result.is_err(), "{result:?}");
+
+        let chats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(chats, 1, "the conversation stays");
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let reasons: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT closed_reason FROM browser_sessions")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(reasons, vec![Some("open-failed".to_string())]);
+        db.close().await;
+    }
+
+    /// A project with a granted site opens on the project profile and sends its write list; the
+    /// agent path must not force the throwaway profile.
+    #[tokio::test]
+    async fn the_agent_window_uses_the_project_profile_when_sites_are_granted() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        browser::grant(
+            &state.pool,
+            "nucleos",
+            &["https://jira.example.org/login".into()],
+            true,
+            NOW,
+        )
+        .await
+        .expect("grant");
+
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+
+        assert_eq!(opened.session.profile_kind, "project");
+        let body = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|entry| entry.strip_prefix("open-body ").map(str::to_string))
+            .expect("the open body was recorded");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["placement"]["profile"]["id"], "nucleos", "{body}");
+        assert_eq!(
+            body["placement"]["writable"],
+            serde_json::json!(["https://jira.example.org:443"]),
+            "{body}"
+        );
+        db.close().await;
+    }
+
+    /// The read verbs refuse a with-agent session once the person has the wheel, as they do for any
+    /// session that is not the agent's.
+    #[tokio::test]
+    async fn the_read_verbs_refuse_a_with_agent_session_in_human_mode() {
+        let (db, state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+        assert!(
+            browser::set_mode(
+                &state.pool,
+                &state.browser.modes,
+                opened.session.id,
+                mode::AGENT,
+                mode::HUMAN,
+            )
+            .await
+            .unwrap()
+        );
+
+        let response = crate::browser::post_snapshot(
+            axum::extract::State(state.clone()),
+            axum::Json(crate::browser::SessionBody {
+                session_id: opened.session.id,
+                changes_only: false,
+                text_from: 0,
+                controls_from: 0,
+                find: String::new(),
+            }),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("refused"), "{text}");
+        assert!(text.contains("theirs"), "{text}");
         db.close().await;
     }
 
