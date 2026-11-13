@@ -3006,6 +3006,9 @@ mod tests {
 
     /// The env lock first, then the rules gate (taken inside `test_state_with_runner`): the order
     /// `worktree::test_env_lock` insists on.
+    // The guard is held across the awaits on purpose: it is returned in the fixture so the env
+    // stays locked for the whole test, and these tests run on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn launch_fixture(prefix: &str) -> LaunchFixture {
         let env_lock = crate::execution::worktree::test_env_lock();
         let worktrees = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
