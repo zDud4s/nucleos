@@ -374,7 +374,7 @@ function TargetName({ link, graph }: { link: NoteLink; graph: NotesGraph }) {
   );
 }
 
-/** Turns an active note into a pending lesson; the owner answers it in Learned. */
+/** Turns an active note into a pending lesson; the owner answers it in the Brain. */
 function Teach({ id }: { id: number }) {
   const teach = useTeachNote();
   const [kind, setKind] = useState<TeachKind>("memory");

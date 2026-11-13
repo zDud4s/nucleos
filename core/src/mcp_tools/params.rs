@@ -6,6 +6,8 @@ use super::*;
 pub(super) struct RunParams {
     pub(super) project_id: String,
     pub(super) prompt: String,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
 }
 
 /// The body of `POST /trees`, field for field (`TreeBody` in `tree_job/http.rs`).
@@ -23,6 +25,8 @@ pub(super) struct TreeLaunchParams {
     /// `integration` (the default here) lands the finished work into the project's integration
     /// branch; `hold` leaves it on `feature_branch` for the owner to land.
     pub(super) land: Option<String>,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
 }
 
 /// What `tree_launch` sends when the caller names no landing mode. Owner, 2026-11-04: a tree must
@@ -46,6 +50,7 @@ impl TreeLaunchParams {
             "contract": self.contract,
             "dirty_owner_files": self.dirty_owner_files,
             "land": land,
+            "launching_session_id": self.session_id,
         })
     }
 }
@@ -91,6 +96,9 @@ pub(super) struct TreeBranchStartParams {
     /// Your estimate of the tokens building this piece takes: a positive number. Pass it on every
     /// piece; it decides leaf or orchestrator and is kept on the branch.
     pub(super) estimate_tokens: Option<i64>,
+    /// Files the branch's agent should start from (paths). Default none.
+    #[serde(default)]
+    pub(super) pointers: Vec<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -604,6 +612,9 @@ pub(super) struct NodeOpenParams {
     /// Paths this node owns. They may not overlap a running sibling. Default none.
     #[serde(default)]
     pub(super) owned_paths: Vec<String>,
+    /// Files this node should start from (paths). Default none.
+    #[serde(default)]
+    pub(super) pointers: Vec<String>,
     /// The token budget for this node. Absent takes the daemon default.
     pub(super) budget_tokens: Option<i64>,
     /// The workflow task this node belongs to.
@@ -631,6 +642,8 @@ pub(super) struct NodeUpdateParams {
     /// Globs you need beyond your owned paths; accepted unless a sibling owns them. A glob you
     /// already own, or a shared file, is dropped.
     pub(super) widen_paths: Option<Vec<String>>,
+    /// Files this node should start from (paths); replaces the stored list.
+    pub(super) pointers: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]

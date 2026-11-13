@@ -10,6 +10,7 @@ import { KnowledgePanel } from "../brain/knowledge/KnowledgePanel";
 import { ToolRequests } from "../brain/knowledge/ToolRequests";
 import { WaitingPanel } from "../brain/knowledge/WaitingPanel";
 import { UnifiedList } from "../brain/UnifiedList";
+import { rememberView, rememberedView } from "../brain/view-memory";
 import { WeeklyReview } from "../brain/WeeklyReview";
 import { ThemesProposed } from "../brain/ThemesProposed";
 import { ThemesAccepted } from "../brain/ThemesAccepted";
@@ -44,14 +45,29 @@ import "./brain.css";
 export function Brain() {
   const { view, item } = useBrainSearch();
   const navigate = useNavigate();
+  const rawView = (useSearch({ strict: false }) as Record<string, unknown>).view;
+
+  // A bare /brain opens on the last view chosen (spec U7). Only on arrival: the address then
+  // carries it, so back/forward and shared links keep meaning what they say.
+  useEffect(() => {
+    if (rawView !== undefined || rememberedView() !== "graph") return;
+    void navigate({
+      to: "/brain",
+      search: (prev: Record<string, unknown>) => brainSearch({ ...validateBrainSearch(prev), view: "graph" }),
+      replace: true,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- arrival only
+  }, []);
 
   // Switching view replaces the entry; picking an item pushes one (spec §3.2).
-  const showView = (next: BrainView) =>
+  const showView = (next: BrainView) => {
+    rememberView(next);
     void navigate({
       to: "/brain",
       search: (prev: Record<string, unknown>) => brainSearch({ ...validateBrainSearch(prev), view: next }),
       replace: true,
     });
+  };
   const showItem = (next: string) =>
     void navigate({
       to: "/brain",

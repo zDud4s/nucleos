@@ -14,7 +14,9 @@ N = NUCLEOS_HEAVY_TARGET_SLOTS (default 3), to every eligible cargo child:
   is removed instead;
 - a lease whose holder process is gone does not block;
 - `hold-worktree` leases NO slot and exports no target dir; nested broker calls lease their own,
-  and the first such lease stays pinned to the session until it ends.
+  and the first such lease stays pinned to the session until it ends;
+- a subcommand that never touches a target dir (`cargo fmt`, `metadata`, `tree`...) leases
+  nothing, so it neither takes a slot over nor makes its owner's next build clean it.
 
 Eligibility itself is pinned in test_heavy_targetdir*.py. Fixtures (fake cargo, throwaway
 repos, hermetic state) come from test_heavy_targetdir.py. Nothing real is compiled.
@@ -351,6 +353,65 @@ class PoolTests(base.TargetDirTests):
                          "nobody else built in the slot, so nothing may have cleaned it")
         # The session is over: the pin goes with it.
         self.assertEqual(real(self.run_seq("C", self.repo_b, slots=1)), real(self.slot(1)))
+
+    # 10 -------------------------------------------------------------------------------
+    def slot_rec(self, k: int) -> dict:
+        p = self.state / "target-slots" / f"{k}.json"
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+    def test_fmt_leases_no_slot_and_leaves_the_owner_warm(self) -> None:
+        # 2026-11-12: a tree leaf's `cargo fmt -p <crate>` through the broker leased the main
+        # checkout's slot, so the main's next build cleaned every workspace member and rebuilt.
+        self.run_seq("A", self.repo, slots=1)
+        before = self.slot_rec(1)
+        self.assertTrue(before.get("last_worktree"), before)
+        n_calls = len(self.calls())
+        cp = subprocess.run(
+            [sys.executable, str(HEAVY), "--wait-max", "60", "--", str(self.cargo), "fmt",
+             "-p", "nucleos-core"],
+            env=self.pool_env("F", 1, False), cwd=str(self.repo_b), capture_output=True,
+            text=True, timeout=LONG + 60)
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        fmt = [c for c in self.calls() if c["tag"] == "F"]
+        self.assertEqual([c["argv"] for c in fmt], [["fmt", "-p", "nucleos-core"]],
+                         f"fmt must run alone, with no metadata/clean for a slot: {fmt}")
+        self.assertIsNone(fmt[0]["td"], f"fmt must get no target dir: {fmt[0]}")
+        self.assertEqual(len(self.calls()), n_calls + 1, self.calls())
+        after = self.slot_rec(1)
+        self.assertEqual(real(after.get("last_worktree")), real(before["last_worktree"]),
+                         f"fmt took the slot over: {before} -> {after}")
+        self.assertEqual(after.get("acquired"), before.get("acquired"), after)
+        # The owner comes back to a slot nobody else used: no clean.
+        self.assertEqual(real(self.run_seq("A2", self.repo, slots=1)), real(self.slot(1)))
+        self.assertFalse([c for c in self.calls() if self.is_member_clean(c)],
+                         "fmt in another worktree made the owner's next build clean its slot")
+
+    def test_a_build_from_another_worktree_still_leases_and_cleans(self) -> None:
+        self.run_seq("A", self.repo, slots=1)
+        td_b = self.run_seq("B", self.repo_b, slots=1)
+        self.assertEqual(real(td_b), real(self.slot(1)))
+        self.assertEqual(real(self.slot_rec(1).get("last_worktree")), real(self.repo_b))
+        self.assertTrue([c for c in self.calls() if self.is_member_clean(c) and c["tag"] == "B"],
+                        "a `cargo test` taking A's slot must still clean it first")
+
+    def test_only_subcommands_without_a_target_dir_skip_the_pool(self) -> None:
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("heavy_no_td_probe", HEAVY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        root, cwd = str(self.repo), str(self.repo)
+        skip = [["fmt"], ["fmt", "-p", "x", "--", "--check"], ["+nightly", "fmt"], ["metadata"],
+                ["tree"], ["locate-project"], ["pkgid"], ["verify-project"], ["version"],
+                ["--version"], ["-V"], ["help", "build"], ["search", "x"], ["update"],
+                ["generate-lockfile"], ["--color", "never", "fmt"]]
+        keep = [["test", "-p", "nucleos-core"], ["build"], ["clippy"], ["clean"], ["install"],
+                ["package"], ["nextest", "run"], ["tauri", "build"], ["-C", "tree", "build"],
+                ["--color", "always", "build"], ["xtask"], ["--", "fmt"]]
+        with mock.patch.dict(os.environ, self.env(), clear=True):
+            for args in skip:
+                self.assertIsNone(mod.injected_target_dir(["cargo", *args], root, cwd), args)
+            for args in keep:
+                self.assertIsNotNone(mod.injected_target_dir(["cargo", *args], root, cwd), args)
 
 
 # The parent's own tests must not run again under this module.

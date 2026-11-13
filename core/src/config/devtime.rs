@@ -27,6 +27,8 @@ pub struct DevtimeConfig {
     pub rules: DevtimeRulesConfig,
     /// The automatic actions' thresholds (phase 2, shadow mode first).
     pub actions: DevtimeActionsConfig,
+    /// The context-fit thresholds (context-fit spec section 5).
+    pub context_fit: DevtimeContextFitConfig,
 }
 
 impl Default for DevtimeConfig {
@@ -41,6 +43,7 @@ impl Default for DevtimeConfig {
             retention_days: 180,
             rules: DevtimeRulesConfig::default(),
             actions: DevtimeActionsConfig::default(),
+            context_fit: DevtimeContextFitConfig::default(),
         }
     }
 }
@@ -401,6 +404,7 @@ pub struct DevtimeAdaptersConfig {
 /// outside [0, 1], or a count that must be at least one. A file that fails this is refused whole.
 pub fn validate_devtime(config: &DevtimeConfig) -> Result<(), String> {
     validate_actions(&config.actions)?;
+    validate_context_fit(&config.context_fit)?;
     let rules = &config.rules;
     for class in rules.vocab.error_signatures.keys() {
         if !RULES_ERROR_CLASSES.contains(&class.as_str()) {
@@ -707,6 +711,62 @@ fn validate_actions(actions: &DevtimeActionsConfig) -> Result<(), String> {
     }
     if actions.inject_max_per_session == 0 {
         return Err("actions.inject_max_per_session must be at least 1".to_string());
+    }
+    Ok(())
+}
+
+/// The context-fit card's thresholds. A partial or absent block is valid: every field has the spec default.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeContextFitConfig {
+    // under (u1): reads outside the owned paths and pointers before the first edit.
+    pub u1_reads: u32,
+    // over (o1): the share of pointers never read.
+    pub o1_unread_share: f64,
+    // over (o2): the initial context as a share of the node's ceiling.
+    pub o2_initial_share: f64,
+    // over (o3): the percentile of tokens per changed line among the same layer's nodes, the
+    // window of days it is taken over and the fewest nodes it needs before it speaks.
+    pub o3_pct: u32,
+    pub o3_window_days: u32,
+    pub o3_min_nodes: u32,
+    // split (s2): handoffs from one node.
+    pub s2_handoffs: u32,
+    // split (s5): the context peak as a share of the ceiling, without closing done.
+    pub s5_peak_share: f64,
+}
+
+impl Default for DevtimeContextFitConfig {
+    fn default() -> Self {
+        Self {
+            u1_reads: 8,
+            o1_unread_share: 0.5,
+            o2_initial_share: 0.4,
+            o3_pct: 90,
+            o3_window_days: 30,
+            o3_min_nodes: 20,
+            s2_handoffs: 2,
+            s5_peak_share: 0.8,
+        }
+    }
+}
+
+/// Refuses a share outside [0, 1] and a percentile outside 1..=99.
+fn validate_context_fit(fit: &DevtimeContextFitConfig) -> Result<(), String> {
+    for (name, value) in [
+        ("context_fit.o1_unread_share", fit.o1_unread_share),
+        ("context_fit.o2_initial_share", fit.o2_initial_share),
+        ("context_fit.s5_peak_share", fit.s5_peak_share),
+    ] {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(format!("{name} must be within [0, 1], got {value}"));
+        }
+    }
+    if !(1..=99).contains(&fit.o3_pct) {
+        return Err(format!(
+            "context_fit.o3_pct must be within 1..=99, got {}",
+            fit.o3_pct
+        ));
     }
     Ok(())
 }

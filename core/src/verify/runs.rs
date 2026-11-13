@@ -191,17 +191,32 @@ pub async fn timed_gate(
 
 /// The worktree's HEAD, or `None` when it is not a repository or git did not answer in time.
 async fn head_sha(worktree: &Path) -> Option<String> {
-    let args = [
-        std::ffi::OsStr::new("rev-parse"),
-        std::ffi::OsStr::new("HEAD"),
-    ];
-    let result = crate::execution::git_exec::run_git(worktree, &args, SHA_TIMEOUT)
+    let mut command = crate::execution::worktree::git();
+    command
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // The unit measures the checkout at `worktree`: a GIT_DIR inherited from the environment the
+    // daemon (or a gate) runs in must not point rev-parse at some other repository.
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(var);
+    }
+    let output = tokio::time::timeout(SHA_TIMEOUT, command.output())
         .await
+        .ok()?
         .ok()?;
-    if result.exit_code != Some(0) {
+    if !output.status.success() {
         return None;
     }
-    let sha = result.stdout.trim();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout.trim();
     (!sha.is_empty()).then(|| sha.to_owned())
 }
 
@@ -620,6 +635,49 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn head_sha_reads_the_scratch_repository_whatever_git_dir_the_process_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            // The gate runs this suite from inside a git-driven environment: whatever GIT_* it
+            // exports must not point these commands away from the scratch repository.
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(dir.path());
+            for var in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_COMMON_DIR",
+            ] {
+                command.env_remove(var);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        let sha = head_sha(dir.path()).await;
+        assert_eq!(sha.map(|s| s.len()), Some(40));
     }
 
     #[tokio::test]

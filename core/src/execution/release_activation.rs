@@ -580,6 +580,8 @@ mod tests {
             .await
             .expect("every precondition holds");
 
+        // One tuple per selected column: a named type would only restate the SELECT.
+        #[allow(clippy::type_complexity)]
         let row: (
             String,
             Option<String>,

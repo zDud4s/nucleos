@@ -51,6 +51,10 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 libc = "0.2"
 
 [dev-dependencies]
+# This crate's own `testkit`, on for its own tests, so `cargo test -p nucleos-app` alone and the
+# gate's combined invocation build it with the same features and share the artifact (see
+# `nucleos-core`'s manifest).
+nucleos-app = { path = ".", features = ["testkit"] }
 nucleos-core = { path = "../..", features = ["testkit"] }
 tempfile = "3.27.0"
 # `channels::port_tests_commands` captures the log lines a refused command writes.
