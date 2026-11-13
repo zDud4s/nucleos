@@ -327,6 +327,26 @@ class Pure(unittest.TestCase):
     def probe(busy, avail=20000):
         return {"logical": 12, "total_mb": 32000, "avail_mb": avail, "busy_cores": busy}
 
+    def test_dynamic_fit_reserves_unused_predicted_share_of_held(self) -> None:
+        c = self.load()
+        # 3 held compiles predicted at 17.5 cores each, machine still mostly idle (busy 2 of 12):
+        # the not-yet-used share (52.5 - 2) must be subtracted, so a 4th is not admitted.
+        ok, adm = c.dynamic_fit(3, self.probe(2), 100.0, 8, True, held_pred_cores=52.5)
+        self.assertFalse(ok)
+        self.assertEqual(adm["rule"], "room")
+        self.assertEqual(adm["idle_cores"], -40.5)
+        # Without the held prediction the old behaviour (the bug) admitted it.
+        ok, _ = c.dynamic_fit(3, self.probe(2), 100.0, 8, True)
+        self.assertTrue(ok)
+        # Held jobs already using what they predicted: busy covers it, nothing extra reserved.
+        ok, adm = c.dynamic_fit(1, self.probe(6), 100.0, 8, True, held_pred_cores=4.0)
+        self.assertTrue(ok)
+        self.assertEqual(adm["idle_cores"], 6.0)
+        # A small prediction leaves room: 12 - max(2, 5) = 7 idle.
+        ok, adm = c.dynamic_fit(1, self.probe(2), 100.0, 8, True, held_pred_cores=5.0)
+        self.assertTrue(ok)
+        self.assertEqual(adm["idle_cores"], 7.0)
+
     # 9
     def test_dynamic_fit_idle_cores_and_none_busy(self) -> None:
         c = self.load()

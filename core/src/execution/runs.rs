@@ -7,6 +7,7 @@ use crate::search::{escape_like, fts_query};
 use crate::state::AppState;
 
 pub mod api;
+mod context_given;
 mod create;
 mod handoff;
 mod lifecycle;
@@ -11465,6 +11466,55 @@ tests:
         }
     }
 
+    /// A run launched from a Claude Code session records it in `launching_session_id`, from
+    /// `LAUNCH_SESSION_HEADER`. A value that is not a plain session id tags nothing, a run that has
+    /// one keeps it, and the chat tag is untouched.
+    #[tokio::test]
+    async fn tag_launching_session_records_a_valid_header_once() {
+        let pool = search_test_pool().await;
+        let mut ids = Vec::new();
+        for prompt in ["a", "b"] {
+            ids.push(
+                sqlx::query(
+                    "INSERT INTO runs (prompt, status, mode, created_at)
+                     VALUES (?, 'completed', 'worktree', '2026-10-01T00:00:02Z')",
+                )
+                .bind(prompt)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid(),
+            );
+        }
+        let header = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                crate::daemon_client::LAUNCH_SESSION_HEADER,
+                value.parse().unwrap(),
+            );
+            headers
+        };
+        api::tag_launching_session(&pool, ids[0], &header("sess-1_A")).await;
+        api::tag_launching_session(&pool, ids[0], &header("sess-2")).await;
+        api::tag_launching_session(&pool, ids[1], &header("bad session!")).await;
+        api::tag_launching_session(&pool, ids[1], &axum::http::HeaderMap::new()).await;
+
+        let stored = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT launching_session_id FROM runs WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(stored(ids[0]).await.as_deref(), Some("sess-1_A"));
+        assert_eq!(stored(ids[1]).await, None);
+    }
+
     /// Chat turns leave the list; the run a chat LAUNCHED stays, carrying the conversation it came
     /// from — tagged by `tag_launching_chat` from the speaking turn's `RUN_ID_HEADER`. A header that
     /// names a run which is not a turn tags nothing (decision of 2026-10-11).
@@ -12148,6 +12198,8 @@ tests:
             cache_read_tokens: Some(20_000),
             num_turns: Some(3),
             context_fill: None,
+            initial_context: None,
+            tools_given: None,
             steerable: false,
             successor_run_id: None,
             chat_id: None,
