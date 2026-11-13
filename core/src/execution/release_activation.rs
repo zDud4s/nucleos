@@ -580,6 +580,7 @@ mod tests {
             .await
             .expect("every precondition holds");
 
+        #[allow(clippy::type_complexity)]
         let row: (
             String,
             Option<String>,
