@@ -1513,11 +1513,10 @@ mod tests {
         assert_eq!(drawn, "team NucleOS · never ran");
     }
 
-    /// O que nao foi medido escreve-se `—`, nunca `0`.
+    /// What was not measured is written `—`, never `0`.
     ///
-    /// Um pico ausente e um ajuste que se recusou a existir sao as duas coisas que um desenho
-    /// descuidado transforma em zeros -- e um zero aqui e uma afirmacao sobre uma janela que
-    /// ninguem mediu.
+    /// A missing peak and a fit that refused to exist are the two things a careless drawing turns
+    /// into zeros -- and a zero here is a claim about a window nobody measured.
     #[test]
     fn what_was_not_measured_is_drawn_as_a_dash_and_never_as_a_zero() {
         let drawn = render_pressure(&serde_json::json!({
@@ -1541,23 +1540,23 @@ mod tests {
             }],
         }));
 
-        assert!(drawn.contains("job job-1"), "o job aparece: {drawn}");
-        let row = drawn.lines().last().expect("a linha do rollup");
-        assert!(row.contains("Nucleo"), "o agente aparece: {row}");
-        // Os dois picos, as tres colunas do ajuste que nao existe, e o veredicto que nao ha. As
-        // contagens que valem zero -- `comp`, `sem run` -- ficam a zero de proposito: essas foram
-        // medidas.
+        assert!(drawn.contains("job job-1"), "the job appears: {drawn}");
+        let row = drawn.lines().last().expect("the rollup row");
+        assert!(row.contains("Nucleo"), "the agent appears: {row}");
+        // The two peaks, the three columns of the fit that does not exist, and the verdict that is
+        // absent. The counts that are zero -- `comp`, `sem run` -- stay zero on purpose: those
+        // were measured.
         assert_eq!(
             row.matches('—').count(),
             6,
-            "cada celula por medir sai como travessao: {row}"
+            "every unmeasured cell is drawn as a dash: {row}"
         );
     }
 
-    /// Um ajuste que existe desenha-se com o R2 ao lado.
+    /// A fit that exists is drawn with its R2 beside it.
     ///
-    /// O R2 nao e decoracao: com uma variavel e tarefas heterogeneas isto e diagnostico
-    /// populacional, e um arranque sem ele le-se com uma confianca que nao tem.
+    /// The R2 is not decoration: with one variable and heterogeneous tasks this is population
+    /// diagnostics, and an intercept without it is read with a confidence it does not have.
     #[test]
     fn a_fit_that_exists_is_drawn_with_its_r2_beside_it() {
         let drawn = render_pressure(&serde_json::json!({
@@ -1581,11 +1580,11 @@ mod tests {
             }],
         }));
 
-        assert!(drawn.contains("50000"), "o arranque: {drawn}");
-        assert!(drawn.contains("0.87"), "o R2: {drawn}");
+        assert!(drawn.contains("50000"), "the intercept: {drawn}");
+        assert!(drawn.contains("0.87"), "the R2: {drawn}");
         assert!(
             drawn.contains("split_speciality, trim_prompt"),
-            "os dois veredictos, e nao so o primeiro: {drawn}"
+            "both verdicts, not just the first: {drawn}"
         );
     }
 
