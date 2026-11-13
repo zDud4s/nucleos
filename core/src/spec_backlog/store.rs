@@ -852,6 +852,8 @@ struct DecisionRow {
     answer: Option<String>,
     status: String,
     at: String,
+    answered_at: Option<String>,
+    obsolete_reason: Option<String>,
 }
 
 /// The owner's single list: every spec question not closed and, when the tree-job `decisions` table
@@ -899,6 +901,7 @@ pub async fn list_owner_decisions_by_status(
             kind: "decision".to_owned(),
             tree_id: None,
             node_id: None,
+            obsolete_reason: None,
         })
         .collect();
 
@@ -911,8 +914,8 @@ pub async fn list_owner_decisions_by_status(
         let decisions: Vec<DecisionRow> = match status {
             Some(status) => {
                 sqlx::query_as(
-                    "SELECT id, tree_id, node_id, question, answer, status, at FROM decisions \
-                     WHERE status = ?",
+                    "SELECT id, tree_id, node_id, question, answer, status, at, answered_at, \
+                     obsolete_reason FROM decisions WHERE status = ?",
                 )
                 .bind(status)
                 .fetch_all(pool)
@@ -920,7 +923,8 @@ pub async fn list_owner_decisions_by_status(
             }
             None => {
                 sqlx::query_as(
-                    "SELECT id, tree_id, node_id, question, answer, status, at FROM decisions",
+                    "SELECT id, tree_id, node_id, question, answer, status, at, answered_at, \
+                     obsolete_reason FROM decisions",
                 )
                 .fetch_all(pool)
                 .await?
@@ -945,7 +949,8 @@ pub async fn list_owner_decisions_by_status(
                 status: row.status,
                 at: row.at.clone(),
                 created_at: row.at,
-                answered_at: None,
+                answered_at: row.answered_at,
+                obsolete_reason: row.obsolete_reason,
             }
         }));
     }
@@ -1047,7 +1052,7 @@ mod tests {
             pool,
             "CREATE TABLE decisions (id TEXT PRIMARY KEY, tree_id TEXT, node_id TEXT, \
              question TEXT NOT NULL, answer TEXT, origin TEXT, at TEXT NOT NULL, \
-             status TEXT NOT NULL)",
+             status TEXT NOT NULL, answered_at TEXT, obsolete_reason TEXT)",
             &[],
         )
         .await;
@@ -1744,6 +1749,72 @@ mod tests {
         // No filter: unchanged, the answered rows are still there.
         let all = list_owner_decisions(&pool).await.unwrap();
         assert_eq!(all.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn listing_exposes_answered_at_and_obsolete_reason_of_tree_decisions() {
+        let pool = crate::testdb::fresh_pool().await;
+        recreate_decisions(&pool).await;
+        seed_tree_decision(&pool, "d-open", "Open?", None).await;
+        seed_tree_decision(&pool, "d-stale", "Stale?", None).await;
+        seed_tree_decision(&pool, "d-done", "Done?", Some("yes")).await;
+        exec(
+            &pool,
+            "UPDATE decisions SET answered_at = '2026-10-30T10:00:00+00:00' WHERE id = 'd-done'",
+            &[],
+        )
+        .await;
+        assert!(
+            crate::tree_job::decisions::mark_obsolete(&pool, "d-stale", "tree finished")
+                .await
+                .unwrap()
+        );
+
+        let open = list_owner_decisions_by_status(&pool, Some("open"))
+            .await
+            .unwrap();
+        assert_eq!(
+            open.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["d-open"]
+        );
+        assert_eq!(open[0].obsolete_reason, None);
+
+        let obsolete = list_owner_decisions_by_status(&pool, Some("obsolete"))
+            .await
+            .unwrap();
+        assert_eq!(obsolete.len(), 1);
+        assert_eq!(obsolete[0].id, "d-stale");
+        assert_eq!(obsolete[0].status, "obsolete");
+        assert_eq!(
+            obsolete[0].obsolete_reason.as_deref(),
+            Some("tree finished")
+        );
+
+        let answered = list_owner_decisions_by_status(&pool, Some("answered"))
+            .await
+            .unwrap();
+        assert_eq!(answered.len(), 1);
+        assert_eq!(
+            answered[0].answered_at.as_deref(),
+            Some("2026-10-30T10:00:00+00:00")
+        );
+    }
+
+    #[tokio::test]
+    async fn answering_through_the_store_fills_answered_at_in_the_listing() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_tree_decision(&pool, "d-1", "Q?", None).await;
+
+        crate::tree_job::decisions::answer(&pool, "d-1", "yes", "owner")
+            .await
+            .unwrap();
+
+        let rows = list_owner_decisions_by_status(&pool, Some("answered"))
+            .await
+            .unwrap();
+        let row = rows.iter().find(|row| row.id == "d-1").unwrap();
+        let at = row.answered_at.as_deref().expect("answered_at set");
+        assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok());
     }
 
     #[tokio::test]

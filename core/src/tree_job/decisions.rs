@@ -22,6 +22,8 @@ use super::store::{self, StoreError};
 
 pub const STATUS_OPEN: &str = "open";
 pub const STATUS_ANSWERED: &str = "answered";
+/// A question closed without an answer because it no longer applies; see `mark_obsolete`.
+pub const STATUS_OBSOLETE: &str = "obsolete";
 /// The `origin` of a row until somebody answers it, when the answering channel takes over.
 pub const ORIGIN_AGENT: &str = "agent";
 
@@ -481,11 +483,12 @@ pub async fn answer(
     // Nothing below may ask the pool for a connection while `tx` holds one.
     let mut tx = pool.begin().await?;
     let claimed = sqlx::query(
-        "UPDATE decisions SET answer = ?, origin = ?, at = ?, status = ?
+        "UPDATE decisions SET answer = ?, origin = ?, at = ?, answered_at = ?, status = ?
          WHERE id = ? AND status = ?",
     )
     .bind(text)
     .bind(origin)
+    .bind(&at)
     .bind(&at)
     .bind(STATUS_ANSWERED)
     .bind(decision_id)
@@ -509,6 +512,22 @@ pub async fn answer(
     decision.at = at;
     decision.status = STATUS_ANSWERED.to_owned();
     Ok(decision)
+}
+
+/// Closes an `open` decision as `obsolete`, recording why. Returns whether a row changed: only an
+/// open row ever does, so a repeat call, an answered row or an unknown id is `false`. Never deletes
+/// and never touches an answer.
+pub async fn mark_obsolete(pool: &SqlitePool, id: &str, reason: &str) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE decisions SET status = ?, obsolete_reason = ? WHERE id = ? AND status = ?",
+    )
+    .bind(STATUS_OBSOLETE)
+    .bind(reason)
+    .bind(id)
+    .bind(STATUS_OPEN)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// The manifest to write once `decision` is answered, or `None` when no branch waits on it.
@@ -817,6 +836,9 @@ mod tests {
             ("default_action", 0, 0),
             ("default_due", 0, 0),
             ("default_evidence", 0, 0),
+            // Migration 0305: when it was answered, and why it went obsolete.
+            ("answered_at", 0, 0),
+            ("obsolete_reason", 0, 0),
         ]
         .into_iter()
         .map(|(name, not_null, pk)| (name.to_owned(), "TEXT".to_owned(), not_null, pk))
@@ -1018,6 +1040,92 @@ mod tests {
         );
         assert!(instant(&answered.at) > instant(OLD), "{}", answered.at);
         assert_eq!(stored(&pool, &parked.id).await, answered);
+    }
+
+    #[tokio::test]
+    async fn answer_sets_answered_at_as_rfc3339() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT answered_at FROM decisions WHERE id = ?")
+                .bind(&parked.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, None);
+
+        let answered = answer(&pool, &parked.id, ANSWER, CHANNEL).await.unwrap();
+
+        let stored_at: Option<String> =
+            sqlx::query_scalar("SELECT answered_at FROM decisions WHERE id = ?")
+                .bind(&parked.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let stored_at = stored_at.expect("answered_at must be set");
+        assert!(chrono::DateTime::parse_from_rfc3339(&stored_at).is_ok());
+        assert_eq!(stored_at, answered.at);
+    }
+
+    #[tokio::test]
+    async fn answer_by_auto_default_origin_sets_answered_at() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+
+        answer(&pool, &parked.id, ANSWER, "auto_default")
+            .await
+            .unwrap();
+
+        let stored_at: Option<String> =
+            sqlx::query_scalar("SELECT answered_at FROM decisions WHERE id = ?")
+                .bind(&parked.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&stored_at.unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn mark_obsolete_closes_only_open_rows_and_is_idempotent() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+
+        assert!(mark_obsolete(&pool, &parked.id, "tree gone").await.unwrap());
+        assert!(!mark_obsolete(&pool, &parked.id, "other").await.unwrap());
+        assert!(!mark_obsolete(&pool, "no-such-id", "x").await.unwrap());
+
+        let (status, reason, answer): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, obsolete_reason, answer FROM decisions WHERE id = ?")
+                .bind(&parked.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, STATUS_OBSOLETE);
+        assert_eq!(status, "obsolete");
+        assert_eq!(reason.as_deref(), Some("tree gone"));
+        assert_eq!(answer, None);
+    }
+
+    #[tokio::test]
+    async fn mark_obsolete_never_touches_an_answered_row() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+        answer(&pool, &parked.id, ANSWER, CHANNEL).await.unwrap();
+
+        assert!(!mark_obsolete(&pool, &parked.id, "late").await.unwrap());
+
+        let (status, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, obsolete_reason FROM decisions WHERE id = ?")
+                .bind(&parked.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, STATUS_ANSWERED);
+        assert_eq!(reason, None);
     }
 
     #[tokio::test]
