@@ -302,9 +302,9 @@ pub(super) async fn git(root: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// The pattern of the report files a tree node writes in its worktree (`.nucleos-report.md`, and the
-/// root's `.nucleos-root-report.md`). A node may only write inside its worktree, so the files cannot
-/// live elsewhere; they are kept out of git instead, or `checkpoint` (`git add -A`) would commit
-/// them and a node with no other work would look like it has a diff.
+/// root's `.nucleos-root-report.md`). These are the fallback location, used when the node has no
+/// state dir to write its report to; they are kept out of git, or `checkpoint` (`git add -A`) would
+/// commit them and a node with no other work would look like it has a diff.
 const REPORT_EXCLUDE: &str = "/.nucleos-*report.md";
 
 /// Everything a tree worktree holds that is the daemon's and not the branch's, so `checkpoint`

@@ -149,6 +149,46 @@ pub(super) async fn wind_down_decision(
     )
 }
 
+/// Whether `tool` is a Write/Edit whose target is exactly `own_report`. An exact path match: no
+/// other file under the state dir, and no other node's report, passes. Reuses `allowed_for_node`
+/// for the path comparison (it reads the `Write` spelling of the input).
+fn writes_own_report(tool: &str, input: &Value, kind: &str, own_report: Option<&Path>) -> bool {
+    matches!(tool, "Write" | "Edit") && allowed_for_node("Write", input, kind, own_report)
+}
+
+/// Lets a tree node write its own handoff report, at any context fill. The report lives in the
+/// project's state dir, outside the worktree, where the classifier refuses a write outside the cwd
+/// and the node scope fence knows nothing of it. `None` for any other tool, a run without a node,
+/// and any other path: those fall through to the rules that follow.
+pub(super) async fn own_report_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    run_id: i64,
+) -> Option<Json<Decision>> {
+    if !matches!(payload.tool_name.as_str(), "Write" | "Edit") {
+        return None;
+    }
+    let node = node_verdict(state, run_id).await?;
+    let own_report = state
+        .machine_config_root
+        .as_deref()
+        .zip(node.project_id.as_deref())
+        .and_then(|(root, project)| crate::project::state::dir(root, project))
+        .map(|dir| handoff_path(&dir, &node.root_id, &node.node_id));
+    writes_own_report(
+        &payload.tool_name,
+        &payload.tool_input,
+        &node.kind,
+        own_report.as_deref(),
+    )
+    .then(|| {
+        Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "a node may write its own handoff report".to_owned(),
+        })
+    })
+}
+
 /// Restricts a docs branch to declared writes and shell actions that alter its checkout. This is
 /// before the classifier so a refusal is immediate rather than an approval a tree run cannot answer.
 pub(super) async fn docs_write_decision(
@@ -675,6 +715,52 @@ mod tests {
             agent_type: None,
             subagent: false,
         }
+    }
+
+    #[test]
+    fn a_node_may_write_only_its_own_report() {
+        let state_dir = Path::new("/state/projects/p1");
+        let own = handoff_path(state_dir, "root-1", "node-a");
+        let input = |path: &Path| serde_json::json!({"file_path": path.to_string_lossy()});
+
+        for kind in ["leaf", "orchestrator"] {
+            for tool in ["Write", "Edit"] {
+                assert!(
+                    writes_own_report(tool, &input(&own), kind, Some(&own)),
+                    "{kind} {tool} must reach its own report"
+                );
+            }
+        }
+        // Another node's report, under the same root or another.
+        for other in [
+            handoff_path(state_dir, "root-1", "node-b"),
+            handoff_path(state_dir, "root-2", "node-a"),
+        ] {
+            assert!(!writes_own_report(
+                "Write",
+                &input(&other),
+                "leaf",
+                Some(&own)
+            ));
+        }
+        // A sibling file in the same directory, and a traversal back to the report.
+        let sibling = own.with_file_name("notes.md");
+        assert!(!writes_own_report(
+            "Write",
+            &input(&sibling),
+            "leaf",
+            Some(&own)
+        ));
+        let dotdot = state_dir.join("nodes/root-1/x/../node-a.md");
+        assert!(!writes_own_report(
+            "Write",
+            &input(&dotdot),
+            "leaf",
+            Some(&own)
+        ));
+        // Any other tool, and a node whose state dir is unknown.
+        assert!(!writes_own_report("Read", &input(&own), "leaf", Some(&own)));
+        assert!(!writes_own_report("Write", &input(&own), "leaf", None));
     }
 
     #[test]

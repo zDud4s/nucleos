@@ -46,8 +46,8 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
    stop opening children: write your handoff file, `node_close` with status `handoff`.
 10. **Close.** `node_close` with `status` (`done`, `blocked`, `handoff`, `failed`), `summary`
     (at most 1500 characters: what landed, what is open, decisions) and `handoff_path`. The
-    handoff file is the path your prompt names (in a daemon-run node, `.nucleos-report.md` in
-    your worktree), shaped by `packets/handoff.md`: the one handoff format. For the root's
+    handoff file is the path your prompt names (normally
+    `<state_dir>/nodes/<root_id>/<node_id>.md`), shaped by `packets/handoff.md`: the one handoff format. For the root's
     verification, list the test and build commands for your branch under `## Commands for the
     root`, the one validation field the `node_close` parser accepts; do not run them.
 
