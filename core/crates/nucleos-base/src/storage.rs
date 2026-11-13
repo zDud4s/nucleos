@@ -1,4 +1,6 @@
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use std::path::Path;
 
 /// The daemon's schema, embedded once. Every caller — `open` below, `testdb` and the tests that
@@ -108,6 +110,9 @@ fn connect_options(db_path: &Path, busy_timeout: std::time::Duration) -> SqliteC
         .filename(db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        // In WAL mode NORMAL skips the fsync on every commit (only checkpoints sync); a power cut
+        // can lose the last commits but never corrupts the database. FULL cost an fsync per write.
+        .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(busy_timeout)
         // SQLite disables foreign keys per connection unless asked. The schema declares them
         // (`worktrees.run_id`, `action_grants.proposal_id`, ...), so without this they were
@@ -491,6 +496,24 @@ mod tests {
             .fetch_one(&background)
             .await
             .unwrap();
+        background.close().await;
+        shared.close().await;
+    }
+
+    #[tokio::test]
+    async fn pools_use_synchronous_normal() {
+        const NORMAL: i64 = 1;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let shared = open(&path).await.unwrap();
+        let background = open_background(&path).await.unwrap();
+        for pool in [&shared, &background] {
+            let (level,): (i64,) = sqlx::query_as("PRAGMA synchronous")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(level, NORMAL);
+        }
         background.close().await;
         shared.close().await;
     }
