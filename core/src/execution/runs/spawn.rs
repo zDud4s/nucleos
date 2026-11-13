@@ -930,14 +930,24 @@ pub(super) fn spawn_run(
                                 .await;
                             }
                             Some(crate::gate::GateOutcome::Errored { reason }) => {
-                                let _ = crate::feed::append(
-                                    &pool,
-                                    feed_project_id.as_deref(),
+                                // A gate that could not read its ticket for a locked database or
+                                // an exhausted pool measured nothing: held, not a danger line.
+                                let kind = super::transient::feed_kind_for(
                                     "worktree_gate_failed",
-                                    &format!("worktree gate errored: {reason}"),
-                                    Some(id),
-                                    Some(&crate::feed::run_subject(&pool, id).await),
-                                )
+                                    &reason,
+                                );
+                                let summary = format!("worktree gate errored: {reason}");
+                                let subject = crate::feed::run_subject(&pool, id).await;
+                                let _ = super::transient::retry_transient(|| {
+                                    crate::feed::append(
+                                        &pool,
+                                        feed_project_id.as_deref(),
+                                        kind,
+                                        &summary,
+                                        Some(id),
+                                        Some(&subject),
+                                    )
+                                })
                                 .await;
                             }
                             Some(crate::gate::GateOutcome::Passed) | None => {
@@ -1337,22 +1347,34 @@ pub(super) async fn fail_provisioning(
     project_id: Option<&str>,
     summary: &str,
 ) {
-    let failed = sqlx::query(
-        "UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
-    )
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(id)
-    .execute(&state.pool)
+    use super::transient::{feed_kind_for, retry_transient};
+    let completed_at = chrono::Utc::now().to_rfc3339();
+    // A burst of writers ("database is locked", "pool timed out") is ridden out with a short retry;
+    // both statements are safe to repeat (compare-and-set, and an append that never landed).
+    let failed = retry_transient(|| {
+        sqlx::query(
+            "UPDATE runs SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
+        )
+        .bind(&completed_at)
+        .bind(id)
+        .execute(&state.pool)
+    })
     .await;
     warn_on_terminal_write_err(&failed, id, "failed");
-    let _ = crate::feed::append(
-        &state.pool,
-        project_id,
-        "worktree_provision_failed",
-        summary,
-        Some(id),
-        Some(&crate::feed::run_subject(&state.pool, id).await),
-    )
+    let subject = crate::feed::run_subject(&state.pool, id).await;
+    // Still locked after the retries: that is the database being busy, not the worktree being
+    // impossible, so it goes out as the held kind rather than a danger line.
+    let kind = feed_kind_for("worktree_provision_failed", summary);
+    let _ = retry_transient(|| {
+        crate::feed::append(
+            &state.pool,
+            project_id,
+            kind,
+            summary,
+            Some(id),
+            Some(&subject),
+        )
+    })
     .await;
 }
 
