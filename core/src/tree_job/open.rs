@@ -861,8 +861,8 @@ pub async fn bind_branch(
 // The stored launches and the relaunches built on them live in `relaunch`; they are re-exported here
 // because this is where callers have always imported them from.
 pub use super::relaunch::{
-    Answered, Relaunched, StoredLaunch, answer_and_relaunch, latest_launch, relaunch_resumed,
-    save_launch, stored_launch,
+    Answered, Relaunched, StoredLaunch, answer_and_relaunch, answer_and_relaunch_widening,
+    latest_launch, relaunch_resumed, save_launch, stored_launch,
 };
 pub(super) use super::relaunch::{
     DIED_PREFIX, FIX_PREFIX, WRAP_PREFIX, relaunch_node, run_is_live,

@@ -71,3 +71,57 @@ describe("OwnerDecisionsInbox", () => {
     await waitFor(() => expect(screen.queryByTestId("owner-decision-d1")).toBeNull());
   });
 });
+
+const FENCE_Q =
+  "Branch b1 changed files outside its declared paths [core/src/**]: shell/src/a.tsx, shell/src/b.ts. Move that change to the branch that owns those paths, or have the parent widen this branch's paths.";
+
+describe("OwnerDecisionsInbox - fence park", () => {
+  function withFence() {
+    const rows = [
+      { ...open[0], id: "f1", question: FENCE_Q },
+      open[0],
+    ];
+    apiFetch.mockImplementation(async (_path: string, init?: RequestInit) =>
+      init?.method === "POST" ? undefined : rows,
+    );
+  }
+
+  it("shows Widen paths only on a fence-park decision", async () => {
+    withFence();
+    renderInbox();
+    fireEvent.click(await screen.findByRole("button", { name: /decisions/i }));
+    const fence = await screen.findByTestId("owner-decision-f1");
+    expect(within(fence).queryByRole("button", { name: "Widen paths" })).not.toBeNull();
+    const plain = screen.getByTestId("owner-decision-d1");
+    expect(within(plain).queryByRole("button", { name: "Widen paths" })).toBeNull();
+  });
+
+  it("sends exactly the listed files", async () => {
+    withFence();
+    renderInbox();
+    fireEvent.click(await screen.findByRole("button", { name: /decisions/i }));
+    const fence = await screen.findByTestId("owner-decision-f1");
+    fireEvent.click(within(fence).getByRole("button", { name: "Widen paths" }));
+    await waitFor(() =>
+      expect(apiFetch).toHaveBeenCalledWith("/decisions/f1", {
+        method: "POST",
+        body: JSON.stringify({ answer: "widen", widen_paths: ["shell/src/a.tsx", "shell/src/b.ts"] }),
+      }),
+    );
+  });
+
+  it("still sends a free-text answer without widen_paths", async () => {
+    withFence();
+    renderInbox();
+    fireEvent.click(await screen.findByRole("button", { name: /decisions/i }));
+    const fence = await screen.findByTestId("owner-decision-f1");
+    fireEvent.change(within(fence).getByRole("textbox"), { target: { value: "moved it" } });
+    fireEvent.click(within(fence).getByRole("button", { name: /send/i }));
+    await waitFor(() =>
+      expect(apiFetch).toHaveBeenCalledWith("/decisions/f1", {
+        method: "POST",
+        body: JSON.stringify({ answer: "moved it" }),
+      }),
+    );
+  });
+});
