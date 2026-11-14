@@ -463,8 +463,13 @@ async fn post_tree(
             "tree job {} is open but its root run did not start: {reason}",
             job.id
         );
-        let _ =
-            crate::feed::append(&state.pool, None, ROOT_START_FAILED_KIND, &line, None, None).await;
+        // A locked database or an exhausted pool is not a root run that cannot start: held kind.
+        let kind =
+            crate::execution::runs::transient::feed_kind_for(ROOT_START_FAILED_KIND, &reason);
+        let _ = crate::execution::runs::transient::retry_transient(|| {
+            crate::feed::append(&state.pool, None, kind, &line, None, None)
+        })
+        .await;
         // Reload so the answer carries the marker `root_pending::start` stored.
         let stored = store::load(&state.pool, &id).await.ok().flatten();
         return Ok(Json(summary(stored.as_ref().unwrap_or(&job), false)));

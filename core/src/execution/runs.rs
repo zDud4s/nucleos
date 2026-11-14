@@ -14,6 +14,7 @@ mod lifecycle;
 mod policy;
 mod resume;
 mod spawn;
+pub mod transient;
 pub(crate) mod verify_wake;
 
 pub use self::api::*;
@@ -1106,13 +1107,14 @@ pub mod tests {
         );
     }
 
-    /// A conflict whose worktree cannot be made counts an attempt but stays unclaimed, so the
-    /// resolver retries it while attempts remain: a transient failure (index.lock, a timeout) gets
-    /// another go. Request 513 in the field: its target `aut/integ` never existed, and with nothing
-    /// counted the resolver minted a failed run every minute; now it spends at most
-    /// `MAX_RESOLUTION_ATTEMPTS` and then goes to a person through the conflict ticket.
+    /// A conflict whose TARGET branch does not exist fails once and is settled, with every open
+    /// twin of it, so nothing retries. Request 513 in the field: its target `aut/integ` never
+    /// existed. The per-request attempt cap (`MAX_RESOLUTION_ATTEMPTS`) bounded only that one row,
+    /// and the same merge asked again arrived as a new row with fresh attempts: 39 identical
+    /// `worktree_provision_failed` lines in a day. A ref that is positively absent cannot appear
+    /// by retrying, so the request settles as `target-gone` instead of counting an attempt.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_conflict_whose_worktree_cannot_be_made_counts_an_attempt_and_stays_retryable() {
+    async fn a_conflict_whose_target_branch_is_missing_fails_once_and_settles_its_twins() {
         let _env_lock = crate::execution::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
@@ -1120,6 +1122,9 @@ pub mod tests {
         let (_container, repo) = init_contained_repo("nucleos-runs-resolve-no-target-");
         let state = test_state().await;
         let request = escalated_merge(&state.pool, &repo).await;
+        // The same merge asked again: a fresh row, which used to bring fresh attempts.
+        let twin = escalated_merge(&state.pool, &repo).await;
+        assert_ne!(request, twin, "the same merge is admitted as a new row");
 
         let refused = create_resolution_run(
             &state,
@@ -1142,17 +1147,26 @@ pub mod tests {
         assert_eq!(
             resolution_run_id_of(&state.pool, request).await,
             None,
-            "the row stays unclaimed so the resolver can retry it"
+            "no resolution run owns the row: its tree was never born"
         );
-        let (attempts,): (i64,) =
-            sqlx::query_as("SELECT resolution_attempts FROM vcs_requests WHERE id = ?")
-                .bind(request)
+        for id in [request, twin] {
+            let (reason,): (Option<String>,) = sqlx::query_as(
+                "SELECT settled_reason FROM vcs_requests WHERE id = ? AND settled_at IS NOT NULL",
+            )
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .expect("a missing target settles the request and its twin");
+            assert_eq!(reason.as_deref(), Some("target-gone"));
+        }
+        let (failures,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM feed WHERE kind = 'worktree_provision_failed'")
                 .fetch_one(&state.pool)
                 .await
-                .expect("read the attempts back");
+                .expect("count the provisioning failures");
         assert_eq!(
-            attempts, 1,
-            "the failure counts toward the cap, so a permanent one cannot retry for ever"
+            failures, 1,
+            "the missing branch fails once, not once per request"
         );
     }
 
