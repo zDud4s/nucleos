@@ -129,7 +129,10 @@ def ask(payload, answer, delay=0.0):
     try:
         with mock.patch.dict(os.environ, {"NUCLEOS_DAEMON_URL": server.url}), \
                 mock.patch.object(hook, "read_control_token", return_value=("tok", None)):
-            return hook.agent_model_decision(payload), server.seen
+            began = time.monotonic()
+            decision = hook.agent_model_decision(payload)
+            ask.elapsed = time.monotonic() - began  # before close(): shutdown waits out a slow handler
+            return decision, server.seen
     finally:
         server.close()
 
@@ -161,9 +164,8 @@ def test_a_non_alias_answer_is_ignored():
 
 
 def test_a_slow_or_dead_daemon_fails_open_within_the_ceiling():
-    start = time.monotonic()
     result, _ = ask(spawn(), {"model": "haiku"}, delay=4.0)
-    assert result is None and time.monotonic() - start < 2.5
+    assert result is None and ask.elapsed < 2.5, ask.elapsed
     with mock.patch.dict(os.environ, {"NUCLEOS_DAEMON_URL": "http://127.0.0.1:1"}), \
             mock.patch.object(hook, "read_control_token", return_value=("tok", None)):
         assert hook.agent_model_decision(spawn()) is None
