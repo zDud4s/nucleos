@@ -1265,9 +1265,10 @@ mod tests {
     fn a_task_whose_command_is_not_the_exe_is_not_registered() {
         let exe = Path::new(r"C:\x\nucleos-core.exe");
         let genuine = task_xml(exe);
+        // The exe stays in the document (as a comment), only the action's command changes.
         let forged = genuine.replace(
             r"<Command>C:\x\nucleos-core.exe</Command>",
-            r"<Command>C:\Windows\System32\cmd.exe</Command>",
+            r"<Command>C:\Windows\System32\cmd.exe</Command><!-- C:\x\nucleos-core.exe -->",
         );
         assert_ne!(
             forged, genuine,
