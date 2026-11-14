@@ -302,6 +302,7 @@ pub(super) async fn pause_for_approval(
     tool_name: String,
     tool_input: String,
     reason: String,
+    park: crate::proposals::ParkContext,
 ) {
     // Active termination (spec §8.4 steps 2–3): drive the run to `awaiting_approval` via the same
     // atomic-handle-removal arbiter cancellation uses (`finalize_termination`, Chunk 2 Task 4).
@@ -376,7 +377,7 @@ pub(super) async fn pause_for_approval(
         return;
     }
 
-    let recorded = crate::proposals::create_action_approval(
+    let recorded = crate::proposals::create_action_approval_with_context(
         &state.pool,
         run_id,
         session_id.as_deref(),
@@ -384,6 +385,7 @@ pub(super) async fn pause_for_approval(
         &tool_name,
         &reason,
         Some(&tool_input),
+        &park,
     )
     .await;
 
@@ -542,6 +544,7 @@ mod wake_tests {
             "Bash".to_string(),
             "{}".to_string(),
             "wake test".to_string(),
+            crate::proposals::ParkContext::default(),
         )
         .await;
 

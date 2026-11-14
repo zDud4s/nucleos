@@ -30,8 +30,8 @@ pub struct Proposal {
     pub read_from: Option<String>,
     pub created_at: String,
     pub decided_at: Option<String>,
-    /// Joined in only by `list_skipped_items`; `None` elsewhere means that query did not ask.
-    /// There, `None` means the run or item can no longer be resolved because runs are pruned.
+    /// Joined in by `list_skipped_items` and `list_pending`; `None` elsewhere means that query did
+    /// not ask. Where it is asked, `None` means the run is not a job's, or the run or item can no longer be resolved because runs are pruned.
     pub job_id: Option<i64>,
     pub run_stage: Option<String>,
     pub item_ordinal: Option<i64>,
@@ -69,6 +69,42 @@ pub struct Proposal {
     pub job_low_task: Option<String>,
     #[sqlx(default)]
     pub job_high_task: Option<String>,
+    /// What the classifier said when it parked the line, as `pause_for_approval` stored it. `None`
+    /// on a row written before migration 0305, and from every query but `list_pending`.
+    #[sqlx(default)]
+    pub action_class: Option<String>,
+    #[sqlx(default)]
+    pub culprit_segment: Option<String>,
+    #[sqlx(default)]
+    pub culprit_reason: Option<String>,
+    /// The stored JSON text; `segments` is the same thing parsed, and is what is served.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub segments_json: Option<String>,
+    #[sqlx(skip)]
+    pub segments: Option<Vec<String>>,
+    /// Where the asking run works, as `list_pending` joins it. All `None` for a pruned run.
+    #[sqlx(default)]
+    pub run_mode: Option<String>,
+    #[sqlx(default)]
+    pub run_title: Option<String>,
+    #[sqlx(default)]
+    pub node_id: Option<String>,
+    #[sqlx(default)]
+    pub branch: Option<String>,
+    #[sqlx(default)]
+    pub worktree_path: Option<String>,
+    #[sqlx(default)]
+    pub project_target: Option<String>,
+}
+
+/// What the classifier concluded about a parked action, to be stored beside the proposal.
+#[derive(Debug, Clone, Default)]
+pub struct ParkContext {
+    pub action_class: Option<String>,
+    pub culprit_segment: Option<String>,
+    pub culprit_reason: Option<String>,
+    pub segments: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -93,12 +129,44 @@ pub async fn create_action_approval(
     reasoning: &str,
     tool_input: Option<&str>,
 ) -> sqlx::Result<i64> {
+    create_action_approval_with_context(
+        pool,
+        run_id,
+        session_id,
+        project_id,
+        tool_name,
+        reasoning,
+        tool_input,
+        &ParkContext::default(),
+    )
+    .await
+}
+
+/// `create_action_approval` that also stores what the classifier said. An empty split is stored as
+/// `NULL`, not `[]`, so "no split" and "not recorded" read the same.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_action_approval_with_context(
+    pool: &SqlitePool,
+    run_id: i64,
+    session_id: Option<&str>,
+    project_id: Option<&str>,
+    tool_name: &str,
+    reasoning: &str,
+    tool_input: Option<&str>,
+    park: &ParkContext,
+) -> sqlx::Result<i64> {
     let now = chrono::Utc::now().to_rfc3339();
+    let segments_json = if park.segments.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&park.segments).ok()
+    };
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         "INSERT INTO proposals
-         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
-         VALUES ('action-approval', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL)",
+         (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at,
+          decided_at, action_class, culprit_segment, culprit_reason, segments_json)
+         VALUES ('action-approval', 'pending', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
     )
     .bind(run_id)
     .bind(session_id)
@@ -107,6 +175,10 @@ pub async fn create_action_approval(
     .bind(reasoning)
     .bind(tool_input)
     .bind(&now)
+    .bind(&park.action_class)
+    .bind(&park.culprit_segment)
+    .bind(&park.culprit_reason)
+    .bind(&segments_json)
     .execute(&mut *transaction)
     .await?;
     let proposal_id = result.last_insert_rowid();
@@ -802,12 +874,41 @@ pub async fn count_pending(pool: &SqlitePool) -> sqlx::Result<usize> {
 }
 
 pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    let mut rows = list_pending_rows(pool).await?;
+    for row in &mut rows {
+        row.segments = row
+            .segments_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok());
+    }
+    Ok(rows)
+}
+
+/// The worktree a run works in: its own, else its node's, else its job's, whichever is still live.
+const LIVE_WORKTREE: &str = "SELECT {col} FROM worktrees w
+         WHERE w.removed_at IS NULL
+           AND ((w.owner_kind = 'run' AND w.owner_id = r.id)
+             OR (w.owner_kind = 'item' AND w.owner_id = r.item_id)
+             OR (w.owner_kind = 'job' AND w.owner_id = r.job_id))
+         ORDER BY CASE w.owner_kind WHEN 'run' THEN 0 WHEN 'item' THEN 1 ELSE 2 END LIMIT 1";
+
+async fn list_pending_rows(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
+    let worktree_path = LIVE_WORKTREE.replace("{col}", "w.path");
+    let worktree_branch = LIVE_WORKTREE.replace("{col}", "w.branch");
+    let worktree_root = LIVE_WORKTREE.replace("{col}", "w.project_root");
     sqlx::query_as::<_, Proposal>(sqlx::AssertSqlSafe(format!(
         // LEFT so a pruned run still lists. The prompt is cut to its opening, which is where a
         // task says what it is; the steps are the last few, each detail cut to a line or two.
         "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
                 p.reasoning, p.tool_input, p.read_from, p.created_at, p.decided_at,
-                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description,
+                r.job_id AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description,
+                p.action_class, p.culprit_segment, p.culprit_reason, p.segments_json,
+                r.mode AS run_mode,
+                COALESCE(n.description, substr(r.prompt, 1, 120)) AS run_title,
+                n.node_id AS node_id,
+                ({worktree_branch}) AS branch,
+                ({worktree_path}) AS worktree_path,
+                COALESCE(j.project_root, ({worktree_root})) AS project_target,
                 r.status AS run_status, r.cwd AS run_cwd, substr(r.prompt, 1, 600) AS run_prompt,
                 CASE WHEN json_valid(r.tools_used) THEN (
                     SELECT json_group_array(json_object(
@@ -820,6 +921,8 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
                 ) END AS run_recent
          FROM proposals p
          LEFT JOIN runs r ON r.id = p.run_id
+         LEFT JOIN job_nodes n ON n.id = r.item_id
+         LEFT JOIN jobs j ON j.id = r.job_id
          WHERE {PENDING_APPROVAL_WHERE}
          ORDER BY p.id ASC"
     )))
@@ -1667,6 +1770,108 @@ mod tests {
 
     /// An approval is decided on what the action is for, so the queue carries the run behind it:
     /// its state, its directory, how its prompt opens, and its last three steps in order.
+    #[tokio::test]
+    async fn a_parked_line_stores_its_culprit_and_lists_it_with_the_run_context() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (7, 'p', 'C:/repo', 'implementing', 3, '2026-11-12T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_nodes (id, job_id, node_id, ordinal, description, status)
+             VALUES (5, 7, 'implement', 1, 'wire the store', 'running')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, item_id)
+             VALUES ('p', 'do it', 'awaiting_approval', 'worktree', '2026-11-12T00:00:00Z', 7, 5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, created_at)
+             VALUES ('job', 7, 'p', 'C:/repo', 'C:/repo/.wt/job-7', 'job/7', '2026-11-12T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let park = ParkContext {
+            action_class: Some("git-push".into()),
+            culprit_segment: Some("git push origin main".into()),
+            culprit_reason: Some("pushes to a remote".into()),
+            segments: vec!["cargo fmt".into(), "git push origin main".into()],
+        };
+
+        create_action_approval_with_context(
+            &pool,
+            run_id,
+            Some("s"),
+            Some("p"),
+            "Bash",
+            "held",
+            None,
+            &park,
+        )
+        .await
+        .unwrap();
+
+        let listed = list_pending(&pool).await.unwrap();
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(json["action_class"], "git-push");
+        assert_eq!(json["culprit_segment"], "git push origin main");
+        assert_eq!(json["culprit_reason"], "pushes to a remote");
+        assert_eq!(
+            json["segments"],
+            serde_json::json!(["cargo fmt", "git push origin main"])
+        );
+        assert_eq!(json["run_mode"], "worktree");
+        assert_eq!(json["run_title"], "wire the store");
+        assert_eq!(json["job_id"], 7);
+        assert_eq!(json["node_id"], "implement");
+        assert_eq!(json["branch"], "job/7");
+        assert_eq!(json["worktree_path"], "C:/repo/.wt/job-7");
+        assert_eq!(json["project_target"], "C:/repo");
+        assert!(json.get("segments_json").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_old_row_lists_with_nulls_for_the_new_fields() {
+        let pool = test_pool().await;
+        let (run_id, _) = parked_run(&pool, "awaiting_approval").await;
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, run_id, tool_name, reasoning, created_at)
+             VALUES ('action-approval', 'pending', ?, 'Bash', 'old', '2026-09-01T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let listed = list_pending(&pool).await.unwrap();
+        let json = serde_json::to_value(&listed[0]).unwrap();
+
+        for field in [
+            "action_class",
+            "culprit_segment",
+            "culprit_reason",
+            "segments",
+            "job_id",
+            "node_id",
+            "branch",
+            "worktree_path",
+            "project_target",
+        ] {
+            assert!(json[field].is_null(), "{field} should be null: {json}");
+        }
+    }
+
     #[tokio::test]
     async fn the_approval_queue_says_what_the_run_was_doing() {
         let pool = test_pool().await;
