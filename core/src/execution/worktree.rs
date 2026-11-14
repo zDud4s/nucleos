@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod checkpoint_guard;
+mod checkpoint_message;
+use checkpoint_message::fallback_checkpoint_message;
+pub use checkpoint_message::{CheckpointContext, checkpoint_message, is_checkpoint_message};
 mod gc;
 mod registry;
 
@@ -1204,11 +1207,13 @@ pub async fn preserve_uncommitted(worktree_path: &Path, byte_ceiling: u64) -> io
 /// whole change exists to abolish. If a ceiling is ever wanted here it has to come with an answer to
 /// "and then what does the next item revert to", and today there is none.
 pub async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
-    checkpoint_with_message(worktree_path, "nucleos: checkpoint a gate agreed with").await
+    checkpoint_with_message(worktree_path, &fallback_checkpoint_message(true)).await
 }
 
-/// The subject of a checkpoint taken over an item no gate measured (`gate_after_each_item` off).
-pub const UNGATED_CHECKPOINT: &str = "nucleos: checkpoint an item no gate measured";
+/// [`checkpoint`] with a message that names the item (see [`checkpoint_message`]).
+pub async fn checkpoint_for(worktree_path: &Path, ctx: &CheckpointContext) -> io::Result<String> {
+    checkpoint_with_message(worktree_path, &checkpoint_message(ctx)).await
+}
 
 /// [`checkpoint`] with the commit subject chosen by the caller, so the history says whether a gate
 /// agreed with the commit or it only keeps an unmeasured item's work safe from a later revert.
@@ -1513,6 +1518,103 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
+
+    fn ckpt_ctx(title: &str, gated: bool) -> CheckpointContext {
+        CheckpointContext {
+            id: "42".to_string(),
+            title: title.to_string(),
+            run_id: Some(7),
+            tree_id: Some("tree-abc".to_string()),
+            gated,
+        }
+    }
+
+    #[test]
+    fn checkpoint_subject_names_the_item() {
+        let msg = checkpoint_message(&ckpt_ctx("add the parser", true));
+        assert_eq!(msg.lines().next().unwrap(), "nucleos(42): add the parser");
+    }
+
+    #[test]
+    fn checkpoint_subject_truncates_char_safe_on_one_line() {
+        let title = format!("first line\nsecond {}", "é".repeat(200));
+        let msg = checkpoint_message(&ckpt_ctx(&title, true));
+        let subject = msg.lines().next().unwrap();
+        assert!(!subject.contains('\n'));
+        assert!(subject.starts_with("nucleos(42): first line second"));
+        let title_part = subject.strip_prefix("nucleos(42): ").unwrap();
+        assert!(title_part.chars().count() <= 60, "{title_part}");
+        // Nothing was split mid-character: the string is valid and still ends in a whole `é`
+        // (or the ellipsis the cut adds).
+        assert!(title_part.ends_with('é') || title_part.ends_with('…'));
+    }
+
+    #[test]
+    fn checkpoint_body_carries_verdict_run_and_tree() {
+        let gated = checkpoint_message(&ckpt_ctx("t", true));
+        assert!(gated.contains("a gate agreed with this"), "{gated}");
+        assert!(gated.contains("Run: 7"), "{gated}");
+        assert!(gated.contains("tree-abc"), "{gated}");
+        let ungated = checkpoint_message(&ckpt_ctx("t", false));
+        assert!(ungated.contains("no gate measured this"), "{ungated}");
+        assert!(!ungated.contains("a gate agreed with this"));
+    }
+
+    #[test]
+    fn checkpoint_trailer_is_the_last_line() {
+        let gated = checkpoint_message(&ckpt_ctx("t", true));
+        assert_eq!(
+            gated.trim_end().lines().last().unwrap(),
+            "Nucleos-Checkpoint: gated"
+        );
+        let ungated = checkpoint_message(&ckpt_ctx("t", false));
+        assert_eq!(
+            ungated.trim_end().lines().last().unwrap(),
+            "Nucleos-Checkpoint: ungated"
+        );
+    }
+
+    #[test]
+    fn checkpoint_message_without_run_or_tree_omits_those_lines() {
+        let ctx = CheckpointContext {
+            id: "1".to_string(),
+            title: "x".to_string(),
+            run_id: None,
+            tree_id: None,
+            gated: true,
+        };
+        let msg = checkpoint_message(&ctx);
+        assert!(!msg.contains("Run:") && !msg.contains("Tree:"), "{msg}");
+        assert!(is_checkpoint_message(&msg));
+    }
+
+    #[test]
+    fn is_checkpoint_message_recognizes_new_legacy_and_fallback() {
+        assert!(is_checkpoint_message(&checkpoint_message(&ckpt_ctx(
+            "a", true
+        ))));
+        assert!(is_checkpoint_message(&checkpoint_message(&ckpt_ctx(
+            "a", false
+        ))));
+        assert!(is_checkpoint_message(&fallback_checkpoint_message(true)));
+        assert!(is_checkpoint_message(
+            "nucleos: checkpoint a gate agreed with"
+        ));
+        assert!(is_checkpoint_message(
+            "nucleos: checkpoint an item no gate measured\n"
+        ));
+        assert!(!is_checkpoint_message("fix: something else"));
+        assert!(!is_checkpoint_message(
+            "feat: mention Nucleos-Checkpoint: gated in the middle\n\nof a body"
+        ));
+    }
+
+    #[test]
+    fn fallback_checkpoint_message_has_generic_subject_and_gated_trailer() {
+        let msg = fallback_checkpoint_message(true);
+        assert_eq!(msg.lines().next().unwrap(), "nucleos: checkpoint");
+        assert!(msg.trim_end().ends_with("Nucleos-Checkpoint: gated"));
+    }
 
     /// A directory junction (Windows) or symlink (unix) at `link` pointing at `target`.
     fn link_dir(link: &Path, target: &Path) {
