@@ -363,7 +363,7 @@ fn first_literal_argument(call: &str) -> Option<String> {
 // Safe-list additions that need more than a prefix.
 // ---------------------------------------------------------------------------------------------
 
-/// Reads this file adds to the safe list: `date`, `gofmt -l`, `sed -n <addr>p`, and
+/// Reads this file adds to the safe list: `date`, `gofmt -l`, and
 /// `git -C <path> show|log|status|diff`. `segment` is the raw text; the shape guards the other
 /// reads clear (`shell_form_is_readable`) are the caller's.
 pub(super) fn is_added_read(segment: &str) -> bool {
@@ -379,38 +379,7 @@ pub(super) fn is_added_read(segment: &str) -> bool {
         "gofmt" => {
             rest.first().is_some_and(|w| w == "-l") && rest[1..].iter().all(|w| !w.starts_with('-'))
         }
-        "sed" => match rest {
-            [flag, script, files @ ..] if flag == "-n" => {
-                is_print_address(script) && files.iter().all(|w| !w.starts_with('-'))
-            }
-            _ => false,
-        },
         "git" => is_git_dash_c_read(&words),
-        _ => false,
-    }
-}
-
-/// `<addr>p` or `<addr>,<addr>p`, an address being a number, `$`, or a `/literal/`.
-fn is_print_address(script: &str) -> bool {
-    let Some(addresses) = script.strip_suffix('p') else {
-        return false;
-    };
-    let address = |part: &str| {
-        part == "$"
-            || (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-            || (part.len() > 2
-                && part.starts_with('/')
-                && part.ends_with('/')
-                && !part[1..part.len() - 1].contains(['/', '\\', '\'', '"', '`', '$']))
-    };
-    if addresses.starts_with('/') {
-        return address(addresses);
-    }
-    let mut parts = addresses.split(',');
-    match (parts.next(), parts.next(), parts.next()) {
-        // A lone regex address is `grep`, judged elsewhere; only a line number or `$` here.
-        (Some(a), None, None) => !a.starts_with('/') && address(a),
-        (Some(a), Some(b), None) => address(a) && address(b),
         _ => false,
     }
 }
@@ -502,6 +471,28 @@ pub(super) fn is_pure_read(normalized: &str) -> bool {
     }
 }
 
+/// A shell edit of files inside the run's own worktree, judged like an `Edit`/`Write` of the same
+/// paths: `Some(ReadLocal)` only when the shape is one this file names exactly AND every path it
+/// writes clears `write_target_ok`. `None` means "not this", and the ordinary chain (which parks
+/// the shape) judges the segment. POSIX with a workspace only.
+pub(super) fn shell_edit_verdict(
+    command: &str,
+    segment: &str,
+    cwd: Option<&Path>,
+    rules: &crate::project::policy::ShellRules,
+    shell: crate::command_reader::Shell,
+) -> Option<super::Segment> {
+    let cwd = cwd?;
+    if !matches!(shell, crate::command_reader::Shell::Posix) {
+        return None;
+    }
+    let targets = shell_edit_targets(segment, command)?;
+    targets
+        .iter()
+        .all(|path| write_target_ok(path, cwd, rules))
+        .then_some(super::Segment::ReadLocal)
+}
+
 /// `git merge ...` as the program's first two words: a merge into the checked-out branch, which for
 /// a run is its own worktree's. `git -C dir merge` and `sudo git merge` are not this.
 pub(super) fn is_plain_git_merge(normalized: &str) -> bool {
@@ -521,18 +512,6 @@ mod tests {
         assert!(!is_plain_substitution("s/a/b/w out.txt"));
         assert!(!is_plain_substitution("s/a/b/g;d"));
         assert!(!is_plain_substitution("d"));
-    }
-
-    #[test]
-    fn a_print_address_is_a_number_a_dollar_or_a_plain_literal() {
-        assert!(is_print_address("5p"));
-        assert!(is_print_address("2,9p"));
-        assert!(is_print_address("$p"));
-        assert!(is_print_address("/foo/p"));
-        assert!(!is_print_address("p"));
-        assert!(!is_print_address("1,2,3p"));
-        assert!(!is_print_address("1d"));
-        assert!(!is_print_address("/a/w x/p"));
     }
 
     #[test]

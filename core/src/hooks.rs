@@ -334,9 +334,9 @@ mod tests {
 
     /// The example of "an action that needs a person". Not `git push`: a run's push is refused
     /// outright (`role_policy::PUSH_REFUSAL`), so it never parks. A merge is the same
-    /// `push-merge-deploy` class, is no push, and classifies `pending_approval`. The `-C .` keeps
-    /// it off the plain `git merge` that a run's own worktree is allowed to perform.
-    const NEEDS_A_PERSON: &str = "git -C . merge feature";
+    /// `push-merge-deploy` class, is no push, and classifies `pending_approval`. It is `gh pr
+    /// merge`, not `git merge`: a plain `git merge` in a run's own worktree is allowed.
+    const NEEDS_A_PERSON: &str = "gh pr merge 42";
 
     /// As the control token, which is what these tests were written against — they are about what
     /// the classifier decides, not about who is allowed to ask. `decide_as` is for the latter.

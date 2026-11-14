@@ -1205,7 +1205,7 @@ fn classify_shell_command(
             && crate::command_reader::without_quoted_text(&segment).is_none_or(|outside| {
                 outside.contains(crate::command_reader::SUBSTITUTION_PLACEHOLDER)
             });
-        let verdict = shell_edit_verdict(command, &segment, cwd, rules, shell)
+        let verdict = leaf_allows::shell_edit_verdict(command, &segment, cwd, rules, shell)
             .unwrap_or_else(|| classify_segment(&segment, cwd, policy, rules, shell, unrecognized));
         // A `cd` out of the workspace followed only by pure reads: the `cd` is held back here and
         // settled below (`cd_elsewhere`), so `cd C:/x && git status` reads and a bare `cd C:/x`
@@ -1394,28 +1394,6 @@ fn approval_segment(
         }
     }
     texts.first().map_or_else(String::new, |t| (*t).to_owned())
-}
-
-/// A shell edit of files inside the run's own worktree, judged like an `Edit`/`Write` of the same
-/// paths: `Some(ReadLocal)` only when the shape is one `leaf_allows` names exactly AND every path it
-/// writes clears `write_target_ok`. `None` means "not this", and the ordinary chain (which parks
-/// the shape) judges the segment. POSIX with a workspace only.
-fn shell_edit_verdict(
-    command: &str,
-    segment: &str,
-    cwd: Option<&Path>,
-    rules: &crate::project::policy::ShellRules,
-    shell: crate::command_reader::Shell,
-) -> Option<Segment> {
-    let cwd = cwd?;
-    if !matches!(shell, crate::command_reader::Shell::Posix) {
-        return None;
-    }
-    let targets = leaf_allows::shell_edit_targets(segment, command)?;
-    targets
-        .iter()
-        .all(|path| leaf_allows::write_target_ok(path, cwd, rules))
-        .then_some(Segment::ReadLocal)
 }
 
 /// Whether one command text needs the push/merge/deploy approval. Whole-text pattern hits and
