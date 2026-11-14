@@ -431,8 +431,8 @@ mod tests {
         run_id
     }
 
-    /// A command the classifier parks in a worktree run (a pipe into `tee`).
-    const PARKED: &str = "cargo test --workspace | tee t.log";
+    /// A command the classifier parks in a worktree run (a pipe into `tee` of a file outside the worktree).
+    const PARKED: &str = "cargo test --workspace | tee C:/outside/t.log";
 
     async fn declined(state: &AppState, root: i64, command: &str) {
         let input = serde_json::json!({ "command": command }).to_string();
@@ -531,7 +531,11 @@ mod tests {
         declined(&state, marked, PARKED).await;
         let app = test_router(state.clone());
 
-        let variant = decide(&app, &bash(marked, "cargo test --workspace | tee u.log")).await;
+        let variant = decide(
+            &app,
+            &bash(marked, "cargo test --workspace | tee C:/outside/u.log"),
+        )
+        .await;
         let elsewhere = decide(&app, &bash(other, PARKED)).await;
 
         assert_eq!(variant.decision, "pending_approval");
@@ -975,9 +979,12 @@ mod tests {
         let first = resolving_run(&state, "enforce").await;
         assert_eq!(decide(&app, &bash(first, PARKED)).await.decision, "deny");
         assert_eq!(
-            decide(&app, &bash(first, "cargo test --workspace | tee v.log"))
-                .await
-                .decision,
+            decide(
+                &app,
+                &bash(first, "cargo test --workspace | tee C:/outside/v.log")
+            )
+            .await
+            .decision,
             "deny",
             "the second redirect"
         );
@@ -1003,9 +1010,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            decide(&app, &bash(resumed, "cargo test --workspace | tee w.log"))
-                .await
-                .decision,
+            decide(
+                &app,
+                &bash(resumed, "cargo test --workspace | tee C:/outside/w.log")
+            )
+            .await
+            .decision,
             "pending_approval"
         );
     }
@@ -1378,7 +1388,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
             ),
         )
         .await;
@@ -1448,7 +1458,7 @@ mod tests {
             &call(
                 asked_run,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
             ),
         )
         .await;
@@ -1481,7 +1491,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
             ),
         )
         .await;
@@ -1506,7 +1516,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
             ),
         )
         .await;
@@ -1527,7 +1537,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
             ),
         )
         .await;
@@ -1543,7 +1553,7 @@ mod tests {
             PreToolUsePayload {
                 run_id,
                 tool_name: "Bash".to_owned(),
-                tool_input: serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                tool_input: serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
                 agent_id: None,
                 agent_type: None,
                 subagent: false,
@@ -1637,7 +1647,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
             ),
         )
         .await;
@@ -1717,7 +1727,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
             ),
         )
         .await;
