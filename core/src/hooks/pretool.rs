@@ -1424,12 +1424,19 @@ pub(super) async fn pretooluse_decision_from(
             // dropped request drops the handler future exactly the way `abort()` does. Awaiting the
             // JoinHandle keeps the response as synchronous as before; dropping a JoinHandle only
             // detaches its task, so the pause still gets recorded when the request goes away.
+            let park = crate::proposals::ParkContext {
+                action_class: Some(classification.action_class.to_string()),
+                culprit_segment: classification.culprit.as_ref().map(|c| c.segment.clone()),
+                culprit_reason: classification.culprit.as_ref().map(|c| c.reason.clone()),
+                segments: classification.segments.clone(),
+            };
             let _ = tokio::spawn(pause_for_approval(
                 state.clone(),
                 run_id,
                 payload.tool_name.clone(),
                 payload.tool_input.to_string(),
                 classification.reason.clone(),
+                park,
             ))
             .await;
         } else {
