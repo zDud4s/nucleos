@@ -681,6 +681,9 @@ pub(super) struct NodeTreeParams {
     pub(super) root_id: String,
     /// "brief" (default) or "full".
     pub(super) view: Option<String>,
+    /// "summary" (default): a bounded answer, done nodes counted not listed. "full": uncapped.
+    #[serde(default)]
+    pub(super) detail: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]

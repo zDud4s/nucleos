@@ -369,6 +369,113 @@ pub fn summarize_tree(status: Value, node_id: Option<&str>) -> Value {
     cap_value(Value::Object(out), DEFAULT_CAP, FULL_HINT)
 }
 
+// ----- node_tree -----
+
+/// Work-node statuses that are still in play: such a node is listed, the `done` ones are counted.
+const NODE_FINISHED: &[&str] = &["done"];
+/// Longest rendered `text` a summary keeps; the full rendering is up to 16000 characters.
+const NODE_TEXT_MAX: usize = 2500;
+/// Longest `owned_paths` / `pointers` list a summarized node spells out.
+const NODE_PATHS_MAX: usize = 6;
+
+fn short_list(node: &Value, key: &str) -> Option<Value> {
+    let list = node.get(key).and_then(Value::as_array)?;
+    if list.is_empty() {
+        return None;
+    }
+    let mut shown: Vec<Value> = list
+        .iter()
+        .take(NODE_PATHS_MAX)
+        .map(|item| match item {
+            Value::String(text) => json!(truncate_text(text, 120)),
+            other => other.clone(),
+        })
+        .collect();
+    if list.len() > NODE_PATHS_MAX {
+        shown.push(json!(format!("… +{} more", list.len() - NODE_PATHS_MAX)));
+    }
+    Some(Value::Array(shown))
+}
+
+/// The bounded view of `GET /nodes/tree/{root_id}`: the root's goal and decisions, counts per
+/// status, every node that is not `done` (ids, parent, depth, status, short summary), the done
+/// ones collapsed to a count, and the rendered `text` cut. Callers that parse the node list
+/// (`tree.py`, `tree_record.py`) need `detail: "full"`.
+pub fn summarize_node_tree(tree: Value) -> Value {
+    let nodes: Vec<Value> = tree
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut live = Vec::new();
+    let mut finished = 0usize;
+    for node in &nodes {
+        let status = node.get("status").and_then(Value::as_str).unwrap_or("?");
+        *counts.entry(status.to_owned()).or_insert(0) += 1;
+        if NODE_FINISHED.contains(&status) {
+            finished += 1;
+            continue;
+        }
+        let mut entry = Map::new();
+        for key in ["id", "parent_id", "depth", "kind", "status", "updated_at"] {
+            if let Some(value) = node.get(key).filter(|value| !value.is_null()) {
+                entry.insert(key.to_owned(), value.clone());
+            }
+        }
+        if let Some(title) = text_of(node.get("title"), 120) {
+            entry.insert("title".to_owned(), json!(title));
+        }
+        if let Some(summary) = text_of(node.get("summary"), 300) {
+            entry.insert("summary".to_owned(), json!(summary));
+        }
+        for key in ["owned_paths", "pointers"] {
+            if let Some(list) = short_list(node, key) {
+                entry.insert(key.to_owned(), list);
+            }
+        }
+        live.push(Value::Object(entry));
+    }
+
+    let mut out = Map::new();
+    out.insert("detail".to_owned(), json!("summary"));
+    for key in ["root_id", "status"] {
+        if let Some(value) = tree.get(key).filter(|value| !value.is_null()) {
+            out.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(goal) = text_of(tree.get("goal"), 400) {
+        out.insert("goal".to_owned(), json!(goal));
+    }
+    if let Some(list) = tree.get("decisions").and_then(Value::as_array) {
+        let shown: Vec<Value> = list
+            .iter()
+            .take(8)
+            .map(|d| json!(text_of(Some(d), 300)))
+            .collect();
+        out.insert("decisions".to_owned(), json!({"count": list.len(), "latest": shown}));
+    }
+    out.insert("counts".to_owned(), json!(counts));
+    out.insert("nodes".to_owned(), Value::Array(live));
+    out.insert("finished_collapsed".to_owned(), json!(finished));
+    let full_text = tree.get("text").and_then(Value::as_str).unwrap_or_default();
+    if let Some(text) = text_of(tree.get("text"), NODE_TEXT_MAX) {
+        out.insert("text".to_owned(), json!(text));
+    }
+    let how_to_get_more =
+        "call again with detail:\"full\" for every node and the whole rendered text";
+    if finished > 0 || full_text.chars().count() > NODE_TEXT_MAX {
+        out.insert(
+            "note".to_owned(),
+            json!(format!(
+                "{finished} done node(s) counted, not listed; text cut to {NODE_TEXT_MAX} chars; \
+                 {how_to_get_more}"
+            )),
+        );
+    }
+    cap_value(Value::Object(out), DEFAULT_CAP, how_to_get_more)
+}
+
 // ----- get_run -----
 
 /// The bounded view of a run: scalars and timestamps kept, long text (logs, transcripts, output)
@@ -467,6 +574,44 @@ mod tests {
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0]["branch"], json!("done-3"));
         assert!(out.get("finished_collapsed").is_none());
+    }
+
+    fn big_node_tree() -> Value {
+        let mut nodes = vec![json!({"id": "root", "parent_id": null, "depth": 0, "kind": "root",
+            "title": "root", "status": "running", "summary": null,
+            "owned_paths": [], "pointers": [], "updated_at": "t"})];
+        for i in 0..80 {
+            nodes.push(json!({"id": format!("d{i}"), "parent_id": "root", "depth": 1,
+                "kind": "leaf", "title": "t".repeat(300), "status": "done",
+                "summary": "s".repeat(1500), "owned_paths": ["a/b.rs"], "pointers": [],
+                "updated_at": "t"}));
+        }
+        nodes.push(json!({"id": "bad", "parent_id": "root", "depth": 1, "kind": "leaf",
+            "title": "broken", "status": "blocked", "summary": "x".repeat(2000),
+            "owned_paths": (0..20).map(|i| format!("p/{i}.rs")).collect::<Vec<_>>(),
+            "pointers": [], "updated_at": "t9"}));
+        json!({"root_id": "root", "goal": "g".repeat(5000), "status": "running",
+               "decisions": ["use x"], "nodes": nodes, "text": "T".repeat(16_000)})
+    }
+
+    #[test]
+    fn node_tree_summary_lists_the_unfinished_and_counts_the_done() {
+        let out = summarize_node_tree(big_node_tree());
+        assert!(size(&out) <= DEFAULT_CAP, "was {}", size(&out));
+        assert_eq!(out["finished_collapsed"], json!(80));
+        assert_eq!(out["counts"]["done"], json!(80));
+        assert_eq!(out["counts"]["blocked"], json!(1));
+        let ids: Vec<&str> = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["root", "bad"]);
+        assert_eq!(out["nodes"][1]["updated_at"], json!("t9"));
+        assert_eq!(out["nodes"][1]["owned_paths"].as_array().unwrap().len(), 7);
+        assert!(out["note"].as_str().unwrap().contains("full"));
+        assert_eq!(out["decisions"]["count"], json!(1));
     }
 
     #[test]

@@ -604,7 +604,7 @@ the contract, not a snapshot.
 | `mcp_tools/task_tools.rs` | The task-claim `#[tool]`s (`task_tools` router): `task_list`, `task_claim`, `task_release`, `task_done`, `task_report` and `task_decline` of one shared problem with one owner, over the `/tasks/*` routes of `http/tasks.rs`. |
 | `mcp_tools/fence.rs` | What leaves the server: outgoing filtering, the untrusted-content fence and its nonce, and redaction of rendered text. |
 | `mcp_tools/backlog_view.rs` | The compact view of `spec_backlog`: counts per status plus the specs with a tree or an error, one line per spec, and the "never discovered" answer in place of an empty list. |
-| `mcp_tools/compact.rs` | Compact-by-default answers: `Detail` (summary/full), `cap_value`/`compact_value` (bring a JSON value under ~8000 chars with a `truncated` note saying what was dropped and how to get more), and the `tree_status` and `get_run` summaries. `node_tree` reuses the helper. |
+| `mcp_tools/compact.rs` | Compact-by-default answers: `Detail` (summary/full), `cap_value`/`compact_value` (bring a JSON value under ~8000 chars with a `truncated` note saying what was dropped and how to get more), and the `tree_status` and `get_run` summaries. and the `node_tree` summary. |
 | `mcp_tools/boxes.rs` | Which tools each box serves, the admission rule, and the worktree, ticket and client a box's calls are held to. |
 | `mcp_tools/effects.rs` | What each tool does to the world: `ToolEffect`, the effects table and the effect of one call. |
 | `mcp_tools/local_box.rs` | `LocalToolBox`, the in-process tool box, and its bounded reads of project files. |
