@@ -14,6 +14,11 @@
 //! - Product, budget and irreversible questions never get one: their sites call plain
 //!   `decisions::park_or_ask`.
 //!
+//! After the defaults, [`sweep`] also drives the decision runs (owner decision 2026-11-13): for
+//! every question that is not owner-only the tree launches one read-only run of its own
+//! orchestrator and applies its text as the answer at once, through `auto_resolve`. See the
+//! "decision runs" section below.
+//!
 //! `split_remaining_into_new_nodes` has no mechanism to call yet: it can be attached, and the sweep
 //! leaves it for the owner.
 //!
@@ -258,6 +263,7 @@ pub async fn sweep(state: &AppState) {
             tracing::warn!(decision = %id, %error, "could not apply a default answer");
         }
     }
+    decision_run_tick(state).await;
 }
 
 async fn applied_count(
@@ -341,6 +347,512 @@ async fn apply_one(state: &AppState, row: Expired) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ----- decision runs (owner decision 2026-11-13: the tree decides itself) -----
+//
+// For every question that is not owner-only the tree launches ONE read-only run of its own
+// orchestrator, and that run's text is applied as the answer at once through
+// `auto_resolve::resolve_decision` (the normal `decisions::answer` path, then
+// `relaunch::answer_and_relaunch`, so the text lands in the relaunched node's prompt). There is no
+// deadline. The flag and the caps are `auto_resolve`'s (`autonomy.tree_decides_itself`,
+// `decision_runs_per_node`, `decision_runs_per_job`); runs in flight count against them, and when
+// they are spent the question falls through to the owner. A run is recorded in `tree_transitions`
+// as `(node, "decision_run", decision id)` with the run id as result, so a decision gets one run,
+// ever; `failed` (or an empty reservation) leaves the question to the owner for good, which is also
+// how a stalled-tree question ends up with the owner after its decision run failed.
+
+const DECISION_RUN: &str = "decision_run";
+const RUN_FAILED: &str = "failed";
+/// An answer is appended to a prompt: keep it a directive, not an essay.
+const MAX_ANSWER_CHARS: usize = 4000;
+/// The standing mandate every decision run carries.
+const MANDATE: &str = "develop this spec until it is done";
+
+/// The kind of a question, read from its wording (`decisions` has no kind column). Anything not
+/// recognised as owner-only is `ordinary`.
+pub(super) fn classify(question: &str) -> &'static str {
+    let lower = question.to_lowercase();
+    if lower.contains("nucleos.tests.yaml") || lower.contains("scripts/gates.sh") {
+        "governance_file"
+    } else if lower.contains("widen") && lower.contains("path") {
+        "widen_paths"
+    } else if lower.contains("budget") {
+        "budget_raise"
+    } else if lower.contains("ticket #") || lower.contains("pick an owner") {
+        "ticket_ownership"
+    } else {
+        "ordinary"
+    }
+}
+
+/// The prompt of a decision run.
+pub(super) fn decision_prompt(
+    goal: &str,
+    node_id: &str,
+    branch_state: &str,
+    question: &str,
+) -> String {
+    format!(
+        "You are the orchestrator of a NucleOS tree, deciding for the owner. Standing mandate: \
+         {MANDATE}.\n\nTree goal: {goal}\nNode: {node_id}\nBranch state: {branch_state}\n\n\
+         Question the tree is stuck on:\n{question}\n\n\
+         Decide it yourself from the goal and the state. Do not edit anything. Reply with the \
+         answer only: a short, concrete instruction for the node, no preamble."
+    )
+}
+
+/// The answer text of a finished run, bounded; `None` when it said nothing usable.
+pub(super) fn answer_of(status: &str, stdout: Option<&str>) -> Option<String> {
+    if status != "completed" {
+        return None;
+    }
+    let text = stdout?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(MAX_ANSWER_CHARS).collect())
+}
+
+/// One pass over the open tree decisions. A failure on one is logged and stops no other.
+pub(super) async fn decision_run_tick(state: &AppState) {
+    let rows: Result<Vec<(String, String, String, String)>, _> = sqlx::query_as(
+        "SELECT id, tree_id, node_id, question FROM decisions
+         WHERE status = ? AND tree_id IS NOT NULL AND node_id IS NOT NULL ORDER BY at, id",
+    )
+    .bind(decisions::STATUS_OPEN)
+    .fetch_all(&state.pool)
+    .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not list the open decisions for decision runs");
+            return;
+        }
+    };
+    for (id, tree_id, node_id, question) in rows {
+        if let Err(error) = decision_run_step(state, &id, &tree_id, &node_id, &question).await {
+            tracing::warn!(decision = %id, %error, "decision run step failed");
+        }
+    }
+}
+
+async fn run_recorded(
+    pool: &SqlitePool,
+    node_id: &str,
+    decision_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(node_id)
+    .bind(DECISION_RUN)
+    .bind(decision_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Option::unwrap_or_default))
+}
+
+async fn set_run_result(
+    pool: &SqlitePool,
+    node_id: &str,
+    decision_id: &str,
+    result: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE tree_transitions SET result = ? WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(result)
+    .bind(node_id)
+    .bind(DECISION_RUN)
+    .bind(decision_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Self-answers so far for a node or a job: answered with origin `auto`/`driver`, plus decision
+/// runs still in flight.
+async fn runs_spent(
+    pool: &SqlitePool,
+    column: &'static str,
+    value: &str,
+) -> Result<i64, sqlx::Error> {
+    // `AssertSqlSafe`: `column` is one of two literal column names, and the value is bound.
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM decisions d WHERE d.{column} = ? AND (
+            d.origin IN ('auto', 'driver')
+            OR (d.status = 'open' AND EXISTS (
+                SELECT 1 FROM tree_transitions t
+                WHERE t.node_id = d.node_id AND t.transition = '{DECISION_RUN}'
+                  AND t.key = d.id
+                  AND COALESCE(t.result, '') NOT IN ('', '{RUN_FAILED}'))))"
+    )))
+    .bind(value)
+    .fetch_one(pool)
+    .await
+}
+
+async fn decision_run_step(
+    state: &AppState,
+    id: &str,
+    tree_id: &str,
+    node_id: &str,
+    question: &str,
+) -> Result<(), String> {
+    let recorded = run_recorded(&state.pool, node_id, id)
+        .await
+        .map_err(|e| e.to_string())?;
+    match recorded.as_deref() {
+        // Failed, or reserved and never stored: the owner keeps it.
+        Some("") | Some(RUN_FAILED) => Ok(()),
+        Some(run_id) => collect_decision_run(state, id, node_id, run_id).await,
+        None => launch_decision_run(state, id, tree_id, node_id, question).await,
+    }
+}
+
+async fn launch_decision_run(
+    state: &AppState,
+    id: &str,
+    tree_id: &str,
+    node_id: &str,
+    question: &str,
+) -> Result<(), String> {
+    use super::auto_resolve as resolve;
+    let pool = &state.pool;
+    let Some(job) = store::load(pool, tree_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let config = resolve::Config::load(&job.manifest.project_root);
+    let node_spent = runs_spent(pool, "node_id", node_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let job_spent = runs_spent(pool, "tree_id", tree_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if resolve::verdict(&config, classify(question), node_spent, job_spent)
+        != resolve::Verdict::Resolve
+    {
+        return Ok(());
+    }
+    let claimed = sqlx::query(
+        "INSERT INTO tree_transitions (node_id, transition, key, result, created_at)
+         VALUES (?, ?, ?, '', ?) ON CONFLICT (node_id, transition, key) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(DECISION_RUN)
+    .bind(id)
+    .bind(stamp(Utc::now()))
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .rows_affected();
+    if claimed == 0 {
+        return Ok(());
+    }
+    let branch_state = job
+        .manifest
+        .branches
+        .values()
+        .find(|branch| branch.node_id.as_deref() == Some(node_id))
+        .map_or_else(
+            || "no branch".to_owned(),
+            |branch| format!("{} is {}", branch.name, branch.state),
+        );
+    let text = decision_prompt(&job.goal, node_id, &branch_state, question);
+    // "shadow" is plan-only: no worktree, no edits.
+    let started = crate::execution::runs::create_run_inner(
+        state,
+        text,
+        job.project_id.clone(),
+        None,
+        "shadow",
+        false,
+    )
+    .await;
+    match started {
+        Ok(run_id) => set_run_result(pool, node_id, id, &run_id.to_string()).await,
+        Err(error) => {
+            set_run_result(pool, node_id, id, RUN_FAILED).await?;
+            Err(format!("could not start the decision run: {error:?}"))
+        }
+    }
+}
+
+async fn collect_decision_run(
+    state: &AppState,
+    id: &str,
+    node_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    use super::auto_resolve as resolve;
+    let pool = &state.pool;
+    if super::relaunch::run_is_live(pool, run_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(());
+    }
+    let Ok(number) = run_id.parse::<i64>() else {
+        return set_run_result(pool, node_id, id, RUN_FAILED).await;
+    };
+    let run: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, stdout FROM runs WHERE id = ?")
+            .bind(number)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some(answer) = run.and_then(|(status, stdout)| answer_of(&status, stdout.as_deref()))
+    else {
+        return set_run_result(pool, node_id, id, RUN_FAILED).await;
+    };
+    // `resolve_decision` re-checks the flag and the caps against answered rows.
+    match resolve::resolve_decision(state, id, "ordinary", &answer, resolve::Origin::Auto).await {
+        Ok(resolve::Outcome::Resolved(_) | resolve::Outcome::AlreadyDecided) => Ok(()),
+        Ok(resolve::Outcome::Declined(_) | resolve::Outcome::NotATreeDecision) => {
+            set_run_result(pool, node_id, id, RUN_FAILED).await
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod decision_run_tests {
+    //! Tests of the decision runs (owner decision 2026-11-13).
+
+    use super::*;
+    use crate::tree_job::auto_resolve;
+    use crate::tree_job::model::Manifest;
+    use crate::tree_job::store::TreeJob;
+
+    #[test]
+    fn owner_only_questions_are_recognised_from_their_wording() {
+        let budget = "Node n1 was not started again: the tree budget does not permit it (x). \
+                      Raise the budget, or say how the node should go on.";
+        let ticket =
+            "Ticket #5 k was launched twice and nobody fixed it. Pick an owner or close it.";
+        assert_eq!(classify(budget), "budget_raise");
+        assert_eq!(classify(ticket), "ticket_ownership");
+        assert_eq!(classify("May I edit scripts/gates.sh?"), "governance_file");
+        assert_eq!(classify("Edit nucleos.tests.yaml?"), "governance_file");
+        assert_eq!(
+            classify("Widen the declared paths to core/?"),
+            "widen_paths"
+        );
+        for kind in [
+            "governance_file",
+            "widen_paths",
+            "budget_raise",
+            "ticket_ownership",
+        ] {
+            assert!(auto_resolve::is_owner_only(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn everything_else_is_ordinary_including_a_stalled_tree() {
+        assert_eq!(classify("which way?"), "ordinary");
+        assert_eq!(
+            classify("The tree has not moved for 30 minutes: nothing runs. What should it do?"),
+            "ordinary"
+        );
+        assert!(!auto_resolve::is_owner_only("ordinary"));
+    }
+
+    #[test]
+    fn the_prompt_carries_mandate_question_and_state() {
+        let text = decision_prompt("Ship B", "n7", "b1 is parked", "which way?");
+        for part in [MANDATE, "Ship B", "n7", "b1 is parked", "which way?"] {
+            assert!(text.contains(part), "{part}");
+        }
+    }
+
+    #[test]
+    fn only_a_completed_run_with_text_answers() {
+        assert_eq!(
+            answer_of("completed", Some("  go left \n")).as_deref(),
+            Some("go left")
+        );
+        assert_eq!(answer_of("completed", Some("  ")), None);
+        assert_eq!(answer_of("completed", None), None);
+        assert_eq!(answer_of("failed", Some("go left")), None);
+        let long = "x".repeat(MAX_ANSWER_CHARS + 50);
+        assert_eq!(
+            answer_of("completed", Some(&long)).unwrap().chars().count(),
+            MAX_ANSWER_CHARS
+        );
+    }
+
+    // ----- database -----
+
+    const TREE: &str = "dr-job";
+    const NODE: &str = "dr-node";
+    const AT: &str = "2020-01-01T00:00:00+00:00";
+
+    async fn state() -> AppState {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(std::time::Duration::from_secs(60)),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
+        state
+    }
+
+    async fn seed_job(pool: &SqlitePool) {
+        let manifest = Manifest::new(TREE, "feat/dr", "Decide it", "C:/nowhere", &[]);
+        let job = TreeJob {
+            id: TREE.to_owned(),
+            root_node_id: "dr-root".to_owned(),
+            project_id: None,
+            feature_branch: Some("feat/dr".to_owned()),
+            goal: "Decide it".to_owned(),
+            state: "open".to_owned(),
+            manifest,
+            contract: None,
+            created_at: AT.to_owned(),
+            updated_at: AT.to_owned(),
+        };
+        store::save(pool, &job).await.unwrap();
+    }
+
+    async fn seed_open(pool: &SqlitePool, id: &str, question: &str) {
+        sqlx::query(
+            "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+             VALUES (?, ?, ?, ?, NULL, 'agent', ?, 'open')",
+        )
+        .bind(id)
+        .bind(TREE)
+        .bind(NODE)
+        .bind(question)
+        .bind(AT)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_transition(pool: &SqlitePool, id: &str, result: &str) {
+        sqlx::query(
+            "INSERT INTO tree_transitions (node_id, transition, key, result, created_at)
+             VALUES (?, 'decision_run', ?, ?, ?)",
+        )
+        .bind(NODE)
+        .bind(id)
+        .bind(result)
+        .bind(AT)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_run(pool: &SqlitePool, status: &str, stdout: Option<&str>) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, stdout, mode, created_at)
+             VALUES ('p', ?, ?, 'shadow', ?)",
+        )
+        .bind(status)
+        .bind(stdout)
+        .bind(AT)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn row(pool: &SqlitePool, id: &str) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT status, answer, origin FROM decisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_finished_decision_run_is_applied_as_the_answer_at_once() {
+        let state = state().await;
+        seed_job(&state.pool).await;
+        seed_open(&state.pool, "d-1", "which way?").await;
+        let run = seed_run(&state.pool, "completed", Some("take the left branch")).await;
+        seed_transition(&state.pool, "d-1", &run.to_string()).await;
+
+        decision_run_tick(&state).await;
+
+        let (status, answer, origin) = row(&state.pool, "d-1").await;
+        assert_eq!(status, "answered");
+        assert_eq!(answer.as_deref(), Some("take the left branch"));
+        assert_eq!(origin.as_deref(), Some("auto"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_decision_run_leaves_the_question_with_the_owner_for_good() {
+        let state = state().await;
+        seed_job(&state.pool).await;
+        seed_open(&state.pool, "d-1", "which way?").await;
+        let run = seed_run(&state.pool, "failed", Some("boom")).await;
+        seed_transition(&state.pool, "d-1", &run.to_string()).await;
+
+        decision_run_tick(&state).await;
+        decision_run_tick(&state).await;
+
+        assert_eq!(row(&state.pool, "d-1").await.0, "open");
+        let result = run_recorded(&state.pool, NODE, "d-1").await.unwrap();
+        assert_eq!(result.as_deref(), Some(RUN_FAILED));
+    }
+
+    #[tokio::test]
+    async fn an_owner_only_question_gets_no_run() {
+        let state = state().await;
+        seed_job(&state.pool).await;
+        seed_open(
+            &state.pool,
+            "d-1",
+            "Raise the budget, or say how the node should go on.",
+        )
+        .await;
+
+        decision_run_tick(&state).await;
+
+        assert_eq!(run_recorded(&state.pool, NODE, "d-1").await.unwrap(), None);
+        assert_eq!(row(&state.pool, "d-1").await.0, "open");
+    }
+
+    #[tokio::test]
+    async fn spent_caps_start_no_run_and_runs_in_flight_count() {
+        let state = state().await;
+        seed_job(&state.pool).await;
+        // Three runs in flight on the node: the per-node default cap is spent.
+        for n in 0..3 {
+            let id = format!("d-{n}");
+            seed_open(&state.pool, &id, "which way?").await;
+            let run = seed_run(&state.pool, "running", None).await;
+            seed_transition(&state.pool, &id, &run.to_string()).await;
+        }
+        assert_eq!(runs_spent(&state.pool, "node_id", NODE).await.unwrap(), 3);
+        seed_open(&state.pool, "d-9", "which way?").await;
+
+        decision_run_tick(&state).await;
+
+        assert_eq!(run_recorded(&state.pool, NODE, "d-9").await.unwrap(), None);
+        assert_eq!(row(&state.pool, "d-9").await.0, "open");
+    }
+
+    #[tokio::test]
+    async fn a_run_still_live_is_left_alone() {
+        let state = state().await;
+        seed_job(&state.pool).await;
+        seed_open(&state.pool, "d-1", "which way?").await;
+        let run = seed_run(&state.pool, "running", None).await;
+        seed_transition(&state.pool, "d-1", &run.to_string()).await;
+
+        decision_run_tick(&state).await;
+
+        assert_eq!(row(&state.pool, "d-1").await.0, "open");
+        let result = run_recorded(&state.pool, NODE, "d-1").await.unwrap();
+        assert_eq!(result, Some(run.to_string()));
+    }
 }
 
 #[cfg(test)]
