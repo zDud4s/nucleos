@@ -24,6 +24,9 @@ pub const STATUS_OPEN: &str = "open";
 pub const STATUS_ANSWERED: &str = "answered";
 /// The `origin` of a row until somebody answers it, when the answering channel takes over.
 pub const ORIGIN_AGENT: &str = "agent";
+/// The `origin` of a decision a conductor session answered through the `decision_answer` MCP tool,
+/// distinct from the shell (`shell`), the owner and the `auto_default` timer.
+pub const ORIGIN_CONDUCTOR: &str = "conductor";
 
 const PARKED: &str = "parked";
 const FEED_KIND: &str = "work_tree_parked";

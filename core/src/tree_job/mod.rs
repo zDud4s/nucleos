@@ -9,6 +9,7 @@ pub mod budget;
 pub mod checklist;
 pub mod close;
 pub mod commands;
+pub mod decision_tools;
 pub mod decisions;
 pub mod docs_paths;
 pub mod driver;

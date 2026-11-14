@@ -1045,6 +1045,8 @@ mod tests {
                 "cancel_run",
                 "create_job",
                 "create_run",
+                "decision_answer",
+                "decision_list",
                 "declare_refinement",
                 "get_budget",
                 "get_council",
@@ -2789,6 +2791,8 @@ mod tests {
             [
                 "create_job",
                 "create_run",
+                "decision_answer",
+                "decision_list",
                 "get_job",
                 "get_run",
                 "list_jobs",
@@ -3038,6 +3042,7 @@ mod tests {
             let launch_act = [
                 "create_job",
                 "create_run",
+                "decision_answer",
                 "spec_finish",
                 "spec_finish_cancel",
                 "tree_abandon",
@@ -3059,6 +3064,8 @@ mod tests {
             [
                 "create_job",
                 "create_run",
+                "decision_answer",
+                "decision_list",
                 "get_job",
                 "get_run",
                 "list_jobs",

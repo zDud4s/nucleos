@@ -71,6 +71,24 @@ pub(super) struct TreeAbandonParams {
     pub(super) force: Option<bool>,
 }
 
+/// The body of `POST /tree-decisions/{id}/answer`, with the decision id lifted out into the path.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct DecisionAnswerParams {
+    /// The decision to answer (`d-…`, as `decision_list` or `tree_status` shows it).
+    pub(super) id: String,
+    /// The answer: it is handed to the parked branch's node when it resumes.
+    pub(super) answer: String,
+}
+
+/// The query of `GET /tree-decisions`.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct DecisionListParams {
+    /// Only the decisions of this tree job. Absent is every tree.
+    pub(super) tree_id: Option<String>,
+    /// `open` (the default) or `answered`; `all` lists both.
+    pub(super) status: Option<String>,
+}
+
 /// The body of `POST /trees/{id}/branch_start`, with the job id lifted out into the path.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct TreeBranchStartParams {
