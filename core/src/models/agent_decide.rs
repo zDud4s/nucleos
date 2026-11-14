@@ -81,11 +81,7 @@ struct Advice {
 /// Asks the router for a model inside the Claude families. `None` on any failure, a slow answer,
 /// or a model the Agent tool would not accept.
 async fn ask_router(router: &Router, req: &AgentModelRequest, failed: &[Rung]) -> Option<Advice> {
-    let task = head_chars(
-        &format!("{}\n{}", req.description, req.prompt),
-        TASK_CHARS,
-    )
-    .to_owned();
+    let task = head_chars(&format!("{}\n{}", req.description, req.prompt), TASK_CHARS).to_owned();
     if task.trim().is_empty() {
         return None;
     }
@@ -157,8 +153,8 @@ pub async fn decide(
         return finish(pool, spawn, None).await;
     }
 
-    let failed = recent_failures(pool, &req.session_id, &req.description, FAILURE_WINDOW_SECS)
-        .await;
+    let failed =
+        recent_failures(pool, &req.session_id, &req.description, FAILURE_WINDOW_SECS).await;
     spawn.failed = failed.iter().map(|r| r.as_alias().to_owned()).collect();
     let (rung, source) = match ask_router(&router, req, &failed).await {
         Some(advice) => {
@@ -248,7 +244,10 @@ mod tests {
         let answer = decide(&pool, router(&url, Mode::Apply, 2000), &req).await;
         assert_eq!(answer.model, None);
         assert_eq!(answer.source, "explicit");
-        assert!(seen.try_recv().is_err(), "an explicit model is never routed");
+        assert!(
+            seen.try_recv().is_err(),
+            "an explicit model is never routed"
+        );
         let got = rows(&pool).await;
         assert_eq!(got[0].0.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(got[0].1, "explicit");
