@@ -631,6 +631,17 @@ mod tests {
             asked_for: None,
             job_low_task: None,
             job_high_task: None,
+            action_class: None,
+            culprit_segment: None,
+            culprit_reason: None,
+            segments_json: None,
+            segments: None,
+            run_mode: None,
+            run_title: None,
+            node_id: None,
+            branch: None,
+            worktree_path: None,
+            project_target: None,
         }
     }
 

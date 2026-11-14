@@ -530,6 +530,8 @@ pub(super) async fn pretooluse_decision_from(
             },
             action_class: "read-local",
             reason: "a leaf's self-check through the broker is allowed".to_owned(),
+            culprit: None,
+            segments: Vec::new(),
         };
     }
     tracing::info!(
@@ -1430,12 +1432,19 @@ pub(super) async fn pretooluse_decision_from(
             // dropped request drops the handler future exactly the way `abort()` does. Awaiting the
             // JoinHandle keeps the response as synchronous as before; dropping a JoinHandle only
             // detaches its task, so the pause still gets recorded when the request goes away.
+            let park = crate::proposals::ParkContext {
+                action_class: Some(classification.action_class.to_string()),
+                culprit_segment: classification.culprit.as_ref().map(|c| c.segment.clone()),
+                culprit_reason: classification.culprit.as_ref().map(|c| c.reason.clone()),
+                segments: classification.segments.clone(),
+            };
             let _ = tokio::spawn(pause_for_approval(
                 state.clone(),
                 run_id,
                 payload.tool_name.clone(),
                 payload.tool_input.to_string(),
                 classification.reason.clone(),
+                park,
             ))
             .await;
         } else {
@@ -2062,7 +2071,7 @@ mod tests {
 
     /// A command that writes a file by redirection: unrecognized by the classifier, so a
     /// `worktree` run is parked for it (`redirects_a_file`).
-    const REDIRECTING_COMMAND: &str = "cat > .nucleos-report.md <<'EOF'\nx\nEOF";
+    const REDIRECTING_COMMAND: &str = "python -c \"open('.nucleos-report.md','w').write('x')\"";
 
     async fn run_status_and_action_approvals(state: &AppState, run_id: i64) -> (String, i64) {
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")

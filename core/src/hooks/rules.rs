@@ -217,6 +217,11 @@ impl ProjectRules {
                 reason: reason.clone(),
             },
             action_class: classification.action_class,
+            culprit: Some(classifier::Culprit {
+                segment: String::new(),
+                reason: reason.clone(),
+            }),
+            segments: classification.segments,
             reason,
         }
     }

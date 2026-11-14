@@ -65,6 +65,74 @@ export function ToolInput({ raw }: { raw: string | null }) {
   );
 }
 
+/* ---------------------------------------------------------------- the culprit -- */
+
+/**
+ * The one segment of a command that stopped it, and the concrete reason, ahead of everything else.
+ *
+ * Null when the row carries no culprit (older rows): the card then leads with the classifier's
+ * generic reason as before.
+ */
+export function CulpritLead({
+  segment,
+  reason,
+}: {
+  segment: string | null | undefined;
+  reason: string | null | undefined;
+}) {
+  const seg = segment?.trim() ?? "";
+  if (seg === "") return null;
+  const why = reason?.trim() ?? "";
+  return (
+    <div className="waiting-culprit">
+      <p className="waiting-approval-label">this part stopped it</p>
+      <code className="waiting-culprit-segment">{seg}</code>
+      {why !== "" && <p className="waiting-culprit-reason">{why}</p>}
+    </div>
+  );
+}
+
+/**
+ * A compound command split into its segments, the culprit marked.
+ *
+ * Replaces the single flattened line when the daemon sent the split; an empty split renders
+ * nothing so the caller can fall back to `ToolInput`.
+ */
+export function CommandSegments({
+  id,
+  segments,
+  culprit,
+}: {
+  id: number;
+  segments: string[] | null | undefined;
+  culprit: string | null | undefined;
+}) {
+  if (!segments || segments.length === 0) return null;
+  const mark = culprit?.trim() ?? "";
+  return (
+    <ol className="waiting-segments" aria-label={`Command segments of approval #${id}`}>
+      {segments.map((segment, index) => {
+        const isCulprit = mark !== "" && segment.trim() === mark;
+        return (
+          <li
+            className="waiting-segment"
+            key={`${index}-${segment}`}
+            data-culprit={isCulprit ? "true" : undefined}
+          >
+            <code>{segment}</code>
+            {isCulprit && <span className="waiting-segment-flag"> culprit</span>}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+/** Whether a row carries the split, so the card knows to use it instead of the flat line. */
+export function hasSegments(segments: string[] | null | undefined): boolean {
+  return Array.isArray(segments) && segments.length > 0;
+}
+
 /* ---------------------------------------------------------------- the provenance -- */
 
 /** One thing a turn read before it reached for an action. */
