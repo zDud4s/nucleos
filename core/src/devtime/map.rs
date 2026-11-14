@@ -46,6 +46,48 @@ pub fn is_daemon_worktree(path: &str) -> bool {
     path.rsplit('/').next().is_some_and(is_run_or_job)
 }
 
+/// A daemon-run transcript whose session belongs to a run bound to a tree node (spec 2026-11-12
+/// section 3.1): the mapping is `kind = "tree_node"`, attributed to the run's project.
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub mapping: CwdMapping,
+    pub run_id: i64,
+    pub node_id: String,
+}
+
+impl TreeNode {
+    /// Stamps the ingested session with its run and node; a failure is logged, not fatal.
+    pub async fn stamp(&self, pool: &SqlitePool, session: &str) {
+        if let Err(error) =
+            devtime_store::set_session_node(pool, session, self.run_id, &self.node_id).await
+        {
+            tracing::warn!(%error, "devtime: could not stamp a node session");
+        }
+    }
+}
+
+/// `daemon` is the cwd's mapping, which must be a daemon worktree. Looked up per session, never
+/// cached with the cwd: a run's node binding can land after its first transcript. A session with
+/// no node-bound run, or a failed lookup, answers `None` and stays skipped.
+pub async fn tree_node_for_session(
+    pool: &SqlitePool,
+    session: &str,
+    daemon: &CwdMapping,
+) -> Option<TreeNode> {
+    if daemon.kind != "daemon_worktree" {
+        return None;
+    }
+    let (run_id, node_id, project) = devtime_store::node_run_for_session(pool, session)
+        .await
+        .map_err(|error| tracing::warn!(%error, "devtime: could not look up a session's run"))
+        .ok()??;
+    Some(TreeNode {
+        mapping: mapping(&daemon.cwd, Some(&project), None, "tree_node"),
+        run_id,
+        node_id,
+    })
+}
+
 fn under(path: &str, root: &str) -> bool {
     path == root
         || path
@@ -324,5 +366,62 @@ mod tests {
         assert_eq!(again.kind, "unmapped", "{again:?}");
         let stored = devtime_store::cwd_mapping(&pool, &cwd).await.unwrap();
         assert_eq!(stored.map(|row| row.kind).as_deref(), Some("unmapped"));
+    }
+
+    async fn bind_run(pool: &sqlx::SqlitePool, run: i64, session: &str, node: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, session_id, created_at)
+             VALUES (?, 'p1', 'x', 'completed', ?, '2026-11-12T00:00:00.000Z')",
+        )
+        .bind(run)
+        .bind(session)
+        .execute(pool)
+        .await
+        .unwrap();
+        if let Some(node) = node {
+            sqlx::query("INSERT INTO work_node_runs (node_id, run_id) VALUES (?, ?)")
+                .bind(node)
+                .bind(run)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_daemon_transcript_of_a_node_run_maps_to_tree_node_and_a_plain_one_stays_daemon() {
+        let pool = test_pool().await;
+        bind_run(&pool, 7, "s-node", Some("n-leaf")).await;
+        bind_run(&pool, 8, "s-plain", None).await;
+        let daemon = mapping(
+            "C:/p/proj/.nucleos/worktrees/run-7",
+            None,
+            None,
+            "daemon_worktree",
+        );
+
+        let node = tree_node_for_session(&pool, "s-node", &daemon)
+            .await
+            .unwrap();
+        assert_eq!(node.mapping.kind, "tree_node");
+        assert_eq!(node.mapping.project_id.as_deref(), Some("p1"));
+        assert_eq!((node.run_id, node.node_id.as_str()), (7, "n-leaf"));
+
+        assert!(
+            tree_node_for_session(&pool, "s-plain", &daemon)
+                .await
+                .is_none()
+        );
+        assert!(
+            tree_node_for_session(&pool, "s-unknown", &daemon)
+                .await
+                .is_none()
+        );
+        let project = mapping("C:/p/proj", Some("p1"), None, "project");
+        assert!(
+            tree_node_for_session(&pool, "s-node", &project)
+                .await
+                .is_none()
+        );
     }
 }

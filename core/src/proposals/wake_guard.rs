@@ -47,6 +47,7 @@ const LISTED: &[(&str, &str)] = &[
     ("src/governance/exclusion.rs", "propose"),
     ("src/knowledge/propose.rs", "propose_in_with"),
     ("src/devtime/actions/deliver.rs", "deliver_proposals"),
+    ("src/context_fit/learn.rs", "file_budget_proposal"),
 ];
 
 /// Creators that must call `bump(` in their own body.
@@ -62,6 +63,7 @@ const BUMP_IN_BODY: &[(&str, &str)] = &[
     ("src/governance/exclusion.rs", "propose"),
     ("src/knowledge/propose.rs", "propose"),
     ("src/devtime/actions/deliver.rs", "deliver_proposals"),
+    ("src/context_fit/learn.rs", "file_budget_proposal"),
 ];
 
 /// Helpers that insert a proposal outside `cfg(test)` without being creators:

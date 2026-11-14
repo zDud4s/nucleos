@@ -905,6 +905,11 @@ pub async fn ingest_cycle(
             }
         };
         let key = path_key(&file.path);
+        let node = match mapping.as_ref() {
+            Some(m) => devtime_map::tree_node_for_session(pool, &file.session, m).await,
+            None => None,
+        };
+        let mapping = node.as_ref().map(|n| n.mapping.clone()).or(mapping);
         match mapping.as_ref() {
             Some(m) if m.kind == "daemon_worktree" => {
                 if counted.insert(file.main.clone()) {
@@ -917,7 +922,7 @@ pub async fn ingest_cycle(
                 project_id: Some(project),
                 worktree,
                 ..
-            }) if kind == "project" || kind == "worktree" => {
+            }) if kind == "project" || kind == "worktree" || kind == "tree_node" => {
                 match ingest_file(
                     pool,
                     file,
@@ -929,7 +934,11 @@ pub async fn ingest_cycle(
                 )
                 .await
                 {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(n) = &node {
+                            n.stamp(pool, &file.session).await;
+                        }
+                    }
                     Err(Fail::Io(error)) => {
                         tracing::warn!(%error, file = %key, "devtime: a transcript could not be read");
                         stats.files_failed += 1;
@@ -2197,6 +2206,74 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    /// A leaf run's transcript (daemon worktree cwd) bound to a tree node is ingested, and the
+    /// findings the unchanged rules write for it carry the run and node; a daemon transcript of a
+    /// run with no node stays skipped.
+    #[tokio::test]
+    async fn a_tree_node_run_is_ingested_and_its_findings_carry_run_and_node() {
+        let h = harness(&[]).await;
+        let (node_sid, plain_sid) = ("s-leaf-node", "s-leaf-plain");
+        for (run, sid, node) in [(7_i64, node_sid, Some("n-leaf")), (8, plain_sid, None)] {
+            let file = write_rules_session(&h, sid, 10);
+            let body = std::fs::read_to_string(&file).unwrap().replace(
+                &format!("\"cwd\":\"{ROOT}\""),
+                &format!("\"cwd\":\"{ROOT}/.nucleos/worktrees/run-{run}\""),
+            );
+            std::fs::write(&file, body).unwrap();
+            sqlx::query(
+                "INSERT INTO runs (id, project_id, prompt, status, session_id, created_at)
+                 VALUES (?, 'p1', 'x', 'completed', ?, '2026-11-12T00:00:00.000Z')",
+            )
+            .bind(run)
+            .bind(sid)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+            if let Some(node) = node {
+                sqlx::query("INSERT INTO work_node_runs (node_id, run_id) VALUES (?, ?)")
+                    .bind(node)
+                    .bind(run)
+                    .execute(&h.pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        let stats = ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(stats.files_failed, 0);
+
+        let findings: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT rule_id, run_id, node_id FROM devtime_findings WHERE session_id = ?",
+        )
+        .bind(node_sid)
+        .fetch_all(&h.pool)
+        .await
+        .unwrap();
+        assert!(
+            findings.iter().any(|(rule, ..)| rule == "A1"),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|(_, run, node)| *run == Some(7) && node.as_deref() == Some("n-leaf")),
+            "{findings:?}"
+        );
+        let project: Option<String> =
+            sqlx::query_scalar("SELECT project_id FROM devtime_sessions WHERE session_id = ?")
+                .bind(node_sid)
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
+        assert_eq!(project.as_deref(), Some("p1"));
+        let plain: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM devtime_sessions WHERE session_id = ?")
+                .bind(plain_sid)
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
+        assert_eq!(plain, 0, "a daemon run with no node stays skipped");
     }
 
     #[tokio::test]

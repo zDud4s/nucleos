@@ -648,6 +648,164 @@ pub(super) async fn note_blocked_base(
     }
 }
 
+// ----- deterministic parks the driver settles itself (owner decision 2026-11-13) -----
+//
+// A park whose cause is one of the four below is answered with origin `driver` through
+// `auto_resolve::resolve_decision`, which honours `autonomy.tree_decides_itself` in `speed.yaml`,
+// the per-node and per-job caps (so every retry here is bounded), and writes the feed line:
+// a stale or dropped base (merge the integration branch and go on), a path-fence refusal whose
+// out-of-path files all arrived with the base, a gate that measured nothing because of
+// infrastructure (run it again), a node that could not start on a locked database or a reserved
+// launch key (start it again). Widening a branch's declared paths is never answered here.
+
+/// Appended by the path fence to a refusal whose out-of-path files all come from the branch's base.
+pub(super) const FROM_BASE_MARK: &str =
+    "All of those files come from its base, not from the branch's own work.";
+
+/// The kind the helper is told: these are ordinary, self-answerable questions.
+const SELF_ANSWER_KIND: &str = "ordinary";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutoCause {
+    /// The branch stands on a base that was dropped, or on a stale one.
+    StaleBase,
+    /// The fence refused files that came in with the base.
+    FenceFromBase,
+    /// The gate measured nothing because of infrastructure.
+    GateInfrastructure,
+    /// The node could not start on a locked database or a reserved launch key.
+    LaunchLocked,
+}
+
+impl AutoCause {
+    /// The answer the node is started again with.
+    pub(super) fn answer(self) -> &'static str {
+        match self {
+            AutoCause::StaleBase | AutoCause::FenceFromBase => {
+                "Merge the integration branch into your branch in your worktree, keep only your \
+                 own changes on top of it, make sure it still builds, commit and finish the node \
+                 again. Do not widen your declared paths."
+            }
+            AutoCause::GateInfrastructure => {
+                "The gate failed on infrastructure, not on your code. Change nothing and finish \
+                 the node again so the gate runs once more."
+            }
+            AutoCause::LaunchLocked => {
+                "The node could not start because a database or launch key was momentarily \
+                 locked. Start again from where you were."
+            }
+        }
+    }
+}
+
+/// What follows `marker` in `text`, if it is there.
+fn text_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    text.find(marker).map(|at| &text[at + marker.len()..])
+}
+
+/// Names the deterministic cause of a park question, if it is one of ours.
+pub(super) fn classify_park(question: &str) -> Option<AutoCause> {
+    if question.starts_with("Branch ")
+        && question.contains(", which was dropped, so it can never merge")
+    {
+        return Some(AutoCause::StaleBase);
+    }
+    if question.contains("cannot merge into")
+        && question.contains("outside its declared paths")
+        && question.contains(FROM_BASE_MARK)
+        && !question.contains("migration whose number")
+    {
+        return Some(AutoCause::FenceFromBase);
+    }
+    if question.starts_with("The gate of branch ")
+        && question.contains("without measuring anything")
+    {
+        let reason = text_after(question, "last reason: ")?;
+        return (!is_permanent_spawn_error(reason) && super::merge_recovery::is_transient(reason))
+            .then_some(AutoCause::GateInfrastructure);
+    }
+    if question.starts_with("Node ")
+        && question.contains("could not be started again")
+        && !is_permanent_spawn_error(question)
+    {
+        let error = text_after(question, "last error: ")?.to_ascii_lowercase();
+        if error.contains("database is locked") || error.contains("is reserved but holds no run") {
+            return Some(AutoCause::LaunchLocked);
+        }
+    }
+    None
+}
+
+/// Answers, for one job, every open decision whose cause is deterministic. Errors are logged and
+/// stop nothing; a decision the helper declines (flag off, cap reached) stays open for the owner.
+pub(super) async fn resolve_open_parks(state: &AppState, job_id: &str) {
+    let open: Result<Vec<(String, String)>, _> = sqlx::query_as(
+        "SELECT id, question FROM decisions WHERE tree_id = ? AND status = ? ORDER BY at, id",
+    )
+    .bind(job_id)
+    .bind(STATUS_OPEN)
+    .fetch_all(&state.pool)
+    .await;
+    let open = match open {
+        Ok(open) => open,
+        Err(error) => {
+            tracing::warn!(job = job_id, %error, "could not list the open decisions");
+            return;
+        }
+    };
+    for (id, question) in open {
+        let Some(cause) = classify_park(&question) else {
+            continue;
+        };
+        let outcome = super::auto_resolve::resolve_decision(
+            state,
+            &id,
+            SELF_ANSWER_KIND,
+            cause.answer(),
+            super::auto_resolve::Origin::Driver,
+        )
+        .await;
+        match outcome {
+            Ok(super::auto_resolve::Outcome::Resolved(_)) => {
+                tracing::info!(job = job_id, decision = %id, ?cause, "the driver settled a deterministic park");
+            }
+            Ok(other) => {
+                tracing::debug!(job = job_id, decision = %id, ?cause, ?other, "left for the owner");
+            }
+            Err(error) => {
+                tracing::warn!(job = job_id, decision = %id, %error, "could not settle a deterministic park");
+            }
+        }
+    }
+}
+
+/// Runs [`resolve_open_parks`] for every unfinished job that has an open decision.
+pub(super) async fn resolve_all_open_parks(state: &AppState) {
+    let jobs: Result<Vec<String>, _> = sqlx::query_scalar(
+        "SELECT DISTINCT d.tree_id FROM decisions d JOIN tree_jobs j ON j.id = d.tree_id \
+         WHERE d.status = ? AND j.state <> ?",
+    )
+    .bind(STATUS_OPEN)
+    .bind(JOB_TERMINAL_STATE)
+    .fetch_all(&state.pool)
+    .await;
+    match jobs {
+        Ok(jobs) => {
+            for job in jobs {
+                resolve_open_parks(state, &job).await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not list the jobs with open decisions");
+        }
+    }
+}
+
+// Registered here, not in `tree_job/mod.rs`: this node does not own that file.
+#[cfg(test)]
+#[path = "retry_auto_tests.rs"]
+mod auto_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

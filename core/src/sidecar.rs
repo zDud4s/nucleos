@@ -1089,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn o_sidecar_recebe_a_pasta_de_enviados() {
+    fn the_sidecar_receives_the_sent_folder() {
         let without_sent = crate::config::EmailConfig {
             sent_mailbox: None,
             ..Default::default()

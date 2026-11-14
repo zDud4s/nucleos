@@ -77,6 +77,8 @@ pub(super) fn reads_in_powershell(command: &str) -> bool {
         ["test-path", arguments @ ..] => tests_paths(arguments),
         ["get-childitem" | "gci", arguments @ ..] => lists_a_directory(arguments),
         ["select-string" | "sls", arguments @ ..] => selects_strings(arguments),
+        ["get-content" | "gc" | "type", arguments @ ..] => reads_a_file(arguments),
+        ["out-string", arguments @ ..] => formats_as_text(arguments),
         [literal] => is_string_literal(literal),
         _ => false,
     }
@@ -211,6 +213,116 @@ fn selects_strings(arguments: &[&str]) -> bool {
         }
     }
     pattern
+}
+
+/// `Get-Content [-Path] <path> [-TotalCount N | -Head N | -Tail N] [-Raw] [-Encoding <name>]
+/// [-ErrorAction SilentlyContinue]`: one literal file, read. `-Wait` (a `tail -f`) and every
+/// parameter not named here are refused.
+fn reads_a_file(arguments: &[&str]) -> bool {
+    let mut paths = 0;
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        let admitted = match *word {
+            "-raw" => true,
+            "-totalcount" | "-head" | "-first" | "-tail" | "-last" => {
+                words.next().is_some_and(|count| is_a_number(count))
+            }
+            "-encoding" => words.next().is_some_and(|name| {
+                unquoted(name)
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            }),
+            "-path" | "-literalpath" => {
+                paths += 1;
+                words.next().is_some_and(|path| literal_paths(path))
+            }
+            "-erroraction" | "-ea" => words.next().is_some_and(|action| quiet_on_error(action)),
+            _ if word.starts_with('-') => false,
+            _ => {
+                paths += 1;
+                literal_paths(word)
+            }
+        };
+        if !admitted {
+            return false;
+        }
+    }
+    paths == 1
+}
+
+/// `Out-String [-Stream] [-NoNewline] [-Width N]`: turns the pipeline into text on the host. It
+/// names no file (`Out-File` does, and is not here).
+fn formats_as_text(arguments: &[&str]) -> bool {
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        let admitted = match *word {
+            "-stream" | "-nonewline" => true,
+            "-width" => words.next().is_some_and(|width| is_a_number(width)),
+            _ => false,
+        };
+        if !admitted {
+            return false;
+        }
+    }
+    true
+}
+
+/// PURE: `$name = git merge-base ...` (or `git rev-parse ...`) as one PowerShell statement, and the
+/// variable's lowercased name. The right-hand side must itself be a compiled git read and carry no
+/// `$`, parenthesis, brace, `@`, backtick, quote or redirection, so what lands in the variable is
+/// the output of a read: a revision. A call is a fresh PowerShell process, so a variable holds
+/// nothing but what a statement of the same line assigned.
+pub(super) fn powershell_git_assignment(segment: &str) -> Option<String> {
+    let rest = segment.trim().strip_prefix('$')?;
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, rest) = rest.split_at(name_end);
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let rhs = rest.trim_start().strip_prefix('=')?.trim();
+    if rhs.contains([
+        '$', '(', ')', '{', '}', '@', '`', '\'', '"', '<', '>', ';', '|', '&',
+    ]) {
+        return None;
+    }
+    let mut words = rhs.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("git")
+        || !words
+            .next()
+            .is_some_and(|sub| matches!(sub, "merge-base" | "rev-parse"))
+    {
+        return None;
+    }
+    is_safe_command(&normalize_command(rhs)).then(|| name.to_ascii_lowercase())
+}
+
+/// PURE: `segment` with each `$name` of `variables` (lowercased, assigned earlier on the line by
+/// `powershell_git_assignment`) spelled as `HEAD`, a revision like the sha it holds, so that the
+/// rest of the classifier judges a line with no variable in it. Any other `$` is left alone, and
+/// is refused as before.
+pub(super) fn with_known_variables(segment: &str, variables: &[String]) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let name = after[..end].to_ascii_lowercase();
+        let bare = !after[end..].starts_with(':');
+        if end > 0 && bare && variables.contains(&name) {
+            out.push_str("HEAD");
+        } else {
+            out.push('$');
+            out.push_str(&after[..end]);
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_a_number(word: &str) -> bool {
@@ -495,6 +607,69 @@ mod tests {
         );
         // PowerShell's cmdlets are PowerShell's: under Bash these names are unknown programs.
         assert_not_allowed("Bash", &["Test-Path x", "Select-String 'a'"]);
+    }
+
+    /// Ticket #17 (b): a leaf reads its own worktree through a pipeline.
+    #[test]
+    fn a_leaf_reads_its_own_worktree_through_a_pipeline() {
+        assert_allowed(
+            "Bash",
+            &[
+                "cd C:/Projects/nucleos && grep -n foo core/src/a.rs | cut -d: -f1 | head -5",
+                "cd C:/Projects/nucleos && git diff --stat master | tail -20",
+                "cd C:/Projects/nucleos && git log --oneline -5 | wc -l",
+                "cd C:/Projects/nucleos && git status --short | head -20",
+                "cd C:/Projects/nucleos && git merge-base master HEAD",
+                "cd C:/Projects/nucleos && ls core | head",
+            ],
+        );
+        assert_not_allowed(
+            "Bash",
+            &[
+                "cd C:/Projects/nucleos && git push origin master",
+                "cd C:/Projects/nucleos && git push --force | head",
+                "cd C:/Projects/nucleos && git diff | sh",
+                "cd C:/Projects/nucleos && git log | xargs rm",
+                "cd C:/Projects/nucleos && grep foo f | tee ../out.txt",
+                "cd C:/Projects/nucleos && git diff > ../out.patch",
+                "cd C:/Windows && git status --short | head",
+                "cd C:/Projects/nucleos && git branch -D x | head",
+            ],
+        );
+    }
+
+    /// Ticket #17 (b): the PowerShell spelling, `Get-Content`, `Out-String` and a revision kept in
+    /// a variable.
+    #[test]
+    fn a_leaf_reads_in_powershell_with_get_content_out_string_and_a_merge_base() {
+        assert_allowed(
+            "PowerShell",
+            &[
+                "Get-Content core/src/a.rs -TotalCount 40",
+                "Get-Content -Path core/src/a.rs -Tail 20",
+                "git diff --stat | Out-String",
+                "git log --oneline -5 | Out-String -Width 200",
+                "$b = git merge-base master HEAD; git diff $b..HEAD --stat",
+                "Set-Location C:/Projects/nucleos; $b = git merge-base master HEAD; git log $b..HEAD --oneline | Out-String",
+            ],
+        );
+        assert_not_allowed(
+            "PowerShell",
+            &[
+                "Get-Content f -Wait",
+                "Get-Content $env:USERPROFILE",
+                "Get-Content a b",
+                "Get-Content (Get-Item x)",
+                "git diff | Out-File x.txt",
+                "git diff | Out-String -OutVariable x",
+                "$b = git push origin master",
+                "$b = git merge-base master HEAD > x",
+                "$b = Remove-Item x; git diff $b",
+                "$b = git merge-base master HEAD; git push origin $b",
+                "$b = git merge-base master HEAD; Remove-Item $b",
+                "$b = git merge-base $(Remove-Item x) HEAD",
+            ],
+        );
     }
 
     /// The compound line that prompted all of this, spelled as it was run.

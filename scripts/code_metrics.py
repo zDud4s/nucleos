@@ -298,23 +298,23 @@ def snapshot(repo: Path) -> dict:
 
 
 ROWS = [
-    ("layout", "files", "ficheiros"),
-    ("layout", "root_entries", "entradas na raiz de src/"),
-    ("layout", "root_files", "ficheiros soltos na raiz"),
-    ("layout", "folders", "pastas"),
-    ("layout", "widest_folder", "pasta mais larga (entradas)"),
-    ("layout", "map_cuts_the_root", "mapa tem de inventar grupos"),
-    ("size", "total", "linhas de código"),
-    ("size", "median", "mediana por ficheiro"),
-    ("size", "p90", "p90 por ficheiro"),
-    ("size", "max", "maior ficheiro"),
-    ("size", "over_limit", f"ficheiros > {LIMIT}"),
-    ("coupling", "edges", "imports entre ficheiros"),
-    ("coupling", "mean_fan_out", "imports por ficheiro"),
-    ("coupling", "files_in_cycles", "ficheiros em ciclos"),
-    ("coupling", "largest_cycle", "maior ciclo"),
-    ("folders", "blocks", "blocos (pastas + raiz)"),
-    ("folders", "modularity_q", "modularidade Q das pastas"),
+    ("layout", "files", "files"),
+    ("layout", "root_entries", "entries at the root of src/"),
+    ("layout", "root_files", "loose files at the root"),
+    ("layout", "folders", "folders"),
+    ("layout", "widest_folder", "widest folder (entries)"),
+    ("layout", "map_cuts_the_root", "map has to invent groups"),
+    ("size", "total", "lines of code"),
+    ("size", "median", "median per file"),
+    ("size", "p90", "p90 per file"),
+    ("size", "max", "largest file"),
+    ("size", "over_limit", f"files > {LIMIT}"),
+    ("coupling", "edges", "imports between files"),
+    ("coupling", "mean_fan_out", "imports per file"),
+    ("coupling", "files_in_cycles", "files in cycles"),
+    ("coupling", "largest_cycle", "largest cycle"),
+    ("folders", "blocks", "blocks (folders + root)"),
+    ("folders", "modularity_q", "folder modularity Q"),
 ]
 
 
@@ -325,10 +325,10 @@ def compare(before: dict, after: dict) -> str:
         mark = "" if a == b else "  *"
         lines.append(f"{label:34}{str(a):>12}{str(b):>12}{mark}")
     lines.append("")
-    lines.append("coesão por pasta (imports que ficam dentro / todos os que lhe tocam):")
+    lines.append("cohesion per folder (imports that stay inside / all that touch it):")
     for name, row in after["folders"]["per_folder"].items():
         if name != "(raiz)":
-            lines.append(f"  {name:20} {row['files']:>3} ficheiros  coesão {row['cohesion']}")
+            lines.append(f"  {name:20} {row['files']:>3} files  cohesion {row['cohesion']}")
     return "\n".join(lines)
 
 

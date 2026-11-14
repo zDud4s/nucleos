@@ -271,6 +271,9 @@ pub(super) async fn record_failure(
 /// One pass over the running branch nodes of unfinished jobs. A failure on one node is logged and
 /// stops no other. Safe to call again at any time.
 pub async fn sweep(state: &AppState) {
+    // A park the driver can settle itself (a locked database, a stale base) is answered before
+    // the owner would see it; the node it relaunches is then looked at below.
+    super::retry::resolve_all_open_parks(state).await;
     let rows: Result<Vec<(String, String)>, _> = sqlx::query_as(
         "SELECT n.id, n.tree_job_id FROM work_nodes n JOIN tree_jobs j ON j.id = n.tree_job_id \
          WHERE n.status = 'running' AND j.state <> ? ORDER BY n.created_at, n.id",

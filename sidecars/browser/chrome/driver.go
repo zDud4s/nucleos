@@ -4,7 +4,7 @@
 //
 // # The fence is a constructor, not a flag
 //
-// Spec §6.2a: "se o interceptor não estiver atado, o separador não navega." The strongest way to say
+// Spec §6.2a: "if the interceptor is not attached, the tab does not navigate." The strongest way to say
 // that in Go is to make an unfenced Driver impossible to hold. [Connect] attaches the interception
 // and returns an error if it cannot; there is no exported way to build a Driver otherwise. So there
 // is no `if !d.fenced` to forget, and no window between construction and arming.

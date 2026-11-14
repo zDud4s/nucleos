@@ -304,6 +304,21 @@ class Prompt(CliCase):
         with mock.patch.dict(ts.OUTCOME_STATUS, {"split": "blocked"}):
             self.assertIn("done -> done; split and contract_request and blocked -> blocked", self.prompt()["prompt"])
 
+    def test_pointers_reach_the_node_record_as_a_node_update_payload(self):
+        out = self.ok("prompt", "n-7", "--branch", "core", "--kind", "leaf", "--goal", "Add the wheel",
+                      "--paths", "core/src/wheel.rs", "--pointers", "core/src/wheel.rs:222-275 - the loop",
+                      "docs/spec.md - background", "core/src/wheel.rs:300-310 - again")
+        self.assertEqual(out["pointers"], ["core/src/wheel.rs", "docs/spec.md"])
+        self.assertEqual(out["mcp"], [{"tool": "node_update",
+                                       "args": {"id": "n-7", "pointers": ["core/src/wheel.rs", "docs/spec.md"]}}])
+        self.assertIn("core/src/wheel.rs:222-275 - the loop", out["prompt"])
+
+    def test_no_pointers_means_no_node_update(self):
+        out = self.ok("prompt", "n-8", "--branch", "core", "--kind", "leaf", "--goal", "Add the wheel",
+                      "--paths", "core/src/wheel.rs")
+        self.assertEqual(out["pointers"], [])
+        self.assertEqual(out["mcp"], [])
+
     def test_the_packet_fields_are_filled_and_nothing_is_left_over(self):
         out = self.prompt("n-5", "leaf", "--depth", "2", "--parent", "n-3", "--task-id", "T9")
         text = out["prompt"]

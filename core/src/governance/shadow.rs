@@ -1397,7 +1397,7 @@ mod tests {
     /// decisions from `shadow`-mode runs, and nothing from a `worktree`-mode run, which was already
     /// enforced and has no verdict left to collect.
     #[tokio::test]
-    async fn a_lista_de_revisao_so_mostra_o_que_conta_para_promocao() {
+    async fn the_review_list_only_shows_what_counts_towards_promotion() {
         let pool = test_pool().await;
         let shadow_run = insert_run_with_mode(&pool, "project-a", "shadow").await;
         let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;

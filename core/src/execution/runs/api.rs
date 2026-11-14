@@ -411,6 +411,10 @@ pub struct RunStatusResponse {
     pub cache_read_tokens: Option<i64>,
     pub num_turns: Option<i64>,
     pub context_fill: Option<i64>,
+    /// Input-side tokens of the run's first assistant turn (what it started from).
+    pub initial_context: Option<i64>,
+    /// JSON list of the tools the run was launched with, from the stream's `init` event.
+    pub tools_given: Option<String>,
     /// Whether this run accepts `POST /runs/{id}/message`. Reported because a caller that is
     /// refused otherwise cannot tell a run that never opted in from one that has already ended.
     pub steerable: bool,
@@ -805,7 +809,7 @@ pub async fn get_run(
         // numbers it was computed from as one read of one row.
         "SELECT id, project_id, status, mode, gate_status, gate_exit_code, gate_output, exit_code,
                 stdout, stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
-                num_turns, context_fill, steerable, successor_run_id, chat_id, cache_creation_tokens,
+                num_turns, context_fill, initial_context, tools_given, steerable, successor_run_id, chat_id, cache_creation_tokens,
                 authored_prompt_chars, model, effort, runner, route_mode, route_decision_id,
                 advised_runner, advised_model, advised_effort, route_failed, account_id
          FROM runs WHERE id = ?",

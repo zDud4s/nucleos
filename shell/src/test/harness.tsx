@@ -9,6 +9,7 @@ import {
   createRouter,
 } from "@tanstack/react-router";
 import { render, type RenderResult } from "@testing-library/react";
+import type { ContextFitReport } from "../data/context-fit";
 import { NAV_PATHS } from "../app/nav";
 import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
@@ -127,6 +128,8 @@ export interface DaemonState {
    * `analytics`: the project route rewrites `scope` and `project_id` and 404s an unknown project.
    */
   analyticsPipeline: PipelineReport;
+  /** `GET /analytics/context-fit`: no tree nodes measured by default. */
+  contextFit: ContextFitReport;
   /** `GET /analytics/devtime` and `/projects/{id}/analytics/devtime` — one payload for both, like `analytics`. */
   devtime: DevtimeOverview;
   /** `GET …/analytics/devtime/findings` — one page; the fake ignores `order`/`cursor`. */
@@ -375,6 +378,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     analytics: analyticsReport(),
     analyticsQuota: quotaHistory(),
     analyticsPipeline: pipelineReport(),
+    contextFit: { days: 7, nodes: 0, by_verdict: { under: 0, over: 0, split: 0, fit: 0 }, by_layer: [], recent: [] },
     devtime: devtimeOverview(),
     devtimeFindings: devtimeFindings({ items: [] }),
     devtimeMarks: [],
@@ -1509,6 +1513,7 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return projectId === undefined ? state.devtime : { ...state.devtime, scope: "project", project_id: projectId };
     }
     if (path.startsWith("/analytics/quota")) return state.analyticsQuota;
+    if (path.startsWith("/analytics/context-fit")) return state.contextFit;
     if (/^\/analytics\/pipeline(?:\?|$)/.test(path)) return state.analyticsPipeline;
     const projectPipeline = /^\/projects\/([^/?]+)\/analytics\/pipeline(?:\?|$)/.exec(path);
     if (projectPipeline !== null) {
