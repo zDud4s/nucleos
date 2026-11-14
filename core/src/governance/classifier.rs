@@ -129,6 +129,9 @@ const TREE_AGENT_TOOLS: &[&str] = &[
     "mcp__nucleos__record",
     "mcp__nucleos__verify",
     "mcp__nucleos__verify_status",
+    // A node files an out-of-scope problem with it instead of fixing a path it does not own
+    // (the node prompt says so); the `/tasks/report` door takes the holder from the run's key.
+    "mcp__nucleos__task_report",
 ];
 
 /// Files whose CONTENTS are the policy, matched as a path suffix wherever they sit.
@@ -7822,6 +7825,7 @@ mod tests {
             "record",
             "verify",
             "verify_status",
+            "task_report",
         ] {
             let tool = format!("mcp__nucleos__{name}");
             let result = classify(&tool, &json!({}), Some(Path::new("C:/work/repo")));
