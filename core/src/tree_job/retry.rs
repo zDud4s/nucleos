@@ -237,7 +237,10 @@ pub(super) async fn apply_gate_answer(
     let Some(held) = job.manifest.branches.get_mut(branch) else {
         return Ok(None);
     };
-    if !matches!(held.state.as_str(), "building" | "fixing" | "reviewing") {
+    if !matches!(
+        held.state.as_str(),
+        "building" | "fixing" | "reviewing" | "gating"
+    ) {
         return Ok(None);
     }
     let mut park = None;
