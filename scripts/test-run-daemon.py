@@ -45,7 +45,7 @@ def fake_target(base: Path) -> Path:
     """<base>/target with a debug dir of fake executables, each with distinct bytes."""
     debug = base / "target" / "debug"
     debug.mkdir(parents=True)
-    for name in ["nucleos-core"] + [f"{s}-sidecar" for s in SIDECARS]:
+    for name in ["nucleos-core"] + [f"nucleos-{s}" for s in SIDECARS]:
         (debug / f"{name}.exe").write_bytes(b"fake " + name.encode())
     return base / "target"
 
@@ -61,7 +61,7 @@ def test_staging_copies_the_daemon_and_every_sidecar_and_touches_no_source():
         for name, data in before.items():
             assert (run_dir / name).read_bytes() == data, name
         assert (run_dir / "built-from.txt").is_file()
-        assert len(list(run_dir.glob("*-sidecar.exe"))) == len(SIDECARS)
+        assert len(list(run_dir.glob("nucleos-*.exe"))) == len(SIDECARS) + 1
         after = {p.name: p.read_bytes() for p in (target / "debug").iterdir()}
         assert after == before, "the source directory changed"
 
@@ -131,7 +131,7 @@ def test_mcp_tool_servers_holding_the_copy_are_moved_aside_not_killed_or_refused
             assert len(aside) == 1, aside
             assert aside[0].name in done.stderr, done.stderr
             assert (run_dir / "nucleos-core.exe").read_bytes() == b"fake nucleos-core"
-            assert len(list(run_dir.glob("*-sidecar.exe"))) == len(SIDECARS)
+            assert len(list(run_dir.glob("nucleos-*.exe"))) == len(SIDECARS) + 1
             assert tools.poll() is None, "the MCP tool server was killed"
         finally:
             tools.kill()

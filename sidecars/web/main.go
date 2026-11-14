@@ -1,4 +1,4 @@
-// Command web-sidecar reads the internet on the núcleo's behalf.
+// Command nucleos-web reads the internet on the núcleo's behalf.
 //
 // It is the only process in NucleOS that fetches a URL somebody else chose, and it is deliberately
 // the dumbest one: it holds no state, opens no database, caches nothing, and makes no decision
@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	log.SetPrefix("web-sidecar: ")
+	log.SetPrefix("nucleos-web: ")
 	// Stateless (see the package comment), so the orderly shutdown when the daemon is gone is to exit.
 	watchLifeline(os.Getenv, os.Stdin, func() { os.Exit(0) })
 	cfg, err := config.Load()

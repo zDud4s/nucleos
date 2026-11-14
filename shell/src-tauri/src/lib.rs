@@ -491,7 +491,7 @@ mod tests {
             let dir = entry.expect("entry").path();
             if dir.join("go.mod").is_file() {
                 let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-                expected.push(format!("binaries/{name}-sidecar"));
+                expected.push(format!("binaries/nucleos-{name}"));
             }
         }
         expected.sort();
@@ -536,10 +536,21 @@ mod tests {
             let dir = entry.expect("entry").path();
             if dir.join("go.mod").is_file() {
                 let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-                let exe = format!("{name}-sidecar.exe");
+                let exe = format!("nucleos-{name}.exe");
                 assert!(hooks.contains(&exe), "hooks.nsh never stops {exe}");
                 let kill = format!("\"$SYSDIR\\taskkill.exe\" /F /T /IM {exe}");
                 assert!(hooks.contains(&kill), "hooks.nsh never runs: {kill}");
+                // The pre-rename name stays killed and deleted so an upgrade leaves no orphan.
+                let old = format!("{name}-sidecar.exe");
+                let old_kill = format!("\"$SYSDIR\\taskkill.exe\" /F /T /IM {old}");
+                assert!(
+                    hooks.contains(&old_kill),
+                    "hooks.nsh never runs: {old_kill}"
+                );
+                assert!(
+                    hooks.contains(&format!("Delete \"$INSTDIR\\{old}\"")),
+                    "hooks.nsh never deletes the leftover {old}"
+                );
             }
         }
     }
