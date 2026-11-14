@@ -55,9 +55,26 @@ impl TreeLaunchParams {
     }
 }
 
+/// `tree_status`: the tree job, how much to answer, and optionally one node.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
-pub(super) struct TreeIdParams {
+pub(super) struct TreeStatusParams {
+    /// The tree job id it was launched with.
     pub(super) id: String,
+    /// "summary" (default): a bounded answer. "full": the whole job, uncapped.
+    #[serde(default)]
+    pub(super) detail: Option<String>,
+    /// Answer only the branch bound to this node id (or named this), finished or not.
+    #[serde(default)]
+    pub(super) node_id: Option<String>,
+}
+
+/// `get_run`: the run, and how much to answer.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct RunGetParams {
+    pub(super) id: i64,
+    /// "summary" (default): id, status, timestamps, outcome, long text cut. "full": the whole run.
+    #[serde(default)]
+    pub(super) detail: Option<String>,
 }
 
 /// The body of `POST /trees/{id}/abandon`, with the job id lifted out into the path.

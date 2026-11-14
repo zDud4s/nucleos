@@ -336,12 +336,25 @@ impl NucleosTools {
         json_result(self.client.cancel_job(id).await)
     }
 
-    #[tool(description = "Get a NucleOS run by ID")]
+    #[tool(
+        description = "Get a NucleOS run by ID. Answers a bounded SUMMARY by default (id, status, \
+                       timestamps, outcome; long logs, transcripts and text cut, with a \
+                       `truncated` note). Pass `detail: \"full\"` for the whole run."
+    )]
     pub(super) async fn get_run(
         &self,
-        Parameters(IdParams { id }): Parameters<IdParams>,
+        Parameters(RunGetParams { id, detail }): Parameters<RunGetParams>,
     ) -> String {
-        json_result(self.client.get_run(id).await)
+        let detail = match Detail::parse(detail.as_deref()) {
+            Ok(detail) => detail,
+            Err(msg) => return error_json(msg),
+        };
+        match self.client.get_run(id).await {
+            Ok(run) if detail == Detail::Summary => {
+                json_result(Ok::<_, String>(summarize_run(run)))
+            }
+            other => json_result(other),
+        }
     }
 
     #[tool(description = "Cancel a NucleOS run by ID")]
@@ -807,13 +820,31 @@ impl NucleosTools {
                        and progress. `nodes[]` lists each branch's node with `nodes[].depth`, \
                        its parent and `nodes[].descent.reason` (why it became an orchestrator, \
                        or `degraded`/`kind_reason` when it opened as a leaf); `start_refusals` \
-                       lists the recent `tree_branch_start` calls that were refused and why."
+                       lists the recent `tree_branch_start` calls that were refused and why. \
+                       Answers a bounded SUMMARY by default: ids, states, `counts` per state, \
+                       every unfinished branch with its reason and latest gate/review, finished \
+                       branches collapsed to `finished_collapsed`, long text cut, and a \
+                       `truncated` note when capped. `node_id` narrows it to one node's branch. \
+                       `detail: \"full\"` answers the whole job."
     )]
     pub(super) async fn tree_status(
         &self,
-        Parameters(TreeIdParams { id }): Parameters<TreeIdParams>,
+        Parameters(TreeStatusParams {
+            id,
+            detail,
+            node_id,
+        }): Parameters<TreeStatusParams>,
     ) -> String {
-        json_result(self.client.tree_status(&id).await)
+        let detail = match Detail::parse(detail.as_deref()) {
+            Ok(detail) => detail,
+            Err(msg) => return error_json(msg),
+        };
+        match self.client.tree_status(&id).await {
+            Ok(status) if detail == Detail::Summary => {
+                json_result(Ok::<_, String>(summarize_tree(status, node_id.as_deref())))
+            }
+            other => json_result(other),
+        }
     }
 
     #[tool(

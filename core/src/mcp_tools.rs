@@ -4,6 +4,7 @@ use serde::Serialize;
 
 mod backlog_view;
 mod boxes;
+mod compact;
 mod effects;
 mod fence;
 mod local_box;
@@ -15,6 +16,7 @@ mod tools;
 
 use self::backlog_view::*;
 pub use self::boxes::*;
+use self::compact::*;
 pub use self::effects::*;
 use self::fence::*;
 pub use self::local_box::*;
