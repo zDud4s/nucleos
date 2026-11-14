@@ -1844,7 +1844,14 @@ mod tests {
     #[tokio::test]
     async fn an_old_row_lists_with_nulls_for_the_new_fields() {
         let pool = test_pool().await;
-        let (run_id, _) = parked_run(&pool, "awaiting_approval").await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at)
+             VALUES ('p', 'old', 'awaiting_approval', 'worktree', '2026-09-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
         sqlx::query(
             "INSERT INTO proposals (kind, status, run_id, tool_name, reasoning, created_at)
              VALUES ('action-approval', 'pending', ?, 'Bash', 'old', '2026-09-01T00:00:00Z')",
