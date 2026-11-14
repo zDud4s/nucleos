@@ -2,12 +2,17 @@
 
 use super::*;
 
+mod filter_rewrite;
 mod job_tools;
+mod leaf_self_check;
 mod node_context;
+mod own_merge;
 mod run_cache;
 mod web_builtin;
 
+use filter_rewrite::filter_rewrite;
 use job_tools::{job_id_of, job_node_web_builtin};
+use leaf_self_check::leaf_self_check_admitted;
 
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
@@ -53,65 +58,6 @@ pub async fn pretooluse_decision(
     })
 }
 
-/// PURE: `autonomy.leaf_self_check` of a `speed.yaml` text. Absent, mistyped or unreadable is
-/// `false`, the closed side.
-pub(super) fn leaf_self_check_from_yaml(text: &str) -> bool {
-    serde_yaml::from_str::<serde_yaml::Value>(text)
-        .ok()
-        .and_then(|doc| doc.get("autonomy")?.get("leaf_self_check")?.as_bool())
-        .unwrap_or(false)
-}
-
-/// Whether the project's `speed.yaml` turns the leaf's `cargo check -p <crate> --tests` on. Read
-/// from the MAIN checkout, never from the run's own worktree: the run could flip a switch it holds.
-fn leaf_self_check_enabled(cwd: &Path) -> bool {
-    cwd.ancestors()
-        .find_map(crate::governance::autopilot::main_checkout_of)
-        .is_some_and(|main| {
-            std::fs::read_to_string(main.join(".nucleos/workflow/speed.yaml"))
-                .is_ok_and(|text| leaf_self_check_from_yaml(&text))
-        })
-}
-
-/// Whether this call is a tree leaf's self-check (S2): an `unrecognized` shell line that is exactly
-/// one of the broker-wrapped forms `classifier::leaf_self_check_form` admits, run by a `Leaf`, with
-/// the broker scripts byte-identical to the main checkout's. The cheap pure parse goes first, and
-/// the role is read only once it matched. Never lifts a `deny` or a destructive class.
-async fn leaf_self_check_admitted(
-    state: &AppState,
-    payload: &PreToolUsePayload,
-    run_id: i64,
-    cwd: Option<&str>,
-    classification: &classifier::Classification,
-) -> bool {
-    if classification.action_class != "unrecognized"
-        || !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
-    {
-        return false;
-    }
-    let (Some(command), Some(cwd)) = (
-        payload.tool_input.get("command").and_then(Value::as_str),
-        cwd.map(Path::new),
-    ) else {
-        return false;
-    };
-    if !classifier::leaf_self_check_form(command, leaf_self_check_enabled(cwd))
-        || !classifier::leaf_self_check_scripts_intact(cwd, command)
-    {
-        return false;
-    }
-    let caller = crate::role_policy::Caller {
-        agent_id: payload.agent_id.clone(),
-        agent_type: payload.agent_type.clone(),
-        // A call with subagent markers but no usable `agent_id` must not resolve to a leaf (D12).
-        subagent: payload.subagent,
-    };
-    matches!(
-        crate::role_policy::resolve(&state.pool, &caller, Some(run_id)).await,
-        crate::role_policy::Role::Leaf
-    )
-}
-
 /// Whether any simple command of the line is `git [global options] push ...`. Deliberately wider
 /// than the queue's own `push_from_command`, which refuses some push shapes outright: for a grant
 /// that must not cover a push, every push shape counts.
@@ -135,51 +81,6 @@ fn command_runs_git_push(command: &str) -> bool {
             }
             false
         })
-}
-
-/// The replacement input that routes a recognized test/check/build command of an in-flight run
-/// through `--filter-run`, or `None` for anything else. Best effort: never panics, and a failure
-/// to read anything simply leaves the command untouched.
-pub(super) async fn filter_rewrite(
-    state: &AppState,
-    run_id: i64,
-    tool_name: &str,
-    tool_input: &Value,
-) -> Option<Value> {
-    if !state
-        .run_handles
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains_key(&run_id)
-    {
-        return None;
-    }
-    let project_id: Option<String> = run_cache::run_facts(state, run_id, true)
-        .await
-        .ok()??
-        .project_id
-        .clone();
-    let kinds = match project_id.as_deref() {
-        Some(pid) => crate::project::rules::autopilot(pid)
-            .map(|r| r.command_kinds)
-            .unwrap_or_default(),
-        None => crate::config::CommandKinds::default(),
-    };
-    let command = tool_input.get("command").and_then(Value::as_str)?;
-    if crate::governance::command_kind::kind_of(command, classifier::shell_for(tool_name), &kinds)
-        == crate::governance::command_kind::Kind::Other
-    {
-        return None;
-    }
-    // A replaced binary names a path that no longer exists (Linux: "<path> (deleted)"): fail open.
-    let exe = std::env::current_exe().ok().filter(|p| p.is_file())?;
-    let data = crate::daemon_client::data_dir()?;
-    crate::execution::output_filter::rewrite_input(
-        tool_name,
-        tool_input,
-        &exe,
-        &crate::execution::output_filter::run_log_dir(&data, run_id),
-    )
 }
 
 /// `pretooluse_decision` with the moment the request began taken as a parameter, so the budget the
@@ -787,11 +688,9 @@ pub(super) async fn pretooluse_decision_from(
             let declared_git_decision: Option<Decision> = async {
                 let project_id = project_id.as_deref()?;
                 let declared = crate::project::policy::git_ops(&state.pool, project_id).await;
-                if declared.is_empty() {
-                    return None;
-                }
 
                 let cwd = cwd.as_deref()?;
+                let run_cwd = cwd;
                 let command = payload.tool_input.get("command").and_then(Value::as_str)?;
                 // The branch is read where the segment RUNS, not where the run stands: `cd x &&`
                 // and `git -C x` move it. A directory change this reader cannot follow is not
@@ -800,6 +699,16 @@ pub(super) async fn pretooluse_decision_from(
                 let segment = segments
                     .iter()
                     .find(|segment| queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).is_some())?;
+                // A project that declared nothing pays no git probe for anything but a merge: that
+                // is the only shape a tree leaf may sync its own worktree with (`own_merge`).
+                if declared.is_empty()
+                    && !matches!(
+                        queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH),
+                        Some(crate::execution::vcs::Op::Merge { .. })
+                    )
+                {
+                    return None;
+                }
                 let cwd = match &segment.dir {
                     crate::execution::vcs::SegmentDir::Session => std::path::PathBuf::from(cwd),
                     crate::execution::vcs::SegmentDir::Steps(steps) => {
@@ -828,11 +737,32 @@ pub(super) async fn pretooluse_decision_from(
                     .ok()?;
 
                 let op = queue_op(&segment.command, &branch)?;
-                let (_, permission) = declared.iter().find(|(kind, _)| kind == op.kind())?;
+                let declaration = declared.iter().find(|(kind, _)| kind == op.kind());
+                // No declaration, but a tree leaf merging its tree's feature branch or the
+                // integration branch into its own worktree is queued all the same.
+                let leaf_sync = match (&op, declaration) {
+                    (crate::execution::vcs::Op::Merge { source, target }, None) => {
+                        own_merge::is_leaf_sync_merge(
+                            &state.pool,
+                            run_id,
+                            project_id,
+                            Path::new(run_cwd),
+                            &root,
+                            source.as_str(),
+                            target.as_str(),
+                        )
+                        .await
+                    }
+                    _ => false,
+                };
+                if declaration.is_none() && !leaf_sync {
+                    return None;
+                }
                 // The declaration is a grant. One that does not cover this requester is not a
                 // refusal: it simply does not apply, and the call takes the normal path, which
                 // means "ask as before". The push refusal below stays unconditional.
-                if *permission != crate::role_policy::Permission::default()
+                if let Some((_, permission)) = declaration
+                    && *permission != crate::role_policy::Permission::default()
                     && !matches!(op, crate::execution::vcs::Op::Push { .. })
                 {
                     let caller = crate::role_policy::Caller {
@@ -865,13 +795,16 @@ pub(super) async fn pretooluse_decision_from(
                 )
                 .await
                 .ok()?;
+                let why = if declaration.is_some() {
+                    format!("{project_id} declared {} in advance", op.kind())
+                } else {
+                    "a tree leaf may bring its tree's base into its own worktree".to_owned()
+                };
                 Some(Decision {
                     decision: "deny".to_owned(),
                     reason: format!(
                         "this action was handed to the daemon's git queue as request {request_id} \
-                         because {project_id} declared {} in advance, and will be carried out \
-                         there — do not attempt it again",
-                        op.kind()
+                         because {why}, and will be carried out there — do not attempt it again"
                     ),
                 })
             }
@@ -1480,6 +1413,8 @@ mod tests {
 
     #[test]
     fn the_leaf_self_check_flag_is_off_unless_the_yaml_says_true() {
+        use super::leaf_self_check::leaf_self_check_from_yaml;
+
         assert!(leaf_self_check_from_yaml(
             "autonomy:\n  leaf_self_check: true\n"
         ));

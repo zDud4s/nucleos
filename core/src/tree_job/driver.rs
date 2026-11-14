@@ -1086,6 +1086,9 @@ async fn landing_step(
         return super::retry::after_settle(state, job, settled, parks).await;
     }
     if !root_is_done(pool, &job.root_node_id).await? {
+        // A root that will never report `done` (dropped) with its work already on the
+        // integration branch another way: the tree finishes as landed instead of waiting forever.
+        super::already_landed::finish_if_already_landed(pool, job).await?;
         return Ok(());
     }
     let empty = is_empty_tree(&job.manifest);
@@ -2707,6 +2710,46 @@ pub(super) mod tests {
 
         assert_eq!(fx.job(JOB).await.state, "finished");
         assert_eq!(fx.requests().await, 0, "an empty tree queues no landing");
+    }
+
+    /// The feature branch reached master another way and the root never reports `done` (it was
+    /// dropped): the tree finishes as landed with master's tip, queuing nothing.
+    #[tokio::test]
+    async fn an_integration_tree_already_on_master_finishes_as_landed() {
+        const JOB: &str = "drv-already-landed";
+        let fx = Fixture::new().await;
+        assert!(git_in(&fx.repo, &["checkout", "-q", "master"]));
+        assert!(git_in(&fx.repo, &["merge", "-q", "--ff-only", "feat/tree"]));
+        let master = sha_of(&fx.repo, "master");
+        fx.seed_job(JOB, vec![merged_branch("api", None)], Some("integration"))
+            .await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        let job = fx.job(JOB).await;
+        assert_eq!(job.state, "finished");
+        assert_eq!(job.manifest.state, "finished");
+        assert_eq!(job.manifest.extra.get("land_sha"), Some(&json!(master)));
+        assert_ne!(job.manifest.extra.get("landing"), Some(&json!("held")));
+        assert_eq!(fx.requests().await, 0, "nothing is queued");
+    }
+
+    /// Guard: unlanded work with a root that is not done keeps waiting.
+    #[tokio::test]
+    async fn an_integration_tree_not_yet_on_master_stays_open() {
+        const JOB: &str = "drv-not-landed";
+        let fx = Fixture::new().await;
+        assert!(git_in(&fx.repo, &["checkout", "-q", "master"]));
+        fx.seed_job(JOB, vec![merged_branch("api", None)], Some("integration"))
+            .await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        let job = fx.job(JOB).await;
+        assert_ne!(job.state, "finished");
+        assert!(!job.manifest.extra.contains_key("land_sha"));
     }
 
     /// Guard: this may pass before the empty-tree completion change, but work in flight must not

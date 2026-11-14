@@ -8137,6 +8137,156 @@ mod tests {
         assert_eq!(status, "awaiting_approval");
     }
 
+    /// A rostered repo whose checkout is on `branch` (the integration branch is `master`), and a
+    /// running `worktree` run standing in it that is a node of a tree job whose feature branch is
+    /// `feat/tree`. No git operation is declared.
+    async fn tree_leaf_on(
+        state: &AppState,
+        prefix: &str,
+        branch: &str,
+    ) -> (tempfile::TempDir, i64) {
+        let repo = rostered_repo(state, prefix).await;
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .expect("git should start")
+                    .success()
+            );
+        };
+        git(&["branch", "-M", "master"]);
+        if branch != "master" {
+            git(&["checkout", "-b", branch]);
+        }
+        let run_id = in_flight_run(
+            state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some(prefix),
+        )
+        .await;
+        let node_id = format!("{prefix}-node");
+        sqlx::query(
+            "INSERT INTO work_nodes (id, project_id, root_id, depth, kind, title, goal, status,
+                                     run_id, created_at, updated_at)
+             VALUES (?, 'p', ?, 1, 'leaf', 't', 'g', 'running', ?, '2026-11-14T00:00:00Z',
+                     '2026-11-14T00:00:00Z')",
+        )
+        .bind(&node_id)
+        .bind(&node_id)
+        .bind(run_id.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let tree_id = format!("{prefix}-tree");
+        crate::tree_job::store::save(
+            &state.pool,
+            &crate::tree_job::store::TreeJob {
+                id: tree_id.clone(),
+                root_node_id: node_id.clone(),
+                project_id: Some("p".to_owned()),
+                feature_branch: Some("feat/tree".to_owned()),
+                goal: "g".to_owned(),
+                state: "open".to_owned(),
+                manifest: crate::tree_job::model::Manifest::new(
+                    &tree_id,
+                    "feat/tree",
+                    "g",
+                    repo.path().to_str().unwrap(),
+                    &[],
+                ),
+                contract: None,
+                created_at: "2026-11-14T00:00:00Z".to_owned(),
+                updated_at: "2026-11-14T00:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work_nodes SET tree_job_id = ? WHERE id = ?")
+            .bind(tree_id)
+            .bind(node_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        (repo, run_id)
+    }
+
+    /// 2026-11-14, `obsolete-auto-close-and-sweep`: a leaf red only because its branch lacked fixes
+    /// already on master could not merge master in. With nothing declared, a tree leaf's merge of
+    /// the integration branch or the tree's feature branch into its OWN worktree goes to the queue.
+    #[tokio::test]
+    async fn a_tree_leaf_merging_its_base_into_its_own_worktree_is_queued() {
+        for (prefix, source) in [
+            ("leaf-sync-master", "master"),
+            ("leaf-sync-feature", "feat/tree"),
+        ] {
+            let state = test_state().await;
+            let (_repo, run_id) = tree_leaf_on(&state, prefix, "tree/job/leaf").await;
+            let app = test_router(state.clone());
+
+            let decision =
+                run_git_decision(&app, run_id, &format!("git -C . merge --no-ff {source}")).await;
+
+            assert_eq!(decision.decision, "deny", "{}", decision.reason);
+            assert!(decision.reason.contains("request 1"), "{}", decision.reason);
+            assert_eq!(
+                queued_run_rows(&state).await,
+                vec![(
+                    1,
+                    "merge".to_owned(),
+                    "run".to_owned(),
+                    "queued".to_owned(),
+                    Some(run_id),
+                )],
+                "{source}"
+            );
+        }
+    }
+
+    /// The grant is narrow: any other source, a merge INTO the integration branch, and a push are
+    /// not queued and do not pass. A tree run's park is never answered, so what would have asked
+    /// for approval is a refusal the agent can act on (`deny`, "autonomous tree job"), not a park.
+    #[tokio::test]
+    async fn a_tree_leaf_merge_into_a_foreign_branch_or_from_a_foreign_source_still_parks() {
+        // A source that is neither the feature branch nor the integration branch.
+        let state = test_state().await;
+        let (_repo, run_id) = tree_leaf_on(&state, "leaf-foreign-source", "tree/job/leaf").await;
+        let app = test_router(state.clone());
+        let decision = run_git_decision(&app, run_id, "git -C . merge --no-ff other/work").await;
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("autonomous tree job"),
+            "{}",
+            decision.reason
+        );
+        assert!(queued_run_rows(&state).await.is_empty());
+
+        // The checkout is on the integration branch itself: a merge there would land in master.
+        let state = test_state().await;
+        let (_repo, run_id) = tree_leaf_on(&state, "leaf-into-master", "master").await;
+        let app = test_router(state.clone());
+        let decision = run_git_decision(&app, run_id, "git -C . merge --no-ff feat/tree").await;
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("autonomous tree job"),
+            "{}",
+            decision.reason
+        );
+        assert!(queued_run_rows(&state).await.is_empty());
+
+        // A push is never queued for a run.
+        let state = test_state().await;
+        let (_repo, run_id) = tree_leaf_on(&state, "leaf-push", "tree/job/leaf").await;
+        let app = test_router(state.clone());
+        let decision = run_git_decision(&app, run_id, "git push origin tree/job/leaf").await;
+        assert_ne!(decision.decision, "allow");
+        assert!(queued_run_rows(&state).await.is_empty());
+    }
+
     /// A declaration grants one queue operation; it does not erase a shell refusal. The classifier
     /// decides the refusal before this admission path is even eligible to inspect the declaration.
     #[tokio::test]

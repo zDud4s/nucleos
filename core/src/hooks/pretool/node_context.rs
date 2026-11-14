@@ -609,6 +609,8 @@ pub(super) async fn record_fence_refusal(
         },
         action_class: "node-scope",
         reason: NODE_SCOPE_REASON.to_owned(),
+        culprit: None,
+        segments: Vec::new(),
     };
     if let Err(error) = crate::governance::shadow::record_decision(
         &state.pool,

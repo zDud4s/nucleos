@@ -190,6 +190,8 @@ async fn record_would_have_said(state: &AppState, run_id: i64, found: &Loop) {
         },
         action_class: "context-warning",
         reason: CONTEXT_WARNING_REASON.to_owned(),
+        culprit: None,
+        segments: Vec::new(),
     };
     let input = serde_json::json!({
         "rule": found.rule,
