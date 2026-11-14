@@ -427,8 +427,7 @@ fn looks_like_stream_json(text: &str) -> bool {
         return false;
     };
     first.starts_with('{')
-        && serde_json::from_str::<serde_json::Value>(first)
-            .is_ok_and(|v| v.get("type").is_some())
+        && serde_json::from_str::<serde_json::Value>(first).is_ok_and(|v| v.get("type").is_some())
 }
 
 /// One pass over the open tree decisions. A failure on one is logged and stops no other.
@@ -704,7 +703,8 @@ mod decision_run_tests {
         );
     }
 
-    const HOOK_LINE: &str = r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart"}"#;
+    const HOOK_LINE: &str =
+        r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart"}"#;
 
     #[test]
     fn a_stream_json_run_answers_with_its_result_text() {
