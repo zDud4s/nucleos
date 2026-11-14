@@ -84,10 +84,10 @@ type Chain<'a> = Vec<&'a SpawnRow>;
 
 /// Groups rows (oldest first) into tasks: a spawn joins the chain of its session whose last attempt
 /// has a near-identical description and is recent enough.
-fn tasks(rows: &[&SpawnRow]) -> Vec<Chain<'_>> {
+fn tasks<'a>(rows: &[&'a SpawnRow]) -> Vec<Chain<'a>> {
     let mut ordered: Vec<&SpawnRow> = rows.to_vec();
     ordered.sort_by_key(|r| r.spawned_at);
-    let mut chains: Vec<Chain<'_>> = Vec::new();
+    let mut chains: Vec<Chain<'a>> = Vec::new();
     for row in ordered {
         let text = row.description.as_deref().unwrap_or("");
         let found = chains.iter_mut().rev().find(|chain| {
@@ -223,12 +223,20 @@ pub fn should_fall_back_to_shadow(window: &[SpawnRow], base_rate: f64) -> bool {
         .is_some_and(|rate| rate > base_rate + FALLBACK_PP)
 }
 
-const COLUMNS: &str = "session_id, description, model, source, mode, advised_model, outcome, \
-                       cost_usd, spawned_at";
+/// Prefixes a literal query tail with the spawn columns, keeping the SQL a `&'static str`.
+macro_rules! select_spawns {
+    ($tail:literal) => {
+        concat!(
+            "SELECT session_id, description, model, source, mode, advised_model, outcome, \
+             cost_usd, spawned_at ",
+            $tail
+        )
+    };
+}
 
 async fn load_since(pool: &SqlitePool, since: i64) -> Result<Vec<SpawnRow>, sqlx::Error> {
-    sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM agent_spawns WHERE spawned_at >= ? ORDER BY spawned_at, id"
+    sqlx::query_as(select_spawns!(
+        "FROM agent_spawns WHERE spawned_at >= ? ORDER BY spawned_at, id"
     ))
     .bind(since)
     .fetch_all(pool)
@@ -246,15 +254,16 @@ pub async fn guard_apply(pool: &SqlitePool) {
     if !in_apply {
         return;
     }
-    let latest: Result<Vec<SpawnRow>, _> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM (SELECT * FROM agent_spawns WHERE mode = 'apply' AND source != ?
-         ORDER BY spawned_at DESC, id DESC LIMIT {FALLBACK_WINDOW}) ORDER BY spawned_at, id"
+    let latest: Result<Vec<SpawnRow>, _> = sqlx::query_as(select_spawns!(
+        "FROM (SELECT * FROM agent_spawns WHERE mode = 'apply' AND source != ?
+         ORDER BY spawned_at DESC, id DESC LIMIT ?) ORDER BY spawned_at, id"
     ))
     .bind(SOURCE_SKIPPED)
+    .bind(FALLBACK_WINDOW as i64)
     .fetch_all(pool)
     .await;
-    let shadow: Result<Vec<SpawnRow>, _> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM agent_spawns WHERE mode = 'shadow' AND source != ?
+    let shadow: Result<Vec<SpawnRow>, _> = sqlx::query_as(select_spawns!(
+        "FROM agent_spawns WHERE mode = 'shadow' AND source != ?
          ORDER BY spawned_at, id"
     ))
     .bind(SOURCE_SKIPPED)
