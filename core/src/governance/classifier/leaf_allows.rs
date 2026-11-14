@@ -373,10 +373,11 @@ pub(super) fn is_added_read(segment: &str) -> bool {
     };
     let rest = &words[1..];
     match program {
-        "date" => rest.iter().all(|w| w == "-u" || w == "--utc" || w.starts_with('+')),
+        "date" => rest
+            .iter()
+            .all(|w| w == "-u" || w == "--utc" || w.starts_with('+')),
         "gofmt" => {
-            rest.first().is_some_and(|w| w == "-l")
-                && rest[1..].iter().all(|w| !w.starts_with('-'))
+            rest.first().is_some_and(|w| w == "-l") && rest[1..].iter().all(|w| !w.starts_with('-'))
         }
         "sed" => match rest {
             [flag, script, files @ ..] if flag == "-n" => {
@@ -436,7 +437,10 @@ fn is_git_dash_c_read(words: &[String]) -> bool {
     }
     let plain = format!("git {sub} {}", rest.join(" "));
     let normalized = super::shell_shape::normalize_command(&plain);
-    flag_words(&normalized).iter().all(|f| !f.starts_with("--output")) && is_safe_command(&normalized)
+    flag_words(&normalized)
+        .iter()
+        .all(|f| !f.starts_with("--output"))
+        && is_safe_command(&normalized)
 }
 
 /// `git checkout -b <name> [<start>]` and `git switch -c <name> [<start>]`: a new local branch.
@@ -474,9 +478,11 @@ pub(super) fn is_plain_cd(segment: &str) -> bool {
         return false;
     }
     !target.replace('\\', "/").split('/').any(|part| {
-        [".ssh", ".aws", ".gnupg", ".config", ".nucleos", ".claude", ".git"]
-            .iter()
-            .any(|name| part.eq_ignore_ascii_case(name))
+        [
+            ".ssh", ".aws", ".gnupg", ".config", ".nucleos", ".claude", ".git",
+        ]
+        .iter()
+        .any(|name| part.eq_ignore_ascii_case(name))
     })
 }
 

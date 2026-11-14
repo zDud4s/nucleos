@@ -1199,11 +1199,16 @@ fn classify_shell_command(
         // keeps its park.
         if cwd.is_some() && cd_elsewhere.is_none() {
             if let Segment::Unrecognized(why) = &verdict {
-                if why.ends_with("leaves the run's workspace")
-                    && leaf_allows::is_plain_cd(&segment)
+                if why.ends_with("leaves the run's workspace") && leaf_allows::is_plain_cd(&segment)
                 {
                     let shown = original_segment_text(command, raw_segment);
-                    cd_elsewhere = Some((shown, why.replace(raw_segment.as_str(), &original_segment_text(command, raw_segment))));
+                    cd_elsewhere = Some((
+                        shown,
+                        why.replace(
+                            raw_segment.as_str(),
+                            &original_segment_text(command, raw_segment),
+                        ),
+                    ));
                     continue;
                 }
             }
@@ -7990,7 +7995,11 @@ mod tests {
             assert_eq!(result.decision.decision, "allow", "{tool}");
             assert_ne!(result.action_class, "unrecognized-tool", "{tool}");
         }
-        for tool in ["mcp__nucleos__task_report_all", "mcp__other__task_claim", "Monitors"] {
+        for tool in [
+            "mcp__nucleos__task_report_all",
+            "mcp__other__task_claim",
+            "Monitors",
+        ] {
             assert_eq!(
                 classify(tool, &json!({}), Some(Path::new("C:/work/repo")))
                     .decision
@@ -8006,7 +8015,11 @@ mod tests {
     const LEAF_CWD: &str = "C:/Projects/nucleos/.nucleos/worktrees/job-26";
 
     fn leaf_bash(command: &str) -> Classification {
-        classify("Bash", &json!({ "command": command }), Some(Path::new(LEAF_CWD)))
+        classify(
+            "Bash",
+            &json!({ "command": command }),
+            Some(Path::new(LEAF_CWD)),
+        )
     }
 
     fn assert_leaf_allows(commands: &[&str]) {
@@ -8065,7 +8078,11 @@ mod tests {
             "cd ../.. && ls",
             "cd -P C:/x && ls",
         ] {
-            assert_eq!(leaf_bash(command).decision.decision, "pending_approval", "{command}");
+            assert_eq!(
+                leaf_bash(command).decision.decision,
+                "pending_approval",
+                "{command}"
+            );
         }
     }
 
@@ -8108,7 +8125,10 @@ mod tests {
         ]);
         assert_leaf_parks(&[
             ("git -C C:/x commit -m y", "git -C C:/x commit -m y"),
-            ("git -C C:/x -c core.pager=x log", "git -C C:/x -c core.pager=x log"),
+            (
+                "git -C C:/x -c core.pager=x log",
+                "git -C C:/x -c core.pager=x log",
+            ),
             (
                 "git -C C:/x diff --output=out.txt",
                 "git -C C:/x diff --output=out.txt",
@@ -8150,15 +8170,24 @@ mod tests {
     #[test]
     fn a_shell_edit_outside_the_worktree_or_on_governance_still_parks() {
         assert_leaf_parks(&[
-            ("sed -i 's/a/b/' C:/other/a.rs", "sed -i 's/a/b/' C:/other/a.rs"),
+            (
+                "sed -i 's/a/b/' C:/other/a.rs",
+                "sed -i 's/a/b/' C:/other/a.rs",
+            ),
             ("sed -i 's/a/b/' ../a.rs", "sed -i 's/a/b/' ../a.rs"),
             (
                 "sed -i 's/a/b/' .claude/settings.json",
                 "sed -i 's/a/b/' .claude/settings.json",
             ),
-            ("sed -i 's/a/b/' .githooks/pre-commit", "sed -i 's/a/b/' .githooks/pre-commit"),
+            (
+                "sed -i 's/a/b/' .githooks/pre-commit",
+                "sed -i 's/a/b/' .githooks/pre-commit",
+            ),
             ("sed -i 's/a/b/' .git/config", "sed -i 's/a/b/' .git/config"),
-            ("sed -i 's/a/b/' .cargo/config.toml", "sed -i 's/a/b/' .cargo/config.toml"),
+            (
+                "sed -i 's/a/b/' .cargo/config.toml",
+                "sed -i 's/a/b/' .cargo/config.toml",
+            ),
             ("sed -i.bak 's/a/b/' a.rs", "sed -i.bak 's/a/b/' a.rs"),
             ("sed -i 's/a/b/e' a.rs", "sed -i 's/a/b/e' a.rs"),
             ("sed -i -e 's/a/b/' a.rs", "sed -i -e 's/a/b/' a.rs"),
@@ -8176,7 +8205,11 @@ mod tests {
             "cat > notes.txt <<EOF\nvalue $HOME\nEOF",
             "cat > a.txt > b.txt <<'EOF'\nx\nEOF",
         ] {
-            assert_eq!(leaf_bash(command).decision.decision, "pending_approval", "{command}");
+            assert_eq!(
+                leaf_bash(command).decision.decision,
+                "pending_approval",
+                "{command}"
+            );
         }
     }
 
@@ -8219,7 +8252,11 @@ mod tests {
             "sed -i 's/a/b/' C:/Users/x/.nucleos/nucleos.db",
             "echo x | tee .nucleos/state.yaml",
         ] {
-            assert_eq!(leaf_bash(command).decision.decision, "pending_approval", "{command}");
+            assert_eq!(
+                leaf_bash(command).decision.decision,
+                "pending_approval",
+                "{command}"
+            );
         }
     }
 
@@ -8236,7 +8273,10 @@ mod tests {
             ("npm publish", "npm publish"),
             ("cargo publish", "cargo publish"),
             ("git merge tree/x && git push", "git push"),
-            ("git -C C:/other merge tree/x", "git -C C:/other merge tree/x"),
+            (
+                "git -C C:/other merge tree/x",
+                "git -C C:/other merge tree/x",
+            ),
         ]);
         // No workspace, no exemption.
         let verdict = classify("Bash", &json!({"command": "git merge tree/x"}), None);
@@ -8258,7 +8298,10 @@ mod tests {
             ("git mv a.rs b.rs", "git mv a.rs b.rs"),
             ("python -c 'print(1)'", "python -c 'print(1)'"),
         ]);
-        assert_eq!(leaf_bash("sleep 5 & git status").decision.decision, "pending_approval");
+        assert_eq!(
+            leaf_bash("sleep 5 & git status").decision.decision,
+            "pending_approval"
+        );
     }
 
     #[test]
