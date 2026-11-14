@@ -3026,9 +3026,12 @@ mod tests {
         }
     }
 
-    /// `create_resolution_run` refuses before its claim when `git worktree add` cannot find the
-    /// base — the live `fatal: invalid reference: aut/integ`. `settle_moot` is deliberately not run:
-    /// this is about the launcher, which must count a failed hand-off as spent so that
+    /// `create_resolution_run` refuses before its claim when the worktree cannot be made, and the
+    /// target branch is NOT the cause: a target that is positively absent settles the request
+    /// instead of counting (`settle_missing_target`). So the failure here is transient by
+    /// construction — `aut/integ` exists, but the worktree root sits beneath a regular file, so
+    /// `create_dir_all` fails on every platform. `settle_moot` is deliberately not run: this is
+    /// about the launcher, which must count a failed hand-off as spent so that
     /// `MAX_RESOLUTION_ATTEMPTS` bounds it, rather than retrying the same row every tick for ever.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
@@ -3037,13 +3040,21 @@ mod tests {
         let pool = &fixture.state.pool;
         let (_container, repo) = moot_repo("nucleos-resolver-spend-");
         assert!(git_at(&repo, &["branch", "feat/x"]));
+        assert!(git_at(&repo, &["branch", "aut/integ"]));
         let unlaunchable = escalated_merge_into(pool, "feat/x", "aut/integ", false).await;
         rooted_at(pool, unlaunchable, &repo).await;
+
+        // A file where the worktree root's parent should be. Declared after the fixture so it drops
+        // first and restores the fixture's own root.
+        let blocker = fixture._worktrees.path().join("not-a-directory");
+        std::fs::write(&blocker, "x").expect("write the blocker file");
+        let _blocked_root =
+            crate::execution::runs::tests::WorktreeRootEnv::set(&blocker.join("root"));
 
         let started = launch_once(&fixture.state).await;
         assert_eq!(
             started, None,
-            "a merge into a missing branch starts no agent"
+            "a merge whose worktree cannot be made starts no agent"
         );
         assert_eq!(
             attempts_of(pool, unlaunchable).await,
@@ -3090,7 +3101,8 @@ mod tests {
             "the unlaunchable row has to be first in line"
         );
 
-        // Enough ticks to spend the older row's attempts and then reach the next one.
+        // The missing target settles the older row on the first tick (`settle_missing_target`), so
+        // it stops being the oldest candidate at once; the loop bound is kept generous anyway.
         for _ in 0..=MAX_RESOLUTION_ATTEMPTS {
             let _ = launch_once(&fixture.state).await;
             if resolution_run_of(pool, younger).await.is_some() {
