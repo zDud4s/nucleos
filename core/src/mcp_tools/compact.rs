@@ -109,10 +109,10 @@ fn trim_once(value: &mut Value, path: &str, cuts: &mut Cuts) -> bool {
                 return false;
             };
             let child_path = format!("{path}.{biggest}");
-            if let Some(child) = map.get_mut(&biggest) {
-                if trim_once(child, &child_path, cuts) {
-                    return true;
-                }
+            if let Some(child) = map.get_mut(&biggest)
+                && trim_once(child, &child_path, cuts)
+            {
+                return true;
             }
             map.remove(&biggest);
             cuts.removed.push(child_path);
