@@ -2358,8 +2358,8 @@ mod tests {
         let leaf = open(&pool, None, &limits, &leaf_args).await.unwrap();
 
         // Writes the line the way `announce_close` does; returns whether it wrote.
-        async fn park(pool: &SqlitePool, node: &Node, decision: &str) -> bool {
-            let mut blocked = node.clone();
+        async fn park(pool: &SqlitePool, opened: &Opened, decision: &str) -> bool {
+            let mut blocked = get(pool, &opened.id).await.unwrap();
             blocked.status = "blocked".into();
             blocked.summary = Some("Needs a call.".into());
             blocked.decisions = vec![decision.into()];
