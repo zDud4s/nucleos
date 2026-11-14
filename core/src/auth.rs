@@ -708,6 +708,8 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "team-triggers",
     "teams",
     "themes",
+    // Admin-only on a paired device (tree decision queue: the owner answering from another machine).
+    "tree-decisions",
     "voice",
     "waiting",
     "web",

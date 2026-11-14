@@ -40,6 +40,8 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/nodes/scope", post(post_scope))
         .route("/nodes/{id}", patch(patch_node))
         .route("/nodes/{id}/close", post(post_close))
+        // Owner-level: no `Scope::Run` allowlist names these, so a tree run's key never reaches them.
+        .merge(crate::tree_job::decision_tools::routes())
 }
 
 type Refusal = (StatusCode, Json<Value>);
