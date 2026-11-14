@@ -1197,42 +1197,36 @@ fn classify_shell_command(
         // A `cd` out of the workspace followed only by pure reads: the `cd` is held back here and
         // settled below (`cd_elsewhere`), so `cd C:/x && git status` reads and a bare `cd C:/x`
         // keeps its park.
-        if cwd.is_some() && cd_elsewhere.is_none() {
-            if let Segment::Unrecognized(why) = &verdict {
-                if why.ends_with("leaves the run's workspace") && leaf_allows::is_plain_cd(&segment)
-                {
-                    let shown = original_segment_text(command, raw_segment);
-                    cd_elsewhere = Some((
-                        shown,
-                        why.replace(
-                            raw_segment.as_str(),
-                            &original_segment_text(command, raw_segment),
-                        ),
-                    ));
-                    continue;
-                }
-            }
+        if cwd.is_some()
+            && cd_elsewhere.is_none()
+            && let Segment::Unrecognized(why) = &verdict
+            && why.ends_with("leaves the run's workspace")
+            && leaf_allows::is_plain_cd(&segment)
+        {
+            let shown = original_segment_text(command, raw_segment);
+            cd_elsewhere = Some((
+                shown,
+                why.replace(
+                    raw_segment.as_str(),
+                    &original_segment_text(command, raw_segment),
+                ),
+            ));
+            continue;
         }
-        if let Some((_, _)) = &cd_elsewhere {
-            if !matches!(verdict, Segment::Unrecognized(_)) {
-                let pure = matches!(verdict, Segment::ReadLocal)
-                    && !unquoted_substitution
-                    && leaf_allows::is_pure_read(&normalize_command(&segment));
-                if !pure {
-                    let shown = original_segment_text(command, raw_segment);
-                    return classification(
-                        "pending_approval",
-                        "unrecognized",
-                        &unrecognized_reason(),
-                    )
+        if cd_elsewhere.is_some() && !matches!(verdict, Segment::Unrecognized(_)) {
+            let pure = matches!(verdict, Segment::ReadLocal)
+                && !unquoted_substitution
+                && leaf_allows::is_pure_read(&normalize_command(&segment));
+            if !pure {
+                let shown = original_segment_text(command, raw_segment);
+                return classification("pending_approval", "unrecognized", &unrecognized_reason())
                     .with_culprit(
                         &shown,
                         format!("`{shown}` is not a pure read after `cd` outside the workspace"),
                     );
-                }
-                after_cd_reads += 1;
-                continue;
             }
+            after_cd_reads += 1;
+            continue;
         }
         match verdict {
             Segment::Unrecognized(why) => {
@@ -1261,11 +1255,11 @@ fn classify_shell_command(
             Segment::ReadLocal => {}
         }
     }
-    if let Some((shown, why)) = cd_elsewhere {
-        if after_cd_reads == 0 {
-            return classification("pending_approval", "unrecognized", &unrecognized_reason())
-                .with_culprit(&shown, why);
-        }
+    if let Some((shown, why)) = cd_elsewhere
+        && after_cd_reads == 0
+    {
+        return classification("pending_approval", "unrecognized", &unrecognized_reason())
+            .with_culprit(&shown, why);
     }
 
     // Ahead of every other class, and for the reason `github-read` is ahead of `vcs-local`: the
@@ -1670,7 +1664,9 @@ fn is_verify_client_call(command: &str, raw: &str) -> bool {
     };
     let named_as_written = split_program(raw).is_some_and(|(word, _)| {
         is_daemon_exe(&word)
-            || word.replace('\\', "/").to_ascii_lowercase() == "c:/nucleos-dev/run/nucleos-core.exe"
+            || word
+                .replace('\\', "/")
+                .eq_ignore_ascii_case("c:/nucleos-dev/run/nucleos-core.exe")
     });
     if program != "nucleos-core" && !named_as_written {
         return false;
