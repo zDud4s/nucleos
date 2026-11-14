@@ -1117,6 +1117,13 @@ pub(super) fn uses_a_flag_its_program_makes_dangerous(command: &str) -> bool {
         // ceiling is the failure this whole feature exists to avoid, and it costs a whole night.
         // `-F` needs no arm of its own: the command reaching here has been lowercased already.
         "tail" => tokens.any(|token| matches!(token, "-f" | "--follow")),
+        // `date -s <time>` / `--set` sets the system clock; every other spelling only prints. A short
+        // cluster holding an `s` is refused too (`-us`), at the price of a false alarm on none: `date`
+        // has no other short option spelled `s`.
+        "date" => tokens.any(|token| match token.strip_prefix("--") {
+            Some(long) => token_name(long).starts_with('s'), // `--set`, or any prefix of it
+            None => token.starts_with('-') && token.contains('s'),
+        }),
         _ => false,
     }
 }

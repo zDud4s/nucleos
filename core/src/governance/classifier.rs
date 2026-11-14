@@ -459,6 +459,22 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // `writes_an_output_file` like everywhere else.
     "diff",
     "comm",
+    // Usage audit 2026-10-31..11-14: harmless reads that still parked runs. Each only prints to
+    // stdout and has no flag that writes a file or runs a program, and none takes a file path to
+    // read: `df` (filesystem totals, no file content), who/where (`whoami`, `hostname`, `uname`,
+    // `id`), `seq`, `printf`. `date` is here too, with `-s`/`--set` (set the clock) taken back in
+    // `uses_a_flag_its_program_makes_dangerous`. Commands that READ a file argument (`stat`, `du`,
+    // `realpath`, `readlink`, `*sum`, `jq`) are deliberately absent: a blanket prefix would let
+    // them read outside the workspace; they fall to the confinement path instead. `sleep` stays
+    // pending (a pause that never ends holds a run). `env`/`printenv` print the run's own tokens.
+    "df",
+    "whoami",
+    "hostname",
+    "uname",
+    "id",
+    "seq",
+    "printf",
+    "date",
 ];
 
 /// Read-only commands whose safety lives in the EXACT form, so they get no argument tolerance: for
@@ -2664,6 +2680,52 @@ mod tests {
                 classify("Bash", &json!({"command": command}), None),
                 "pending_approval",
                 "unrecognized",
+            );
+        }
+    }
+
+    /// Usage audit 2026-10-31..11-14: harmless print-only commands that parked runs. The second
+    /// list is the spellings of the same programs that write or set something, which stay pending.
+    #[test]
+    fn harmless_print_only_commands_are_allowed_and_their_writing_spellings_are_not() {
+        let workspace = Some(Path::new("C:/work/repo"));
+        for command in [
+            "df -h",
+            "whoami",
+            "hostname",
+            "uname -a",
+            "seq 1 5",
+            "printf '%s\\n' hello",
+            "date",
+            "date +%s",
+            "date -u +%Y-%m-%d",
+        ] {
+            let verdict = classify("Bash", &json!({ "command": command }), workspace);
+            assert_eq!(
+                verdict.decision.decision, "allow",
+                "{command}: {}",
+                verdict.reason
+            );
+        }
+        for command in [
+            "date -s 12:00",
+            "date --set=12:00",
+            "date --s 12:00",
+            "date -us 12:00",
+            "jq . package.json > out.json",
+            // File-reading commands are not safe prefixes: outside the workspace they stay refused.
+            r"jq . C:\Windows\System32\config\SAM",
+            "sha256sum /etc/shadow",
+            "seq 1 5 > out.txt",
+            "printf x > out.txt",
+            "env",
+            "printenv",
+        ] {
+            let verdict = classify("Bash", &json!({ "command": command }), workspace);
+            assert_ne!(
+                verdict.decision.decision, "allow",
+                "{command} must not be allowed: {}",
+                verdict.reason
             );
         }
     }
