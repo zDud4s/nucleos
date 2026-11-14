@@ -407,11 +407,28 @@ pub(super) fn answer_of(status: &str, stdout: Option<&str>) -> Option<String> {
     if status != "completed" {
         return None;
     }
-    let text = stdout?.trim();
+    let stdout = stdout?;
+    // The run's stdout is the whole stream-json transcript: the answer is its final `result`.
+    let extracted = crate::execution::runner::extract_reply(stdout);
+    if extracted.is_none() && looks_like_stream_json(stdout) {
+        // A transcript with no result text: never record raw events as the answer.
+        return None;
+    }
+    let text = extracted.as_deref().unwrap_or(stdout).trim();
     if text.is_empty() {
         return None;
     }
     Some(text.chars().take(MAX_ANSWER_CHARS).collect())
+}
+
+/// Whether `text` begins with a stream-json event line (a JSON object carrying a `type`).
+fn looks_like_stream_json(text: &str) -> bool {
+    let Some(first) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return false;
+    };
+    first.starts_with('{')
+        && serde_json::from_str::<serde_json::Value>(first)
+            .is_ok_and(|v| v.get("type").is_some())
 }
 
 /// One pass over the open tree decisions. A failure on one is logged and stops no other.
@@ -685,6 +702,27 @@ mod decision_run_tests {
             answer_of("completed", Some(&long)).unwrap().chars().count(),
             MAX_ANSWER_CHARS
         );
+    }
+
+    const HOOK_LINE: &str = r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart"}"#;
+
+    #[test]
+    fn a_stream_json_run_answers_with_its_result_text() {
+        let stream = format!(
+            "{HOOK_LINE}\n{}\n{}\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"thinking"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"go left"}"#
+        );
+        assert_eq!(
+            answer_of("completed", Some(&stream)).as_deref(),
+            Some("go left")
+        );
+    }
+
+    #[test]
+    fn unparsed_stream_json_is_never_recorded_as_an_answer() {
+        let stream = format!("{HOOK_LINE}\n{}\n", r#"{"type":"system","subtype":"init"}"#);
+        assert_eq!(answer_of("completed", Some(&stream)), None);
     }
 
     // ----- database -----
