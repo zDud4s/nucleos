@@ -135,7 +135,7 @@ pub(super) async fn parked_by_fence(
         },
         None => Ok(None),
     };
-    let reason = match fenced {
+    let mut reason = match fenced {
         Ok(Some(reason)) => reason,
         Ok(None) => {
             // The diff is inside the paths now: whatever an earlier refusal left is over.
@@ -157,6 +157,12 @@ pub(super) async fn parked_by_fence(
             return Ok(false);
         }
     };
+    // Files that came in with the base are not the branch's own doing: the driver can settle that
+    // itself (merge the base, retry). Widening the paths stays with the owner.
+    if from_base(job, name).await {
+        reason.push(' ');
+        reason.push_str(super::retry::FROM_BASE_MARK);
+    }
     tracing::warn!(job = %job.id, branch = name, %reason, "the path fence refused the merge");
     let head = match job.manifest.branches.get(name) {
         Some(held) => head_of(job, held).await.ok(),
@@ -249,6 +255,71 @@ pub(super) async fn regate_if_moved(
     Ok(true)
 }
 
+/// The files of `changed` the fence would call out of path (migrations and the module map aside).
+fn outside_files(paths: &[String], changed: &[String]) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    changed
+        .iter()
+        .filter(|file| {
+            file.as_str() != MODULE_MAP
+                && !is_migration(file)
+                && !paths.iter().any(|glob| owned_glob_matches(glob, file))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether every out-of-path file arrived with the branch's base rather than from its own work:
+/// none of them is in what the branch changed on top of that base.
+fn all_from_base(outside: &[String], own: &[String]) -> bool {
+    !outside.is_empty() && outside.iter().all(|file| !own.contains(file))
+}
+
+/// Whether the branch's fence refusal is entirely the base's doing. Any doubt (no base, no git
+/// branch, a git failure) answers `false`: the owner keeps the question.
+async fn from_base(job: &TreeJob, name: &str) -> bool {
+    let Some(branch) = job.manifest.branches.get(name) else {
+        return false;
+    };
+    let (Some(git_branch), Some(base)) = (&branch.git_branch, &branch.base) else {
+        return false;
+    };
+    let Some(base_git) = job
+        .manifest
+        .branches
+        .get(base)
+        .and_then(|held| held.git_branch.clone())
+    else {
+        return false;
+    };
+    let Ok(target) = super::nesting::merge_target(&job.manifest, name) else {
+        return false;
+    };
+    let root = &job.manifest.project_root;
+    let Ok(changed) = git(
+        root,
+        &["diff", "--name-only", &format!("{target}...{git_branch}")],
+    )
+    .await
+    else {
+        return false;
+    };
+    let Ok(own) = git(
+        root,
+        &["diff", "--name-only", &format!("{base_git}...{git_branch}")],
+    )
+    .await
+    else {
+        return false;
+    };
+    all_from_base(
+        &outside_files(&branch.paths, &lines(&changed)),
+        &lines(&own),
+    )
+}
+
 fn lines(text: &str) -> Vec<String> {
     text.lines()
         .map(|line| line.trim().replace('\\', "/"))
@@ -276,6 +347,21 @@ mod tests {
             "core/AGENTS.md",
         ]);
         assert_eq!(check_leaf_diff(&owned(), &changed, &[]), Ok(()));
+    }
+
+    #[test]
+    fn out_of_path_files_are_from_the_base_only_when_the_branch_did_not_touch_them() {
+        let outside = outside_files(
+            &owned(),
+            &s(&["core/src/execution/a.rs", "core/src/role_policy.rs"]),
+        );
+        assert_eq!(outside, s(&["core/src/role_policy.rs"]));
+        assert!(all_from_base(&outside, &s(&["core/src/execution/a.rs"])));
+        assert!(!all_from_base(&outside, &s(&["core/src/role_policy.rs"])));
+        // Nothing outside the paths: nothing the base can be blamed for.
+        assert!(!all_from_base(&[], &[]));
+        // No declared paths restrict nothing.
+        assert!(outside_files(&[], &s(&["x.rs"])).is_empty());
     }
 
     #[test]
