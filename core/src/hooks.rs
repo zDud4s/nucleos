@@ -431,8 +431,10 @@ mod tests {
         run_id
     }
 
-    /// A command the classifier parks in a worktree run (a pipe into `tee` of a file outside the worktree).
-    const PARKED: &str = "cargo test --workspace | tee C:/outside/t.log";
+    /// A command the classifier parks in a worktree run (a pipe into a program it does not know).
+    /// Not a `tee`: one into the worktree is allowed now, and one outside it trips the judge's G2
+    /// guard, which would take the judge and the resolver out of every test that uses this.
+    const PARKED: &str = "cargo test --workspace | mystery-filter t.log";
 
     async fn declined(state: &AppState, root: i64, command: &str) {
         let input = serde_json::json!({ "command": command }).to_string();
@@ -533,7 +535,7 @@ mod tests {
 
         let variant = decide(
             &app,
-            &bash(marked, "cargo test --workspace | tee C:/outside/u.log"),
+            &bash(marked, "cargo test --workspace | mystery-filter u.log"),
         )
         .await;
         let elsewhere = decide(&app, &bash(other, PARKED)).await;
@@ -981,7 +983,7 @@ mod tests {
         assert_eq!(
             decide(
                 &app,
-                &bash(first, "cargo test --workspace | tee C:/outside/v.log")
+                &bash(first, "cargo test --workspace | mystery-filter v.log")
             )
             .await
             .decision,
@@ -1012,7 +1014,7 @@ mod tests {
         assert_eq!(
             decide(
                 &app,
-                &bash(resumed, "cargo test --workspace | tee C:/outside/w.log")
+                &bash(resumed, "cargo test --workspace | mystery-filter w.log")
             )
             .await
             .decision,
@@ -1388,7 +1390,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1458,7 +1460,7 @@ mod tests {
             &call(
                 asked_run,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1491,7 +1493,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1516,7 +1518,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1537,7 +1539,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1553,7 +1555,7 @@ mod tests {
             PreToolUsePayload {
                 run_id,
                 tool_name: "Bash".to_owned(),
-                tool_input: serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                tool_input: serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
                 agent_id: None,
                 agent_type: None,
                 subagent: false,
@@ -1647,7 +1649,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1727,7 +1729,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee C:/outside/t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -3483,7 +3485,7 @@ mod tests {
         .await;
         let app = test_router(state.clone());
 
-        // A pipe into `tee` is never allowed outright, yet `cargo test` is a recognized kind.
+        // A pipe into an unknown program is never allowed outright, yet `cargo test` is a recognized kind.
         let answer = decide_raw(&app, &bash(run_id, PARKED)).await;
 
         assert_eq!(answer["decision"], "asking", "{answer}");
