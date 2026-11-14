@@ -30,6 +30,11 @@ mod no_legacy_telegram;
 #[path = "../tests/routes_still_used.rs"]
 mod routes_still_used;
 
+// No two migrations share a number (a silent merge of two branches breaks every DB test).
+#[cfg(test)]
+#[path = "../tests/migration_numbers.rs"]
+mod migration_numbers;
+
 use nucleos_app::*;
 use nucleos_core::*;
 // Both crates have a `channels`; the app's is the lib's plus ingest, media and commands, so name it
