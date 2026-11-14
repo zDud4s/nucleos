@@ -790,6 +790,12 @@ def claims_exchange(payload, want_incidents=False, force=False, now=None):
 # `node_open` records the agent that opened the node. The model cannot write `agent_id` into a hook
 # input, so the hook stamps it into the tool call itself, over whatever the model passed.
 NODE_OPEN_TOOL = "mcp__nucleos__node_open"
+# The launching tools: the hook stamps the session id into them so the daemon records which Claude
+# Code session launched the run / tree (`runs.launching_session_id`, the root's
+# `work_nodes.launching_session_id`). Same stamp as the task tools, same overwrite of model values.
+# `node_open` is not one: its `session_id` is also the binding the scope fence reads, so stamping it
+# would bind every child a session opens; a root opened with its own `session_id` is recorded anyway.
+LAUNCH_TOOLS = ("mcp__nucleos__create_run", "mcp__nucleos__tree_launch")
 TASK_TOOLS = tuple(f"mcp__nucleos__task_{name}" for name in ("list", "claim", "release", "done", "report", "decline"))
 INCIDENTS_HEADER = (
     "Live incidents in this project. Before fixing anything outside your own task, claim it with "
@@ -2233,6 +2239,19 @@ def interactive_session(payload: dict) -> None:
     )
     # A task tool forces the registration: the daemon only believes a session id it has seen.
     claims = claims_context(payload, force=stamping)
+    if (
+        tool in LAUNCH_TOOLS
+        and isinstance(session_id, str)
+        and SESSION_ID_SHAPE.fullmatch(session_id) is not None
+        and isinstance(tool_input, dict)
+    ):
+        # Records the launching session. Like the task tools, the stamp overwrites the model's own
+        # `session_id`; the tool is approved because a rewrite rides only on an allow.
+        approve(
+            "launch: stamp the launching session id",
+            {**tool_input, "session_id": session_id},
+            claims or None,
+        )
     if stamping:
         # The ONE approval this hook ever gives, and the reason it is safe to give: the four task
         # tools only write claim rows in the daemon's own table (idempotent, no effect outside it).

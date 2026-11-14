@@ -335,7 +335,7 @@ pub struct ConfiguredAssistants {
     /// One probe per (route, model) pair, not per `can_serve`/`declared_for` call — the reason
     /// `capabilities::DiscoveryCache` exists at all (see its own doc). Owned by the factory rather
     /// than built per call: a `Mutex` created fresh on every call would cache nothing across the
-    /// two calls `a_pergunta_de_capacidades_corre_uma_vez_por_modelo_e_nao_uma_vez_por_pergunta`
+    /// two calls `the_capability_question_runs_once_per_model_and_not_once_per_question`
     /// makes. Entries are keyed `"{brain.as_str()}:{model}"`, not by model name alone: a local
     /// model and a hosted model can share a name (nothing stops it), and before this fix both
     /// routes asked the same Ollama anyway, so the two also happening to share a cache entry went
@@ -689,7 +689,7 @@ impl Assistants for ConfiguredAssistants {
         // The agent CLI is a binary, not a served model this factory could probe — wrong door, not
         // misconfiguration (`Refusal::NotServedByThisFactory`'s own doc). Checked first and
         // returned before anything below touches the network, which is what
-        // `a_rota_da_nuvem_nao_e_sondada_para_saber_se_serve` pins.
+        // `the_cloud_route_is_not_probed_to_see_if_it_serves` pins.
         if brain == crate::chats::Brain::Cloud {
             return Err(Refusal::NotServedByThisFactory);
         }
@@ -1057,25 +1057,25 @@ mod tests {
     // --- A. Model resolution — PURE, no pool, no client, no runtime -----------------------------
 
     #[test]
-    fn um_modelo_fixado_na_conversa_ganha_ao_configurado() {
+    fn a_model_pinned_on_the_conversation_beats_the_configured_one() {
         let resolved = resolve_model(Some("qwen3:8b"), Some("qwen3.5:4b"));
         assert_eq!(resolved, Ok("qwen3:8b".to_string()));
     }
 
     #[test]
-    fn sem_modelo_fixado_a_rota_usa_o_seu_configurado() {
+    fn with_no_pinned_model_the_route_uses_its_own_configured_one() {
         let resolved = resolve_model(None, Some("qwen3.5:4b"));
         assert_eq!(resolved, Ok("qwen3.5:4b".to_string()));
     }
 
     #[test]
-    fn uma_rota_sem_modelo_configurado_recusa_como_rota_desligada() {
+    fn a_route_with_no_configured_model_refuses_as_a_disabled_route() {
         let resolved = resolve_model(None, None);
         assert_eq!(resolved, Err(Refusal::RouteNotConfigured));
     }
 
     #[test]
-    fn um_modelo_fixado_numa_rota_desligada_nao_a_liga() {
+    fn a_model_pinned_on_a_disabled_route_does_not_switch_it_on() {
         let resolved = resolve_model(Some("qwen3:8b"), None);
         assert_eq!(
             resolved,
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recusa_por_rota_desligada_e_a_recusa_por_falta_de_chave_sao_distintas() {
+    fn the_refusal_for_a_disabled_route_and_the_refusal_for_a_missing_key_are_distinct() {
         let route_off = Refusal::RouteNotConfigured;
         let no_key = Refusal::HostedModelNamedButNoKey;
 
@@ -1102,7 +1102,7 @@ mod tests {
     // --- B. The refusal wording — the `http.rs` contract -----------------------------------------
 
     #[test]
-    fn a_rota_local_desligada_recusa_com_a_frase_que_o_http_ja_compara() {
+    fn the_disabled_local_route_refuses_with_the_phrase_http_already_compares() {
         assert_eq!(
             Refusal::RouteNotConfigured.message(Brain::Local),
             crate::assistant_types::NO_LOCAL_MODEL
@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rota_alojada_desligada_recusa_com_a_frase_que_o_http_ja_compara() {
+    fn the_disabled_hosted_route_refuses_with_the_phrase_http_already_compares() {
         assert_eq!(
             Refusal::RouteNotConfigured.message(Brain::OpenRouter),
             crate::assistant_types::NO_HOSTED_MODEL
@@ -1120,7 +1120,7 @@ mod tests {
     // --- C. The toolbox is chosen by the route -----------------------------------------------------
 
     #[tokio::test]
-    async fn a_rota_alojada_leva_exactamente_as_seis_ferramentas_da_lista_branca() {
+    async fn the_hosted_route_carries_exactly_the_six_allowlisted_tools() {
         let toolbox = toolbox_for(
             Brain::OpenRouter,
             "http://127.0.0.1:1".to_string(),
@@ -1150,7 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rota_local_leva_a_caixa_irrestrita() {
+    async fn the_local_route_carries_the_unrestricted_box() {
         let toolbox = toolbox_for(
             Brain::Local,
             "http://127.0.0.1:1".to_string(),
@@ -1192,7 +1192,7 @@ mod tests {
     // --- D. The factory -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn a_fabrica_constroi_um_assistente_para_uma_rota_configurada() {
+    async fn the_factory_builds_an_assistant_for_a_configured_route() {
         let factory = ConfiguredAssistants::new(
             Some("qwen3:8b".to_string()),
             None,
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rota_da_nuvem_nao_e_servida_por_esta_fabrica() {
+    async fn the_cloud_route_is_not_served_by_this_factory() {
         let factory = ConfiguredAssistants::new(
             Some("qwen3:8b".to_string()),
             Some("gpt-oss".to_string()),
@@ -1229,7 +1229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uma_rota_alojada_com_modelo_e_sem_chave_recusa_por_falta_de_chave() {
+    async fn a_hosted_route_with_a_model_and_no_key_refuses_for_a_missing_key() {
         let factory = ConfiguredAssistants::new(
             None,
             Some("gpt-oss".to_string()),
@@ -1250,7 +1250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sem_configuracao_nenhuma_a_fabrica_nao_serve_rota_nenhuma() {
+    async fn with_no_configuration_at_all_the_factory_serves_no_route() {
         let factory = ConfiguredAssistants::new(
             None,
             None,
@@ -1291,8 +1291,8 @@ mod tests {
     }
 
     /// The same route as `stub_show`, with a hit counter the caller keeps — what
-    /// `a_rota_da_nuvem_nao_e_sondada_para_saber_se_serve` and
-    /// `a_pergunta_de_capacidades_corre_uma_vez_por_modelo_e_nao_uma_vez_por_pergunta` need to prove
+    /// `the_cloud_route_is_not_probed_to_see_if_it_serves` and
+    /// `the_capability_question_runs_once_per_model_and_not_once_per_question` need to prove
     /// a call count, not just a value.
     async fn stub_show_counting(
         body: serde_json::Value,
@@ -1341,7 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fabrica_recusa_um_modelo_cuja_janela_nao_chega() {
+    async fn the_factory_refuses_a_model_whose_window_is_too_small() {
         let base_url = stub_show(small_window_body()).await;
         let factory = ConfiguredAssistants::new(
             Some("qwen3:8b".to_string()),
@@ -1378,7 +1378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fabrica_aceita_um_modelo_que_a_maquina_serve() {
+    async fn the_factory_accepts_a_model_the_machine_serves() {
         let base_url = stub_show(large_window_body()).await;
         let factory = ConfiguredAssistants::new(
             Some("qwen3:8b".to_string()),
@@ -1399,7 +1399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rota_da_nuvem_nao_e_sondada_para_saber_se_serve() {
+    async fn the_cloud_route_is_not_probed_to_see_if_it_serves() {
         let (base_url, hits) = stub_show_counting(large_window_body()).await;
         let factory = ConfiguredAssistants::new(
             Some("qwen3:8b".to_string()),
@@ -1425,7 +1425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pergunta_de_capacidades_corre_uma_vez_por_modelo_e_nao_uma_vez_por_pergunta() {
+    async fn the_capability_question_runs_once_per_model_and_not_once_per_question() {
         let (base_url, hits) = stub_show_counting(large_window_body()).await;
         let factory = ConfiguredAssistants::new(
             Some("qwen3:8b".to_string()),
@@ -1486,7 +1486,7 @@ mod tests {
     /// local one was skipped for some unrelated reason (a missing key, say — a hosted key IS
     /// stored here, so that short-circuit is not what is under test).
     #[tokio::test]
-    async fn um_modelo_alojado_nao_e_sondado_contra_o_ollama_local() {
+    async fn a_hosted_model_is_not_probed_against_local_ollama() {
         let (local_base_url, local_hits) = stub_show_counting(large_window_body()).await;
         let (hosted_base_url, hosted_hits) =
             stub_models_counting(serde_json::json!({ "data": [] })).await;
@@ -1563,7 +1563,7 @@ mod tests {
     /// one that was picked and not the configured default.
     ///
     /// End-to-end through `verdict` — one exchange, no tools — rather than an assertion about
-    /// `resolve_model` alone, which `um_modelo_fixado_na_conversa_ganha_ao_configurado` already
+    /// `resolve_model` alone, which `a_model_pinned_on_the_conversation_beats_the_configured_one` already
     /// covers: the fact worth pinning here is what reaches the endpoint, and only a request can
     /// say that.
     ///

@@ -196,13 +196,13 @@ def the_smoke_script_checks_the_install_and_the_daemon():
         assert needle in body, f"smoke-bundle.sh lacks {needle!r}"
     for binary in (
         "nucleos-core",
-        "browser-sidecar",
-        "echo-sidecar",
-        "email-sidecar",
-        "quota-sidecar",
-        "remote-sidecar",
-        "telegram-sidecar",
-        "web-sidecar",
+        "nucleos-browser",
+        "nucleos-echo",
+        "nucleos-email",
+        "nucleos-quota",
+        "nucleos-remote",
+        "nucleos-telegram",
+        "nucleos-web",
     ):
         assert binary in body, f"smoke-bundle.sh does not check {binary}"
 

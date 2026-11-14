@@ -131,7 +131,7 @@ func TestAnAttachmentGoesNowhereWithoutAWriteGrant(t *testing.T) {
 		Kind:     browser.ActionUpload,
 		Ref:      refFor(t, reading, "Document"),
 		Filename: "segredo.txt",
-		Text:     "nao devia sair",
+		Text:     "should not go out",
 	})
 	if err != nil {
 		t.Fatalf("upload: %v", err)

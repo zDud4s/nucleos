@@ -242,6 +242,7 @@ pub(super) fn settled_words(reason: &str) -> &str {
         "landed" => "its target has since been merged into its source",
         "merged" => "its source is already in its target",
         "source-gone" => "its source branch is gone",
+        "target-gone" => "its target branch is gone",
         "dismissed" => "dismissed",
         other => other,
     }

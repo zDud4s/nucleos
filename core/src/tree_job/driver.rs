@@ -305,6 +305,17 @@ async fn branch_step(
     };
     match branch.state.as_str() {
         "building" | "fixing" | "reviewing" => at_work(state, job, name, gate, parks).await,
+        // A manual transition or a restart mid-gate leaves `gating` with no gate in flight:
+        // (re)start it. `spawn_gate` is a no-op while one is already running for the branch.
+        "gating" => {
+            let backing_off = super::retry::gate_backing_off(&branch.extra);
+            if let Some(gate) = gate
+                && !backing_off
+            {
+                spawn_gate(state, gate, &job.id, name);
+            }
+            Ok(())
+        }
         "red" => red(state, job, name, parks).await,
         "green" => merge(state, job, name, parks).await,
         _ => Ok(()),
@@ -968,6 +979,11 @@ async fn merge(
     // Green is not enough: a gate that measured nothing (`unmeasured`) over an empty diff, or any
     // green over one, would merge nothing and read as done. Such a branch goes to the owner.
     if parked_as_no_change(pool, job, name, parks).await? {
+        return Ok(());
+    }
+    // An owner's answer to a fence refusal retries the merge on the head that was refused: when the
+    // head moved meanwhile, it is gated again first.
+    if super::path_fence::regate_if_moved(pool, job, name).await? {
         return Ok(());
     }
     if super::path_fence::parked_by_fence(pool, job, name, node, parks).await? {
@@ -3135,6 +3151,55 @@ pub(super) mod tests {
         fx.wait_branch_state(JOB, "api", "green").await;
         assert_eq!(gate.calls().len(), 1);
         assert_eq!(fx.branch(JOB, "api").await.gates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gating_branch_without_a_gate_in_flight_gets_its_gate_started() {
+        const JOB: &str = "drv-gating-restart";
+        let fx = Fixture::new().await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "gating", Some("api-node"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.run_ended("api-node", Some("done")).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Green]);
+
+        fx.tick(JOB, &gate).await;
+
+        wait_calls(&gate, 1).await;
+        assert_eq!(gate.calls(), vec![(JOB.to_owned(), "api".to_owned())]);
+        fx.wait_branch_state(JOB, "api", "green").await;
+    }
+
+    #[tokio::test]
+    async fn a_gating_branch_with_a_gate_in_flight_is_left_alone() {
+        const JOB: &str = "drv-gating-inflight";
+        let fx = Fixture::new().await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "gating", Some("api-node"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.run_ended("api-node", Some("done")).await;
+        let (gate, release) = FakeGate::held(GateVerdict::Green);
+        let short = Duration::from_secs(2);
+
+        fx.tick_within(JOB, &gate, short).await;
+        wait_calls(&gate, 1).await;
+        fx.tick_within(JOB, &gate, short).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gate.calls().len(), 1, "a gate in flight is not restarted");
+        assert_eq!(fx.branch(JOB, "api").await.state, "gating");
+
+        release.notify_one();
+        fx.wait_branch_state(JOB, "api", "green").await;
+        assert_eq!(gate.calls().len(), 1);
     }
 
     /// `api` (parent, its run done) with the given children as `(name, state)`.

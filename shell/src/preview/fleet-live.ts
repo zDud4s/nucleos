@@ -79,9 +79,9 @@ function build(): { nodes: FleetNode[]; lines: Record<string, TermLine[]> } {
     [x1.id]: [t("prompt", "Where does /runs/{id}/tail read from? Callers and file paths."), t("tool", "Grep \"fn tail\" core/src"), t("result", "3 matches"), t("tool", "Read core/src/http/runs.rs:410-470")],
     [c1.id]: [t("prompt", "Execution packet: chunk 3 (layoutForest + tests)"), t("tool", "shell rg -n \"positionsFor\" shell/src"), t("result", "4 matches"), t("tool", "apply_patch shell/src/fleet/layout.ts"), t("result", "+88"), t("tool", "shell npx tsc --noEmit -p shell"), t("error", "layout.ts:41 Type 'undefined' is not assignable to 'number'")],
     [p1.id]: [t("final", "Plan written: 3 chunks, 14 tasks")],
-    [r2.id]: [t("prompt", "porque é que o gate do shell falha com os error 32?"), t("tool", "Read .ai/WINDOWS_GOTCHAS.md:120-160"), t("text", "npm run tauri dev is holding the target dir. Stop it with Ctrl+C before scripts/gates.sh shell."), t("text", "Do you want me to add a pre-flight check to gates.sh that detects the running dev server?")],
+    [r2.id]: [t("prompt", "why does the shell gate fail with os error 32?"), t("tool", "Read .ai/WINDOWS_GOTCHAS.md:120-160"), t("text", "npm run tauri dev is holding the target dir. Stop it with Ctrl+C before scripts/gates.sh shell."), t("text", "Do you want me to add a pre-flight check to gates.sh that detects the running dev server?")],
     [r3.id]: [t("prompt", "Triage the 9 new issues since yesterday"), t("tool", "issues.list since=2026-10-19"), t("result", "9 issues"), t("text", "#412 is a duplicate of #398 (same os error 5 on nucleos-core.exe).")],
-    [r4.id]: [t("prompt", "compara as APIs de preços e escolhe uma"), t("tool", "Agent general-purpose · Compare price APIs"), t("status", "waiting on 1 background agent")],
+    [r4.id]: [t("prompt", "compare the price APIs and pick one"), t("tool", "Agent general-purpose · Compare price APIs"), t("status", "waiting on 1 background agent")],
     [d1.id]: [t("prompt", "Compare Keepa, Rainforest and PriceAPI: cost, limits, coverage"), t("tool", "WebSearch Keepa API pricing 2026"), t("result", "8 results"), t("tool", "WebFetch rainforestapi.com/pricing"), t("result", "200 · 41 KB")],
     [r5.id]: [t("text", "Sketching the scraper layout…")],
   };

@@ -1,4 +1,4 @@
-// Command quota-sidecar reads how much of each assistant's usage limit the owner has burned.
+// Command nucleos-quota reads how much of each assistant's usage limit the owner has burned.
 //
 // It exists because the núcleo may not open a connection off this machine (core/AGENTS.md), and one
 // of the two providers it reads is a remote endpoint. Like the web sidecar it is deliberately dumb:
@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-	log.SetPrefix("quota-sidecar: ")
+	log.SetPrefix("nucleos-quota: ")
 	// Stateless, so the orderly shutdown when the daemon is gone is simply to exit.
 	watchLifeline(os.Getenv, os.Stdin, func() { os.Exit(0) })
 

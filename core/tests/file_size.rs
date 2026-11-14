@@ -149,11 +149,19 @@ fn no_core_file_holds_more_code_than_its_ceiling() {
         running_in.display(),
     );
 
-    let counts = crate::source_scan::rust_files()
+    // This file compiles into the `nucleos-daemon` binary's unit tests (see `src/main.rs`), whose
+    // package is `core/crates/nucleos-daemon`; the sources and the baseline hang from `core/`, two
+    // levels up, which is also the root `nucleos_core::source_scan` scans from.
+    let core_root = built_in
+        .parent()
+        .and_then(Path::parent)
+        .expect("the daemon package sits two levels below core/");
+
+    let counts = nucleos_core::source_scan::rust_files()
         .into_iter()
         .map(|path| {
             let name = path
-                .strip_prefix(built_in)
+                .strip_prefix(core_root)
                 .expect("every source root is inside the package")
                 .components()
                 .map(|part| part.as_os_str().to_string_lossy())
@@ -176,7 +184,7 @@ fn no_core_file_holds_more_code_than_its_ceiling() {
     );
 
     let ceilings = baseline(
-        &fs::read_to_string(built_in.join("file-size-baseline.txt"))
+        &fs::read_to_string(core_root.join("file-size-baseline.txt"))
             .expect("file-size-baseline.txt should be readable"),
     );
 

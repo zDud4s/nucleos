@@ -411,6 +411,10 @@ pub struct RunStatusResponse {
     pub cache_read_tokens: Option<i64>,
     pub num_turns: Option<i64>,
     pub context_fill: Option<i64>,
+    /// Input-side tokens of the run's first assistant turn (what it started from).
+    pub initial_context: Option<i64>,
+    /// JSON list of the tools the run was launched with, from the stream's `init` event.
+    pub tools_given: Option<String>,
     /// Whether this run accepts `POST /runs/{id}/message`. Reported because a caller that is
     /// refused otherwise cannot tell a run that never opted in from one that has already ended.
     pub steerable: bool,
@@ -531,6 +535,7 @@ pub async fn create_run_route(
     let pool = state.pool.clone();
     let created = create_run(State(state), Json(req)).await?;
     tag_launching_chat(&pool, created.0.id, &headers).await;
+    tag_launching_session(&pool, created.0.id, &headers).await;
     tag_origin(&pool, created.0.id, &headers).await;
     Ok(created)
 }
@@ -719,6 +724,36 @@ pub(super) async fn tag_launching_chat(
     }
 }
 
+/// Records on run `id` the Claude Code session that launched it, from `LAUNCH_SESSION_HEADER`.
+///
+/// The header is sent by the MCP server from the `session_id` the session's hook stamped into the
+/// `create_run` call. A value that is not a plain session id tags nothing, and a run that already
+/// has one keeps it. Best effort after the INSERT, like `tag_launching_chat`: a label, so a run
+/// left untagged is still a run.
+pub(super) async fn tag_launching_session(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    headers: &axum::http::HeaderMap,
+) {
+    let Some(session) = headers
+        .get(crate::daemon_client::LAUNCH_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| crate::daemon_client::valid_session_id(value))
+    else {
+        return;
+    };
+    let tagged = sqlx::query(
+        "UPDATE runs SET launching_session_id = ? WHERE id = ? AND launching_session_id IS NULL",
+    )
+    .bind(session)
+    .bind(id)
+    .execute(pool)
+    .await;
+    if let Err(error) = tagged {
+        tracing::warn!(%error, id, "the run was created but not tagged with the session that launched it");
+    }
+}
+
 /// Where a tail read should resume from. Absent is the start.
 #[derive(serde::Deserialize)]
 pub struct TailQuery {
@@ -774,7 +809,7 @@ pub async fn get_run(
         // numbers it was computed from as one read of one row.
         "SELECT id, project_id, status, mode, gate_status, gate_exit_code, gate_output, exit_code,
                 stdout, stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
-                num_turns, context_fill, steerable, successor_run_id, chat_id, cache_creation_tokens,
+                num_turns, context_fill, initial_context, tools_given, steerable, successor_run_id, chat_id, cache_creation_tokens,
                 authored_prompt_chars, model, effort, runner, route_mode, route_decision_id,
                 advised_runner, advised_model, advised_effort, route_failed, account_id
          FROM runs WHERE id = ?",

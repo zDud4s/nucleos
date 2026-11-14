@@ -1,4 +1,4 @@
-// Command telegram is the Telegram sidecar on the channel kit (built as telegram-sidecar).
+// Command telegram is the Telegram sidecar on the channel kit (built as nucleos-telegram).
 package main
 
 import (
@@ -36,8 +36,12 @@ func main() {
 
 	factory := func(c *kit.Client, sink kit.Sink) (kit.Adapter, kit.Ingest, error) {
 		attacher := adapter.MediaAttacher{Bot: bot, Up: mediaUploader{c: c}}
+		capture := &adapter.Capture{
+			API: adapter.CaptureHTTP{BaseURL: cfg.Kit.BaseURL, Token: cfg.Kit.Token},
+			Bot: bot,
+		}
 		ingest := func(ctx context.Context) error {
-			return adapter.Poll(ctx, bot, attacher, &sink, cfg.OffsetPath, clk)
+			return adapter.Poll(ctx, bot, attacher, &sink, cfg.OffsetPath, clk, adapter.WithCapture(capture))
 		}
 		return adapter.New(bot, c), ingest, nil
 	}

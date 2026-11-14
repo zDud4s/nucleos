@@ -80,19 +80,38 @@ export function useOwnerDecisions() {
   });
 }
 
+const FENCE_PARK =
+  /changed files outside its declared paths \[[^\]]*\]:\s*([\s\S]+?)\.\s*Move that change to the branch that owns those paths/;
+
+/**
+ * The files a fence-park decision names after the colon, or `null` when the question is not a
+ * fence park (or names no file). The wire row carries no structured list, so the text is parsed.
+ */
+export function fenceParkFiles(question: string): string[] | null {
+  const match = FENCE_PARK.exec(question);
+  if (match === null) return null;
+  const files = match[1]
+    .split(",")
+    .map((file) => file.trim().replace(/^[`'"]+|[`'"]+$/g, ""))
+    .filter((file) => file !== "");
+  return files.length === 0 ? null : files;
+}
+
 export interface AnswerOwnerDecisionInput {
   id: string;
   answer: string;
+  /** Files to add to the branch's declared paths; sent only when present. */
+  widen_paths?: string[];
 }
 
 /** Answer one decision. Not retried: a refused answer does not become a different one. */
 export function useAnswerOwnerDecision() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, answer }: AnswerOwnerDecisionInput) =>
+    mutationFn: ({ id, answer, widen_paths }: AnswerOwnerDecisionInput) =>
       apiFetch<void>(`/decisions/${encodeURIComponent(id)}`, {
         method: "POST",
-        body: JSON.stringify({ answer }),
+        body: JSON.stringify(widen_paths === undefined ? { answer } : { answer, widen_paths }),
       }),
     retry: false,
     onSuccess: () => {

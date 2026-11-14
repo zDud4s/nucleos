@@ -738,3 +738,206 @@ pub(super) fn line_runs_settings_cli(command: &str) -> bool {
     pieces().any(is_daemon_binary)
         && pieces().any(|piece| piece == RESET_FLAG || piece == ROLLBACK_FLAG)
 }
+
+/// The refusal a python heredoc that only writes files inside the worktree gets.
+pub(super) const PYTHON_HEREDOC_WRITE_REASON: &str =
+    "a python heredoc that writes files is refused: use Edit/Write to create or change files";
+
+/// PURE: the `deny` verdict for `python - <<'EOF' ... EOF` whose body only writes files inside the
+/// run's own worktree, or `None` for every other command.
+///
+/// Such a heredoc parked headless leaf runs in `awaiting_approval` although the right answer is
+/// known: the agent has `Edit`/`Write`, so it is told to use them. It is deliberately NOT an allow
+/// (that would be arbitrary code execution): anything that is not provably a plain file write
+/// returns `None` and keeps asking. Hook-up (not done here, `classifier.rs` is another branch's):
+/// call it at the top of `classify_shell_command` and return the verdict when it is `Some`.
+///
+/// Accepted shape: one command, `python|python3|py [-] <<'TAG'` with a QUOTED tag (an unquoted body
+/// is expanded by the shell), body up to the closing TAG line, nothing after it. The body must
+/// write at least one file (`open(<literal>, "w"|"a"|"x"...)`, `Path(<literal>).write_text/bytes`),
+/// every `open(`/`Path(` argument must be a relative string literal without `..`, `~`, `$`, `%` or
+/// a drive, and the body may name no module or call that runs, deletes or reaches elsewhere.
+pub(super) fn python_heredoc_worktree_write(command: &str) -> Option<Classification> {
+    let (head, rest) = command.trim().split_once('\n')?;
+    let (program, opener) = head.trim_end().split_once("<<")?;
+    let mut words = program.split_whitespace();
+    if !matches!(words.next()?, "python" | "python3" | "py") {
+        return None;
+    }
+    let args: Vec<&str> = words.collect();
+    if !(args.is_empty() || args == ["-"]) {
+        return None;
+    }
+    let opener = opener.strip_prefix('-').unwrap_or(opener).trim();
+    let tag = opener
+        .strip_prefix('\'')
+        .and_then(|t| t.strip_suffix('\''))
+        .or_else(|| opener.strip_prefix('"').and_then(|t| t.strip_suffix('"')))?;
+    if tag.is_empty() || tag.contains(char::is_whitespace) {
+        return None;
+    }
+    let lines: Vec<&str> = rest.lines().collect();
+    let close = lines.iter().position(|line| line.trim_end() == tag)?;
+    if lines[close + 1..]
+        .iter()
+        .any(|line| !line.trim().is_empty())
+    {
+        return None;
+    }
+    if !body_writes_only_inside(&lines[..close].join("\n")) {
+        return None;
+    }
+    Some(classification(
+        "deny",
+        "write-via-python-heredoc",
+        PYTHON_HEREDOC_WRITE_REASON,
+    ))
+}
+
+/// PURE: whether a python body writes at least one file and every file it opens is a relative
+/// literal staying inside the worktree, with nothing in it that runs or removes anything.
+fn body_writes_only_inside(body: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "subprocess",
+        "shutil",
+        "socket",
+        "urllib",
+        "requests",
+        "ctypes",
+        "http",
+        "__import__",
+        "exec(",
+        "eval(",
+        "compile(",
+        "importlib",
+        "pty",
+        "popen",
+        "system(",
+        "remove(",
+        "unlink(",
+        "rmdir(",
+        "rmtree",
+        "chmod",
+        "chown",
+        "rename(",
+        "symlink",
+        "link(",
+        "input(",
+        "sys.stdin",
+        "getattr(",
+        "globals(",
+        "builtins",
+    ];
+    let lowered = body.to_ascii_lowercase();
+    if FORBIDDEN.iter().any(|word| lowered.contains(word)) || lowered.contains("os.") {
+        return false;
+    }
+    let mut wrote = false;
+    for call in ["open(", "Path("] {
+        let mut rest = body;
+        while let Some(at) = rest.find(call) {
+            // A method `.open(` or a longer name ending in `Path(` is not ours to judge.
+            let before = rest[..at].chars().next_back();
+            rest = &rest[at + call.len()..];
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                return false;
+            }
+            let Some((literal, after)) = leading_string_literal(rest) else {
+                return false;
+            };
+            if !relative_inside(literal) {
+                return false;
+            }
+            if call == "open(" {
+                if let Some(mode) = after.trim_start().strip_prefix(',') {
+                    let mode = mode.trim_start();
+                    let mode = mode.strip_prefix("mode=").unwrap_or(mode);
+                    match leading_string_literal(mode) {
+                        Some((m, _)) => wrote |= m.contains(['w', 'a', 'x', '+']),
+                        None => return false,
+                    }
+                }
+            } else {
+                wrote |= body.contains(".write_text(") || body.contains(".write_bytes(");
+            }
+        }
+    }
+    wrote
+}
+
+/// PURE: a leading quoted string literal (no escapes, no prefixes) and the text after it.
+fn leading_string_literal(text: &str) -> Option<(&str, &str)> {
+    let quote = text.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let inside = &text[1..];
+    let end = inside.find(quote)?;
+    let literal = &inside[..end];
+    (!literal.contains('\\')).then_some((literal, &inside[end + 1..]))
+}
+
+/// PURE: a non-empty relative path with no drive, home, variable or `..` part.
+fn relative_inside(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with(['/', '\\', '~'])
+        && !path.contains([':', '$', '%'])
+        && !path.replace('\\', "/").split('/').any(|part| part == "..")
+}
+
+#[cfg(test)]
+mod python_heredoc_tests {
+    use super::*;
+
+    fn refused(command: &str) -> bool {
+        python_heredoc_worktree_write(command).is_some()
+    }
+
+    #[test]
+    fn a_worktree_write_heredoc_is_refused_with_the_use_edit_write_message() {
+        let command =
+            "python - <<'EOF'\nwith open('src/a.py', 'w') as f:\n    f.write('x = $(1)')\nEOF";
+        let got = python_heredoc_worktree_write(command).expect("refused");
+        assert_eq!(got.decision.decision, "deny");
+        assert_eq!(got.action_class, "write-via-python-heredoc");
+        assert!(got.reason.contains("Edit/Write"));
+    }
+
+    #[test]
+    fn path_write_text_inside_the_worktree_is_refused() {
+        let command =
+            "python3 <<\"PY\"\nfrom pathlib import Path\nPath('docs/x.md').write_text('hi')\nPY\n";
+        assert!(refused(command));
+    }
+
+    #[test]
+    fn writes_outside_the_worktree_keep_asking() {
+        for path in ["/etc/x", "../x", "~/x", "C:/x", "$HOME/x"] {
+            let command = format!("python - <<'EOF'\nopen('{path}', 'w').write('x')\nEOF");
+            assert!(!refused(&command), "{path}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_execution_keeps_asking() {
+        for body in [
+            "import subprocess\nsubprocess.run(['ls'])\nopen('a','w')",
+            "import os\nos.system('x')\nopen('a','w')",
+            "open(name, 'w').write('x')",
+            "exec('open(\"a\",\"w\")')",
+            "print(open('a').read())",
+        ] {
+            let command = format!("python - <<'EOF'\n{body}\nEOF");
+            assert!(!refused(&command), "{body}");
+        }
+    }
+
+    #[test]
+    fn extra_commands_or_an_unquoted_tag_keep_asking() {
+        let body = "open('a','w').write('x')";
+        assert!(!refused(&format!(
+            "python - <<'EOF'\n{body}\nEOF\ngit push"
+        )));
+        assert!(!refused(&format!("python - <<EOF\n{body}\nEOF")));
+        assert!(!refused(&format!(
+            "git push && python - <<'EOF'\n{body}\nEOF"
+        )));
+    }
+}

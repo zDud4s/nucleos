@@ -595,7 +595,8 @@ impl CommandRunner for ClaudeCliRunner {
                         turn_ended = true;
                         // `line` is the `result` that ended the turn, which is all the 429 test reads.
                         super::auth_watch::report(super::auth_watch::AuthSignal::TurnEnded {
-                            rate_limited: failed_on_rate_limit(&line),
+                            rate_limited: failed_on_rate_limit(&line)
+                                || usage_limit_reset(&line, chrono::Utc::now()).is_some(),
                         });
                         usage = turn.usage;
                         if turn.cost_usd.is_some() {

@@ -441,6 +441,20 @@ def posix(path) -> str:
     return str(path).replace("\\", "/")
 
 
+_POINTER_RANGE = re.compile(r":\d+(?:-\d+)?$")
+
+
+def pointer_paths(pointers) -> list[str]:
+    """The paths of `<path>:<start>-<end> - why` pointers, in order and without repeats: what the
+    daemon stores on the node (`work_nodes.pointers`). Blank entries and the word `none` are skipped."""
+    paths: list[str] = []
+    for pointer in pointers or []:
+        path = _POINTER_RANGE.sub("", pointer.split(" - ", 1)[0].strip()).replace("\\", "/")
+        if path and path != "none" and path not in paths:
+            paths.append(path)
+    return paths
+
+
 def run_prompt(args) -> dict:
     tree_id, manifest = open_manifest(args)
     branch = ts.get_branch(manifest, args.branch)
@@ -494,8 +508,13 @@ def run_prompt(args) -> dict:
     target = ts.tree_dir(tree_id) / "prompts" / f"{node_id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
+    pointers = pointer_paths(args.pointers)
+    # The node exists already (the controller opened it before asking for the prompt), so the pointers
+    # reach its record through the `node_update` the controller makes from this payload.
+    mcp = [{"tool": "node_update", "args": {"id": node_id, "pointers": pointers}}] if pointers else []
     return {"verb": "prompt", "tree_id": tree_id, "node_id": node_id, "branch": args.branch, "kind": kind,
-            "prompt_file": str(target), "handoff_file": handoff, "prompt": text}
+            "prompt_file": str(target), "handoff_file": handoff, "prompt": text,
+            "pointers": pointers, "mcp": mcp}
 
 
 # --- partition --------------------------------------------------------------------------------

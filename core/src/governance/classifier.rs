@@ -1051,10 +1051,23 @@ fn classify_shell_command(
     let mut touches_github = false;
     let mut confined = false;
     let mut declared = false;
+    // PowerShell only: the names `$b = git merge-base ...` assigned earlier on this line, see
+    // `reads::powershell_git_assignment`.
+    let mut variables: Vec<String> = Vec::new();
     for segment in segments
         .iter()
         .map(|s| crate::command_reader::escapes_masked(s, shell))
     {
+        let segment = segment.to_string();
+        let segment = if shell == crate::command_reader::Shell::PowerShell {
+            if let Some(name) = reads::powershell_git_assignment(&segment) {
+                variables.push(name);
+                continue;
+            }
+            reads::with_known_variables(&segment, &variables)
+        } else {
+            segment
+        };
         // ASYMMETRY, on purpose: a substitution inside double quotes (`"$(…)"`) is one argument, so
         // it is read like an unknown variable and keeps today's verdict. An UNQUOTED one is split by
         // the shell into several arguments whose number and content nobody here can know, so the
@@ -1291,6 +1304,51 @@ fn names_approval_command_word(normalized: &str) -> bool {
 /// a quote or another shape is `false`. Says nothing about whether the scripts are trustworthy:
 /// see `leaf_self_check_scripts_intact`.
 pub fn leaf_self_check_form(command: &str, self_check: bool) -> bool {
+    // The harmless dressing a leaf puts around the call: a `timeout N` prefix, a `2>&1` fold, a
+    // `| tail -N` / `| head -N` cut and the `; echo rc=$?` / `; git status` tail. Each is parsed as
+    // a whole piece, never as a stray metacharacter, so the core below still sees none.
+    let mut pieces = command.split(';');
+    let main = pieces.next().unwrap_or("");
+    let dressing_ok = pieces.all(|piece| {
+        let words: Vec<&str> = piece.split_whitespace().collect();
+        matches!(
+            words.as_slice(),
+            ["echo", "rc=$?"] | ["git", "status"] | ["git", "status", "--short" | "-s"]
+        )
+    });
+    if !dressing_ok {
+        return false;
+    }
+    let is_count = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
+    let mut stages = main.split('|');
+    let core = stages.next().unwrap_or("");
+    let cut_ok = match (stages.next(), stages.next()) {
+        (None, _) => true,
+        (Some(cut), None) => {
+            let words: Vec<&str> = cut.split_whitespace().collect();
+            match words.as_slice() {
+                ["tail" | "head", n] => n.strip_prefix('-').is_some_and(is_count),
+                ["tail" | "head", "-n", n] => is_count(n),
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !cut_ok {
+        return false;
+    }
+    let mut core_words: Vec<&str> = core.split_whitespace().collect();
+    if core_words.last() == Some(&"2>&1") {
+        core_words.pop();
+    }
+    if core_words.first() == Some(&"timeout") && core_words.get(1).is_some_and(|n| is_count(n)) {
+        core_words.drain(..2);
+    }
+    leaf_self_check_core(&core_words.join(" "), self_check)
+}
+
+/// PURE: the bare wrapped form, with no dressing around it. See `leaf_self_check_form`.
+fn leaf_self_check_core(command: &str, self_check: bool) -> bool {
     const FORBIDDEN: &[char] = &[
         ';', '|', '&', '<', '>', '$', '`', '\n', '\r', '(', ')', '{', '}', '*', '?', '~', '!', '#',
         '\'', '"',
@@ -3331,6 +3389,54 @@ mod tests {
             "",
         ] {
             assert!(!leaf_self_check_form(command, false), "{command}");
+        }
+    }
+
+    /// Ticket #17 (a): the dressing a leaf puts around the wrapped call, one shape per line.
+    #[test]
+    fn the_leaf_self_check_admits_its_harmless_dressing() {
+        let fmt = "python scripts/heavy.py --agent leaf-b1835318 cargo fmt -p nucleos-core";
+        let inv = "python scripts/heavy.py -- python scripts/check_invariants.py";
+        for command in [
+            format!("{fmt} 2>&1 | tail -5"),
+            format!("{fmt} 2>&1 | tail -n 5"),
+            format!("{fmt} | head -20"),
+            format!("{fmt}; echo rc=$?"),
+            format!("{fmt} 2>&1; echo rc=$?"),
+            format!("{fmt}; git status --short"),
+            format!("{fmt}; git status"),
+            format!("timeout 300 {fmt}"),
+            format!("timeout 300 {inv} 2>&1 | tail -3; echo rc=$?; git status -s"),
+            format!("{inv} 2>&1 | tail -10"),
+        ] {
+            assert!(leaf_self_check_form(&command, false), "{command}");
+        }
+    }
+
+    /// Ticket #17 (a), the other side: nothing the dressing could smuggle in.
+    #[test]
+    fn the_leaf_self_check_dressing_admits_no_execution_or_writes() {
+        let fmt = "python scripts/heavy.py cargo fmt -p core";
+        for command in [
+            format!("{fmt} | sh"),
+            format!("{fmt} | tail -5 | sh"),
+            format!("{fmt} | tail -f x"),
+            format!("{fmt} | tee out.txt"),
+            format!("{fmt} > out.txt"),
+            format!("{fmt} 2>&1 > out.txt"),
+            format!("{fmt}; rm -rf ."),
+            format!("{fmt}; git push"),
+            format!("{fmt}; git status --short; git push"),
+            format!("{fmt}; git status && git push"),
+            format!("{fmt}; echo rc=$? > f"),
+            format!("{fmt}; echo $(id)"),
+            format!("{fmt} && git push"),
+            format!("{fmt} & rm x"),
+            format!("timeout x {fmt}"),
+            format!("timeout 5 sh -c '{fmt}'"),
+            format!("sh {fmt}"),
+        ] {
+            assert!(!leaf_self_check_form(&command, true), "{command}");
         }
     }
 

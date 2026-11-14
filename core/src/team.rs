@@ -185,7 +185,7 @@ pub struct Team {
     pub updated_at: String,
 }
 
-/// A team with its roster and its alçada, which is how the shell reads one: the membership and what
+/// A team with its roster and its authority, which is how the shell reads one: the membership and what
 /// it may ask for ARE the team.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TeamView {
@@ -214,7 +214,7 @@ pub struct TeamRequest {
     #[serde(default)]
     pub members: Vec<String>,
     /// Replaced wholesale, exactly as `members` is, and for the same reason: the editor sends the
-    /// alçada as the owner left it, and a merge would make revoking one impossible through the only
+    /// authority as the owner left it, and a merge would make revoking one impossible through the only
     /// surface that edits it.
     #[serde(default)]
     pub grants: Vec<TeamGrant>,
@@ -344,7 +344,7 @@ fn files_root(state: &AppState) -> Result<std::path::PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Alçada: what a department asks for, and what the core does about it
+// Authority: what a department asks for, and what the core does about it
 // ---------------------------------------------------------------------------------------------
 
 /// Which node of a team run is calling, and what it is.
@@ -1154,10 +1154,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Alçada
+    // Authority
     // -----------------------------------------------------------------------------------------
 
-    /// Grants a team an alçada and starts a run, returning that run's id.
+    /// Grants a team an authority and starts a run, returning that run's id.
     async fn team_with_grant(state: &AppState, kind: &str, mode: &str) -> String {
         marketing(state).await;
         sqlx::query("INSERT INTO team_grants (team_id, kind, mode) VALUES ('marketing', ?, ?)")
@@ -1778,14 +1778,14 @@ mod tests {
         (director_run, specialist_run)
     }
 
-    /// A department that used its alçada can still be deleted afterwards.
+    /// A department that used its authority can still be deleted afterwards.
     ///
     /// **A pre-existing bug, found by reading the schema while designing `team_notes`.**
     /// `team_actions.team_run_id` is `TEXT NOT NULL REFERENCES team_runs(id)` (0086), `storage.rs`
     /// runs with `foreign_keys` ON, and `delete_team_run` deletes `team_items` and `team_runs` and
     /// nothing else — so the DELETE fails with `FOREIGN KEY constraint failed` and the owner gets a
     /// 500 naming nothing. It bites only a run that actually asked for something, which is why it
-    /// went unnoticed: a department that never used its alçada deletes fine.
+    /// went unnoticed: a department that never used its authority deletes fine.
     ///
     /// `team_notes` was designed around this rather than repeating it: it carries the same NOT NULL
     /// reference AND `delete_team_run` clears it, which is the whole bargain — the constraint is
@@ -1800,7 +1800,7 @@ mod tests {
         let id = team_with_grant(&state, "send_email", "propose").await;
         ask(&state, &id, "send_email", an_email())
             .await
-            .expect("the alçada was granted");
+            .expect("the authority was granted");
 
         // Only a finished run may be deleted, which is the route's own first check.
         sqlx::query("UPDATE team_runs SET state = 'done' WHERE id = ?")
@@ -1813,7 +1813,7 @@ mod tests {
 
         assert!(
             outcome.is_ok(),
-            "a department that used its alçada could not be deleted: {:?}",
+            "a department that used its authority could not be deleted: {:?}",
             outcome.err()
         );
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_runs WHERE id = ?")
@@ -2268,11 +2268,11 @@ mod tests {
     /// than on the tool**, because the marking is what `hooks::team_decision` reads and the tool
     /// refusal is tested there. Writing a note is `WritesOwn` so a specialist that read the web can
     /// still tell a colleague what it found; the taint travels WITH the words and lands here. The
-    /// cost is real and deliberate: this node has lost its alçada for this turn.
+    /// cost is real and deliberate: this node has lost its authority for this turn.
     ///
     /// The second half — a node with no mail is untouched — is the more important of the two. Every
     /// department that never uses this feature has to keep the authority it has today, and a
-    /// marking applied unconditionally would take the alçada away from all of them.
+    /// marking applied unconditionally would take the authority away from all of them.
     #[tokio::test]
     async fn a_node_handed_a_colleagues_words_is_born_having_read_them() {
         let (state, _root) = state_with_root().await;
@@ -2311,7 +2311,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             clean, 0,
-            "a department that leaves no notes lost its alçada anyway"
+            "a department that leaves no notes lost its authority anyway"
         );
 
         // Then: the same agent, with a colleague's words waiting.

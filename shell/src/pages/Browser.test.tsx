@@ -698,6 +698,27 @@ describe("Browser - opening a window yourself", () => {
     expect(screen.getByText(/log in with Open a window and keep the site first/i)).toBeTruthy();
   });
 
+  it("shows the core's own message when opening with the agent is refused", async () => {
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: () => {
+            throw new ApiRefusal(409, "conflict", "browsing is fenced off: fence is not attached");
+          },
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open with agent" }));
+
+    expect(await screen.findByText(/fence is not attached/i)).toBeTruthy();
+  });
+
   it("asks for an address before opening with the agent, because the browser opens https pages only", async () => {
     daemon.apiFetch.mockImplementation(browserFetch(withProject()));
 

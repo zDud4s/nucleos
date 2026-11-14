@@ -494,8 +494,8 @@ impl ModelsConfig {
     /// Delegates to `catalogue_with_installed(&[])` rather than keeping a second copy of this
     /// logic -- "an empty installed list behaves exactly as today" is then true by construction,
     /// not by two implementations happening to agree, and
-    /// `um_api_tags_mudo_degrada_para_o_configurado_e_nunca_para_um_menu_vazio` /
-    /// `sem_modelo_local_configurado_os_instalados_nao_entram_no_menu` both lean on that.
+    /// `a_silent_api_tags_degrades_to_the_configured_model_and_never_to_an_empty_menu` /
+    /// `with_no_local_model_configured_the_installed_ones_do_not_enter_the_menu` both lean on that.
     pub fn catalogue(&self) -> Vec<AssistantChoice> {
         self.catalogue_with_installed(&[])
     }

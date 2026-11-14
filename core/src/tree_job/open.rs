@@ -302,9 +302,9 @@ pub(super) async fn git(root: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// The pattern of the report files a tree node writes in its worktree (`.nucleos-report.md`, and the
-/// root's `.nucleos-root-report.md`). A node may only write inside its worktree, so the files cannot
-/// live elsewhere; they are kept out of git instead, or `checkpoint` (`git add -A`) would commit
-/// them and a node with no other work would look like it has a diff.
+/// root's `.nucleos-root-report.md`). These are the fallback location, used when the node has no
+/// state dir to write its report to; they are kept out of git, or `checkpoint` (`git add -A`) would
+/// commit them and a node with no other work would look like it has a diff.
 const REPORT_EXCLUDE: &str = "/.nucleos-*report.md";
 
 /// Everything a tree worktree holds that is the daemon's and not the branch's, so `checkpoint`
@@ -861,8 +861,8 @@ pub async fn bind_branch(
 // The stored launches and the relaunches built on them live in `relaunch`; they are re-exported here
 // because this is where callers have always imported them from.
 pub use super::relaunch::{
-    Answered, Relaunched, StoredLaunch, answer_and_relaunch, latest_launch, relaunch_resumed,
-    save_launch, stored_launch,
+    Answered, Relaunched, StoredLaunch, answer_and_relaunch, answer_and_relaunch_widening,
+    latest_launch, relaunch_resumed, save_launch, stored_launch,
 };
 pub(super) use super::relaunch::{
     DIED_PREFIX, FIX_PREFIX, WRAP_PREFIX, relaunch_node, run_is_live,

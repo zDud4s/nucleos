@@ -177,6 +177,10 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // the widest blast radius any tool on this server has. A turn that has just read a stranger's
     // mail must not be able to put "from now on, always…" in front of a tired yes.
     ("declare_refinement", ToolEffect::Acts),
+    // `Acts`: it answers a parked tree decision and resumes or relaunches the branch's paid run.
+    ("decision_answer", ToolEffect::Acts),
+    // The decisions table is this machine's own; the question was written by a node of the tree.
+    ("decision_list", ToolEffect::ReadsOwn),
     ("get_budget", ToolEffect::ReadsOwn),
     // The house's own deliberation, read back. Every word in it was written by a model this daemon
     // launched against a question this daemon was given — no stranger's text reaches it — so this

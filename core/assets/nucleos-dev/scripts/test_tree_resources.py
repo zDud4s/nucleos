@@ -237,7 +237,7 @@ class BudgetTest(Env):
             clock["now"] = "2026-10-21T10:11:00+00:00"
             later = tr.run_budget(self.args())
             self.assertEqual(later["land_wait_minutes"], 11)
-            self.assertTrue(any("passar a outro ramo" in r for r in later["reasons"]))
+            self.assertTrue(any("move on to another branch" in r for r in later["reasons"]))
             self.assertEqual(self.store.m["land_waiting_since"], "2026-10-21T10:00:00+00:00")
             self.heavy["locks"] = []  # the lock is gone: the wait ends
             clock["now"] = "2026-10-21T10:12:00+00:00"
