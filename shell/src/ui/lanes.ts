@@ -92,6 +92,7 @@ const LANE_OF: Record<string, FeedLane> = {
   work_tree_relaunch_skipped: "jobs",
   work_tree_descent: "jobs",
   work_tree_auto_default: "jobs",
+  work_tree_auto_resolve: "jobs",
   work_tree_stalled: "jobs",
   spec_audit_unavailable: "machine",
 
