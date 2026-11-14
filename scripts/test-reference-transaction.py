@@ -376,11 +376,15 @@ def test_escape_logs_both_branches_in_one_transaction():
             ["git", "update-ref", "--stdin"],
             cwd=repo,
             env=env_with(NUCLEOS_ALLOW_DIRECT_GIT="1"),
-            input=script,
+            # Bytes, not text: in text mode Windows writes CRLF and git reads "start" plus a CR.
+            input=script.encode(),
             capture_output=True,
-            text=True,
         )
-        check("two-ref escape: transaction passes", done.returncode == 0, done.stderr)
+        check(
+            "two-ref escape: transaction passes",
+            done.returncode == 0,
+            done.stderr.decode(errors="replace"),
+        )
         lines = log_lines(repo)
         check("two-ref escape: two lines logged", len(lines) == 2, repr(lines))
         refs = sorted(line.split()[-1] for line in lines)

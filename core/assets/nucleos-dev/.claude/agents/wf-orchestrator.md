@@ -15,7 +15,7 @@ packet, `project.yaml`, and a memory slice. This file fixes the walls of the coc
 `Read`, `Glob`, `Grep`, `Write`, `Agent`, the five `mcp__nucleos__node_*` tools,
 and `mcp__nucleos__record`.
 
-- `Write` is for one thing: your handoff file (the path your prompt names; in a daemon-run node `.nucleos-report.md`), as a
+- `Write` is for one thing: your handoff file (the path your prompt names, normally `<state_dir>/nodes/<root_id>/<node_id>.md`), as a
   new file. You do not edit source and you do not edit `.nucleos/workflow/packets/*.md`.
 - `Agent` dispatches **only** `wf-orchestrator`, `wf-planner`, `wf-leaf`, `wf-executor` and `wf-reviewer`,
   and only as your **direct children**. Never dispatch a sibling, a parent, or any other agent.

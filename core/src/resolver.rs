@@ -116,7 +116,8 @@ pub(crate) const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
 /// instead of refused for good by `land_finished`. A run that finished with a failed gate, failed or
 /// gave up had its attempt, and that stays a person's. A row somebody settled (`settled_at`), one a later success already
 /// settled, or one no longer `escalated` is left alone, and `MAX_RESOLUTION_ATTEMPTS` bounds the
-/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`.
+/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`, and also
+/// by a worktree-provisioning failure there, which counts the attempt without claiming the row.
 /// Returns how many rows were released.
 async fn release_unfinished(pool: &sqlx::SqlitePool) -> u64 {
     let released = sqlx::query(
@@ -252,6 +253,11 @@ struct Candidate {
 /// dismissed row it overrides a person's "nobody needs to act". The later-success subquery below
 /// stays: it covers the tick before `settle_moot` has run, which runs after this on the same tick.
 ///
+/// **`resolution_attempts < MAX_RESOLUTION_ATTEMPTS` caps the retries of an unclaimed row.** A
+/// worktree that could not be made counts an attempt but leaves `resolution_run_id` NULL, so
+/// without the cap a permanent failure would be retried every tick for ever. For the normal path it
+/// is a no-op: `release_unfinished` only frees rows whose attempts are already under the cap.
+///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
 /// runner to prove.
@@ -262,6 +268,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           WHERE status = 'escalated'
             AND op = 'merge'
             AND resolution_run_id IS NULL
+            AND resolution_attempts < ?
             AND from_resolution = 0
             AND settled_at IS NULL
             AND NOT EXISTS (
@@ -282,6 +289,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           ORDER BY id
           LIMIT 1",
     )
+    .bind(MAX_RESOLUTION_ATTEMPTS)
     .fetch_optional(pool)
     .await
 }
@@ -581,8 +589,8 @@ struct Published {
 ///
 /// Two arms, cheapest first. The table's own record (`vcs::settle_by_record`: a later identical
 /// success, a hand-off to a resolution) needs no git. The git arm then asks the repository about
-/// each open merge or rebase: a source branch that is gone settles as `source-gone`, a source
-/// already contained in its target as `merged`.
+/// each open merge or rebase: a source branch that is gone settles as `source-gone`, a target
+/// branch that is gone as `target-gone`, a source already contained in its target as `merged`.
 ///
 /// **Any git error leaves the row alone.** A repository that moved, a timeout, a missing path: none
 /// of those is evidence the work is done, and a row wrongly kept costs a glance where a row wrongly
@@ -636,15 +644,19 @@ async fn settle_moot(pool: &sqlx::SqlitePool) {
         let reason = match crate::execution::git_exec::branch_exists(root, source, deadline).await {
             Ok(false) => "source-gone",
             Ok(true) => {
+                // A target that is gone settles too: the resolver would otherwise mint a run every
+                // tick whose worktree cannot be based on it, failing before the attempt is claimed.
                 match crate::execution::git_exec::branch_exists(root, target, deadline).await {
-                    Ok(true) => {}
-                    _ => continue,
-                }
-                match crate::execution::git_exec::is_ancestor(root, ancestor, descendant, deadline)
+                    Ok(true) => match crate::execution::git_exec::is_ancestor(
+                        root, ancestor, descendant, deadline,
+                    )
                     .await
-                {
-                    Ok(true) => "merged",
-                    _ => continue,
+                    {
+                        Ok(true) => "merged",
+                        _ => continue,
+                    },
+                    Ok(false) => "target-gone",
+                    Err(_) => continue,
                 }
             }
             Err(_) => continue,
@@ -1552,6 +1564,51 @@ mod tests {
         assert!(
             next_conflict(&pool).await.unwrap().is_none(),
             "every conflict has been attempted; a fresh agent per tick is the failure this prevents"
+        );
+    }
+
+    /// An unclaimed row whose attempts are spent is not picked up again. A worktree that cannot be
+    /// made counts an attempt but leaves `resolution_run_id` NULL, so the cap is what stops a
+    /// permanent failure from minting a run every tick; one attempt short of it still retries.
+    #[tokio::test]
+    async fn an_unclaimed_conflict_whose_attempts_are_spent_is_not_picked_up() {
+        let pool = test_pool().await;
+
+        let spent = escalated_merge_of(&pool, "feat/spent", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(spent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retryable = escalated_merge_of(&pool, "feat/retryable", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS - 1)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let picked = next_conflict(&pool)
+            .await
+            .expect("the query should run")
+            .expect("the row one attempt short of the cap is still retried");
+        assert_eq!(
+            picked.id, retryable,
+            "picked {} — spent={spent}, retryable={retryable}",
+            picked.id
+        );
+
+        // Once that one spends its last attempt too, there is nothing left to start.
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "a conflict with its attempts spent belongs to a person, not to another run"
         );
     }
 
@@ -2823,6 +2880,29 @@ mod tests {
         }
     }
 
+    /// Request 513 in the field: `master` into `aut/integ`, a target that never existed. Unsettled,
+    /// the resolver minted a run every tick that failed at `git worktree add` before its attempt
+    /// was claimed, so the cap of three never applied.
+    #[tokio::test]
+    async fn a_merge_whose_target_is_gone_is_settled_as_target_gone() {
+        let (_container, repo) = moot_repo("nucleos-settle-target-gone-");
+        let pool = test_pool().await;
+        let merge = escalated_merge_into(&pool, "master", "aut/integ", false).await;
+        let rebase = escalated_rebase_of(&pool, "master", "feat/deleted-base").await;
+        rooted_at(&pool, merge, &repo).await;
+        rooted_at(&pool, rebase, &repo).await;
+
+        settle_moot(&pool).await;
+
+        for id in [merge, rebase] {
+            assert_eq!(
+                settlement_of(&pool, id).await.1.as_deref(),
+                Some("target-gone"),
+                "request {id} targets a branch that is no longer `refs/heads/<b>`"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_live_conflict_or_unreadable_repo_stays_unsettled() {
         let (_container, repo) = moot_repo("nucleos-settle-live-");
@@ -2895,5 +2975,133 @@ mod tests {
         // beside it, never put away, is still the one launched.
         let next = next_conflict(&pool).await.unwrap().map(|c| c.id);
         assert_eq!(next, Some(open));
+    }
+
+    async fn attempts_of(pool: &sqlx::SqlitePool, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT resolution_attempts FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the attempts")
+    }
+
+    async fn resolution_run_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT resolution_run_id FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read the resolution run")
+    }
+
+    /// A real `AppState` for `launch_once`, with worktrees provisioned under a root of the test's
+    /// own. Field order matters on drop: the env override and the lock go last.
+    struct LaunchFixture {
+        state: AppState,
+        _worktrees: tempfile::TempDir,
+        _env: crate::execution::runs::tests::WorktreeRootEnv,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// The env lock first, then the rules gate (taken inside `test_state_with_runner`): the order
+    /// `worktree::test_env_lock` insists on.
+    // The guard is held across the awaits on purpose: it is returned in the fixture so the env
+    // stays locked for the whole test, and these tests run on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn launch_fixture(prefix: &str) -> LaunchFixture {
+        let env_lock = crate::execution::worktree::test_env_lock();
+        let worktrees = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
+        let env = crate::execution::runs::tests::WorktreeRootEnv::set(worktrees.path());
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            None,
+            crate::state::DEFAULT_RUN_TIMEOUT,
+        )
+        .await;
+        LaunchFixture {
+            state,
+            _worktrees: worktrees,
+            _env: env,
+            _env_lock: env_lock,
+        }
+    }
+
+    /// `create_resolution_run` refuses before its claim when `git worktree add` cannot find the
+    /// base — the live `fatal: invalid reference: aut/integ`. `settle_moot` is deliberately not run:
+    /// this is about the launcher, which must count a failed hand-off as spent so that
+    /// `MAX_RESOLUTION_ATTEMPTS` bounds it, rather than retrying the same row every tick for ever.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_that_fails_before_the_claim_still_spends_an_attempt() {
+        let fixture = launch_fixture("nucleos-resolver-spend-wt-").await;
+        let pool = &fixture.state.pool;
+        let (_container, repo) = moot_repo("nucleos-resolver-spend-");
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        let unlaunchable = escalated_merge_into(pool, "feat/x", "aut/integ", false).await;
+        rooted_at(pool, unlaunchable, &repo).await;
+
+        let started = launch_once(&fixture.state).await;
+        assert_eq!(
+            started, None,
+            "a merge into a missing branch starts no agent"
+        );
+        assert_eq!(
+            attempts_of(pool, unlaunchable).await,
+            1,
+            "a hand-off that failed is an attempt spent, not an attempt kept"
+        );
+
+        for _ in 1..MAX_RESOLUTION_ATTEMPTS {
+            let _ = launch_once(&fixture.state).await;
+        }
+        assert_eq!(
+            attempts_of(pool, unlaunchable).await,
+            MAX_RESOLUTION_ATTEMPTS
+        );
+        assert_eq!(
+            next_conflict(pool).await.unwrap().map(|c| c.id),
+            None,
+            "a conflict whose attempts are spent is no longer a candidate"
+        );
+    }
+
+    /// The head-of-line block itself: `next_conflict` takes the oldest row, so an oldest row that
+    /// can never be launched must stop being the oldest candidate, or every escalation behind it
+    /// waits for ever.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_unlaunchable_conflict_does_not_starve_the_ones_behind_it() {
+        let fixture = launch_fixture("nucleos-resolver-starve-wt-").await;
+        let pool = &fixture.state.pool;
+        let (_container, repo) = moot_repo("nucleos-resolver-starve-");
+        // The younger row is a real conflict: `feat/y` and `master` change the same line.
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/y"]));
+        commit_file(&repo, "theirs\n", "theirs");
+        assert!(git_at(&repo, &["checkout", "-q", "master"]));
+        commit_file(&repo, "ours\n", "ours");
+
+        let older = escalated_merge_into(pool, "feat/x", "aut/integ", false).await;
+        let younger = escalated_merge_into(pool, "feat/y", "master", false).await;
+        rooted_at(pool, older, &repo).await;
+        rooted_at(pool, younger, &repo).await;
+        assert!(
+            older < younger,
+            "the unlaunchable row has to be first in line"
+        );
+
+        // Enough ticks to spend the older row's attempts and then reach the next one.
+        for _ in 0..=MAX_RESOLUTION_ATTEMPTS {
+            let _ = launch_once(&fixture.state).await;
+            if resolution_run_of(pool, younger).await.is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            resolution_run_of(pool, younger).await.is_some(),
+            "the conflict behind an unlaunchable one is handed to an agent"
+        );
+        assert_eq!(attempts_of(pool, younger).await, 1);
     }
 }

@@ -15,6 +15,7 @@ import { ErrorNote, Segmented, Skeleton, StaleNote, StatCard } from "../ui";
 import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, unreachable, type MetricKey } from "./sections";
 import { PipelineSection } from "./PipelineSection";
 import { DevtimeSection } from "./DevtimeSection";
+import { ContextFitSection } from "./ContextFitSection";
 import "./analytics.css";
 
 /**
@@ -44,6 +45,7 @@ const SECTION_OPTIONS: { value: AnalyticsSection; label: string }[] = [
   { value: "summary", label: "Summary" },
   { value: "pipeline", label: "Pipeline" },
   { value: "devtime", label: "Development time" },
+  { value: "context-fit", label: "Context fit" },
 ];
 
 /**
@@ -75,7 +77,7 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange, section: a
         <Segmented
           label="Section"
           value={section}
-          options={SECTION_OPTIONS}
+          options={global ? SECTION_OPTIONS : SECTION_OPTIONS.filter((option) => option.value !== "context-fit")}
           onChange={(option) => {
             if (option !== section) chooseSection(option);
           }}
@@ -127,6 +129,8 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange, section: a
       {section === "pipeline" ? <PipelineSection projectId={projectId} days={days} /> : null}
       {/* Likewise development time. */}
       {section === "devtime" ? <DevtimeSection projectId={projectId} days={days} /> : null}
+      {/* Likewise context fit; its route is global, so a project's view has no such section. */}
+      {section === "context-fit" && global ? <ContextFitSection days={days} /> : null}
     </div>
   );
 }

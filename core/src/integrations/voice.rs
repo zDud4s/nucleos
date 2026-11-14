@@ -71,7 +71,7 @@ pub const CLEANUP_NUM_CTX: usize = 4_096;
 /// What voice cleanup requires from a model, read by `capabilities::missing_capabilities` instead of
 /// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window: cleanup
 /// checks nothing else today, and `capabilities`' own guard test
-/// (`nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela`) fails if this ever claims more without
+/// (`none_of_the_three_roles_requires_more_than_the_window_today`) fails if this ever claims more without
 /// that being a deliberate change.
 pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
     crate::capabilities::Requirement {

@@ -1,14 +1,14 @@
 # Run the daemon from a COPY of its binaries, so no cargo target dir is ever held open.
 #
 # Why: `cargo run -p nucleos-daemon` keeps <target>/debug/nucleos-core.exe (and the
-# *-sidecar.exe beside it) open for as long as the daemon lives, and on Windows every other
+# nucleos-<name>.exe beside it) open for as long as the daemon lives, and on Windows every other
 # cargo build or test that relinks that path then fails with "os error 5". That pushed sessions
 # onto private target dirs, which is what saturated CPU and disk on 2026-10-01. Running a copy
 # leaves the target dir rebuildable while the daemon runs.
 #
 # What is copied, and why all of it: only the sidecars are resolved relative to current_exe()
-# (core/src/sidecar.rs, binary_in: $NUCLEOS_SIDECAR_DIR/<name>-sidecar.exe, else beside the
-# exe). So every *-sidecar.exe goes next to the daemon, and NUCLEOS_SIDECAR_DIR is cleared for
+# (core/src/sidecar.rs, binary_in: $NUCLEOS_SIDECAR_DIR/nucleos-<name>.exe, else beside the
+# exe). So every nucleos-<name>.exe goes next to the daemon, and NUCLEOS_SIDECAR_DIR is cleared for
 # the child so they resolve beside the copy and not in the target dir.
 #
 # Why the runtime path is STABLE (no versioned copy dirs): a primary daemon re-registers the
@@ -119,7 +119,7 @@ if ((Test-Path -LiteralPath $RunDir) -and -not $Stage) {
         try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
     }
     $candidates = @(Get-ChildItem -LiteralPath $RunDir -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ieq 'nucleos-core.exe' -or $_.Name -like '*-sidecar.exe' })
+        Where-Object { $_.Name -ieq 'nucleos-core.exe' -or $_.Name -like 'nucleos-*.exe' -or $_.Name -like '*-sidecar.exe' })
     foreach ($f in $candidates) {
         try {
             $h = [IO.File]::Open($f.FullName, 'Open', 'ReadWrite', 'None')
@@ -148,8 +148,10 @@ if ($held.Count -gt 0) {
     }
     else {
         $who = if ($daemons.Count -gt 0) { " (pid " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ', ') + ")" } else { "" }
-        # `schtasks /End` is no use here: the task runs the daemon through `conhost --headless`, and
-        # /End kills only that conhost, leaving the daemon alive.
+        # The hint names the daemon's pid. (The task's own process is now the supervisor, so
+        # `schtasks /End` would also work, but only the supervisor would be killed first; its job
+        # object then takes the daemon down. Stop-Process on the daemon alone makes the supervisor
+        # restart it, so stop the supervisor's task for a real stop.)
         $stopHint = if ($daemons.Count -gt 0) {
             "Stop-Process -Id " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ',')
         } else { "Stop-Process -Id <pid>" }
@@ -239,16 +241,21 @@ if ($moveAside.Count -gt 0) {
         ($moved -join ', ') + " and staging fresh")
 }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
-$sidecars = @(Get-ChildItem -LiteralPath $out -Filter '*-sidecar.exe' -File)
+$sidecars = @(Get-ChildItem -LiteralPath $out -Filter 'nucleos-*.exe' -File |
+    Where-Object { $_.Name -notlike 'nucleos-core.*' })
 Copy-Item -LiteralPath $core -Destination $RunDir -Force
 foreach ($s in $sidecars) { Copy-Item -LiteralPath $s.FullName -Destination $RunDir -Force }
+# Sidecars used to be <name>-sidecar.exe; drop copies an older run left behind (best effort).
+foreach ($old in @(Get-ChildItem -LiteralPath $RunDir -File -Filter '*-sidecar.exe' -ErrorAction SilentlyContinue)) {
+    try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
+}
 
 $srcDir = Join-Path $RepoRoot 'sidecars'
 if (Test-Path -LiteralPath $srcDir) {
     foreach ($d in @(Get-ChildItem -LiteralPath $srcDir -Directory)) {
         if (Test-Path -LiteralPath (Join-Path $d.FullName 'go.mod')) {
-            if (-not (Test-Path -LiteralPath (Join-Path $out ($d.Name + '-sidecar.exe')))) {
-                [Console]::Error.WriteLine("run-daemon: WARNING: no $($d.Name)-sidecar.exe in $out; the supervisor will report it")
+            if (-not (Test-Path -LiteralPath (Join-Path $out ('nucleos-' + $d.Name + '.exe')))) {
+                [Console]::Error.WriteLine("run-daemon: WARNING: no nucleos-$($d.Name).exe in $out; the supervisor will report it")
             }
         }
     }
@@ -292,8 +299,8 @@ if ($NoStart) { exit 0 }
 # --- 5. start (foreground, like `cargo run`) ---------------------------------------------------
 
 # The daemon must not be a child of the agent session that ran this script: when that session
-# ends, a child daemon dies with it. The "NucleOS Daemon" logon task (conhost --headless
-# nucleos-core.exe --supervise) is the daemon's real parent, so when it exists and runs the staged
+# ends, a child daemon dies with it. The "NucleOS Daemon" logon task (nucleos-core.exe
+# --supervise, run directly: the supervisor is the root of the process tree) is the daemon's real parent, so when it exists and runs the staged
 # copy, start it through the task. The decision is a pure function, kept apart for testing.
 function Get-DaemonStartMode([bool]$TaskExists, [string]$TaskArguments, [string]$StagedExe, [bool]$Foreground) {
     if ($Foreground) { return 'direct-forced' }
@@ -314,7 +321,7 @@ if (-not $forceDirect) {
     }
     catch { $taskInfo = $null }
 }
-$taskArgs = if ($taskInfo) { [string](@($taskInfo.Actions | ForEach-Object { $_.Arguments }) -join ' ') } else { '' }
+$taskArgs = if ($taskInfo) { [string](@($taskInfo.Actions | ForEach-Object { ($_.Execute + ' ' + $_.Arguments) }) -join ' ') } else { '' }
 $mode = Get-DaemonStartMode ($null -ne $taskInfo) $taskArgs (Join-Path $RunDir 'nucleos-core.exe') $forceDirect
 if ($mode -eq 'task') {
     try {

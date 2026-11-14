@@ -580,7 +580,9 @@ mod tests {
             .await
             .expect("every precondition holds");
 
-        type PostgateRow = (
+        // One tuple per selected column: a named type would only restate the SELECT.
+        #[allow(clippy::type_complexity)]
+        let row: (
             String,
             Option<String>,
             Option<String>,
@@ -588,8 +590,7 @@ mod tests {
             Option<String>,
             Option<String>,
             Option<String>,
-        );
-        let row: PostgateRow = sqlx::query_as(
+        ) = sqlx::query_as(
             "SELECT target, red_sha, last_attempted_sha, covered_sha, last_green_sha,
                     running_sha, red_phase
              FROM postgate_state WHERE project_id = 'alpha'",

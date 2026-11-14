@@ -1045,6 +1045,8 @@ mod tests {
                 "cancel_run",
                 "create_job",
                 "create_run",
+                "decision_answer",
+                "decision_list",
                 "declare_refinement",
                 "get_budget",
                 "get_council",
@@ -2465,6 +2467,9 @@ mod tests {
             (LOCAL_TOOLS, "LOCAL_TOOLS"),
             (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
             (TEAM_TOOLS, "TEAM_TOOLS"),
+            (JOB_NODE_TOOLS, "JOB_NODE_TOOLS"),
+            (EVERY_BOX_TOOLS, "EVERY_BOX_TOOLS"),
+            (WORKTREE_BOX_TOOLS, "WORKTREE_BOX_TOOLS"),
         ] {
             assert!(
                 !list.contains(&"send_to_chat"),
@@ -2789,6 +2794,8 @@ mod tests {
             [
                 "create_job",
                 "create_run",
+                "decision_answer",
+                "decision_list",
                 "get_job",
                 "get_run",
                 "list_jobs",
@@ -3038,6 +3045,7 @@ mod tests {
             let launch_act = [
                 "create_job",
                 "create_run",
+                "decision_answer",
                 "spec_finish",
                 "spec_finish_cancel",
                 "tree_abandon",
@@ -3059,6 +3067,8 @@ mod tests {
             [
                 "create_job",
                 "create_run",
+                "decision_answer",
+                "decision_list",
                 "get_job",
                 "get_run",
                 "list_jobs",
@@ -3701,7 +3711,7 @@ mod tests {
 
     /// Loose conversation does not reach off this machine: the web tools are on no chat list.
     #[test]
-    fn a_caixa_local_continua_sem_rede() {
+    fn the_local_box_remains_without_network() {
         assert!(
             !LOCAL_TOOLS.contains(&"web_search"),
             "loose conversation gained a network door"
@@ -3846,7 +3856,7 @@ mod tests {
     /// to the cloud assistant and council, which is worse than never offering it. The comparison is
     /// against the router's own list rather than a number that would go stale when a tool is added.
     #[tokio::test]
-    async fn sem_caixa_o_servidor_serve_tudo() {
+    async fn with_no_box_the_server_serves_everything() {
         let (_running, context) = served_request_context().await;
 
         let listed = unboxed_server().list_tools(None, context).await.unwrap();
@@ -3880,7 +3890,7 @@ mod tests {
     /// would break every caller that wants the sequential job — which is every caller there has ever
     /// been — and it would break them by making the tool uncallable rather than by misbehaving.
     #[test]
-    fn create_job_deixa_nomear_a_equipa_e_nao_a_exige() {
+    fn create_job_lets_you_name_the_team_and_does_not_require_it() {
         let tool = NucleosTools::tool_router()
             .list_all()
             .into_iter()
@@ -3910,10 +3920,10 @@ mod tests {
     }
 
     /// The four project reads must be served when nothing narrows the box — the same property
-    /// `sem_caixa_o_servidor_serve_tudo` pins for the server as a whole, checked here by name
+    /// `with_no_box_the_server_serves_everything` pins for the server as a whole, checked here by name
     /// because a registration slip on just these four would be silent under that test alone.
     #[tokio::test]
-    async fn as_quatro_leituras_de_projeto_sao_servidas_sem_caixa() {
+    async fn the_four_project_reads_are_served_without_a_box() {
         let (_running, context) = served_request_context().await;
         let listed = unboxed_server().list_tools(None, context).await.unwrap();
         let names = advertised(&listed);
@@ -3930,7 +3940,7 @@ mod tests {
     /// name resolves to `Acts` in `tool_effect`, so until these four are classified they read as
     /// acting tools rather than as the harmless reads they are.
     #[test]
-    fn uma_leitura_de_projeto_nao_age() {
+    fn a_project_read_does_not_act() {
         for name in ["project_ls", "project_cat", "project_grep", "project_diff"] {
             assert_eq!(
                 tool_effect(name),
@@ -3944,7 +3954,7 @@ mod tests {
     /// AND absent from every narrow list a chat turn, a council seat or a team agent is given —
     /// a project read is a different surface from all three and must not leak into any of them.
     #[test]
-    fn nenhuma_leitura_de_projeto_esta_nas_listas_estreitas() {
+    fn no_project_read_is_in_the_narrow_lists() {
         let registered: Vec<String> = NucleosTools::tool_router()
             .list_all()
             .into_iter()
@@ -3977,9 +3987,9 @@ mod tests {
 
     /// The two shadow reads must be served when nothing narrows the box, for the same reason the
     /// four project reads are checked by name above: a registration slip on just these two would be
-    /// silent under `sem_caixa_o_servidor_serve_tudo`, which counts rather than names.
+    /// silent under `with_no_box_the_server_serves_everything`, which counts rather than names.
     #[tokio::test]
-    async fn as_duas_leituras_do_shadow_sao_servidas_sem_caixa() {
+    async fn the_two_shadow_reads_are_served_without_a_box() {
         let (_running, context) = served_request_context().await;
         let listed = unboxed_server().list_tools(None, context).await.unwrap();
         let names = advertised(&listed);
@@ -3996,7 +4006,7 @@ mod tests {
     /// they read as acting tools — which would refuse them to any turn that had read mail, for no
     /// reason at all.
     #[test]
-    fn uma_leitura_do_shadow_nao_age() {
+    fn a_shadow_read_does_not_act() {
         for name in ["shadow_scoreboard", "shadow_queue"] {
             assert_eq!(
                 tool_effect(name),
@@ -4011,7 +4021,7 @@ mod tests {
     /// the machine itself, not something a fanned-out seat or a topic anyone can post to should be
     /// handed.
     #[test]
-    fn nenhuma_leitura_do_shadow_esta_nas_listas_estreitas() {
+    fn no_shadow_read_is_in_the_narrow_lists() {
         let registered = every_tool_name();
 
         for name in ["shadow_scoreboard", "shadow_queue"] {
@@ -4050,7 +4060,7 @@ mod tests {
     /// is one file over — `DaemonClient` has no method that POSTs to that route, so no tool on this
     /// server has anything to call.
     #[test]
-    fn o_veredicto_do_shadow_nao_e_uma_ferramenta() {
+    fn the_shadow_verdict_is_not_a_tool() {
         let registered = every_tool_name();
 
         assert!(
@@ -4074,10 +4084,10 @@ mod tests {
     }
 
     /// The three job tools must be served when nothing narrows the box, checked by name for the
-    /// reason the project reads are: `sem_caixa_o_servidor_serve_tudo` counts rather than names, so
+    /// reason the project reads are: `with_no_box_the_server_serves_everything` counts rather than names, so
     /// a registration slip on just these three would be silent under it.
     #[tokio::test]
-    async fn as_tres_ferramentas_de_job_sao_servidas_sem_caixa() {
+    async fn the_three_job_tools_are_served_without_a_box() {
         let (_running, context) = served_request_context().await;
         let listed = unboxed_server().list_tools(None, context).await.unwrap();
         let names = advertised(&listed);
@@ -4095,7 +4105,7 @@ mod tests {
     /// no reason — and the stop must NOT be anything but `Acts`, because a turn holding a
     /// stranger's words is exactly the one that should not be able to end a night's work.
     #[test]
-    fn olhar_para_um_job_nao_age_e_parar_um_job_age() {
+    fn looking_at_a_job_does_not_act_and_stopping_a_job_does() {
         for name in ["get_job", "list_jobs"] {
             assert_eq!(
                 tool_effect(name),
@@ -4118,7 +4128,7 @@ mod tests {
     /// same list and stated there: stopping is what somebody reaches for when things are going
     /// wrong, and that stays where the person can see what they are ending.
     #[test]
-    fn um_chat_pode_ver_o_job_que_abriu_mas_nao_o_pode_parar() {
+    fn a_chat_can_see_the_job_it_opened_but_cannot_stop_it() {
         assert!(
             LOCAL_TOOLS.contains(&"create_job"),
             "the whole argument below rests on a chat turn being able to open a job at all"
@@ -4144,7 +4154,7 @@ mod tests {
     /// agent. A council fans one question into up to eight agents; neither is a place to hand the
     /// controls of work already running.
     #[test]
-    fn nenhuma_ferramenta_de_job_chega_a_um_conselho_ou_a_uma_equipa() {
+    fn no_job_tool_reaches_a_council_or_a_team() {
         let registered = every_tool_name();
 
         for name in ["get_job", "list_jobs", "cancel_job"] {

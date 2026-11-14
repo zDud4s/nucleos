@@ -46,7 +46,7 @@ done
 if [ "$dry" -eq 1 ]; then
   echo "$target_dir/release/nucleos-core$exe -> $dest_dir/nucleos-core-$triple$exe"
   for n in "${names[@]}"; do
-    echo "$sidecar_tmp/$n-sidecar$exe -> $dest_dir/$n-sidecar-$triple$exe"
+    echo "$sidecar_tmp/nucleos-$n$exe -> $dest_dir/nucleos-$n-$triple$exe"
   done
   exit 0
 fi
@@ -57,6 +57,6 @@ cp "$target_dir/release/nucleos-core$exe" "$dest_dir/nucleos-core-$triple$exe"
 
 NUCLEOS_SIDECAR_DIR="$sidecar_tmp" bash "$repo_root/scripts/build-sidecars.sh" release
 for n in "${names[@]}"; do
-  cp "$sidecar_tmp/$n-sidecar$exe" "$dest_dir/$n-sidecar-$triple$exe"
+  cp "$sidecar_tmp/nucleos-$n$exe" "$dest_dir/nucleos-$n-$triple$exe"
 done
 echo "staged $((${#names[@]} + 1)) binaries into $dest_dir"

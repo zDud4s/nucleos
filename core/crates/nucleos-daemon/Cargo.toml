@@ -43,6 +43,10 @@ tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors"] }
 tracing = "0.1.44"
 
+[build-dependencies]
+# `build.rs`: the Windows version resource ("NucleOS Core" in Task Manager).
+winresource = "0.1"
+
 [dev-dependencies]
 nucleos-core = { path = "../..", features = ["testkit"] }
 nucleos-app = { path = "../nucleos-app", features = ["testkit"] }

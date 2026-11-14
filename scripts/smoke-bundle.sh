@@ -44,7 +44,7 @@ find_bin() {
   [ -n "$found" ] || return 1
   echo "$found"
 }
-for b in nucleos-core browser-sidecar echo-sidecar email-sidecar quota-sidecar remote-sidecar telegram-sidecar web-sidecar; do
+for b in nucleos-core nucleos-browser nucleos-echo nucleos-email nucleos-quota nucleos-remote nucleos-telegram nucleos-web; do
   path="$(find_bin "$b")" || fail "$b is not installed by $pkg_name"
   [ -x "$path" ] || fail "$b is installed but not executable ($path)"
   echo "ok: $b -> $path"

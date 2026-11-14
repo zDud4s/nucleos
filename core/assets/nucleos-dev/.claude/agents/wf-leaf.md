@@ -24,7 +24,7 @@ Unlike a plain `wf-executor`, you write your own handoff and close your own node
 
 - `node_update` records each decision and state change on **your own node** when it happens.
 - `node_close` closes **your own node** with a summary of at most 1500 chars; the full handoff
-  file is the path your prompt names (in a daemon-run node, `.nucleos-report.md` in your worktree;
+  file is the path your prompt names (normally `<state_dir>/nodes/<root_id>/<node_id>.md`;
   schema `packets/handoff.md`), written with `Write`.
 - `task_report` is for reporting a blocker or a ticket on your task, when your prompt tells you to.
 

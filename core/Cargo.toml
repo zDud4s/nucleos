@@ -3,7 +3,8 @@ name = "nucleos-core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-# `tests/module_map.rs` is compiled into the library's unit tests (see src/lib.rs).
+# `tests/module_map.rs` and the other `tests/` guards are compiled into the daemon binary's unit
+# tests (see src/main.rs and crates/nucleos-daemon).
 autotests = false
 # The library only, since 2026-10-22. `main.rs` and `http.rs` are the binary of `crates/nucleos-daemon`
 # and `app.rs` the root of `crates/nucleos-app`, both reading their sources from this `src/`: a crate
@@ -17,7 +18,8 @@ path = "src/lib.rs"
 doctest = false
 
 # `testkit` exposes test doubles and fixtures to the tests of the crates above (`nucleos-app`,
-# `nucleos-daemon`), whose dev-dependency on this crate turns it on; a release build never sees it.
+# `nucleos-daemon`), whose dev-dependency on this crate turns it on, as does this crate's own
+# dev-dependency on itself (see [dev-dependencies]); a release build never sees it.
 [features]
 testkit = ["dep:tempfile", "nucleos-base/testkit"]
 
@@ -118,10 +120,21 @@ windows-sys = { version = "0.61.2", features = [
 libc = "0.2"
 
 [dev-dependencies]
-# The fixtures this crate's own tests read from the base (`testdb`, `storage::TempDb`). A crate above
-# turning `testkit` on hides a missing line here, so `cargo test -p nucleos-core` alone is the check.
+# This crate's own `testkit`, on for its own tests. Not for the fixtures (`#[cfg(test)]` already
+# compiles them here) but for the artifacts: without this line `cargo test -p nucleos-core` builds
+# the library without `testkit` and the gate's `cargo test -p nucleos-base -p nucleos-core ...`
+# builds it with, so each of the two rebuilds the 160k lines and everything above them after the
+# other ran. With it, every test invocation compiles this crate with one feature set. Dev-dependencies
+# are not unified into a plain `cargo build` (resolver 2), so a release build still never sees it.
+# `nucleos-base` and `nucleos-app` carry the same line for the same reason.
+nucleos-core = { path = ".", features = ["testkit"] }
+# The fixtures this crate's own tests read from the base (`testdb`, `storage::TempDb`). The line above
+# already turns them on through `testkit`; this one says so where a reader of the tests looks.
 nucleos-base = { path = "crates/nucleos-base", features = ["testkit"] }
 tempfile = "3.27.0"
 sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
 # `tokio::time::pause` / `start_paused` for the admission book's clock tests.
+# These two feature additions are the same in all four crates' [dev-dependencies] on purpose: one
+# missing from a crate makes `cargo test -p` of that crate alone build tokio or sqlx (and every
+# crate above them) with a different feature set than the gate does.
 tokio = { version = "1.53.0", features = ["test-util"] }

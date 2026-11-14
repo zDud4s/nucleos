@@ -282,7 +282,7 @@ pub(super) fn has_destructive_flags(command: &str) -> bool {
 /// to decide about it. Substitution is the exception and is still read RAW: `"$(whoami)"` and a
 /// backtick both run a nested command from inside double quotes, so masking would hide them.
 pub(super) fn has_shell_control(command: &str) -> bool {
-    if command.contains('`') || command.contains("$(") {
+    if has_command_substitution(command) {
         return true;
     }
     // An unterminated quote is the one line whose extent cannot be proved, and it masks to a line
@@ -292,6 +292,47 @@ pub(super) fn has_shell_control(command: &str) -> bool {
     };
     const SHELL_CONTROL: &[char] = &[';', '|', '&', '>', '<', '\n', '\r'];
     masked.contains(SHELL_CONTROL)
+}
+
+/// PURE: whether the command line itself holds a backtick or `$(` (which also covers `$((`).
+///
+/// The body of a heredoc with a QUOTED delimiter (`<<'EOF'`, `<<"EOF"`) is literal text the shell
+/// never parses, so a `$(` or backtick in it (a python or markdown snippet) is not substitution
+/// and is not looked at. An UNQUOTED delimiter still expands them, so that body stays in.
+pub(crate) fn has_command_substitution(command: &str) -> bool {
+    let shell_text = without_literal_heredoc_bodies(command);
+    shell_text.contains('`') || shell_text.contains("$(")
+}
+
+/// PURE: `command` with the lines of every quoted-delimiter heredoc body (and its terminator)
+/// dropped; the opener line stays. No terminator found means the body runs to the end.
+pub(crate) fn without_literal_heredoc_bodies(command: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut ending: Option<&str> = None;
+    for line in command.lines() {
+        if let Some(tag) = ending {
+            if line.trim() == tag {
+                ending = None;
+            }
+            continue;
+        }
+        kept.push(line);
+        ending = literal_heredoc_tag(line);
+    }
+    kept.join("\n")
+}
+
+/// PURE: the delimiter of a quoted heredoc opened on this line (`<<'EOF'`, `<<-"EOF"`).
+fn literal_heredoc_tag(line: &str) -> Option<&str> {
+    let after = &line[line.find("<<")? + 2..];
+    if after.starts_with('<') {
+        return None; // `<<<` is a here-string, not a heredoc
+    }
+    let after = after.strip_prefix('-').unwrap_or(after).trim_start();
+    let quote = after.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let inside = &after[1..];
+    let tag = &inside[..inside.find(quote)?];
+    (!tag.is_empty()).then_some(tag)
 }
 
 pub(super) fn is_safe_command(command: &str) -> bool {
@@ -1118,4 +1159,50 @@ pub fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S]) -> b
         let prefix = prefix.as_ref();
         command == prefix || command.starts_with(&format!("{prefix} "))
     })
+}
+
+#[cfg(test)]
+mod heredoc_substitution_tests {
+    use super::*;
+
+    #[test]
+    fn substitution_inside_a_quoted_heredoc_body_is_not_substitution() {
+        for body in ["x = $(1)", "y = $((1 + 2))", "z = `ls`"] {
+            let command = format!("python - <<'EOF'\n{body}\nEOF");
+            assert!(!has_command_substitution(&command), "{body}");
+        }
+        assert!(!has_command_substitution("cat <<\"END\"\n$(a)\nEND"));
+        assert!(!has_command_substitution("cat <<-'END'\n\t$(a)\n\tEND"));
+    }
+
+    #[test]
+    fn substitution_on_the_command_line_still_fires() {
+        assert!(has_command_substitution("echo $(whoami)"));
+        assert!(has_command_substitution("echo $((1+1))"));
+        assert!(has_command_substitution("echo `id`"));
+        assert!(has_command_substitution("cat <<'EOF' $(whoami)\nbody\nEOF"));
+    }
+
+    #[test]
+    fn substitution_after_the_heredoc_terminator_still_fires() {
+        assert!(has_command_substitution(
+            "cat <<'EOF'\nbody\nEOF\necho $(id)"
+        ));
+    }
+
+    #[test]
+    fn an_unquoted_heredoc_body_still_expands_and_still_fires() {
+        assert!(has_command_substitution("cat <<EOF\n$(id)\nEOF"));
+        assert!(has_command_substitution("cat <<EOF\n`id`\nEOF"));
+    }
+
+    #[test]
+    fn a_here_string_is_not_a_heredoc() {
+        assert!(has_command_substitution("cat <<<'x'\n$(id)"));
+    }
+
+    #[test]
+    fn has_shell_control_still_refuses_a_heredoc_command() {
+        assert!(has_shell_control("python - <<'EOF'\nx = $(1)\nEOF"));
+    }
 }

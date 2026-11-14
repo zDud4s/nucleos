@@ -9,13 +9,13 @@
     },
     "externalBin": [
       "binaries/nucleos-core",
-      "binaries/browser-sidecar",
-      "binaries/echo-sidecar",
-      "binaries/email-sidecar",
-      "binaries/quota-sidecar",
-      "binaries/remote-sidecar",
-      "binaries/telegram-sidecar",
-      "binaries/web-sidecar"
+      "binaries/nucleos-browser",
+      "binaries/nucleos-echo",
+      "binaries/nucleos-email",
+      "binaries/nucleos-quota",
+      "binaries/nucleos-remote",
+      "binaries/nucleos-telegram",
+      "binaries/nucleos-web"
     ],
     "windows": {
       "nsis": {

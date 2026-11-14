@@ -42,6 +42,7 @@ mod chat_turns;
 mod chats;
 mod commands;
 mod common;
+mod context_fit;
 mod email;
 mod engines;
 mod files;
@@ -141,6 +142,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(chat_turns::routes())
         .merge(chats::routes())
         .merge(commands::routes())
+        .merge(context_fit::routes())
         .merge(email::routes())
         .merge(files::routes())
         .merge(fleet::routes())
@@ -2625,7 +2627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn um_lote_marcado_de_saida_e_gravado_como_saida() {
+    async fn a_batch_marked_outbound_is_stored_as_outbound() {
         let state = test_state().await;
         let pool = state.pool.clone();
 
@@ -2649,7 +2651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn um_lote_sem_direccao_continua_a_ser_entrada() {
+    async fn a_batch_with_no_direction_is_still_inbound() {
         let state = test_state().await;
         let pool = state.pool.clone();
 
@@ -2668,7 +2670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uma_direccao_vazia_e_lida_como_entrada() {
+    async fn an_empty_direction_is_read_as_inbound() {
         let state = test_state().await;
         let pool = state.pool.clone();
 
@@ -2692,7 +2694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uma_direccao_nula_e_lida_como_entrada() {
+    async fn a_null_direction_is_read_as_inbound() {
         let state = test_state().await;
         let pool = state.pool.clone();
 
@@ -2716,7 +2718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uma_direccao_desconhecida_e_recusada_sem_gravar() {
+    async fn an_unknown_direction_is_refused_without_storing() {
         let state = test_state().await;
         let pool = state.pool.clone();
 
@@ -2953,7 +2955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_caixa_nao_mostra_o_que_o_utilizador_escreveu() {
+    async fn the_inbox_does_not_show_what_the_user_wrote() {
         let state = test_state().await;
         let outbound = serde_json::json!([{
             "message_id": "<sent@user>",
@@ -3899,7 +3901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abrir_a_mensagem_mostra_a_regra_que_decidiu() {
+    async fn opening_the_message_shows_the_rule_that_decided() {
         let state = test_state().await;
         let id = sqlx::query(
             "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, body_text,
@@ -19696,7 +19698,7 @@ mod tests {
     // already carry this allow for.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn um_post_valido_cria_um_job_a_planear_com_a_sua_worktree() {
+    async fn a_valid_post_creates_a_job_in_planning_with_its_worktree() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = seeded_repo("nucleos-http-job-");
         let root = tempfile::tempdir().expect("worktree root");
@@ -20004,7 +20006,7 @@ mod tests {
     // already carry this allow for.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn com_o_kill_switch_engatado_nenhum_job_e_criado() {
+    async fn with_the_kill_switch_engaged_no_job_is_created() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = seeded_repo("nucleos-http-job-kill-");
         let root = tempfile::tempdir().expect("worktree root");
@@ -20035,7 +20037,7 @@ mod tests {
     // already carry this allow for.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn um_projeto_em_shadow_e_recusado_e_a_recusa_diz_porque() {
+    async fn a_project_in_shadow_is_refused_and_the_refusal_says_why() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = seeded_repo("nucleos-http-job-shadow-");
         let root = tempfile::tempdir().expect("worktree root");
@@ -20069,7 +20071,7 @@ mod tests {
     // already carry this allow for.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn um_projeto_corre_ate_ao_tecto_de_slots_e_o_seguinte_leva_409() {
+    async fn a_project_runs_up_to_the_slot_ceiling_and_the_next_one_gets_409() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = seeded_repo("nucleos-http-job-second-");
         let root = tempfile::tempdir().expect("worktree root");
@@ -20122,7 +20124,7 @@ mod tests {
     // already carry this allow for.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn um_job_desta_rota_e_conduzido_pelo_tick_como_qualquer_outro() {
+    async fn a_job_from_this_route_is_driven_by_the_tick_like_any_other() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = seeded_repo("nucleos-http-job-tick-");
         let root = tempfile::tempdir().expect("worktree root");
@@ -23163,7 +23165,7 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     /// A double whose `can_serve` refuses every model with a fixed reason — what
-    /// `o_patch_recusa_um_modelo_que_a_maquina_nao_serve_e_diz_porque` needs to prove the door
+    /// `the_patch_refuses_a_model_the_machine_does_not_serve_and_says_why` needs to prove the door
     /// reads a REFUSAL BODY out of `can_serve`, not just a bare status code the way today's
     /// `patch_chat` answers every path with.
     struct RefusingAssistants {
@@ -23205,7 +23207,7 @@ mod tests {
     }
 
     /// A double whose `can_serve` accepts every model and counts how many times it was asked —
-    /// what `o_patch_aceita_um_modelo_que_a_maquina_serve` needs to prove the door actually
+    /// what `the_patch_accepts_a_model_the_machine_serves` needs to prove the door actually
     /// CONSULTS `can_serve` before storing a pin, rather than storing it unconditionally the way
     /// today's `patch_chat` does. A stored model alone would not tell the two apart: today's
     /// `patch_chat` already stores it without asking anybody.
@@ -23254,7 +23256,7 @@ mod tests {
     /// claims and unreadable pins), the same shape `post_assistant_message` returns for its own
     /// refusals. The picker's door (`http/common.rs`) asks `can_serve` before the pick is stored.
     #[tokio::test]
-    async fn o_patch_recusa_um_modelo_que_a_maquina_nao_serve_e_diz_porque() {
+    async fn the_patch_refuses_a_model_the_machine_does_not_serve_and_says_why() {
         let mut state = test_state().await;
         let reason = "a janela tem 2048 tokens mas são precisos 8192".to_string();
         state.assistants = Arc::new(RefusingAssistants {
@@ -23294,7 +23296,7 @@ mod tests {
     /// existing one at the very same model explained itself — the asymmetry was a packet
     /// boundary, never a decision, and it left the harder-to-diagnose case as the quieter one.
     #[tokio::test]
-    async fn abrir_uma_conversa_num_modelo_que_a_maquina_nao_serve_tambem_diz_porque() {
+    async fn opening_a_conversation_on_a_model_the_machine_does_not_serve_also_says_why() {
         let mut state = test_state().await;
         let reason = "a janela tem 2048 tokens mas são precisos 8192".to_string();
         state.assistants = Arc::new(RefusingAssistants {
@@ -23322,7 +23324,7 @@ mod tests {
     /// accident, since today's `patch_chat` already stores any catalogue model unconditionally,
     /// without consulting `state.assistants` at all.
     #[tokio::test]
-    async fn o_patch_aceita_um_modelo_que_a_maquina_serve() {
+    async fn the_patch_accepts_a_model_the_machine_serves() {
         let mut state = test_state().await;
         let accepting = Arc::new(AcceptingAssistants {
             asked: std::sync::atomic::AtomicUsize::new(0),

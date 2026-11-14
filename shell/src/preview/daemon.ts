@@ -806,7 +806,7 @@ function team(overrides: Partial<TeamView>): TeamView {
 export const TEAMS: TeamView[] = [
   team({
     id: "financas",
-    name: "Finanças",
+    name: "Finance",
     mission:
       "Reconcile what the bank says with what the ledger says, chase the invoices nobody has paid, and be the one who notices before the accountant does.",
     director_agent_id: "controller",
@@ -839,7 +839,7 @@ export const TEAMS: TeamView[] = [
   }),
   team({
     id: "vendas",
-    name: "Vendas",
+    name: "Sales",
     mission: "Answer the people who wrote in, and remember what was promised to whom.",
     director_agent_id: "closer",
     members: ["closer", "researcher", "writer"],
@@ -852,7 +852,7 @@ export const TEAMS: TeamView[] = [
   }),
   team({
     id: "seguranca",
-    name: "Segurança",
+    name: "Security",
     /* No ceiling of its own — the one department where an armed routine can spend
        without bound, which is the case the interlock exists for. */
     budget_usd: null,
@@ -867,10 +867,10 @@ export const TEAMS: TeamView[] = [
   }),
   team({
     id: "informatica",
-    name: "Informática",
+    name: "IT",
     mission: "Keep the machines patched and the backups restorable, and prove the second one.",
     director_agent_id: "sysadmin",
-    /* `closer` directs Vendas and serves here: until this line no director in
+    /* `closer` directs Sales and serves here: until this line no director in
        the fixture served a second department, so two things were never drawn.
        `Who`'s accent ring and dashed outline together — leading one place and
        shared with another — and the catalogue's employment column showing both
@@ -886,7 +886,7 @@ export const TEAMS: TeamView[] = [
   }),
   team({
     id: "operacoes",
-    name: "Operações",
+    name: "Operations",
     /* Created and not yet staffed: a column of empty cells, and the state that
        stops every task it is asked to run. */
     mission: "Just created — nobody on it yet.",
@@ -1014,7 +1014,7 @@ export const JOB: Job = {
   round: 1,
   max_rounds: 3,
   team_id: "financas",
-  team_name: "Finanças",
+  team_name: "Finance",
   team_max_parallel: 2,
 };
 
@@ -1178,7 +1178,7 @@ export const ACTIONS: TeamAction[] = [
     team_run_id: "run-live-1",
     ordinal: null,
     kind: "file_document",
-    payload: JSON.stringify({ path: "financas/2026-10/exceptions.md", title: "October exceptions" }),
+    payload: JSON.stringify({ path: "finance/2026-10/exceptions.md", title: "October exceptions" }),
     why: "The exception list is what the accountant will ask for first.",
     /* Granted `allow`: nobody decides, and it happens on the next tick. */
     proposal_id: null,
@@ -1192,7 +1192,7 @@ export const ACTIONS: TeamAction[] = [
 /** The department the preview's team actions and recruit come from, as the daemon joins it. */
 const DEPARTMENT = {
   team_run_id: "run-live-1",
-  team_name: "Finanças",
+  team_name: "Finance",
   team_request: "Reconcile the October invoices against the bank statement",
 };
 
@@ -1297,7 +1297,7 @@ const PROJECT_KNOWLEDGE: Known[] = [
   known({ id: 3, layer: "episodic", title: "Gate flaked under load", body: "Timing tests in vcs:: failed while another suite ran; each passed alone.", status: "active", observations: 2, created_at: ago(2 * DAY), activated_at: ago(2 * DAY) }),
   known({ id: 4, layer: "semantic", title: "Sidecars own their DB", body: "Each sidecar keeps its own store.", status: "superseded", source: "run", ended_at: ago(4 * DAY), created_at: ago(12 * DAY) }),
   /* Scoped to an agent, a team, another project and the machine: what the Memory section of
-     the Auditor Sénior's editor and of Finanças's Charter shows, and the Brain's queue. */
+     the Senior Auditor's editor and of Finance's Charter shows, and the Brain's queue. */
   known({ id: 5, layer: "semantic", source: "run", generator: null, scope_kind: "agent", scope_id: "auditor", status: "active", activated_at: ago(6 * DAY),
     title: "Reconcile against the bank export, not the ledger", body: "The ledger lags a day; the bank export is the second source that settles a disagreement.", shown_count: 14, outcome_count: 9, green_count: 8 }),
   known({ id: 6, source: "run", generator: null, scope_kind: "agent", scope_id: "auditor", status: "active", activated_at: ago(2 * DAY), layer: "procedural", kind: "skill",
@@ -1528,7 +1528,7 @@ export const AGENTS: Agent[] = [
      name disagreeing — and the one fact only this page can show. */
   agent({
     id: "auditor",
-    name: "Auditor Sénior",
+    name: "Senior Auditor",
     speciality: "Checks the controller's work and says so plainly when it does not add up.",
     prompt: "You audit. Assume the number is wrong until the second source agrees with it.",
     updated_at: ago(11 * DAY),
@@ -1614,8 +1614,8 @@ export const AGENTS: Agent[] = [
   /* A long name, renamed, on nobody's roster: the row that tells you whether the
      column widths were chosen or merely happened. */
   agent({
-    id: "revisor-de-contratos",
-    name: "Revisor de contratos, cláusulas e anexos",
+    id: "contract-reviewer",
+    name: "Reviewer of contracts, clauses and annexes",
     speciality:
       "Reads a contract end to end and lists what changed since the last version, including the annexes nobody opens.",
     prompt: "You review contracts. Quote the clause, then say what it now means.",
@@ -2231,7 +2231,7 @@ export const CALENDAR: EventOccurrence[] = [
   /* Wednesday: more than three, so the month has to count the rest. */
   occurrence(8, "Standup", "2026-08-26T09:30:00", 15),
   occurrence(9, "Pairing on the migration", "2026-08-26T10:00:00", 120),
-  occurrence(10, "Lunch with the Vendas team", "2026-08-26T13:00:00", 60),
+  occurrence(10, "Lunch with the Sales team", "2026-08-26T13:00:00", 60),
   occurrence(11, "Security review", "2026-08-26T15:00:00", 60),
   occurrence(12, "Write up the quarter", "2026-08-26T17:00:00", 45),
 
@@ -2359,9 +2359,9 @@ const NIGHT: Omit<FeedEntry, "id">[] = [
   { project_id: "charlie", kind: "shadow_run_completed", summary: "shadow run 900590 completed: would have opened 2 pull requests", run_id: 900590, subject: "run:900590", created_at: ago(561 * MINUTE) },
   { project_id: "charlie", kind: "vcs_request_finished", summary: "vcs request 44 landed job/54-flaky-hunt into main", run_id: null, subject: "vcs:44", created_at: ago(511 * MINUTE) },
   { project_id: null, kind: "email_digest", summary: "digest: 23 e-mails triaged, 1 urgent held for the morning", run_id: null, subject: null, created_at: ago(466 * MINUTE) },
-  { project_id: null, kind: "team_run_started", summary: "team run 31 started: Finanças on the weekly close", run_id: null, subject: "team_run:31", created_at: ago(458 * MINUTE) },
-  { project_id: null, kind: "team_action", summary: "Finanças's `ledger_summary` carried out: the Q3 ledger summary is drafted", run_id: null, subject: "team_run:31", created_at: ago(431 * MINUTE) },
-  { project_id: null, kind: "team_run_finished", summary: "team run 31 done: Finanças delivered the weekly close with 3 action(s)", run_id: null, subject: "team_run:31", created_at: ago(420 * MINUTE) },
+  { project_id: null, kind: "team_run_started", summary: "team run 31 started: Finance on the weekly close", run_id: null, subject: "team_run:31", created_at: ago(458 * MINUTE) },
+  { project_id: null, kind: "team_action", summary: "Finance's `ledger_summary` carried out: the Q3 ledger summary is drafted", run_id: null, subject: "team_run:31", created_at: ago(431 * MINUTE) },
+  { project_id: null, kind: "team_run_finished", summary: "team run 31 done: Finance delivered the weekly close with 3 action(s)", run_id: null, subject: "team_run:31", created_at: ago(420 * MINUTE) },
   { project_id: "charlie", kind: "worktree_removed", summary: "removed worktree C:/repos/charlie/.nucleos/worktrees/run-900577 after its branch merged", run_id: null, subject: "run:900577", created_at: ago(175 * MINUTE) },
   { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 1 failed, retrying: the sidecar handshake timed out", run_id: 900598, subject: "run:900598", created_at: ago(70 * MINUTE) },
   { project_id: "delta", kind: "run_retry", summary: "run 900598 attempt 2 failed, retrying: the sidecar handshake timed out", run_id: 900598, subject: "run:900598", created_at: ago(62 * MINUTE) },
@@ -2759,7 +2759,7 @@ export const CHATS: ChatSummary[] = [
     created_at: "2026-08-24T09:00:00Z",
     cwd: "C:/Projects/nucleos",
     ide_session_id: null,
-    first_message: "o que muda entre os cinco degraus?",
+    first_message: "what changes between the five rungs?",
     last_activity: "2026-08-24T09:05:00Z",
     waiting: 0,
   },
@@ -2778,8 +2778,8 @@ CHATS.push(
   {
     ...CHATS[0],
     chat_id: CHAT_RUNNING_ID,
-    title: "rever a página dos chats",
-    first_message: "põe agentes a rever a página dos chats antes do PR",
+    title: "review the chats page",
+    first_message: "put agents on reviewing the chats page before the PR",
     last_activity: "2026-08-24T09:20:00Z",
     working: true,
     activity: "working",
@@ -2847,25 +2847,25 @@ const RUNNING_DID = [
     toolCall("toolu_a1_4", "Read", "core/src/turns.rs", 12, 15),
     toolCall("toolu_a1_5", "Read", "core/src/live.rs", 15, 19),
   ]),
-  helper("toolu_a2", "Rever os testes do shell", "general-purpose", 5, null, 48_900),
+  helper("toolu_a2", "Review the shell tests", "general-purpose", 5, null, 48_900),
   ...inside("toolu_a2", [
     toolCall("toolu_a2_1", "Glob", "shell/src/**/*.test.tsx", 6, 7),
     toolCall("toolu_a2_2", "Read", "shell/src/pages/Chats.test.tsx", 7, 14),
     toolCall("toolu_a2_3", "Grep", "stopping a turn", 14, 15),
     toolCall("toolu_a2_4", "Bash", "npx vitest run src/pages/Chats.test.tsx", 16, null, { status: "running" }),
   ]),
-  helper("toolu_a3", "Procurar regressões no CSS", "Explore", 6, null, 19_200),
+  helper("toolu_a3", "Look for CSS regressions", "Explore", 6, null, 19_200),
   ...inside("toolu_a3", [
     toolCall("toolu_a3_1", "Grep", ".chats-topbar", 7, 8),
     toolCall("toolu_a3_2", "Read", "shell/src/pages/chats.css", 8, null),
   ]),
-  helper("toolu_a4", "Escrever o resumo para o PR", "general-purpose", 8, 30, 12_600),
+  helper("toolu_a4", "Write the summary for the PR", "general-purpose", 8, 30, 12_600),
   ...inside("toolu_a4", [
     toolCall("toolu_a4_1", "Bash", "git log --oneline -20", 9, 10),
     toolCall("toolu_a4_2", "Bash", "git diff --stat master", 10, 12),
     toolCall("toolu_a4_3", "Write", ".ai/local/pr-body.md", 25, 29),
   ]),
-  helper("toolu_a5", "Medir o tempo de arranque", "general-purpose", 9, 22, 8_300),
+  helper("toolu_a5", "Measure the startup time", "general-purpose", 9, 22, 8_300),
   ...inside("toolu_a5", [
     toolCall("toolu_a5_1", "Bash", "scripts/run-daemon.ps1 -NoStart", 10, 21, {
       result: "error: failed to remove file nucleos-core.exe (os error 5)",
@@ -2902,7 +2902,7 @@ const RUNNING_TASKS = [
   ["toolu_a2", "subagent", "general-purpose", "running", null, 48_900, null],
   ["toolu_a3", "subagent", "Explore", "running", null, 19_200, null],
   ["toolu_a4", "subagent", "general-purpose", "completed", 30, 12_600, "Resumo escrito em .ai/local/pr-body.md."],
-  ["toolu_a5", "subagent", "general-purpose", "failed", 22, 8_300, "O executável estava em uso pelo daemon."],
+  ["toolu_a5", "subagent", "general-purpose", "failed", 22, 8_300, "The executable was in use by the daemon."],
   ["toolu_b1", "background_bash", null, "running", null, null, null],
 ].map(([id, kind, type, status, to, tokens, summary], i) => ({
   id: i + 1,
@@ -2924,7 +2924,7 @@ const RUNNING_TASKS = [
 export const CHAT_RUNNING_TURNS = [
   {
     id: 2,
-    asked: "põe agentes a rever a página dos chats antes do PR",
+    asked: "put agents on reviewing the chats page before the PR",
     answer: null,
     error: null,
     status: "running",
@@ -2948,10 +2948,10 @@ export const CHAT_RUNNING_TURNS = [
 export const CHAT_TURNS = [
   {
     id: 1,
-    asked: "o que muda entre os cinco degraus?",
+    asked: "what changes between the five rungs?",
     answer:
-      "Manual pergunta por tudo o que muda alguma coisa. Edit automatically adianta as edições. " +
-      "Plan responde com um plano. Auto corre o que as regras reconhecem. Bypass não pergunta.",
+      "Manual asks before anything that changes something. Edit automatically takes the edits ahead of time. " +
+      "Plan answers with a plan. Auto runs what the rules recognise. Bypass does not ask.",
     error: null,
     status: "completed",
     cost_usd: 0.02,
@@ -3246,7 +3246,7 @@ const CONTACTS = [
   { address: "noreply@notifications.example.net", contact_id: 2, linked_by: "implicit", display_name: null, messages_in: 3, outbound_ever: 0, first_seen: ago(9 * DAY), last_seen: ago(DAY), verdict: null },
   { address: "ana.silva@example.com", contact_id: 3, linked_by: "human", display_name: "Ana Silva", messages_in: 17, outbound_ever: 1, first_seen: ago(60 * DAY), last_seen: ago(3 * HOUR), verdict: "pin" },
   { address: "ana@silva-arquitectos.example.pt", contact_id: 3, linked_by: "implicit", display_name: "Ana Silva", messages_in: 5, outbound_ever: 0, first_seen: ago(30 * DAY), last_seen: ago(4 * DAY), verdict: null },
-  { address: "accounts.receivable.department@contabilidade-silva-e-associados.example.pt", contact_id: 4, linked_by: "implicit", display_name: "Contabilidade Silva e Associados, Departamento de Contas a Receber", messages_in: 8, outbound_ever: 1, first_seen: ago(200 * DAY), last_seen: ago(2 * HOUR), verdict: null },
+  { address: "accounts.receivable.department@contabilidade-silva-e-associados.example.pt", contact_id: 4, linked_by: "implicit", display_name: "Silva & Associates Accounting, Accounts Receivable Department", messages_in: 8, outbound_ever: 1, first_seen: ago(200 * DAY), last_seen: ago(2 * HOUR), verdict: null },
   { address: "deals@shop.example.com", contact_id: 5, linked_by: "implicit", display_name: "Shop Deals", messages_in: 96, outbound_ever: 0, first_seen: ago(300 * DAY), last_seen: ago(5 * HOUR), verdict: "mute" },
   { address: "joao@example.org", contact_id: 6, linked_by: "implicit", display_name: "João", messages_in: 1, outbound_ever: 0, first_seen: ago(2 * DAY), last_seen: ago(2 * DAY), verdict: null },
 ];
@@ -3280,7 +3280,7 @@ const CONTACT_MERGES = [
  */
 const MAIL_QUEUE = [
   { id: 1, from_addr: "mira.chen@example.com", from_name: "Mira Chen", subject: "Tuesday planning notes", received_at: ago(18 * MINUTE), triage_class: "action", triage_summary: "The team needs a reply with the agreed delivery date.", triaged_at: ago(14 * MINUTE), has_attachments: 1, sender_verdict: "pin" },
-  { id: 2, from_addr: "accounts@contabilidade.pt", from_name: "Contabilidade Silva", subject: "Q3 reconciliation — still blocked on the missing invoices, second request", received_at: ago(2 * HOUR), triage_class: "urgent", triage_summary: "The accountant cannot close Q3 until invoices 2291 and 2304 are sent; this is the second time they have asked.", triaged_at: ago(2 * HOUR - 4 * MINUTE), has_attachments: 0, sender_verdict: null },
+  { id: 2, from_addr: "accounts@contabilidade.pt", from_name: "Silva Accounting", subject: "Q3 reconciliation — still blocked on the missing invoices, second request", received_at: ago(2 * HOUR), triage_class: "urgent", triage_summary: "The accountant cannot close Q3 until invoices 2291 and 2304 are sent; this is the second time they have asked.", triaged_at: ago(2 * HOUR - 4 * MINUTE), has_attachments: 0, sender_verdict: null },
   { id: 3, from_addr: "noreply@github.com", from_name: "GitHub", subject: "[nucleos] Dependabot opened 3 pull requests", received_at: ago(3 * HOUR), triage_class: null, triage_summary: null, triaged_at: null, has_attachments: 0, sender_verdict: null },
   { id: 4, from_addr: "newsletter@rustweekly.dev", from_name: null, subject: "This Week in Rust 612", received_at: ago(5 * HOUR), triage_class: "noise", triage_summary: null, triaged_at: ago(5 * HOUR - 3 * MINUTE), has_attachments: 0, sender_verdict: "mute" },
   { id: 5, from_addr: "joao.pereira@example.pt", from_name: "João Pereira", subject: null, received_at: ago(9 * HOUR), triage_class: "info", triage_summary: "Confirms the office is closed on Friday for the holiday.", triaged_at: ago(9 * HOUR - 2 * MINUTE), has_attachments: 0, sender_verdict: null },
@@ -3683,7 +3683,7 @@ const FILES: Record<string, { name: string; is_dir: boolean; size_bytes: number;
 
 /**
  * The knowledge store: what the Brain's queue waits on, and what the Memory
- * section of the Auditor Sénior's editor and of Finanças's Charter shows.
+ * section of the Senior Auditor's editor and of Finance's Charter shows.
  */
 function scopedKnown(row: Partial<Known> & Pick<Known, "id" | "scope_kind" | "scope_id" | "title" | "body" | "status">): Known {
   return {
@@ -3796,8 +3796,8 @@ const themeRow = (t: ThemeDetail): ThemeRow => ({
 });
 
 /**
- * The tools beyond the base: what the Tools section of the Auditor Sénior's editor and of
- * Finanças's Charter shows, and what the Brain's "Tools to approve" waits on.
+ * The tools beyond the base: what the Tools section of the Senior Auditor's editor and of
+ * Finance's Charter shows, and what the Brain's "Tools to approve" waits on.
  */
 const LOADOUT_TOOLS: LoadoutTool[] = [
   { id: 1, owner_kind: "agent", owner_id: "auditor", tool: "web_read", status: "active", source: "request",
@@ -4375,8 +4375,8 @@ export function answer(path: string, init?: RequestInit): unknown {
     const op = (JSON.parse(String(init.body ?? "{}")) as { op?: { op?: string } }).op?.op;
     const stdout =
       op === "run_list"
-        ? "completed\tsuccess\tgates\tmaster\ncompleted\tfailure\tgates\tfeat/leitor-de-comandos\n"
-        : "12\tfeat: leitor de comandos\tfeat/leitor-de-comandos\tOPEN\n";
+        ? "completed\tsuccess\tgates\tmaster\ncompleted\tfailure\tgates\tfeat/command-reader\n"
+        : "12\tfeat: command reader\tfeat/command-reader\tOPEN\n";
     return { status: "ran", operation: op ?? "pr_list", exit_code: 0, stdout, output_tail: "" } satisfies ReadOutcome;
   }
   if (route === "/github/declarable-ops") {
@@ -4415,10 +4415,10 @@ export function answer(path: string, init?: RequestInit): unknown {
           behind: 0,
           measured: true,
           last_commit_at: ago(2 * 3_600_000),
-          last_subject: "merge feat/inspector-de-projectos into master",
+          last_subject: "merge feat/project-inspector into master",
         },
         {
-          name: "feat/leitor-de-comandos",
+          name: "feat/command-reader",
           ahead: 7,
           behind: 15,
           measured: true,

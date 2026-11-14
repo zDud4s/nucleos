@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { Outlet, useNavigate, useRouter } from "@tanstack/react-router";
 import { useAllChats } from "../data/chats";
-import { useOpenCaptures } from "../data/captures";
+import { mostUrgentCapture, useOpenCaptures } from "../data/captures";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { POLL } from "../data/poll";
 import { useProjects, useSystemHealth, wantsAttention } from "../data/system";
@@ -121,6 +121,7 @@ function Frame() {
         <Destinations />
         <GlobalSearch />
         <Sidebar
+          urgentCapture={mostUrgentCapture(captures.data)}
           badges={{
             proposals: waiting,
             chats: chats.data === undefined ? undefined : unreadTotal(chats.data),

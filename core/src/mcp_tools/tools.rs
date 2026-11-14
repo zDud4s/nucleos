@@ -137,7 +137,7 @@ impl NucleosTools {
     // control that must not be self-served: every other brake (`budget`, the WIP ceiling, the kill
     // switch) is a limit ON an active project, and this is the gate INTO being one. The reasoning
     // is `LOCAL_TOOLS`'s, applied where it matters most — approvals "stay where the person can see
-    // what they are agreeing to". `o_veredicto_do_shadow_nao_e_uma_ferramenta` is what pins it.
+    // what they are agreeing to". `the_shadow_verdict_is_not_a_tool` is what pins it.
 
     #[tool(
         description = "The shadow scoreboard for one project: for each action class, what the \
@@ -227,9 +227,17 @@ impl NucleosTools {
     #[tool(description = "Create a NucleOS run for a project")]
     pub(super) async fn create_run(
         &self,
-        Parameters(RunParams { project_id, prompt }): Parameters<RunParams>,
+        Parameters(RunParams {
+            project_id,
+            prompt,
+            session_id,
+        }): Parameters<RunParams>,
     ) -> String {
-        match self.client.create_run(&project_id, &prompt).await {
+        match self
+            .client
+            .create_run_in_session(&project_id, &prompt, session_id.as_deref())
+            .await
+        {
             Ok(id) => serde_json::json!({"run_id": id}).to_string(),
             Err(msg) => error_json(msg),
         }
@@ -750,6 +758,7 @@ impl NucleosTools {
             node_id,
             kind,
             estimate_tokens,
+            pointers,
         }): Parameters<TreeBranchStartParams>,
     ) -> String {
         json_result(
@@ -766,6 +775,7 @@ impl NucleosTools {
                         "node_id": node_id,
                         "kind": kind,
                         "estimate_tokens": estimate_tokens,
+                        "pointers": pointers,
                     }),
                 )
                 .await,
@@ -788,6 +798,41 @@ impl NucleosTools {
                     &id,
                     &serde_json::json!({ "reason": reason, "force": force }),
                 )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Answer an open tree decision (`d-…`), the same way the shell does: the \
+                       parked branch resumes, or its node is relaunched with your answer. The \
+                       answer is recorded with origin `conductor`. Owner-level: refused from a \
+                       run of a tree job. Unknown id is 404, an already answered decision 409."
+    )]
+    pub(super) async fn decision_answer(
+        &self,
+        Parameters(DecisionAnswerParams { id, answer }): Parameters<DecisionAnswerParams>,
+    ) -> String {
+        if let Some(refusal) = tree_run_decision_refusal(&self.served) {
+            return json_result::<serde_json::Value>(Err(refusal));
+        }
+        json_result(self.client.decision_answer(&id, &answer).await)
+    }
+
+    #[tool(
+        description = "List tree decisions: [{id, tree, node, branch, question, status}]. Only \
+                       open ones by default; `status` is `open`, `answered` or `all`, `tree_id` \
+                       narrows to one tree job. Owner-level: refused from a run of a tree job."
+    )]
+    pub(super) async fn decision_list(
+        &self,
+        Parameters(DecisionListParams { tree_id, status }): Parameters<DecisionListParams>,
+    ) -> String {
+        if let Some(refusal) = tree_run_decision_refusal(&self.served) {
+            return json_result::<serde_json::Value>(Err(refusal));
+        }
+        json_result(
+            self.client
+                .decision_list(tree_id.as_deref(), status.as_deref())
                 .await,
         )
     }
