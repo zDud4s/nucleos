@@ -157,6 +157,8 @@ fn ckpt_ctx() -> crate::execution::worktree::CheckpointContext {
 async fn format_worktree_checkpoints_the_nodes_work_under_the_nodes_name() {
     let (_container, repo) = init_contained_repo("nucleos-autofmt-ckpt-");
     write_crate(&repo, UNFORMATTED);
+    std::fs::write(repo.join("node-work.txt"), "left uncommitted by the node\n")
+        .expect("write the node's uncommitted work");
 
     let changed = format_worktree(&repo, &root_step(), &ckpt_ctx()).await;
 
@@ -169,7 +171,7 @@ async fn format_worktree_checkpoints_the_nodes_work_under_the_nodes_name() {
         Some("nucleos(node-7): api: fix the thing"),
         "the node's own work, checkpointed before the formatter ran"
     );
-    let body = git_out(&repo, &["log", "-2", "--skip=1", "--format=%B"]);
+    let body = git_out(&repo, &["log", "-1", "--skip=1", "--format=%B"]);
     assert!(body.contains("Tree: tree-9"), "{body}");
     assert!(body.contains("Nucleos-Checkpoint: ungated"), "{body}");
 }
