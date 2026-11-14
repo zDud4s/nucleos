@@ -453,7 +453,10 @@ pub fn summarize_node_tree(tree: Value) -> Value {
             .take(8)
             .map(|d| json!(text_of(Some(d), 300)))
             .collect();
-        out.insert("decisions".to_owned(), json!({"count": list.len(), "latest": shown}));
+        out.insert(
+            "decisions".to_owned(),
+            json!({"count": list.len(), "latest": shown}),
+        );
     }
     out.insert("counts".to_owned(), json!(counts));
     out.insert("nodes".to_owned(), Value::Array(live));
@@ -577,19 +580,25 @@ mod tests {
     }
 
     fn big_node_tree() -> Value {
-        let mut nodes = vec![json!({"id": "root", "parent_id": null, "depth": 0, "kind": "root",
+        let mut nodes = vec![
+            json!({"id": "root", "parent_id": null, "depth": 0, "kind": "root",
             "title": "root", "status": "running", "summary": null,
-            "owned_paths": [], "pointers": [], "updated_at": "t"})];
+            "owned_paths": [], "pointers": [], "updated_at": "t"}),
+        ];
         for i in 0..80 {
-            nodes.push(json!({"id": format!("d{i}"), "parent_id": "root", "depth": 1,
+            nodes.push(
+                json!({"id": format!("d{i}"), "parent_id": "root", "depth": 1,
                 "kind": "leaf", "title": "t".repeat(300), "status": "done",
                 "summary": "s".repeat(1500), "owned_paths": ["a/b.rs"], "pointers": [],
-                "updated_at": "t"}));
+                "updated_at": "t"}),
+            );
         }
-        nodes.push(json!({"id": "bad", "parent_id": "root", "depth": 1, "kind": "leaf",
+        nodes.push(
+            json!({"id": "bad", "parent_id": "root", "depth": 1, "kind": "leaf",
             "title": "broken", "status": "blocked", "summary": "x".repeat(2000),
             "owned_paths": (0..20).map(|i| format!("p/{i}.rs")).collect::<Vec<_>>(),
-            "pointers": [], "updated_at": "t9"}));
+            "pointers": [], "updated_at": "t9"}),
+        );
         json!({"root_id": "root", "goal": "g".repeat(5000), "status": "running",
                "decisions": ["use x"], "nodes": nodes, "text": "T".repeat(16_000)})
     }
