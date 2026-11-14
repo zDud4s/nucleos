@@ -196,12 +196,11 @@ async fn recent_failures_at(
     let mut out = Vec::new();
     for (pos, (_, model, outcome)) in same.iter().enumerate() {
         let redispatched = pos + 1 < same.len();
-        if outcome.as_deref() == Some("error") || redispatched {
-            if let Some(rung) = model.as_deref().and_then(rung_of) {
-                if !out.contains(&rung) {
-                    out.push(rung);
-                }
-            }
+        if (outcome.as_deref() == Some("error") || redispatched)
+            && let Some(rung) = model.as_deref().and_then(rung_of)
+            && !out.contains(&rung)
+        {
+            out.push(rung);
         }
     }
     out
