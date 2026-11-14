@@ -168,7 +168,11 @@ fn production_gate(state: &AppState) -> Option<GateFn> {
                 .get(&branch)
                 .and_then(|held| held.worktree.clone())
                 .ok_or_else(|| format!("branch {branch} has no worktree to gate"))?;
-            super::gate::gate_branch(&executor, &pool, &job_id, &branch, &worktree, GATE_WAIT).await
+            let ctx = super::checkpoint_ctx::for_branch(&job, &branch, true);
+            super::gate::gate_branch(
+                &executor, &pool, &job_id, &branch, &worktree, GATE_WAIT, &ctx,
+            )
+            .await
         })
     });
     Some(gate)
@@ -405,7 +409,8 @@ async fn at_work(
                     .is_some_and(autofmt::blocked_asks_only_formatter);
             let mut formatted = false;
             if asks_formatter && autofmt::allowed(branch) {
-                let result = autofmt::format_owned(branch).await;
+                let ctx = super::checkpoint_ctx::for_branch(job, name, false);
+                let result = autofmt::format_owned(branch, &ctx).await;
                 // Every attempt is counted, whatever its result, so the budget bounds retries.
                 if let Some(held) = job.manifest.branches.get_mut(name) {
                     autofmt::count_run(held);
@@ -431,10 +436,11 @@ async fn at_work(
         _ => return Ok(()),
     }
     // Rust the branch owns is formatted before its gate, so a rustfmt red does not happen.
+    let owned_ctx = super::checkpoint_ctx::for_branch(job, name, false);
     if let Some(branch) = job.manifest.branches.get(name)
         && branch.layer != "docs"
         && autofmt::allowed(branch)
-        && matches!(autofmt::format_owned(branch).await, Ok(true))
+        && matches!(autofmt::format_owned(branch, &owned_ctx).await, Ok(true))
         && let Some(held) = job.manifest.branches.get_mut(name)
     {
         autofmt::count_run(held);
@@ -524,7 +530,8 @@ fn stopped_question(node: &str, branch: Option<&str>, outcome: &str) -> String {
 /// an implement node leaves its work uncommitted.
 async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, String> {
     if let Some(worktree) = &branch.worktree {
-        crate::execution::worktree::checkpoint(Path::new(worktree))
+        let ctx = super::checkpoint_ctx::for_branch(job, &branch.name, false);
+        crate::execution::worktree::checkpoint_for(Path::new(worktree), &ctx)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -703,7 +710,8 @@ async fn red(
 
     // A rustfmt-only red is deterministic: the daemon formats the branch itself and re-gates the new
     // HEAD (next tick, `at_work` sees the finished run). No leaf run, so no fix is counted.
-    if autofmt::heal_red(branch, &findings).await {
+    let heal_ctx = super::checkpoint_ctx::for_branch(job, name, false);
+    if autofmt::heal_red(branch, &findings, &heal_ctx).await {
         let held = job
             .manifest
             .branches

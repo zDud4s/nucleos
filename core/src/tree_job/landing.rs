@@ -490,7 +490,8 @@ pub async fn submit_merge(
         Some(id) => id,
         None => {
             if let Some(worktree) = held.worktree.clone() {
-                crate::execution::worktree::checkpoint(Path::new(&worktree))
+                let ctx = super::checkpoint_ctx::for_branch(job, branch, false);
+                crate::execution::worktree::checkpoint_for(Path::new(&worktree), &ctx)
                     .await
                     .map_err(|error| LandingError::Checkpoint(error.to_string()))?;
             }

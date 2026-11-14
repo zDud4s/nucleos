@@ -386,8 +386,11 @@ impl GateIo for VerifyIo<'_> {
 }
 
 /// The HEAD of the worktree, after its uncommitted work is checkpointed (a node leaves it so).
-async fn head_of(worktree: &str) -> Result<String, String> {
-    crate::execution::worktree::checkpoint(Path::new(worktree))
+async fn head_of(
+    worktree: &str,
+    ctx: &crate::execution::worktree::CheckpointContext,
+) -> Result<String, String> {
+    crate::execution::worktree::checkpoint_for(Path::new(worktree), ctx)
         .await
         .map_err(|e| e.to_string())?;
     let output = tokio::process::Command::new("git")
@@ -418,8 +421,9 @@ pub(super) async fn gate_branch(
     branch: &str,
     worktree: &str,
     wait: Duration,
+    ctx: &crate::execution::worktree::CheckpointContext,
 ) -> Result<GateVerdict, NotMeasured> {
-    let head = head_of(worktree).await?;
+    let head = head_of(worktree, ctx).await?;
     let io = |key, kind, recheck| VerifyIo {
         key,
         kind,

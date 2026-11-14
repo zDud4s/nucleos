@@ -22,7 +22,8 @@ pub(super) const NO_CHANGE_KEY: &str = "no_change";
 async fn no_change_reason(job: &TreeJob, name: &str) -> Result<Option<String>, String> {
     let branch = job.manifest.branches.get(name).ok_or("branch vanished")?;
     if let Some(worktree) = &branch.worktree {
-        crate::execution::worktree::checkpoint(Path::new(worktree))
+        let ctx = super::checkpoint_ctx::for_branch(job, name, false);
+        crate::execution::worktree::checkpoint_for(Path::new(worktree), &ctx)
             .await
             .map_err(|e| e.to_string())?;
     }
