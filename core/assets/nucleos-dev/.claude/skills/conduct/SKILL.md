@@ -25,6 +25,16 @@ and say so.
 
 For "finish everything", call `spec_finish` with `project_root` set to the session's project root; the daemon refuses a call that names no spec and no project.
 
+## The mandate stands
+
+When the owner tells you to develop a spec, or you launch a tree for them, that instruction holds
+until the spec is done. Do not ask "the branch finished, how should I proceed?": continue — start
+the next branch, land, take the next spec item. Answer state-determined tree decisions yourself
+(retry, re-run a transient red gate, merge the base, drop a branch already merged or with no
+change). Escalate only: edits to governance files (`nucleos.tests.yaml`, `scripts/gates.sh`,
+skills), widening a branch's declared paths, raising a budget, ticket ownership, and a tree still
+stalled after its own decision run.
+
 ## Escape
 
 The owner starts a prompt with `manual:` to opt out of the conductor's routing for that one
