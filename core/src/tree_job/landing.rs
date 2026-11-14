@@ -888,6 +888,9 @@ pub async fn settle_land(
             job.manifest.state = JOB_TERMINAL_STATE.to_owned();
             job.manifest.extra.remove("land_failure");
             job.manifest.extra.remove("land_refusal");
+            job.manifest
+                .extra
+                .remove(super::retry::LAND_ESCALATED_SINCE);
             if let Some(sha) = &sha {
                 job.manifest.extra.insert("land_sha".to_owned(), json!(sha));
             }
@@ -2627,6 +2630,52 @@ mod tests {
         assert_eq!(loaded.state, JOB_TERMINAL_STATE);
         assert_eq!(loaded.manifest.state, JOB_TERMINAL_STATE);
         assert!(listed_ids(&h.pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_landed_job_drops_the_stale_land_escalated_since() {
+        let _lock = test_env_lock();
+        let (_container, repo) = repo_with_a_feature_to_land("nucleos-landing-stale-escalated-");
+        let h = harness(&repo).await;
+        let mut job = saved_job(
+            &h.pool,
+            manifest_for_repo(&repo, vec![branch_at("api", "merged")]),
+        )
+        .await;
+
+        land_job(
+            &h.pool,
+            &h.resolved,
+            &mut job,
+            land_deadline(),
+            Origin::Daemon,
+        )
+        .await
+        .unwrap();
+        job.manifest.extra.insert(
+            crate::tree_job::retry::LAND_ESCALATED_SINCE.to_owned(),
+            json!("2026-01-01T00:00:00Z"),
+        );
+        drain(&h.pool).await;
+        let settled = settle_land(&h.pool, &mut job, SETTLE_WAIT).await.unwrap();
+
+        assert!(
+            matches!(settled, LandSettlement::Finished { .. }),
+            "{settled:?}"
+        );
+        assert!(
+            !job.manifest
+                .extra
+                .contains_key(crate::tree_job::retry::LAND_ESCALATED_SINCE)
+        );
+        let loaded = stored(&h.pool, "job-1").await;
+        assert!(
+            !loaded
+                .manifest
+                .extra
+                .contains_key(crate::tree_job::retry::LAND_ESCALATED_SINCE),
+            "persisted"
+        );
     }
 
     /// F6 option (a): a landed tree records its merge on the specs it was opened for, and only
