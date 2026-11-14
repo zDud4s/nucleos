@@ -65,7 +65,7 @@ pub fn similar(a: &str, b: &str) -> bool {
     both / either >= SIMILAR_JACCARD
 }
 
-fn rung_of(model: &str) -> Option<Rung> {
+pub(crate) fn rung_of(model: &str) -> Option<Rung> {
     Rung::parse_alias(&model.to_ascii_lowercase()).or_else(|| rung_of_model_id(model))
 }
 
@@ -110,7 +110,7 @@ pub async fn record_outcome(
     outcome: SpawnOutcome,
     cost_usd: Option<f64>,
 ) -> bool {
-    record_outcome_at(
+    let recorded = record_outcome_at(
         pool,
         session_id,
         agent_id,
@@ -119,7 +119,11 @@ pub async fn record_outcome(
         cost_usd,
         unix_now(),
     )
-    .await
+    .await;
+    if recorded {
+        super::agent_report::guard_apply(pool).await;
+    }
+    recorded
 }
 
 async fn record_outcome_at(
