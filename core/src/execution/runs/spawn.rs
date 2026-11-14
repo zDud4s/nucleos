@@ -163,8 +163,49 @@ pub fn warn_on_terminal_write_err(
 
 /// Stores the runner's complete event stream without making observability part of run correctness.
 pub(super) async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
+    // The write queue's own connection when `main` installed it, else the given pool: a run's
+    // events are hundreds of writes at once and must not hold a connection the readers share.
+    let writes = crate::write_pool::for_writes(pool);
+    append_run_events_in_batches(&writes, run_id, stdout, RUN_EVENT_BATCH).await;
+}
+
+/// Rows per transaction: one write-lock hold and one fsync per batch, not per stdout line, while
+/// no single hold grows with the length of the run.
+const RUN_EVENT_BATCH: usize = 500;
+
+/// Writes the events `batch` rows per transaction and returns how many transactions it committed.
+async fn append_run_events_in_batches(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    stdout: &str,
+    batch: usize,
+) -> usize {
     let created_at = chrono::Utc::now().to_rfc3339();
-    for (seq, payload) in stdout.lines().enumerate() {
+    let lines: Vec<(usize, &str)> = stdout.lines().enumerate().collect();
+    let mut committed = 0;
+    for chunk in lines.chunks(batch.max(1)) {
+        // Best-effort like every row below: a batch that cannot start or commit is skipped.
+        let Ok(mut tx) = pool.begin().await else {
+            continue;
+        };
+        for &(seq, payload) in chunk {
+            insert_run_event(&mut tx, run_id, seq, payload, &created_at).await;
+        }
+        if tx.commit().await.is_ok() {
+            committed += 1;
+        }
+    }
+    committed
+}
+
+async fn insert_run_event(
+    tx: &mut sqlx::SqliteConnection,
+    run_id: i64,
+    seq: usize,
+    payload: &str,
+    created_at: &str,
+) {
+    {
         let kind = serde_json::from_str::<serde_json::Value>(payload)
             .ok()
             .and_then(|event| {
@@ -190,10 +231,10 @@ pub(super) async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdo
         .bind(seq as i64)
         .bind(kind)
         .bind(payload)
-        .bind(&created_at)
+        .bind(created_at)
         .bind(run_id)
         .bind(seq as i64)
-        .execute(pool)
+        .execute(tx)
         .await;
     }
 }
@@ -1378,6 +1419,72 @@ pub(super) async fn fail_provisioning(
         )
     })
     .await;
+}
+
+#[cfg(test)]
+mod run_event_batch_tests {
+    use super::{append_run_events, append_run_events_in_batches};
+
+    async fn seed_run(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'real', '2026-11-13T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    fn stream(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("{{\"type\":\"t{i}\",\"n\":{i}}}\n"))
+            .collect()
+    }
+
+    async fn rows(pool: &sqlx::SqlitePool, id: i64) -> Vec<(i64, String, String)> {
+        sqlx::query_as("SELECT seq, kind, payload FROM run_events WHERE run_id = ? ORDER BY seq")
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_events_land_with_the_same_rows_and_order() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_run(&state.pool).await;
+        append_run_events(&state.pool, id, &stream(7)).await;
+        let got = rows(&state.pool, id).await;
+        assert_eq!(got.len(), 7);
+        for (i, (seq, kind, payload)) in got.iter().enumerate() {
+            assert_eq!(*seq, i as i64);
+            assert_eq!(kind, &format!("t{i}"));
+            assert_eq!(payload, &format!("{{\"type\":\"t{i}\",\"n\":{i}}}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_events_reappended_stay_deduped() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_run(&state.pool).await;
+        append_run_events(&state.pool, id, &stream(5)).await;
+        append_run_events(&state.pool, id, &stream(8)).await;
+        let got = rows(&state.pool, id).await;
+        assert_eq!(got.len(), 8);
+        assert_eq!(got[2].1, "t2");
+    }
+
+    #[tokio::test]
+    async fn run_events_large_batch_is_split_into_several_transactions() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_run(&state.pool).await;
+        let committed = append_run_events_in_batches(&state.pool, id, &stream(25), 10).await;
+        assert_eq!(committed, 3);
+        let got = rows(&state.pool, id).await;
+        assert_eq!(got.len(), 25);
+        assert!(got.iter().enumerate().all(|(i, r)| r.0 == i as i64));
+    }
 }
 
 #[cfg(test)]
