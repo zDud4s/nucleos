@@ -90,18 +90,6 @@ fn free_own_console() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::console_is_ours_to_free;
-
-    #[test]
-    fn only_a_console_with_one_attached_process_is_freed() {
-        assert!(console_is_ours_to_free(1));
-        assert!(!console_is_ours_to_free(0), "no console: nothing to free");
-        assert!(!console_is_ours_to_free(2), "shared with a terminal");
-    }
-}
-
 /// Runs until the daemon is stopped on purpose, another daemon owns the port, or the restart budget
 /// is spent. The return value is this process's exit code.
 pub(super) async fn run() -> i32 {
@@ -232,5 +220,17 @@ pub(super) async fn run() -> i32 {
                 return 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_is_ours_to_free;
+
+    #[test]
+    fn only_a_console_with_one_attached_process_is_freed() {
+        assert!(console_is_ours_to_free(1));
+        assert!(!console_is_ours_to_free(0), "no console: nothing to free");
+        assert!(!console_is_ours_to_free(2), "shared with a terminal");
     }
 }
