@@ -53,6 +53,7 @@ pub async fn run_resolution_loop(state: AppState) {
         // await point could leave a half-cancelled run, a run row without its agent, or a
         // half-landed request. They keep their own inner deadlines.
         cancel_settled(&state).await;
+        step_with_timeout("release_unfinished", release_unfinished(&state.pool)).await;
         step_with_timeout("open_conflict_tickets", open_conflict_tickets(&state.pool)).await;
         launch_once(&state).await;
         land_finished(&state.pool, &mut refused).await;
@@ -101,13 +102,78 @@ fn read_switch(read: sqlx::Result<bool>) -> SwitchReading {
     }
 }
 
+/// Total resolution runs one conflict may be given, the first included. An attempt that ended
+/// without a verdict is retried until this many have been spent; after that the row stays
+/// escalated for a person, as it always did.
+pub(crate) const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
+
+/// Frees escalated conflicts whose resolution run ended without a verdict, so `next_conflict`
+/// mints a fresh attempt.
+///
+/// **Only `cancelled` and `interrupted`, plus a `completed` run whose gate `errored`.** The first two
+/// were stopped — a restart, a cancel — before the agent said anything; an errored gate is
+/// infrastructure (a pool timeout) rather than a verdict on the resolution, so the work is redone
+/// instead of refused for good by `land_finished`. A run that finished with a failed gate, failed or
+/// gave up had its attempt, and that stays a person's. A row somebody settled (`settled_at`), one a later success already
+/// settled, or one no longer `escalated` is left alone, and `MAX_RESOLUTION_ATTEMPTS` bounds the
+/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`, and also
+/// by a worktree-provisioning failure there, which counts the attempt without claiming the row.
+/// Returns how many rows were released.
+async fn release_unfinished(pool: &sqlx::SqlitePool) -> u64 {
+    let released = sqlx::query(
+        "UPDATE vcs_requests
+            SET resolution_run_id = NULL
+          WHERE status = 'escalated'
+            AND op = 'merge'
+            AND from_resolution = 0
+            AND settled_at IS NULL
+            AND resolution_run_id IS NOT NULL
+            AND resolution_attempts < ?
+            AND resolution_run_id IN (
+                SELECT id FROM runs
+                 WHERE status IN ('cancelled', 'interrupted')
+                    OR (status = 'completed' AND gate_status = 'errored'
+                        AND successor_run_id IS NULL)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM vcs_requests AS settled
+                 WHERE settled.project_id = vcs_requests.project_id
+                   AND settled.args = vcs_requests.args
+                   AND settled.status = 'succeeded'
+                   AND settled.id > vcs_requests.id
+            )",
+    )
+    .bind(MAX_RESOLUTION_ATTEMPTS)
+    .execute(pool)
+    .await;
+    match released {
+        Ok(done) => {
+            if done.rows_affected() > 0 {
+                tracing::info!(
+                    released = done.rows_affected(),
+                    "resolver: releasing conflicts whose resolution ended without a verdict for a fresh attempt"
+                );
+            }
+            done.rows_affected()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "resolver: could not release unfinished resolutions");
+            0
+        }
+    }
+}
+
 /// Opens a `conflict:<source>-><target>` ticket for every conflict the loop has given up on: its
-/// one attempt is spent (`resolution_run_id` set) and no resolution of it is live, or the same
-/// merge was escalated more than once. Fail-open: a ticket that could not be written is only
-/// logged, since the gate owns the red and the escalated row is still there for a person.
+/// `MAX_RESOLUTION_ATTEMPTS` are spent and no resolution of it is live, or the same merge was
+/// escalated more than once. Fail-open: a ticket that could not be written is only logged, since
+/// the gate owns the red and the escalated row is still there for a person.
 async fn open_conflict_tickets(pool: &sqlx::SqlitePool) {
-    if let Err(error) =
-        crate::task_claims::machine::open_conflict_tickets(pool, chrono::Utc::now()).await
+    if let Err(error) = crate::task_claims::machine::open_conflict_tickets(
+        pool,
+        MAX_RESOLUTION_ATTEMPTS,
+        chrono::Utc::now(),
+    )
+    .await
     {
         tracing::warn!(%error, "resolver: could not open the tickets of spent conflicts");
     }
@@ -187,9 +253,10 @@ struct Candidate {
 /// dismissed row it overrides a person's "nobody needs to act". The later-success subquery below
 /// stays: it covers the tick before `settle_moot` has run, which runs after this on the same tick.
 ///
-/// **There is no retry path.** A run that was cancelled, interrupted or whose gate errored keeps its
-/// claim; so does a worktree that could not be made (`create_run_with` claims the row with the
-/// failing run). Only a person reopens a conflict.
+/// **`resolution_attempts < MAX_RESOLUTION_ATTEMPTS` caps the retries of an unclaimed row.** A
+/// worktree that could not be made counts an attempt but leaves `resolution_run_id` NULL, so
+/// without the cap a permanent failure would be retried every tick for ever. For the normal path it
+/// is a no-op: `release_unfinished` only frees rows whose attempts are already under the cap.
 ///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
@@ -201,6 +268,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           WHERE status = 'escalated'
             AND op = 'merge'
             AND resolution_run_id IS NULL
+            AND resolution_attempts < ?
             AND from_resolution = 0
             AND settled_at IS NULL
             AND NOT EXISTS (
@@ -221,6 +289,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           ORDER BY id
           LIMIT 1",
     )
+    .bind(MAX_RESOLUTION_ATTEMPTS)
     .fetch_optional(pool)
     .await
 }
@@ -1347,20 +1416,20 @@ mod tests {
         id
     }
 
-    /// Once the one attempt is spent and its resolution ended, nothing will retry the conflict, so
-    /// the loop leaves a `conflict:` ticket for whoever picks the work up.
+    /// Once the cap is spent and the last resolution ended, nothing will retry the conflict, so the
+    /// loop leaves a `conflict:` ticket for whoever picks the work up.
     #[tokio::test]
-    async fn the_loop_opens_a_conflict_ticket_once_the_attempt_is_spent() {
+    async fn the_loop_opens_a_conflict_ticket_once_the_attempts_are_spent() {
         let pool = test_pool().await;
         let request = escalated_merge(&pool, false).await;
         insert_run(&pool, 1, "cancelled").await;
         resolving(&pool, request, 1).await;
         sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
-            .bind(1_i64)
+            .bind(MAX_RESOLUTION_ATTEMPTS)
             .bind(request)
             .execute(&pool)
             .await
-            .expect("spend the attempt");
+            .expect("spend the attempts");
         open_conflict_tickets(&pool).await;
         let key = crate::task_claims::keys::normalize(
             "conflict:feat/x->master",
@@ -1374,51 +1443,62 @@ mod tests {
         assert!(ticket.is_some(), "the spent conflict has a live ticket");
     }
 
-    /// ONE ATTEMPT ONLY. A resolution run that ended without a verdict (cancelled, interrupted, or
-    /// completed with an errored gate) is still the conflict's attempt: repeated ticks never mint a
-    /// second run, whatever the run's status, and the row stays for a person.
+    /// A resolution run that was cancelled or interrupted gets a fresh attempt, up to the cap; one
+    /// that finished, a settled row, and a row at the cap are left alone.
     #[tokio::test]
-    async fn an_attempt_without_a_verdict_is_never_given_a_second_run() {
+    async fn an_attempt_without_a_verdict_is_released_for_a_fresh_one() {
         let pool = test_pool().await;
         let cancelled = escalated_merge_of(&pool, "feat/c", false).await;
         let interrupted = escalated_merge_of(&pool, "feat/i", false).await;
-        let errored = escalated_merge_of(&pool, "feat/e", false).await;
+        let failed = escalated_merge_of(&pool, "feat/f", false).await;
+        let settled = escalated_merge_of(&pool, "feat/s", false).await;
+        let capped = escalated_merge_of(&pool, "feat/k", false).await;
         for (req, run, status) in [
             (cancelled, 1, "cancelled"),
             (interrupted, 2, "interrupted"),
-            (errored, 3, "completed"),
+            (failed, 3, "failed"),
+            (settled, 4, "cancelled"),
+            (capped, 5, "cancelled"),
         ] {
             insert_run(&pool, run, status).await;
             resolving(&pool, req, run).await;
+            sqlx::query("UPDATE vcs_requests SET resolution_attempts = 1 WHERE id = ?")
+                .bind(req)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
-        sqlx::query("UPDATE runs SET gate_status = 'errored' WHERE id = 3")
+        sqlx::query(
+            "UPDATE vcs_requests SET settled_at = 'now', settled_reason = 'dismissed' WHERE id = ?",
+        )
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(capped)
             .execute(&pool)
             .await
             .unwrap();
 
-        for tick in 0..3 {
-            assert!(
-                next_conflict(&pool).await.unwrap().is_none(),
-                "tick {tick}: a spent attempt must not be handed out again"
-            );
-        }
-        let claims: Vec<(i64, Option<i64>)> =
-            sqlx::query_as("SELECT id, resolution_run_id FROM vcs_requests ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            claims,
-            vec![
-                (cancelled, Some(1)),
-                (interrupted, Some(2)),
-                (errored, Some(3))
-            ],
-            "nothing released the claims"
-        );
+        assert_eq!(release_unfinished(&pool).await, 2);
+
+        let free: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM vcs_requests WHERE resolution_run_id IS NULL ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(free, vec![cancelled, interrupted]);
+        let next = next_conflict(&pool)
+            .await
+            .unwrap()
+            .expect("a released conflict");
+        assert_eq!(next.id, cancelled);
     }
 
-    /// A cancelled attempt on a merge a later request already published is not retried either.
+    /// A cancelled attempt whose merge a later request already published is not retried.
     #[tokio::test]
     async fn a_cancelled_attempt_on_a_settled_merge_is_not_retried() {
         let pool = test_pool().await;
@@ -1426,7 +1506,7 @@ mod tests {
         insert_run(&pool, 1, "cancelled").await;
         resolving(&pool, req, 1).await;
         succeeded_merge_of(&pool, "feat/done", false).await;
-        assert!(next_conflict(&pool).await.unwrap().is_none());
+        assert_eq!(release_unfinished(&pool).await, 0);
     }
 
     /// The three exclusions, each of which prevents a different runaway.
@@ -1484,6 +1564,51 @@ mod tests {
         assert!(
             next_conflict(&pool).await.unwrap().is_none(),
             "every conflict has been attempted; a fresh agent per tick is the failure this prevents"
+        );
+    }
+
+    /// An unclaimed row whose attempts are spent is not picked up again. A worktree that cannot be
+    /// made counts an attempt but leaves `resolution_run_id` NULL, so the cap is what stops a
+    /// permanent failure from minting a run every tick; one attempt short of it still retries.
+    #[tokio::test]
+    async fn an_unclaimed_conflict_whose_attempts_are_spent_is_not_picked_up() {
+        let pool = test_pool().await;
+
+        let spent = escalated_merge_of(&pool, "feat/spent", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(spent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retryable = escalated_merge_of(&pool, "feat/retryable", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS - 1)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let picked = next_conflict(&pool)
+            .await
+            .expect("the query should run")
+            .expect("the row one attempt short of the cap is still retried");
+        assert_eq!(
+            picked.id, retryable,
+            "picked {} — spent={spent}, retryable={retryable}",
+            picked.id
+        );
+
+        // Once that one spends its last attempt too, there is nothing left to start.
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "a conflict with its attempts spent belongs to a person, not to another run"
         );
     }
 
@@ -2234,10 +2359,10 @@ mod tests {
         }
     }
 
-    /// There is one attempt: an `errored` gate is refused and announced like any other ending, and
-    /// the conflict is not handed to a second agent.
+    /// An `errored` gate is infrastructure (a pool timeout, an unreadable config), not a verdict on
+    /// the resolution: the run is released for a fresh attempt instead of being refused for good.
     #[tokio::test]
-    async fn an_errored_resolution_gate_reports_failure_and_gets_no_second_attempt() {
+    async fn an_errored_resolution_gate_is_retried_not_refused() {
         let pool = test_pool().await;
         let scenario = resolution_scenario(
             &pool,
@@ -2247,17 +2372,52 @@ mod tests {
         )
         .await;
         gate(&pool, "errored").await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = 1 WHERE id = ?")
+            .bind(scenario.request)
+            .execute(&pool)
+            .await
+            .unwrap();
 
+        // The loop's own order: release, then land.
+        assert_eq!(release_unfinished(&pool).await, 1);
+        land_finished(&pool, &mut Default::default()).await;
+
+        assert!(admitted_resolutions(&pool, &scenario).await.is_empty());
+        assert!(resolution_failed_summaries(&pool).await.is_empty());
+        let next = next_conflict(&pool)
+            .await
+            .unwrap()
+            .expect("the released conflict is minted a fresh attempt");
+        assert_eq!(next.id, scenario.request);
+    }
+
+    /// Retrying is bounded: once the attempts are spent an errored gate is refused and announced
+    /// like any other, so nothing ends silently.
+    #[tokio::test]
+    async fn an_errored_gate_past_the_attempt_cap_reports_failure() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-errored-cap-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "errored").await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(scenario.request)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(release_unfinished(&pool).await, 0);
         land_finished(&pool, &mut Default::default()).await;
 
         assert!(admitted_resolutions(&pool, &scenario).await.is_empty());
         let summaries = resolution_failed_summaries(&pool).await;
         assert_eq!(summaries.len(), 1, "{summaries:?}");
         assert!(summaries[0].contains("errored"), "{}", summaries[0]);
-        assert!(
-            next_conflict(&pool).await.unwrap().is_none(),
-            "the attempt is spent; no second run is minted"
-        );
     }
 
     /// A resolution run that ended without a merge the queue could land used to vanish: not handed

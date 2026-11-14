@@ -788,20 +788,20 @@ async fn create_run_with_policy(
                 match created {
                     Ok(info) => info,
                     Err(error) => {
-                        // A resolution whose tree cannot be made still spends the conflict's one
-                        // attempt: the row is claimed by this (failing) run, so `next_conflict`
-                        // never mints a second one and the conflict goes to a person through its
-                        // ticket. A permanent failure (request 513, target branch `aut/integ`
-                        // never existed) would otherwise mint a failed run every tick for ever.
-                        // Best effort: the run is failing either way.
+                        // A resolution whose tree cannot be made counts an attempt toward
+                        // `MAX_RESOLUTION_ATTEMPTS` but leaves the row unclaimed, so
+                        // `next_conflict` retries it on the next tick while attempts remain. A
+                        // transient failure (index.lock, a timeout) gets another go; a permanent
+                        // one (request 513, target branch `aut/integ` never existed) spends at most
+                        // the cap and then goes to a person through the conflict ticket, instead
+                        // of minting a failed run every minute for ever. Best effort: the run is
+                        // failing either way.
                         if let Some(resolution) = resolution {
                             let _ = sqlx::query(
                                 "UPDATE vcs_requests
-                                    SET resolution_run_id = ?,
-                                        resolution_attempts = resolution_attempts + 1
+                                    SET resolution_attempts = resolution_attempts + 1
                                   WHERE id = ? AND resolution_run_id IS NULL",
                             )
-                            .bind(id)
                             .bind(resolution.request_id)
                             .execute(&state.pool)
                             .await;
