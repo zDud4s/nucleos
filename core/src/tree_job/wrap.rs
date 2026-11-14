@@ -425,6 +425,95 @@ async fn links_since_answer(
     .map_err(|e| e.to_string())
 }
 
+/// PURE: whether a node that kept ending finished its work: its branch holds commits over its
+/// merge target and a report was left that does not say `blocked` or `failed`.
+pub(super) fn finished_despite_ending(commits: u64, results: &[Option<String>]) -> bool {
+    let says = |bad: bool| {
+        results
+            .iter()
+            .any(|r| matches!(r.as_deref(), Some("blocked" | "failed")) == bad)
+    };
+    commits > 0 && !results.is_empty() && !says(true) && says(false)
+}
+
+/// Closes the node's branch as done when [`finished_despite_ending`]: the dead run's `report` row
+/// gets the result `done`, so the driver's next pass gates the branch like any finished one. One
+/// feed line (origin `driver`); nothing happens with `autonomy.tree_decides_itself` off. `Ok(true)`
+/// when it closed the node.
+async fn closed_as_done(
+    pool: &sqlx::SqlitePool,
+    job_id: &str,
+    node_id: &str,
+    dead_run: &str,
+) -> Result<bool, String> {
+    let Some(job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    if !super::auto_resolve::Config::load(&job.manifest.project_root).enabled {
+        return Ok(false);
+    }
+    let Some((name, branch)) = job
+        .manifest
+        .branches
+        .iter()
+        .find(|(_, b)| b.node_id.as_deref() == Some(node_id))
+    else {
+        return Ok(false);
+    };
+    let Some(git_branch) = &branch.git_branch else {
+        return Ok(false);
+    };
+    let Ok(target) = super::nesting::merge_target(&job.manifest, name) else {
+        return Ok(false);
+    };
+    let Ok(counted) = super::driver::git(
+        &job.manifest.project_root,
+        &["rev-list", "--count", &format!("{target}..{git_branch}")],
+    )
+    .await
+    else {
+        return Ok(false);
+    };
+    let results: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = 'report'",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if !finished_despite_ending(counted.parse().unwrap_or(0), &results) {
+        return Ok(false);
+    }
+    let at = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE tree_transitions SET result = 'done' \
+         WHERE node_id = ? AND transition = 'report' AND key = ?",
+    )
+    .bind(node_id)
+    .bind(dead_run)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO tree_transitions (node_id, transition, key, result, created_at) \
+         VALUES (?, 'report', ?, 'done', ?)",
+    )
+    .bind(node_id)
+    .bind(dead_run)
+    .bind(at)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    super::no_change::note_driver_resolution(
+        pool,
+        &job,
+        Some(node_id),
+        &format!("node ended without closing but its branch {name} holds {counted} commit(s) and a report: closed as done"),
+    )
+    .await;
+    Ok(true)
+}
+
 /// Starts the node again under `<prefix><dead run>`, unless the chain's cap of links already
 /// followed the owner's last answer: then it writes the stop line once and asks the owner, parking
 /// the branch, or opening the question on a root that tops none (`decisions::park_or_ask`).
@@ -482,6 +571,12 @@ async fn relaunch_or_stop(
         return Ok(true);
     }
 
+    // A node that kept ending but left commits and a report did its work: the driver settles it as
+    // done before any run or question is spent on it (owner decision 2026-11-13).
+    if closed_as_done(pool, job_id, node_id, dead_run).await? {
+        return Ok(true);
+    }
+
     // The ladder's last rung before the park: a fresh run of the node that reads the evidence of
     // the chain (its last handoff) and decides. It is spent once per owner answer; when it was
     // spent, or the tree's budget refuses it, the owner is asked as before.
@@ -535,6 +630,11 @@ async fn relaunch_or_stop(
     .map_err(|e| e.to_string())?;
     Ok(true)
 }
+
+// `mod.rs` is a shared file this node does not own, so the new test file is wired in from here.
+#[cfg(test)]
+#[path = "wrap_auto_tests.rs"]
+mod wrap_auto_tests;
 
 #[cfg(test)]
 mod tests {
