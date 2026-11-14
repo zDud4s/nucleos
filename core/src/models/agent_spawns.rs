@@ -329,7 +329,8 @@ mod tests {
             NOW + 40,
         )
         .await;
-        assert_eq!(got, vec![Rung::Haiku, Rung::Sonnet]);
+        // Only the first spawn failed: the redispatch is the attempt in flight, not a failure.
+        assert_eq!(got, vec![Rung::Haiku]);
     }
 
     #[tokio::test]
