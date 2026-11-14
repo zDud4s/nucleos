@@ -1148,7 +1148,20 @@ fn classify_shell_command(
             )
             .with_culprit(command, format!("line can't be parsed: {reason}"));
         }
-        None => match crate::command_reader::read(command, shell) {
+        None => match crate::command_reader::read(
+            // PowerShell's call operator: the reader refuses a lone `&` (it backgrounds in POSIX),
+            // so the one line that is nothing but the verification client is read without it.
+            // `is_verify_client_call` is strict about every word, so nothing else gets this.
+            command
+                .trim_start()
+                .strip_prefix("& ")
+                .filter(|rest| {
+                    shell == crate::command_reader::Shell::PowerShell
+                        && is_verify_client_call(&normalize_command(rest), rest)
+                })
+                .unwrap_or(command),
+            shell,
+        ) {
             crate::command_reader::Reading::Sequence(segments) => {
                 segments.into_iter().map(str::to_owned).collect()
             }

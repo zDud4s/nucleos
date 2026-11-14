@@ -408,7 +408,8 @@ fn is_print_address(script: &str) -> bool {
     }
     let mut parts = addresses.split(',');
     match (parts.next(), parts.next(), parts.next()) {
-        (Some(a), None, None) => address(a),
+        // A lone regex address is `grep`, judged elsewhere; only a line number or `$` here.
+        (Some(a), None, None) => !a.starts_with('/') && address(a),
         (Some(a), Some(b), None) => address(a) && address(b),
         _ => false,
     }
