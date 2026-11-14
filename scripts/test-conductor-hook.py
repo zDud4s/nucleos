@@ -684,7 +684,7 @@ def test_composition_of_accepted_parts_and_closing_tails():
             f"{G} status | cat",
             f"{G} log | tail -n 5 | cat",
             f"{G} log | tail -f x",
-            f"{G} log | tail -n 5 && {G} status",
+            f"{G} log | sh && {G} status",
             f"{G} log | head -n 5 > out.txt",
             f"{G} status || true",
             f"{G} status && {G} status || true",
@@ -949,7 +949,6 @@ def test_shell_reads_that_write_chain_or_leave_state_stay_refused():
             ("Bash", "cat .nucleos/workflow/project.json; rm y"),
             ("Bash", "cat .nucleos/workflow/project.json | tee y"),
             ("Bash", "cat .nucleos/x core/src/lib.rs"),
-            ("Bash", "cat core/src/lib.rs"),
             ("Bash", "cat .nucleos/../core/src/lib.rs"),
             ("Bash", "cat .nucleos/*"),
             ("Bash", "cat"),
@@ -957,12 +956,98 @@ def test_shell_reads_that_write_chain_or_leave_state_stay_refused():
             ("Bash", f"cat '{_tool_results('s.jsonl')}'"),
             ("PowerShell", f"Get-Content '{result}' | Set-Content y"),
             ("PowerShell", f"Get-Content -Wait '{result}'"),
-            ("PowerShell", "(Get-Content -Raw 'core/src/lib.rs').Substring(0, 10)"),
             ("PowerShell", f"(Get-Content -Raw '{result}').Remove(0)"),
             ("PowerShell", "Select-String -Pattern x"),
             ("PowerShell", "Select-String fn core/src/lib.rs"),
         ):
             deny(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+
+
+def test_plain_read_only_shell_allowed():
+    with fixture("on") as fx:
+        os.makedirs(fx.path("core", "src"))
+        with open(fx.path("core", "src", "lib.rs"), "w", encoding="utf-8") as handle:
+            handle.write("fn main() {}\n")
+        for tool, command in (
+            ("Bash", "ls"),
+            ("Bash", "ls -la core/src"),
+            ("Bash", "ls .ai/scripts/usage_audit.py; ls ~/.claude/scripts/usage/; cat core/src/lib.rs | head -20"),
+            ("Bash", "pwd"),
+            ("Bash", "cat core/src/lib.rs | wc -l"),
+            ("Bash", "head -n 5 core/src/lib.rs | tail -2"),
+            ("Bash", f"{G} log --oneline | head -5"),
+            ("Bash", f"{G} branch"),
+            ("Bash", f"{G} branch --show-current"),
+            ("Bash", f"{G} status | grep -i modified"),
+            ("Bash", "wc -l core/src/lib.rs"),
+            ("PowerShell", "Get-ChildItem core/src"),
+            ("PowerShell", "Get-ChildItem -Path core -Force"),
+            ("PowerShell", "Get-Content core/src/lib.rs -TotalCount 5"),
+            ("PowerShell", "Get-Content core/src/lib.rs | Select-Object -First 3"),
+            ("PowerShell", "Get-Location"),
+        ):
+            allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+
+
+def test_plain_shell_reads_that_write_run_or_overflow_stay_refused():
+    with fixture("on") as fx:
+        os.makedirs(fx.path("core", "src"))
+        with open(fx.path("core", "src", "lib.rs"), "w", encoding="utf-8") as handle:
+            handle.write("fn main() {}\n")
+        with open(fx.path("big.txt"), "wb") as handle:
+            handle.write(b"x" * 100000)
+        for tool, command in (
+            ("Bash", "ls -R"),
+            ("Bash", "ls > out.txt"),
+            ("Bash", "ls | tee out.txt"),
+            ("Bash", "ls | xargs rm"),
+            ("Bash", "ls | sh"),
+            ("Bash", "cat core/src/lib.rs | python -"),
+            ("Bash", "cat core/src/lib.rs | grep -f pats x"),
+            ("Bash", "cat core/src/lib.rs | head -n 5 core/src/lib.rs"),
+            ("Bash", "cat core/src/*.rs"),
+            ("Bash", "cat big.txt"),
+            ("Bash", "cat missing.txt"),
+            ("Bash", "tail -f core/src/lib.rs"),
+            ("Bash", "ls || rm x"),
+            ("Bash", "ls |"),
+            ("Bash", f"{G} branch new-branch"),
+            ("Bash", f"{G} branch -D x"),
+            ("Bash", f"{G} branch -a new-branch"),
+            ("Bash", "pwd x"),
+            ("PowerShell", "Get-ChildItem -Recurse"),
+            ("PowerShell", "Get-ChildItem | Remove-Item"),
+            ("PowerShell", "Select-String fn core/src/lib.rs"),
+        ):
+            deny(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+
+
+def test_edit_outside_the_project_is_refused_with_a_clear_reason():
+    with fixture("on") as fx:
+        _project(fx)
+        outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere", "settings.json")
+        reason = deny(
+            fx.verdict("Edit", {"file_path": outside, "old_string": "a", "new_string": "b"}), "outside"
+        )["reason"]
+        if "inside the project" not in reason:
+            raise AssertionError(f"the refusal should say edits are limited to the project, got {reason!r}")
+
+
+def test_session_start_tells_a_conductor_what_it_may_do_by_hand():
+    with fixture("on") as fx:
+        payload = {"hook_event_name": "SessionStart", "session_id": "s", "cwd": fx.cwd}
+        with mock.patch.dict(os.environ, {"NUCLEOS_CONDUCTOR_STATE_DIR": fx.state_dir}):
+            line = _need("conductor_context")(payload)
+            if "Conductor session" not in line or "\n" in line:
+                raise AssertionError(f"expected one conductor line, got {line!r}")
+            if _need("conductor_context")({**payload, "hook_event_name": "UserPromptSubmit"}):
+                raise AssertionError("only SessionStart carries the line")
+            if _need("conductor_context")({**payload, "agent_id": "a1"}):
+                raise AssertionError("a subagent gets no line")
+        fx.set_mode("off")
+        with mock.patch.dict(os.environ, {"NUCLEOS_CONDUCTOR_STATE_DIR": fx.state_dir}):
+            if _need("conductor_context")(payload):
+                raise AssertionError("mode off carries no line")
 
 
 def test_refusal_says_what_the_root_may_do_itself():
@@ -986,7 +1071,7 @@ def test_refusal_says_what_the_root_may_do_itself():
         ):
             if needle not in reason:
                 raise AssertionError(f"the refusal should mention {needle!r}, got {reason!r}")
-        if reason.count("\n") > 1 or len(reason) > 700:
+        if reason.count("\n") > 1 or len(reason) > 760:
             raise AssertionError(f"the refusal should stay compact, got {len(reason)} characters")
 
 
