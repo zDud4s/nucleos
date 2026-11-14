@@ -421,6 +421,9 @@ pub struct AutopilotRules {
     /// daemon sets it.
     #[serde(default)]
     pub postgate_idle_command: Option<String>,
+    /// The branch that only receives promotions of a commit the post-merge gate proved green; absent means off.
+    #[serde(default)]
+    pub release_branch: Option<String>,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
@@ -458,6 +461,51 @@ pub struct AutopilotRules {
     pub command_kinds: CommandKinds,
 }
 
+/// The preconditions for switching `release_branch` on, each refused with its own message. Pure:
+/// the caller measures the git facts and passes them in. Without `release_branch` it passes.
+pub fn release_activation_preconditions(
+    rules: &AutopilotRules,
+    integration: &str,
+    release_exists: bool,
+    integration_exists: bool,
+    release_is_ancestor: bool,
+) -> Result<(), String> {
+    let Some(release) = rules.release_branch() else {
+        return Ok(());
+    };
+    if !rules.gate_after_land {
+        return Err("release_branch needs gate_after_land to be on".to_string());
+    }
+    if rules
+        .gate_command
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(
+            "release_branch needs gate_command to be set: without it no gate runs and a promotion would wait forever"
+                .to_string(),
+        );
+    }
+    if release == integration.trim() {
+        return Err(format!(
+            "release_branch must differ from the integration branch (both are `{release}`)"
+        ));
+    }
+    if !release_exists {
+        return Err(format!("release branch `{release}` does not exist"));
+    }
+    if !integration_exists {
+        return Err(format!("integration branch `{integration}` does not exist"));
+    }
+    if !release_is_ancestor {
+        return Err(format!(
+            "release branch `{release}` is not an ancestor of integration branch `{integration}`"
+        ));
+    }
+    Ok(())
+}
+
 /// The `command_kinds:` key. Absent means only the compiled defaults; each entry is a command
 /// prefix matched like a project shell rule.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
@@ -490,7 +538,17 @@ impl AutopilotRules {
     /// A reader and not a field read: with one active step the merge is gated whatever
     /// `gate_before_publish` says, because a step's output must never be published unmeasured.
     pub fn merge_gate_required(&self) -> bool {
-        self.gate_before_publish || self.integration_steps.iter().any(|s| s.enabled)
+        let forced_by_steps =
+            self.release_branch().is_none() && self.integration_steps.iter().any(|s| s.enabled);
+        self.gate_before_publish || forced_by_steps
+    }
+
+    /// The release branch when one is configured and not blank.
+    pub fn release_branch(&self) -> Option<&str> {
+        self.release_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
     }
 
     /// Whether the attention brake applies, resolving the unconfigured case to ON.
@@ -923,7 +981,7 @@ mod tests {
     /// `brain: "local"` entry -- the whole point of this packet: a machine with a dozen models
     /// pulled offers more than the one name in the config file.
     #[test]
-    fn o_catalogo_lista_os_modelos_instalados_nesta_maquina() {
+    fn the_catalogue_lists_the_models_installed_on_this_machine() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -952,7 +1010,7 @@ mod tests {
     /// rather than a hand-written expectation, so "no behaviour change without a reachable Ollama"
     /// is a fact this test enforces rather than a claim in a comment.
     #[test]
-    fn um_api_tags_mudo_degrada_para_o_configurado_e_nunca_para_um_menu_vazio() {
+    fn a_silent_api_tags_degrades_to_the_configured_model_and_never_to_an_empty_menu() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -966,7 +1024,7 @@ mod tests {
     /// A model can be configured and not yet pulled. The daemon must not hide the one entry it was
     /// explicitly told about just because Ollama's own list disagrees with the config file.
     #[test]
-    fn o_modelo_configurado_aparece_mesmo_que_o_api_tags_nao_o_liste() {
+    fn the_configured_model_appears_even_if_api_tags_does_not_list_it() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -986,7 +1044,7 @@ mod tests {
     /// The configured model and an installed model can name the same id. That must produce ONE
     /// entry, not two rows a person cannot tell apart in the picker.
     #[test]
-    fn um_modelo_instalado_que_ja_e_o_configurado_nao_aparece_duas_vezes() {
+    fn an_installed_model_that_is_already_the_configured_one_does_not_appear_twice() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -1011,7 +1069,7 @@ mod tests {
     /// ship-dark true, and exactly what `assistants::resolve_model` needs to stay correct, since it
     /// refuses `RouteNotConfigured` whatever a pin says when the route itself has no model.
     #[test]
-    fn sem_modelo_local_configurado_os_instalados_nao_entram_no_menu() {
+    fn with_no_local_model_configured_the_installed_ones_do_not_enter_the_menu() {
         let config = ModelsConfig::default();
         let installed = vec!["qwen3.5:4b".to_string(), "llama3.2:3b".to_string()];
 
@@ -1032,7 +1090,7 @@ mod tests {
     /// guarantee has to survive the SAME models arriving in a DIFFERENT order, not just the same
     /// slice handed back twice.
     #[test]
-    fn a_ordem_dos_modelos_no_menu_nao_muda_entre_duas_leituras_iguais() {
+    fn the_order_of_the_models_in_the_menu_does_not_change_between_two_identical_reads() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -1862,7 +1920,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     }
 
     #[test]
-    fn sem_pasta_de_enviados_o_pilar_arranca() {
+    fn without_a_sent_folder_the_pillar_starts() {
         let config = email_config_from("enabled: true\nhost: imap.example.com\n");
 
         assert!(
@@ -2985,6 +3043,99 @@ resolve_effort: \"  \"
     }
 
     #[test]
+    fn release_branch_is_absent_by_default_and_parses_when_set() {
+        assert!(AutopilotRules::default().release_branch.is_none());
+        assert_eq!(AutopilotRules::default().release_branch(), None);
+        let rules = parse_schedule_rules("release_branch: master\n").unwrap();
+        assert_eq!(rules.release_branch(), Some("master"));
+    }
+
+    #[test]
+    fn release_branch_moves_the_step_forced_gate_to_the_promotion() {
+        let steps = "gate_command: x\n\
+             integration_steps:\n\
+             \x20 - id: on\n\
+             \x20   kind: builtin:renumber-sequence\n";
+        let without = parse_schedule_rules(steps).unwrap();
+        assert!(without.merge_gate_required());
+        let with = parse_schedule_rules(&format!("{steps}release_branch: master\n")).unwrap();
+        assert!(!with.merge_gate_required());
+        // An explicit gate_before_publish is still honoured.
+        let explicit = AutopilotRules {
+            gate_before_publish: true,
+            ..with
+        };
+        assert!(explicit.merge_gate_required());
+    }
+
+    fn release_rules() -> AutopilotRules {
+        AutopilotRules {
+            gate_after_land: true,
+            gate_command: Some("gate".into()),
+            release_branch: Some("master".into()),
+            ..AutopilotRules::default()
+        }
+    }
+
+    #[test]
+    fn release_activation_passes_when_every_precondition_holds_or_unset() {
+        assert_eq!(
+            release_activation_preconditions(&release_rules(), "integration", true, true, true),
+            Ok(())
+        );
+        // No release_branch: nothing to activate, whatever the facts say.
+        assert_eq!(
+            release_activation_preconditions(
+                &AutopilotRules::default(),
+                "master",
+                false,
+                false,
+                false
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn each_release_activation_precondition_refuses_with_its_own_message() {
+        let ok = release_rules();
+        let msg = |r: &AutopilotRules, i: &str, re: bool, ie: bool, an: bool| {
+            release_activation_preconditions(r, i, re, ie, an).unwrap_err()
+        };
+        let no_gate_after = AutopilotRules {
+            gate_after_land: false,
+            ..release_rules()
+        };
+        let no_command = AutopilotRules {
+            gate_command: None,
+            ..release_rules()
+        };
+        let messages = [
+            msg(&no_gate_after, "integration", true, true, true),
+            msg(&no_command, "integration", true, true, true),
+            msg(&ok, "master", true, true, true),
+            msg(&ok, "integration", false, true, true),
+            msg(&ok, "integration", true, false, true),
+            msg(&ok, "integration", true, true, false),
+        ];
+        assert!(messages[0].contains("gate_after_land"), "{}", messages[0]);
+        assert!(messages[1].contains("gate_command"), "{}", messages[1]);
+        assert!(messages[2].contains("differ"), "{}", messages[2]);
+        assert!(messages[3].contains("release branch"), "{}", messages[3]);
+        assert!(
+            messages[4].contains("integration branch"),
+            "{}",
+            messages[4]
+        );
+        assert!(messages[5].contains("ancestor"), "{}", messages[5]);
+        for (i, a) in messages.iter().enumerate() {
+            for b in &messages[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
     fn a_disabled_step_is_not_active_and_does_not_force_the_gate() {
         let rules = parse_schedule_rules(
             "integration_steps:\n  - id: s1\n    kind: program\n    program: fmt\n    enabled: false\n",
@@ -3141,7 +3292,7 @@ resolve_effort: \"  \"
     /// `Some(true)` for a model that declared tools, `Some(false)` for one that explicitly did
     /// not — never guessed for either, and never the same answer for two different models.
     #[test]
-    fn o_catalogo_marca_quem_nao_declara_ferramentas() {
+    fn the_catalogue_flags_whoever_does_not_declare_tools() {
         let choices = vec![
             unmarked_choice("qwen3.5:4b"),
             unmarked_choice("llama3.2:3b"),
@@ -3191,7 +3342,7 @@ resolve_effort: \"  \"
     /// broken. `AssistantChoice::tools`'s own doc is the reason: "declares no tools" and "we have
     /// not asked" are different facts, and only one of them is worth warning anybody about.
     #[test]
-    fn um_modelo_de_capacidades_desconhecidas_nao_e_marcado_de_lado_nenhum() {
+    fn a_model_of_unknown_capabilities_is_flagged_on_neither_side() {
         let choices = vec![unmarked_choice("novo-modelo")];
         let declared = std::collections::HashMap::new();
 

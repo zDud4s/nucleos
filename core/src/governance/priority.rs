@@ -79,7 +79,7 @@ pub fn adjust(
     }
 }
 
-// Consumed by the `o_derivado_nunca_promove` policy invariant test.
+// Consumed by the `the_derived_never_promotes` policy invariant test.
 #[cfg(test)]
 fn rank(class: &str) -> u8 {
     match class {
@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn o_derivado_nunca_promove() {
+    fn the_derived_never_promotes() {
         let first_contact = profile(1, false);
         let established = profile(2, false);
         let has_outbound = profile(1, true);
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn a_precedencia_respeita_a_ordem() {
+    fn precedence_respects_the_order() {
         let first_contact = profile(1, false);
         let cases = [
             (
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn a_regra_derivada_e_estreita() {
+    fn the_derived_rule_is_narrow() {
         let first_contact = profile(1, false);
         let zero_messages = profile(0, false);
         let established = profile(2, false);
@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn a_regra_que_decidiu_e_nomeada() {
+    fn the_rule_that_decided_is_named() {
         let first_contact = profile(1, false);
         let has_outbound = profile(1, true);
         let cases = [
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_classe_desconhecida_deixa_de_ser_silenciosa() {
+    fn an_unknown_class_stops_being_silent() {
         let established = profile(2, false);
 
         // This has its own test because turning an unrecognised answer into `noise` is the quietest
@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn uma_sobreposicao_humana_decide_antes_de_tudo() {
+    fn a_human_override_decides_before_everything() {
         let first_contact = profile(1, false);
         let cases = [
             (

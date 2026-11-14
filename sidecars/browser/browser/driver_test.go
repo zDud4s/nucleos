@@ -50,8 +50,8 @@ func TestAPlacementNobodyFilledInIsNotUsable(t *testing.T) {
 	}
 }
 
-// TestOpenFailsClosedWithoutFence pins spec §6.2a: "se o interceptor não estiver atado, o separador
-// não navega". The zero-value Fake has no fence, and must refuse rather than browse.
+// TestOpenFailsClosedWithoutFence pins spec §6.2a: "if the interceptor is not attached, the tab
+// does not navigate". The zero-value Fake has no fence, and must refuse rather than browse.
 func TestOpenFailsClosedWithoutFence(t *testing.T) {
 	var driver Fake // deliberately unconfigured
 	_, err := driver.Open(context.Background(), OpenRequest{URL: "https://example.org/"})

@@ -7,11 +7,11 @@
 //!
 //! **The two documents number their decisions separately, and both have a decision #2.** An
 //! unqualified "decision #N" anywhere in this file is the 2026-08-27 design's, which is the
-//! numbering the module was written against; a citation of the alçada design says "alçada §4.1"
+//! numbering the module was written against; a citation of the authority design says "authority §4.1"
 //! before its number. Getting this wrong costs a reader the wrong document, so it is spelled out
 //! rather than left to be inferred.
 //!
-//! The dono asked for one thing in his own words — *"a responsabilidade do bom merge sem conflitos
+//! The owner asked for one thing in his own words — *"a responsabilidade do bom merge sem conflitos
 //! ser de um módulo específico"* — after watching the queue land on a tree nobody chose roughly
 //! ten times. Two defects composed to cause it: the target used to be read off the main checkout's
 //! HEAD (`http.rs`, before this module existed), and a checkout parked on the wrong branch silently
@@ -66,11 +66,11 @@ pub enum LandRefusal {
     /// in. Refused before a row is written, not during execution — a queued row is a promise to
     /// whoever is waiting on it, and "there was nothing to land" is not a promise worth making.
     NothingToLand(String),
-    /// The landing has no target it may use. Three causes, and after the alçada design the last
+    /// The landing has no target it may use. Three causes, and after the authority design the last
     /// two are the common ones: the integration branch could not be resolved — decision #2's
     /// refusal (a declared branch that no longer exists, or nothing to derive one from), or a
     /// database read that failed on the way; the caller named a target this project does not
-    /// admit (alçada §4.1, decision #2); or the named target is admitted and its branch is gone.
+    /// admit (authority §4.1, decision #2); or the named target is admitted and its branch is gone.
     Refused(String),
     /// Every check passed and the queue still would not admit the request.
     NotAdmitted(String),
@@ -94,13 +94,13 @@ impl LandRefusal {
 /// The branch a project's landings merge into — declared once, in `autopilot_state.integration_branch`,
 /// and never read off any worktree's HEAD.
 ///
-/// **This is the 2026-08-27 design's decision #2 in full** — the alçada design has a decision #2
+/// **This is the 2026-08-27 design's decision #2 in full** — the authority design has a decision #2
 /// of its own, about a target a caller may NAME, which is `resolve_target`'s and not this
 /// function's — **and the sentence that matters is the negative one: nothing here
 /// ever runs `current_branch` on the project's main checkout.** That read is the exact line the
 /// design's defect 1 traces to (`http.rs`, before this module existed) — a checkout parked on a
 /// feature branch used to redirect every landing in the project to it. Answering from a column
-/// instead makes that redirection impossible to express, which is the whole of what the dono asked
+/// instead makes that redirection impossible to express, which is the whole of what the owner asked
 /// for.
 ///
 /// Answered in this order, and the order is the design:
@@ -301,7 +301,7 @@ pub async fn integration_branch_reading(
 
 /// The branch THIS landing is for.
 ///
-/// **Alçada §4.1, decision #2, and it is the guard that lets that design's decision #1 exist at
+/// **Authority §4.1, decision #2, and it is the guard that lets that design's decision #1 exist at
 /// all.** This module was written because the target used to be *inferred* from a checkout's HEAD
 /// and the queue landed on a branch nobody chose about ten times. An argument is not that defect —
 /// inferred is not the same as said — but a typo that happens to name a real branch would be, so a
@@ -360,6 +360,12 @@ async fn resolve_target(
         return integration_branch(pool, project_id, project_root, deadline).await;
     };
 
+    // The release branch only moves by promotion: refuse it before any table is consulted.
+    refuse_release_branch(
+        crate::project::policy::release_branch_of(project_id).as_deref(),
+        requested,
+    )?;
+
     let recorded = crate::project::policy::land_targets(pool, project_id).await;
     if recorded
         .iter()
@@ -409,6 +415,17 @@ async fn resolve_target(
         "{requested} is not among the landing targets recorded for {project_id} — those are: {}",
         alternatives.join(", ")
     ))
+}
+
+/// Refuses a landing target that is the project's release branch. Unset refuses nothing.
+fn refuse_release_branch(release: Option<&str>, requested: &str) -> Result<(), String> {
+    if crate::project::policy::is_release_branch(release, requested) {
+        return Err(format!(
+            "{requested} is the release branch: it only moves by promotion of a commit the \
+             postgate proved green, so nothing may land on it"
+        ));
+    }
+    Ok(())
 }
 
 /// Admits a landing for a caller with no claims override. See [`submit_with`].
@@ -855,6 +872,35 @@ mod tests {
     use crate::task_claims::{
         self, ClaimOutcome, Holder, HolderKind, NewTask, TaskKind, TaskRow, keys,
     };
+
+    #[test]
+    fn the_release_branch_is_refused_as_a_land_target_only_when_set() {
+        let err = refuse_release_branch(Some("master"), "master").unwrap_err();
+        assert!(err.contains("release branch"), "{err}");
+        assert!(refuse_release_branch(Some("master"), "integration").is_ok());
+        assert!(refuse_release_branch(None, "master").is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolve_target_refuses_the_release_branch_even_when_listed() {
+        let pool = test_pool().await;
+        let _home = crate::project::rules::testing::Home::new();
+        crate::project::rules::testing::publish_rules("alpha", "release_branch: master\n");
+        crate::project::policy::declare_land_target(&pool, "alpha", "master")
+            .await
+            .unwrap();
+        let err = resolve_target(
+            &pool,
+            "alpha",
+            Path::new("."),
+            Some("master"),
+            Some("master"),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("release branch"), "{err}");
+    }
 
     async fn test_pool() -> sqlx::SqlitePool {
         // The queue's executor reads the project's rules from the settings snapshot: hold the shared side of
@@ -1536,7 +1582,7 @@ mod tests {
         assert!(refusal.contains("alpha"), "{refusal}");
     }
 
-    /// Alçada §4.1, decision #2. A named target has to be admitted before it is anything else --
+    /// Authority §4.1, decision #2. A named target has to be admitted before it is anything else --
     /// and the refusal NAMES what would have been admitted, because a caller who has to open the
     /// app to find out has lost the reason this command exists.
     #[tokio::test]
@@ -1575,7 +1621,7 @@ mod tests {
         );
     }
 
-    /// Alçada §4.1: the integration branch is admissible without being in the table. An empty
+    /// Authority §4.1: the integration branch is admissible without being in the table. An empty
     /// table means "only the usual place", never "nowhere".
     #[tokio::test]
     async fn the_integration_branch_is_admitted_without_being_declared() {
@@ -1714,7 +1760,7 @@ mod tests {
         assert!(refused.is_err());
     }
 
-    /// Alçada §4.1: a target the project admits but git no longer has is refused HERE, not three
+    /// Authority §4.1: a target the project admits but git no longer has is refused HERE, not three
     /// git commands into a merge -- the same rule `integration_branch` already applies to a stale
     /// column.
     #[tokio::test]
@@ -1793,7 +1839,7 @@ mod tests {
         assert_eq!(op["source"], "feat/x", "{args}");
     }
 
-    /// Alçada §4.1's last line — decision #1's negative half, and the one that keeps the old defect
+    /// Authority §4.1's last line — decision #1's negative half, and the one that keeps the old defect
     /// from returning by another door: naming a target for one landing must not declare the
     /// project's default.
     ///

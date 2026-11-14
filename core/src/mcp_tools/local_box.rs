@@ -239,7 +239,7 @@ impl crate::models::local_agent::ToolBox for LocalToolBox {
             }
             "get_budget" => self.tools.get_budget().await,
             "get_kill" => self.tools.get_kill().await,
-            "get_run" => self.tools.get_run(Parameters(parsed!(IdParams))).await,
+            "get_run" => self.tools.get_run(Parameters(parsed!(RunGetParams))).await,
             // The fifth list a tool on `LOCAL_TOOLS` has to join, and the one nothing about adding
             // a tool reminds you of: this box dispatches to the methods DIRECTLY rather than
             // through the router, so a name offered here and unhandled here is a tool the model is

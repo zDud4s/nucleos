@@ -121,6 +121,8 @@ export function buildModel(
 
   for (const link of graph.links) {
     if (!keptNoteIds.has(String(link.note_id))) continue;
+    // A job is evidence, not an entity: the panel names and links it, the graph draws no node for it.
+    if (link.target_kind === "job") continue;
     if (!filters.edgeTypes.has(link.link_type) || !keepsKind(link.target_kind)) continue;
     const source = nodes.get(`n:${link.note_id}`);
     if (!source) continue; // the note itself was filtered by Estado

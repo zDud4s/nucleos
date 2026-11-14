@@ -1088,7 +1088,7 @@ mod tests {
     /// A sidecar that answers the driver's verbs and the two wheel ones, and records every call.
     ///
     /// It answers `/wheel/return` with a chain the test chooses, because the chain is the only thing
-    /// a handover produces that outlives it â€” everything else here is a window that closes.
+    /// a handover produces that outlives it — everything else here is a window that closes.
     async fn stub_sidecar(
         chain: Vec<&'static str>,
         take_fails: bool,
@@ -1153,11 +1153,15 @@ mod tests {
             )
             .route(
                 "/{verb}",
-                post(move |Path(verb): Path<String>, _body: axum::body::Bytes| {
+                post(move |Path(verb): Path<String>, body: axum::body::Bytes| {
                     let recorder = verb_recorder.clone();
                     async move {
                         recorder.lock().unwrap().push(verb.clone());
                         if verb == "open" {
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(format!("open-body {}", String::from_utf8_lossy(&body)));
                             return axum::Json(serde_json::json!({
                                 "id": "s1",
                                 "mode": "agent",
@@ -1354,8 +1358,8 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§4.4 rule 3, and the first half of rule 1. Asking raises a proposal â€” the daemon runs
-    /// without a shell, so the request has to survive the window being closed â€” and the session
+    /// Spec §4.4 rule 3, and the first half of rule 1. Asking raises a proposal — the daemon runs
+    /// without a shell, so the request has to survive the window being closed — and the session
     /// leaves the agent's hands in the same breath.
     #[tokio::test]
     async fn asking_for_the_wheel_raises_a_proposal_and_takes_the_session_off_the_agent() {
@@ -1382,7 +1386,7 @@ mod tests {
         assert_eq!(raised.project_id.as_deref(), Some("acme"));
         assert_eq!(raised.run_id, Some(7));
 
-        // Spec Â§5.2 measure 1: the dialogue is given the complete, literal origin â€” with its port,
+        // Spec §5.2 measure 1: the dialogue is given the complete, literal origin — with its port,
         // in the punycode form the policy stores. Prettifying it is the attack.
         let input: serde_json::Value =
             serde_json::from_str(raised.tool_input.as_deref().unwrap()).unwrap();
@@ -1400,8 +1404,8 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§4.5 and Â§4.2 together, which is the whole point of the handover: the agent was in a
-    /// throwaway, and the person is sent to the PROJECT's profile â€” the one that is not deleted with
+    /// Spec §4.5 and §4.2 together, which is the whole point of the handover: the agent was in a
+    /// throwaway, and the person is sent to the PROJECT's profile — the one that is not deleted with
     /// the run, and therefore the only one where a login is worth making.
     #[tokio::test]
     async fn accepting_opens_the_project_profile_and_not_the_throwaway() {
@@ -1426,7 +1430,7 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§4.4a. The window does not open, and the wheel does NOT go back to the agent â€” a failure
+    /// Spec §4.4a. The window does not open, and the wheel does NOT go back to the agent — a failure
     /// of ours is not a reason to let it drive again. The proposal carries the reason, so the person
     /// can retry or give up.
     #[tokio::test]
@@ -1461,7 +1465,7 @@ mod tests {
         db.close().await;
     }
 
-    /// Spec Â§5.2 and Â§5.3a, end to end: the wheel comes back with the chain, and NOTHING is granted
+    /// Spec §5.2 and §5.3a, end to end: the wheel comes back with the chain, and NOTHING is granted
     /// until a person answers. The two steps are separate because the person has to see the set
     /// before agreeing to it.
     #[tokio::test]
@@ -1877,6 +1881,294 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        db.close().await;
+    }
+
+    /// Pillar off: the first gate. No conversation, no row, no call.
+    #[tokio::test]
+    async fn a_disabled_browser_gets_no_chat_and_no_window_with_the_agent() {
+        let (db, mut state, seen) = wheeled(vec![], false).await;
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime::disabled());
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await,
+            Err(WheelError::Disabled)
+        ));
+        let chats: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chats WHERE title LIKE 'Browser · %'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(chats, 0, "no conversation was made");
+        assert!(seen.lock().unwrap().is_empty());
+        db.close().await;
+    }
+
+    /// The sidecar cannot open (down, or its profile is taken): the row closes `open-failed`, the
+    /// caller gets the error, and the empty conversation stays — undoing it is one more step that
+    /// can fail (spec §3.2).
+    #[tokio::test]
+    async fn a_sidecar_that_cannot_open_closes_the_row_and_leaves_an_empty_chat() {
+        let (db, mut state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        // A port nobody listens on.
+        let dead = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&dead.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
+        });
+
+        let result =
+            open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await;
+        assert!(matches!(result, Err(WheelError::Sidecar(_))), "{result:?}");
+
+        let chats: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT chat_id, title FROM chats WHERE title LIKE 'Browser · %'")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(chats.len(), 1, "the conversation stays");
+        assert_eq!(chats[0].1.as_deref(), Some("Browser · jira.example.org"));
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let reasons: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT closed_reason FROM browser_sessions")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(reasons, vec![Some("open-failed".to_string())]);
+        assert!(
+            browser::open_sessions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.close().await;
+    }
+
+    /// A project root on record that is not a folder on disk gives the conversation no directory.
+    #[tokio::test]
+    async fn a_project_root_that_is_not_a_folder_gives_the_chat_no_cwd() {
+        let (db, state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('nucleos', 'off', ?)",
+        )
+        .bind("Z:\\no\\such\\folder\\anywhere")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+
+        let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM chats WHERE chat_id = ?")
+            .bind(&opened.chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(cwd, None);
+        db.close().await;
+    }
+
+    /// A profile already in use (the sidecar answers 409 to the open) is an open failure like any
+    /// other: the row closes `open-failed`, the conversation stays empty, the caller gets an error.
+    #[tokio::test]
+    async fn a_busy_profile_closes_the_row_and_leaves_an_empty_chat() {
+        use axum::response::IntoResponse as _;
+
+        let (db, mut state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let app = axum::Router::new().route(
+            "/{verb}",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::CONFLICT, "profile busy").into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&address.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
+        });
+
+        let result =
+            open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await;
+        assert!(result.is_err(), "{result:?}");
+
+        let chats: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chats WHERE title LIKE 'Browser · %'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(chats, 1, "the conversation stays");
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let reasons: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT closed_reason FROM browser_sessions")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(reasons, vec![Some("open-failed".to_string())]);
+        db.close().await;
+    }
+
+    /// A project with a granted site opens on the project profile and sends its write list; the
+    /// agent path must not force the throwaway profile.
+    #[tokio::test]
+    async fn the_agent_window_uses_the_project_profile_when_sites_are_granted() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        browser::grant(
+            &state.pool,
+            "nucleos",
+            &["https://jira.example.org/login".into()],
+            true,
+            NOW,
+        )
+        .await
+        .expect("grant");
+
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+
+        assert_eq!(opened.session.profile_kind, "project");
+        let body = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|entry| entry.strip_prefix("open-body ").map(str::to_string))
+            .expect("the open body was recorded");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["placement"]["profile"]["id"], "nucleos", "{body}");
+        assert_eq!(
+            body["placement"]["writable"],
+            serde_json::json!(["https://jira.example.org:443"]),
+            "{body}"
+        );
+        db.close().await;
+    }
+
+    /// The read verbs refuse a with-agent session once the person has the wheel, as they do for any
+    /// session that is not the agent's.
+    #[tokio::test]
+    async fn the_read_verbs_refuse_a_with_agent_session_in_human_mode() {
+        let (db, state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+        assert!(
+            browser::set_mode(
+                &state.pool,
+                &state.browser.modes,
+                opened.session.id,
+                mode::AGENT,
+                mode::HUMAN,
+            )
+            .await
+            .unwrap()
+        );
+
+        let response = crate::browser::post_snapshot(
+            axum::extract::State(state.clone()),
+            axum::Json(crate::browser::SessionBody {
+                session_id: opened.session.id,
+                changes_only: false,
+                text_from: 0,
+                controls_from: 0,
+                find: String::new(),
+            }),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("refused"), "{text}");
+        assert!(text.contains("theirs"), "{text}");
+        db.close().await;
+    }
+
+    /// An address with no host names the conversation after the project instead.
+    #[tokio::test]
+    async fn a_url_without_a_host_names_the_chat_after_the_project() {
+        let (db, state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let _ = open_window_with_agent(&state, "nucleos", "not a url").await;
+
+        let title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM chats WHERE title LIKE 'Browser · %'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(title.as_deref(), Some("Browser · nucleos"));
         db.close().await;
     }
 

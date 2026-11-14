@@ -244,7 +244,7 @@ describe("the workflow canvas", () => {
   });
 
   /**
-   * A núcleo that went away between the blur and the answer is a failure, not a refusal, and it was
+   * The núcleo going away between the blur and the answer is a failure, not a refusal, and it was
    * dropped: the field kept a value that was never saved and nothing said so.
    */
   it("says so when a change could not be saved because the background service gave no reply", async () => {

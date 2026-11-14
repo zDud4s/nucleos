@@ -640,10 +640,34 @@ pub async fn try_land_targets(pool: &SqlitePool, project_id: &str) -> Result<Vec
 /// a project that declared nothing, which is why its refusal says what was *recorded* rather than
 /// what the project *admits*.
 pub async fn land_targets(pool: &SqlitePool, project_id: &str) -> Vec<String> {
-    try_land_targets(pool, project_id).await.unwrap_or_else(|error| {
+    let recorded = try_land_targets(pool, project_id).await.unwrap_or_else(|error| {
         tracing::warn!(%error, project_id, "land targets: unreadable; this project lands nowhere extra");
         Vec::new()
-    })
+    });
+    without_release_branch(recorded, release_branch_of(project_id).as_deref())
+}
+
+/// The project's `release_branch` rule, if set. An unreadable rules document reads as unset.
+pub fn release_branch_of(project_id: &str) -> Option<String> {
+    crate::project::rules::autopilot(project_id)
+        .ok()
+        .and_then(|rules| rules.release_branch().map(str::to_owned))
+}
+
+/// Whether `branch` is the project's release branch, which no land may name.
+pub fn is_release_branch(release: Option<&str>, branch: &str) -> bool {
+    release.is_some_and(|release| release == branch.trim())
+}
+
+/// `entries` minus every one that would admit the release branch, literal or glob.
+pub fn without_release_branch(entries: Vec<String>, release: Option<&str>) -> Vec<String> {
+    match release {
+        None => entries,
+        Some(release) => entries
+            .into_iter()
+            .filter(|entry| !land_target_admits(entry, release))
+            .collect(),
+    }
 }
 
 /// Whether a recorded land-target entry admits `branch`.
@@ -1480,6 +1504,32 @@ mod tests {
         assert!(shell_rules(&pool, "alpha").await.unwrap().is_empty());
         assert!(github_ops(&pool, "alpha").await.is_empty());
         assert!(land_targets(&pool, "alpha").await.is_empty());
+    }
+
+    #[test]
+    fn the_release_branch_is_never_an_admissible_land_target() {
+        let entries = || {
+            vec![
+                "feat/*".to_string(),
+                "master".to_string(),
+                "rel".to_string(),
+            ]
+        };
+        // Set: the literal entry is dropped, the others stay.
+        assert_eq!(
+            without_release_branch(entries(), Some("master")),
+            vec!["feat/*".to_string(), "rel".to_string()]
+        );
+        // A glob that would admit it goes too.
+        assert_eq!(
+            without_release_branch(vec!["feat/*".into()], Some("feat/x")),
+            Vec::<String>::new()
+        );
+        // Unset: nothing changes.
+        assert_eq!(without_release_branch(entries(), None), entries());
+        assert!(is_release_branch(Some("master"), " master "));
+        assert!(!is_release_branch(Some("master"), "integration"));
+        assert!(!is_release_branch(None, "master"));
     }
 
     #[test]

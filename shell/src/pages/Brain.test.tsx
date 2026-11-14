@@ -32,6 +32,7 @@ vi.mock("../brain/ForceGraph", () => ({
 
 beforeEach(() => {
   window.sessionStorage.clear();
+  window.localStorage.clear();
   daemon.apiFetch.mockReset();
 });
 
@@ -175,6 +176,53 @@ describe("Brain", () => {
     fireEvent.click(screen.getByRole("button", { name: "List" }));
     await waitFor(() => expect(router.state.location.search).toEqual({}));
     expect(screen.queryByRole("list", { name: "Graph nodes" })).toBeNull();
+  });
+
+  it("remembers the last view: a bare /brain opens on it, an explicit one wins", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith());
+    const first = await renderWithRouter(<Brain />, { initialPath: "/brain" });
+    await screen.findByRole("button", { name: "Graph" });
+    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+    await screen.findByRole("list", { name: "Graph nodes" });
+    expect(window.localStorage.getItem("brain.view")).toBe("graph");
+    first.unmount();
+
+    const second = await renderWithRouter(<Brain />, { initialPath: "/brain" });
+    expect(await screen.findByRole("list", { name: "Graph nodes" })).toBeTruthy();
+    await waitFor(() => expect(second.router.state.location.search).toEqual({ view: "graph" }));
+  });
+
+  it("a storage that throws is ignored", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    daemon.apiFetch.mockImplementation(daemonWith());
+    await renderWithRouter(<Brain />, { initialPath: "/brain" });
+    fireEvent.click(await screen.findByRole("button", { name: "Graph" }));
+    expect(await screen.findByRole("list", { name: "Graph nodes" })).toBeTruthy();
+    vi.restoreAllMocks();
+  });
+
+  it("switching view replaces the history entry; picking an item pushes one", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith());
+    const { router } = await renderWithRouter(<Brain />, { initialPath: "/brain?view=graph" });
+    await screen.findByRole("list", { name: "Graph nodes" });
+    // The harness types the router as only what most tests assert on; the memory history is there.
+    const entries = () => (router as unknown as { history: { length: number } }).history.length;
+    const before = entries();
+
+    fireEvent.click(screen.getByRole("button", { name: "List" }));
+    await waitFor(() => expect(router.state.location.search).toEqual({}));
+    expect(entries()).toBe(before);
+
+    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+    await screen.findByRole("list", { name: "Graph nodes" });
+    fireEvent.click(screen.getByRole("button", { name: "n:1" }));
+    await waitFor(() => expect(router.state.location.search).toEqual({ view: "graph", item: "note:1" }));
+    expect(entries()).toBe(before + 1);
   });
 
   it("clicking a note in the graph puts it in the address and opens it", async () => {

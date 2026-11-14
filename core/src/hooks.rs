@@ -7237,6 +7237,39 @@ mod tests {
         );
     }
 
+    /// Relay safety proof (a), CLI path: a page a stranger wrote cannot aim `send_to_chat`.
+    ///
+    /// A relay lands in a conversation a person reads and whose next turn holds the whole of it, so
+    /// a turn that has read `web_read` text and then hands words to another conversation is the
+    /// injection the relay gate exists to refuse. The same turn without the read sends freely —
+    /// the barrier is about what was read, not about the tool.
+    #[tokio::test]
+    async fn a_web_page_cannot_reach_send_to_chat() {
+        let state = test_state().await;
+        let clean = in_flight_run(&state, "assistant", None, None, None).await;
+        let tainted = in_flight_run(&state, "assistant", None, None, None).await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({"chat_id": "other-chat", "text": "hi"});
+
+        let sent = orchestrator_tool(&app, clean, "send_to_chat", input.clone()).await;
+        assert_eq!(
+            sent.decision, "allow",
+            "a turn that read nothing third-party may relay"
+        );
+
+        let read = orchestrator_tool(
+            &app,
+            tainted,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/pagina"}),
+        )
+        .await;
+        assert_eq!(read.decision, "allow", "reading is what the turn is for");
+        let refused = orchestrator_tool(&app, tainted, "send_to_chat", input).await;
+        assert_eq!(refused.decision, "deny", "send_to_chat after web_read");
+        assert_eq!(refused.reason, UNTRUSTED_CONTEXT_DENY_REASON);
+    }
+
     /// The rule is about acting, not about reading, and a barrier that also stopped the reading
     /// would have taken the feature with it: the owner asked what was in their mail, and the answer
     /// needs more than one message to assemble.

@@ -41,7 +41,7 @@ pub async fn pretooluse_decision(
                 tracing::warn!(run_id, %error, "pretooluse-decision: could not read the run's ticket notices");
                 Vec::new()
             });
-        parts.extend(node_context::warn_hint(&state, run_id).await);
+        parts.extend(node_context::hints(&state, run_id, &tool_name, &tool_input).await);
         (!parts.is_empty()).then(|| parts.join("\n\n"))
     } else {
         None
@@ -420,6 +420,13 @@ pub(super) async fn pretooluse_decision_from(
         return decision;
     }
 
+    // A node's own handoff report lives in the state dir, outside its worktree: allow exactly that
+    // path, at any fill, before the classifier (which refuses writes outside the cwd) and the
+    // node scope fence.
+    if let Some(decision) = node_context::own_report_decision(&state, &payload, run_id).await {
+        return decision;
+    }
+
     // The retired `.ai/` layout takes no new writes from any run: its material lives under
     // `<state_dir>` now. Before the docs rule, so a docs run is told where to write instead.
     if let Some(decision) =
@@ -455,6 +462,7 @@ pub(super) async fn pretooluse_decision_from(
         )
         .await
         {
+            node_context::record_fence_refusal(&state, run_id, &payload).await;
             let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
             return Json(Decision {
                 decision: "deny".to_owned(),
@@ -1751,6 +1759,100 @@ mod tests {
         assert!(!context.contains("split the rest"), "got {context:?}");
     }
 
+    async fn context_warning_rows(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions WHERE reason = 'context_warning'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn set_context_warning_mode(state: &AppState, mode: &str) {
+        sqlx::query(
+            "INSERT INTO devtime_action_state (action, rule_id, mode, since, changed_by)
+             VALUES ('inject', 'CTX', ?, '2026-11-12T00:00:00Z', 'test')",
+        )
+        .bind(mode)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_looping_node_run_in_shadow_records_the_warning_and_says_nothing() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(answer(&state, run_id, "Read", read_input()).await);
+        }
+        let last = last.unwrap();
+
+        assert_allowed(&last.decision, "the third identical read");
+        assert!(
+            last.additional_context.is_none(),
+            "{:?}",
+            last.additional_context
+        );
+        assert_eq!(context_warning_rows(&state).await, 1);
+        let again = answer(&state, run_id, "Read", read_input()).await;
+        assert!(again.additional_context.is_none());
+        assert_eq!(context_warning_rows(&state).await, 1, "said once");
+    }
+
+    #[tokio::test]
+    async fn a_looping_node_run_in_live_mode_gets_the_advisory_and_the_same_decision() {
+        let state = test_state().await;
+        set_context_warning_mode(&state, "live").await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+
+        let first = answer(&state, run_id, "Read", read_input()).await;
+        answer(&state, run_id, "Read", read_input()).await;
+        let third = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_eq!(third.decision.decision, first.decision.decision);
+        assert_eq!(third.decision.reason, first.decision.reason);
+        let context = third.additional_context.expect("the advisory");
+        assert!(context.contains("contract_request"), "got {context:?}");
+        assert!(context.contains("lib.rs"), "got {context:?}");
+        assert!(first.additional_context.is_none());
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_context_warning_ignores_a_run_without_a_node_and_a_mode_that_is_off() {
+        let state = test_state().await;
+        set_context_warning_mode(&state, "live").await;
+        let plain = seed_run(&state, "shadow", Some(1_000)).await;
+        for _ in 0..4 {
+            let answer = answer(&state, plain, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+
+        sqlx::query("UPDATE devtime_action_state SET mode = 'off'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+        for _ in 0..4 {
+            let answer = answer(&state, run_id, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn two_identical_reads_of_a_node_run_say_nothing() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+        for _ in 0..2 {
+            let answer = answer(&state, run_id, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
     /// An `open` ticket of the test project guarding `core/a.rs`, routed to the run whose node owns
     /// that path. Returns the ticket id.
     async fn offer_a_ticket_to(state: &AppState, run_id: i64, node_id: &str) -> i64 {
@@ -2647,6 +2749,45 @@ mod tests {
         .await;
 
         assert_allowed(&decision, "a code branch commit");
+    }
+
+    /// The node scope fence leaves the refused call in `shadow_decisions` (marker `node_scope`,
+    /// input capped to 2 KB) and answers exactly what it answered before.
+    #[tokio::test]
+    async fn a_fence_refusal_is_recorded_with_its_call() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "core", &["core/src/**"]).await;
+        sqlx::query("UPDATE work_nodes SET owned_paths = '[\"core/src/**\"]' WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let mut input = write_input(Path::new(r"C:\work\repo\shell\x.ts"));
+        input["content"] = json!("x".repeat(10_000));
+
+        let decision = decide(&state, run_id, "Write", input).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(!decision.reason.is_empty());
+        let rows: Vec<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
+            "SELECT tool_name, tool_input, decision, reason FROM shadow_decisions WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (tool, stored, verdict, reason) = &rows[0];
+        assert_eq!(tool, "Write");
+        assert_eq!(verdict, "deny");
+        assert_eq!(reason.as_deref(), Some("node_scope"));
+        let stored = stored.as_deref().unwrap();
+        assert!(stored.contains("shell"), "{stored}");
+        assert!(
+            stored.len() < 3_000,
+            "the input must be capped: {}",
+            stored.len()
+        );
     }
 
     /// F2: a warm `Read` of a node run does not read the run again. The joined read behind

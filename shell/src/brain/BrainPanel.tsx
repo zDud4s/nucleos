@@ -366,6 +366,15 @@ function LocalGraph({
 
 function TargetName({ link, graph }: { link: NoteLink; graph: NotesGraph }) {
   const target = graph.targets.find((t) => t.kind === link.target_kind && t.ref === link.target_ref);
+  if (link.target_kind === "job") {
+    // The label arrives resolved ("job #N — <first line>"); a job that is gone falls back to its number.
+    return (
+      <span>
+        <Link to="/fleet">{target?.label ?? `job #${link.target_ref}`}</Link>
+        {target?.missing === true && <span className="brain-node-tag">gone</span>}
+      </span>
+    );
+  }
   return (
     <span>
       {link.target_kind}: {target?.label ?? link.target_ref}
@@ -374,7 +383,7 @@ function TargetName({ link, graph }: { link: NoteLink; graph: NotesGraph }) {
   );
 }
 
-/** Turns an active note into a pending lesson; the owner answers it in Learned. */
+/** Turns an active note into a pending lesson; the owner answers it in the Brain. */
 function Teach({ id }: { id: number }) {
   const teach = useTeachNote();
   const [kind, setKind] = useState<TeachKind>("memory");

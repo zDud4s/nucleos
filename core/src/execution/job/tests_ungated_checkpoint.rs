@@ -93,8 +93,9 @@ async fn a_red_last_item_reverts_only_its_own_work_after_ungated_items() {
         );
     }
     // The checkpoint says in git that no gate agreed with it.
-    let subject = git(checkout.path(), &["log", "-1", "--format=%s"]);
-    assert!(subject.contains("no gate"), "{subject}");
+    let message = git(checkout.path(), &["log", "-1", "--format=%B"]);
+    assert!(message.contains("no gate measured"), "{message}");
+    assert!(message.contains("Nucleos-Checkpoint: ungated"), "{message}");
 
     std::fs::write(checkout.path().join("item3.txt"), "broken\n").unwrap();
     let red = crate::gate::GateOutcome::Failed {

@@ -188,7 +188,7 @@ pub async fn are_linked(pool: &SqlitePool, a: &str, b: &str) -> sqlx::Result<boo
 ///
 /// - As CHILD, its own active link is closed: an archived browser agent answers to nobody.
 /// - As PARENT, each child that answered to it is relinked to the panel only (`parent_chat_id`
-///   NULL, still active): the child "continua só com o painel" rather than vanishing from the
+///   NULL, still active): the child "carries on with the panel only" rather than vanishing from the
 ///   panel's list along with its mother. Relinked the way `open` relinks — the active row closed,
 ///   a new one opened, one transaction — so the history still says who the child answered to.
 ///   `kind` and `created_by_run` travel to the new row: the child is the same agent, made by the

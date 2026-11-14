@@ -134,9 +134,10 @@ const TREE_AGENT_TOOLS: &[&str] = &[
     "mcp__nucleos__record",
     "mcp__nucleos__verify",
     "mcp__nucleos__verify_status",
-    // A leaf reports a problem outside its paths, reads the tree and the backlog and claims a
-    // task; `Monitor` only watches a background command's output. The route behind each is the
-    // real gate, as above.
+    // A node files an out-of-scope problem with it instead of fixing a path it does not own
+    // (the node prompt says so); the `/tasks/report` door takes the holder from the run's key.
+    // A leaf also reads the tree and the backlog and claims a task; `Monitor` only watches a
+    // background command's output. The route behind each is the real gate, as above.
     "mcp__nucleos__task_report",
     "mcp__nucleos__tree_status",
     "mcp__nucleos__task_claim",
@@ -472,6 +473,22 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // `writes_an_output_file` like everywhere else.
     "diff",
     "comm",
+    // Usage audit 2026-10-31..11-14: harmless reads that still parked runs. Each only prints to
+    // stdout and has no flag that writes a file or runs a program, and none takes a file path to
+    // read: `df` (filesystem totals, no file content), who/where (`whoami`, `hostname`, `uname`,
+    // `id`), `seq`, `printf`. `date` is here too, with `-s`/`--set` (set the clock) taken back in
+    // `uses_a_flag_its_program_makes_dangerous`. Commands that READ a file argument (`stat`, `du`,
+    // `realpath`, `readlink`, `*sum`, `jq`) are deliberately absent: a blanket prefix would let
+    // them read outside the workspace; they fall to the confinement path instead. `sleep` stays
+    // pending (a pause that never ends holds a run). `env`/`printenv` print the run's own tokens.
+    "df",
+    "whoami",
+    "hostname",
+    "uname",
+    "id",
+    "seq",
+    "printf",
+    "date",
 ];
 
 /// Read-only commands whose safety lives in the EXACT form, so they get no argument tolerance: for
@@ -1190,10 +1207,23 @@ fn classify_shell_command(
     let mut declared = false;
     let mut cd_elsewhere: Option<(String, String)> = None;
     let mut after_cd_reads = 0usize;
+    // PowerShell only: the names `$b = git merge-base ...` assigned earlier on this line, see
+    // `reads::powershell_git_assignment`.
+    let mut variables: Vec<String> = Vec::new();
     for (raw_segment, segment) in segments
         .iter()
         .map(|s| (s, crate::command_reader::escapes_masked(s, shell)))
     {
+        let segment = segment.to_string();
+        let segment = if shell == crate::command_reader::Shell::PowerShell {
+            if let Some(name) = reads::powershell_git_assignment(&segment) {
+                variables.push(name);
+                continue;
+            }
+            reads::with_known_variables(&segment, &variables)
+        } else {
+            segment
+        };
         // ASYMMETRY, on purpose: a substitution inside double quotes (`"$(…)"`) is one argument, so
         // it is read like an unknown variable and keeps today's verdict. An UNQUOTED one is split by
         // the shell into several arguments whose number and content nobody here can know, so the
@@ -1215,6 +1245,7 @@ fn classify_shell_command(
             && let Segment::Unrecognized(why) = &verdict
             && why.ends_with("leaves the run's workspace")
             && leaf_allows::is_plain_cd(&segment)
+            && cwd.is_some_and(|cwd| leaf_allows::cd_lands_in_the_project_checkout(&segment, cwd))
         {
             let shown = original_segment_text(command, raw_segment);
             cd_elsewhere = Some((
@@ -1546,6 +1577,51 @@ fn names_approval_command_word(normalized: &str) -> bool {
 /// a quote or another shape is `false`. Says nothing about whether the scripts are trustworthy:
 /// see `leaf_self_check_scripts_intact`.
 pub fn leaf_self_check_form(command: &str, self_check: bool) -> bool {
+    // The harmless dressing a leaf puts around the call: a `timeout N` prefix, a `2>&1` fold, a
+    // `| tail -N` / `| head -N` cut and the `; echo rc=$?` / `; git status` tail. Each is parsed as
+    // a whole piece, never as a stray metacharacter, so the core below still sees none.
+    let mut pieces = command.split(';');
+    let main = pieces.next().unwrap_or("");
+    let dressing_ok = pieces.all(|piece| {
+        let words: Vec<&str> = piece.split_whitespace().collect();
+        matches!(
+            words.as_slice(),
+            ["echo", "rc=$?"] | ["git", "status"] | ["git", "status", "--short" | "-s"]
+        )
+    });
+    if !dressing_ok {
+        return false;
+    }
+    let is_count = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
+    let mut stages = main.split('|');
+    let core = stages.next().unwrap_or("");
+    let cut_ok = match (stages.next(), stages.next()) {
+        (None, _) => true,
+        (Some(cut), None) => {
+            let words: Vec<&str> = cut.split_whitespace().collect();
+            match words.as_slice() {
+                ["tail" | "head", n] => n.strip_prefix('-').is_some_and(is_count),
+                ["tail" | "head", "-n", n] => is_count(n),
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !cut_ok {
+        return false;
+    }
+    let mut core_words: Vec<&str> = core.split_whitespace().collect();
+    if core_words.last() == Some(&"2>&1") {
+        core_words.pop();
+    }
+    if core_words.first() == Some(&"timeout") && core_words.get(1).is_some_and(|n| is_count(n)) {
+        core_words.drain(..2);
+    }
+    leaf_self_check_core(&core_words.join(" "), self_check)
+}
+
+/// PURE: the bare wrapped form, with no dressing around it. See `leaf_self_check_form`.
+fn leaf_self_check_core(command: &str, self_check: bool) -> bool {
     const FORBIDDEN: &[char] = &[
         ';', '|', '&', '<', '>', '$', '`', '\n', '\r', '(', ')', '{', '}', '*', '?', '~', '!', '#',
         '\'', '"',
@@ -2891,6 +2967,52 @@ mod tests {
         }
     }
 
+    /// Usage audit 2026-10-31..11-14: harmless print-only commands that parked runs. The second
+    /// list is the spellings of the same programs that write or set something, which stay pending.
+    #[test]
+    fn harmless_print_only_commands_are_allowed_and_their_writing_spellings_are_not() {
+        let workspace = Some(Path::new("C:/work/repo"));
+        for command in [
+            "df -h",
+            "whoami",
+            "hostname",
+            "uname -a",
+            "seq 1 5",
+            "printf '%s\\n' hello",
+            "date",
+            "date +%s",
+            "date -u +%Y-%m-%d",
+        ] {
+            let verdict = classify("Bash", &json!({ "command": command }), workspace);
+            assert_eq!(
+                verdict.decision.decision, "allow",
+                "{command}: {}",
+                verdict.reason
+            );
+        }
+        for command in [
+            "date -s 12:00",
+            "date --set=12:00",
+            "date --s 12:00",
+            "date -us 12:00",
+            "jq . package.json > out.json",
+            // File-reading commands are not safe prefixes: outside the workspace they stay refused.
+            r"jq . C:\Windows\System32\config\SAM",
+            "sha256sum /etc/shadow",
+            "seq 1 5 > out.txt",
+            "printf x > out.txt",
+            "env",
+            "printenv",
+        ] {
+            let verdict = classify("Bash", &json!({ "command": command }), workspace);
+            assert_ne!(
+                verdict.decision.decision, "allow",
+                "{command} must not be allowed: {}",
+                verdict.reason
+            );
+        }
+    }
+
     /// Spec A D13: shell reads that wrote nothing and still parked autonomous runs, each spelled
     /// the way the daemon's ledger recorded it (classifier version 13, 2026-09-09..14).
     #[test]
@@ -3612,6 +3734,54 @@ mod tests {
             "",
         ] {
             assert!(!leaf_self_check_form(command, false), "{command}");
+        }
+    }
+
+    /// Ticket #17 (a): the dressing a leaf puts around the wrapped call, one shape per line.
+    #[test]
+    fn the_leaf_self_check_admits_its_harmless_dressing() {
+        let fmt = "python scripts/heavy.py --agent leaf-b1835318 cargo fmt -p nucleos-core";
+        let inv = "python scripts/heavy.py -- python scripts/check_invariants.py";
+        for command in [
+            format!("{fmt} 2>&1 | tail -5"),
+            format!("{fmt} 2>&1 | tail -n 5"),
+            format!("{fmt} | head -20"),
+            format!("{fmt}; echo rc=$?"),
+            format!("{fmt} 2>&1; echo rc=$?"),
+            format!("{fmt}; git status --short"),
+            format!("{fmt}; git status"),
+            format!("timeout 300 {fmt}"),
+            format!("timeout 300 {inv} 2>&1 | tail -3; echo rc=$?; git status -s"),
+            format!("{inv} 2>&1 | tail -10"),
+        ] {
+            assert!(leaf_self_check_form(&command, false), "{command}");
+        }
+    }
+
+    /// Ticket #17 (a), the other side: nothing the dressing could smuggle in.
+    #[test]
+    fn the_leaf_self_check_dressing_admits_no_execution_or_writes() {
+        let fmt = "python scripts/heavy.py cargo fmt -p core";
+        for command in [
+            format!("{fmt} | sh"),
+            format!("{fmt} | tail -5 | sh"),
+            format!("{fmt} | tail -f x"),
+            format!("{fmt} | tee out.txt"),
+            format!("{fmt} > out.txt"),
+            format!("{fmt} 2>&1 > out.txt"),
+            format!("{fmt}; rm -rf ."),
+            format!("{fmt}; git push"),
+            format!("{fmt}; git status --short; git push"),
+            format!("{fmt}; git status && git push"),
+            format!("{fmt}; echo rc=$? > f"),
+            format!("{fmt}; echo $(id)"),
+            format!("{fmt} && git push"),
+            format!("{fmt} & rm x"),
+            format!("timeout x {fmt}"),
+            format!("timeout 5 sh -c '{fmt}'"),
+            format!("sh {fmt}"),
+        ] {
+            assert!(!leaf_self_check_form(&command, true), "{command}");
         }
     }
 
@@ -8064,6 +8234,10 @@ mod tests {
             "cd C:/Users/x/.aws && ls",
             "cd ../.. && ls",
             "cd -P C:/x && ls",
+            // Only the checkout that holds the leaf's worktree is read this way.
+            "cd C:/Windows && git status --short | head",
+            "cd C:/Projects/other && ls",
+            "cd /tmp && cat x",
         ] {
             assert_eq!(
                 leaf_bash(command).decision.decision,

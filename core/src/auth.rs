@@ -708,6 +708,8 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "team-triggers",
     "teams",
     "themes",
+    // Admin-only on a paired device (tree decision queue: the owner answering from another machine).
+    "tree-decisions",
     "voice",
     "waiting",
     "web",
@@ -6023,7 +6025,7 @@ mod tests {
     /// The hook reads those tables per decision and caches nothing, so a single `allow` row written
     /// through `POST /projects/{id}/shell-rules` binds the very next tool call of every in-flight
     /// run of that project — no restart, no second confirmation, and no moment at which a person is
-    /// shown what widened. A key that could write one is a key that can rewrite its own alçada,
+    /// shown what widened. A key that could write one is a key that can rewrite its own authority,
     /// which is a strictly larger power than anything a scoped key is sold as buying.
     ///
     /// Asserted as membership rather than through a request, like the `/settings` routes and

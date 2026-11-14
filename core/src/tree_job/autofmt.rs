@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::model::Branch;
+use crate::execution::worktree::CheckpointContext;
 
 /// Daemon-side formatter runs allowed per branch; past it the leaf is asked, as before.
 pub(super) const AUTOFMT_CAP: i64 = 3;
@@ -233,8 +234,12 @@ async fn dirty(worktree: &Path) -> Result<bool, String> {
 
 /// Formats the worktree with `steps` and commits what changed. Answers whether anything changed.
 /// Work the node left uncommitted is checkpointed first, so the formatter's diff is its own commit.
-pub(super) async fn format_worktree(worktree: &Path, steps: &[Step]) -> Result<bool, String> {
-    crate::execution::worktree::checkpoint(worktree)
+pub(super) async fn format_worktree(
+    worktree: &Path,
+    steps: &[Step],
+    ctx: &CheckpointContext,
+) -> Result<bool, String> {
+    crate::execution::worktree::checkpoint_for(worktree, ctx)
         .await
         .map_err(|error| error.to_string())?;
     for step in steps {
@@ -261,7 +266,7 @@ pub(super) fn manifest_probe(worktree: &Path) -> impl Fn(&str) -> bool + '_ {
 /// Formats a branch for the formatter steps a red gate named. True when that produced a commit
 /// (so a re-gate sees a new HEAD); false when nothing changed, the budget is spent or it failed:
 /// the caller then falls back to asking the leaf.
-pub(super) async fn heal_red(branch: &Branch, findings: &str) -> bool {
+pub(super) async fn heal_red(branch: &Branch, findings: &str, ctx: &CheckpointContext) -> bool {
     if !fmt_only(findings) || !allowed(branch) {
         return false;
     }
@@ -269,7 +274,7 @@ pub(super) async fn heal_red(branch: &Branch, findings: &str) -> bool {
         return false;
     };
     let steps = steps_from_findings(findings, dir_probe(worktree));
-    match format_worktree(worktree, &steps).await {
+    match format_worktree(worktree, &steps, ctx).await {
         Ok(changed) => changed,
         Err(error) => {
             tracing::warn!(%error, worktree = %worktree.display(), "heal_red: formatter failed");
@@ -281,7 +286,7 @@ pub(super) async fn heal_red(branch: &Branch, findings: &str) -> bool {
 /// Formats the Rust paths a branch owns before its gate. `Ok(true)` when a commit was made,
 /// `Ok(false)` when nothing ran (no worktree, not allowed, no steps) or nothing changed, `Err`
 /// when the formatter failed (also logged).
-pub(super) async fn format_owned(branch: &Branch) -> Result<bool, String> {
+pub(super) async fn format_owned(branch: &Branch, ctx: &CheckpointContext) -> Result<bool, String> {
     let Some(worktree) = branch.worktree.as_deref().map(Path::new) else {
         return Ok(false);
     };
@@ -292,7 +297,7 @@ pub(super) async fn format_owned(branch: &Branch) -> Result<bool, String> {
     if steps.is_empty() {
         return Ok(false);
     }
-    let result = format_worktree(worktree, &steps).await;
+    let result = format_worktree(worktree, &steps, ctx).await;
     if let Err(error) = &result {
         tracing::warn!(%error, worktree = %worktree.display(), "format_owned: formatter failed");
     }

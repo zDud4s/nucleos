@@ -43,6 +43,14 @@ func (m MediaAttacher) Attach(ctx context.Context, ev *contract.Event, msg *tele
 	return AttachMedia(ctx, ev, msg, m.Bot, m.Up)
 }
 
+type pollOptions struct{ capture *Capture }
+
+// PollOption tunes Poll.
+type PollOption func(*pollOptions)
+
+// WithCapture routes replies to capture requests to c instead of the core's event stream.
+func WithCapture(c *Capture) PollOption { return func(o *pollOptions) { o.capture = c } }
+
 // Poll long-polls getUpdates and hands each update to the core, one at a time and in order.
 //
 // The offset policy is the opposite of v1: it is persisted only after the core settled the update
@@ -52,7 +60,11 @@ func (m MediaAttacher) Attach(ctx context.Context, ev *contract.Event, msg *tele
 //
 // Poll returns nil when ctx ends, and an error when the Sink gives up without ctx ending (a fatal
 // 401/403/409); in both cases the offset has not moved past the unsettled update.
-func Poll(ctx context.Context, bot PollBot, att Attacher, sink Poster, offsetPath string, clk clock.Clock) error {
+func Poll(ctx context.Context, bot PollBot, att Attacher, sink Poster, offsetPath string, clk clock.Clock, opts ...PollOption) error {
+	var po pollOptions
+	for _, o := range opts {
+		o(&po)
+	}
 	offset := config.LoadOffset(offsetPath)
 	retry := backoff.Updates.Base
 	wait := func() bool {
@@ -76,7 +88,7 @@ func Poll(ctx context.Context, bot PollBot, att Attacher, sink Poster, offsetPat
 		retry = backoff.Updates.Base
 
 		for _, u := range updates {
-			advance, err := handleUpdate(ctx, att, sink, u)
+			advance, err := handleUpdate(ctx, att, sink, po.capture, u)
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil
@@ -101,7 +113,11 @@ func Poll(ctx context.Context, bot PollBot, att Attacher, sink Poster, offsetPat
 
 // handleUpdate translates and delivers one update. advance reports whether the offset may move past
 // it. A non-nil error is the Sink giving up (or ctx ending inside Post).
-func handleUpdate(ctx context.Context, att Attacher, sink Poster, u telegram.Update) (advance bool, err error) {
+func handleUpdate(ctx context.Context, att Attacher, sink Poster, capture *Capture, u telegram.Update) (advance bool, err error) {
+	// A reply to a capture request is answered here, before any media is fetched and without a turn.
+	if handled, adv := capture.handle(ctx, u); handled {
+		return adv, nil
+	}
 	var (
 		ev         contract.Event
 		needsMedia bool

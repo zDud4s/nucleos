@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::Path;
 
 use sqlx::SqlitePool;
 
@@ -60,6 +61,7 @@ pub(super) fn node_prompt(
     tree_job_id: &str,
     kind: &str,
     task: &str,
+    report_file: Option<&Path>,
 ) -> String {
     if task.starts_with(NODE_PROMPT_HEADER) {
         return task.to_owned();
@@ -73,7 +75,7 @@ pub(super) fn node_prompt(
             " Its tree job id is {tree_job_id}: when you call tree_branch_start, pass `id` = {tree_job_id} (the tree job id, not a node id) and `node_id` = {node_id}."
         )
     };
-    let report = report_format(node_id, root_id);
+    let report = report_format(node_id, root_id, report_file);
     let size_rule = if leaf {
         LEAF_TOO_LARGE.to_owned()
     } else {
@@ -89,10 +91,17 @@ pub(super) fn node_prompt(
     } else {
         (ORCHESTRATOR_READING_RULES, String::new())
     };
+    let report_where = match report_file {
+        Some(path) => format!(
+            "Write the handoff file at `{}` with the Write tool (the daemon allows exactly that path; it is outside your worktree, so nothing of it is committed) and pass the same absolute path as handoff_path.",
+            path.display()
+        ),
+        None => "Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.".to_owned(),
+    };
     format!(
         "{HEADLESS_PREAMBLE}
 
-You are the agent for NucleOS tree node {node_id}.{job_line} {size_rule} Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.
+You are the agent for NucleOS tree node {node_id}.{job_line} {size_rule} Finish by writing a handoff file and calling node_close. {report_where}
 
 {DONE_RULES}
 
@@ -108,11 +117,15 @@ You are the agent for NucleOS tree node {node_id}.{job_line} {size_rule} Finish 
     )
 }
 
-/// The report a node writes to `.nucleos-report.md`: the shape `report::parse_report` reads and
+/// The report a node writes (to `report_file`, else `.nucleos-report.md` in its worktree): the shape `report::parse_report` reads and
 /// `report::report_problems` checks, with this node's id and its tree's root id filled in.
-fn report_format(node_id: &str, root_id: &str) -> String {
+fn report_format(node_id: &str, root_id: &str, report_file: Option<&Path>) -> String {
+    let location = match report_file {
+        Some(path) => format!("`{}`", path.display()),
+        None => "`.nucleos-report.md` in your worktree".to_owned(),
+    };
     format!(
-        "Write your report to `.nucleos-report.md` in your worktree, in this shape. The daemon checks \
+        "Write your report to {location}, in this shape. The daemon checks \
 it, and `node_close` refuses a report that breaks a rule below:\n\n\
 # Node Handoff\n\n\
 Node ID: {node_id}\n\
@@ -451,12 +464,23 @@ pub async fn launch_resuming(
                     .fetch_optional(pool)
                     .await?
                     .unwrap_or((None, None, String::new()));
+            // The report goes to the node's own file in the project's state dir (the same lookup
+            // as the PreToolUse hook), outside the worktree; without a state dir the worktree
+            // fallback stays.
+            let root_id = root_id.as_deref().unwrap_or("");
+            let report_file = state
+                .machine_config_root
+                .as_deref()
+                .zip(project_id.as_deref())
+                .and_then(|(root, project)| crate::project::state::dir(root, project))
+                .map(|dir| crate::conductor::context::handoff_path(&dir, root_id, node_id));
             node_prompt(
                 node_id,
-                root_id.as_deref().unwrap_or(""),
+                root_id,
                 tree_job_id.as_deref().unwrap_or(""),
                 &kind,
                 &prompt,
+                report_file.as_deref(),
             )
         }
         None => prompt,
@@ -1338,6 +1362,7 @@ mod tests {
             "job-1",
             "orchestrator",
             "Implement the parser.",
+            None,
         );
 
         assert!(prompt.contains("node-abc-123"), "{prompt}");
@@ -1347,8 +1372,8 @@ mod tests {
     }
 
     /// `node_prompt` takes the tree job's id as its third argument,
-    /// `node_prompt(node_id, root_id, tree_job_id, kind, task)`. The branch routes key on the job id,
-    /// not on the node uuid.
+    /// `node_prompt(node_id, root_id, tree_job_id, kind, task, report_file)`. The branch routes key on
+    /// the job id, not on the node uuid.
     #[test]
     fn a_node_prompt_names_its_tree_job_id() {
         let prompt = node_prompt(
@@ -1357,6 +1382,7 @@ mod tests {
             "proof-slugify-3",
             "orchestrator",
             "Implement the parser.",
+            None,
         );
 
         assert!(prompt.contains("proof-slugify-3"), "{prompt}");
@@ -1365,11 +1391,41 @@ mod tests {
         assert!(prompt.contains("Implement the parser."), "{prompt}");
     }
 
+    #[test]
+    fn a_node_prompt_names_the_state_dir_report_and_drops_the_worktree_one() {
+        let report = Path::new("C:/state/projects/p1/nodes/root-9/node-abc-123.md");
+        let prompt = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "leaf",
+            "Task.",
+            Some(report),
+        );
+
+        assert!(prompt.contains(&report.display().to_string()), "{prompt}");
+        assert!(!prompt.contains(".nucleos-report.md"), "{prompt}");
+    }
+
+    #[test]
+    fn a_node_prompt_without_a_state_dir_keeps_the_worktree_report() {
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "leaf", "Task.", None);
+
+        assert!(prompt.contains(".nucleos-report.md"), "{prompt}");
+    }
+
     /// RED: `node_prompt` must name the root of the tree in the report it asks for, as
     /// `Root ID: <root_id>`, so the node does not have to look it up in `node_tree`.
     #[test]
     fn a_node_prompt_names_its_root_id() {
-        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "orchestrator", "Task.");
+        let prompt = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "orchestrator",
+            "Task.",
+            None,
+        );
 
         assert!(prompt.contains("Root ID: root-9"), "{prompt}");
         assert!(!prompt.contains("node_tree shows"), "{prompt}");
@@ -1390,6 +1446,7 @@ mod tests {
             "job-1",
             "orchestrator",
             "Implement the parser.",
+            None,
         );
 
         assert!(prompt.contains("node-abc-123"), "{prompt}");
@@ -1410,33 +1467,48 @@ mod tests {
             "job-1",
             "orchestrator",
             "Implement the parser.",
+            None,
         );
         assert_eq!(first.matches(TICKET_RULES).count(), 1, "{first}");
         let report_at = first.find("## Summary").expect("report format");
         let rules_at = first.find(TICKET_RULES).expect("rules");
         let task_at = first.find("Implement the parser.").expect("task");
         assert!(report_at < rules_at && rules_at < task_at, "{first}");
-        let relaunch = node_prompt("node-abc-123", "root-9", "job-1", "orchestrator", &first);
+        let relaunch = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "orchestrator",
+            &first,
+            None,
+        );
         assert_eq!(relaunch, first);
         assert_eq!(relaunch.matches(TICKET_RULES).count(), 1);
     }
 
     #[test]
     fn a_leaf_prompt_does_not_name_tree_branch_start_and_mentions_the_budget() {
-        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "leaf", "Implement it.");
+        let prompt = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "leaf",
+            "Implement it.",
+            None,
+        );
 
         assert!(!prompt.contains("tree_branch_start"), "{prompt}");
         assert!(prompt.contains("exceeded the leaf budget"), "{prompt}");
         assert!(prompt.contains("node_close"), "{prompt}");
         assert!(prompt.contains("Implement it."), "{prompt}");
-        let relaunch = node_prompt("node-abc-123", "root-9", "job-1", "leaf", &prompt);
+        let relaunch = node_prompt("node-abc-123", "root-9", "job-1", "leaf", &prompt, None);
         assert_eq!(relaunch, prompt);
     }
 
     #[test]
     fn every_node_prompt_opens_with_the_headless_preamble() {
         for kind in ["leaf", "orchestrator"] {
-            let prompt = node_prompt("node-abc-123", "root-9", "job-1", kind, "Task.");
+            let prompt = node_prompt("node-abc-123", "root-9", "job-1", kind, "Task.", None);
             assert!(prompt.starts_with(HEADLESS_PREAMBLE), "{kind}: {prompt}");
             assert!(prompt.contains("wait_advice"), "{kind}");
             assert_eq!(prompt.matches(HEADLESS_PREAMBLE).count(), 1, "{kind}");
@@ -1453,7 +1525,7 @@ mod tests {
 
     #[test]
     fn a_leaf_prompt_carries_the_budget_rules_the_cargo_rule_and_red_expected() {
-        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "leaf", "Task.");
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "leaf", "Task.", None);
         assert!(prompt.contains("core/MODULE_MAP.md"), "{prompt}");
         assert!(!prompt.contains("read core/AGENTS.md"), "{prompt}");
         assert!(prompt.contains("do not need .nucleos/workflow/workflow.md or dispatch.md"));
@@ -1466,7 +1538,14 @@ mod tests {
 
     #[test]
     fn an_orchestrator_prompt_reads_only_one_section_of_dispatch() {
-        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "orchestrator", "Task.");
+        let prompt = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "orchestrator",
+            "Task.",
+            None,
+        );
         assert!(
             prompt.contains("\"One controller per node\" section"),
             "{prompt}"

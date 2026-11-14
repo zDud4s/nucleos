@@ -233,6 +233,8 @@ pub const TASK_TOOL_NAMES: [&str; 6] = [
 pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "create_job",
     "create_run",
+    "decision_answer",
+    "decision_list",
     "get_job",
     "get_run",
     "list_jobs",
@@ -447,6 +449,26 @@ pub fn tree_leaf_verify_refusal(served: &McpBox) -> Option<String> {
     })
 }
 
+/// Why `decision_answer` is refused here, when it is.
+///
+/// Answering a tree decision is an owner-level act: a run of a tree job (leaf, orchestrator, rescue
+/// or decision run) must never answer its own or another node's question. The daemon already
+/// refuses it (a run's key reaches only a short list of routes, and the decision routes are not on
+/// it); this is the second fence, read from the same sign `tree_leaf_verify_refusal` uses: the
+/// worktree is on a `tree/…` branch.
+pub fn tree_run_decision_refusal(served: &McpBox) -> Option<String> {
+    let McpBox::Worktree(own) = served else {
+        return None;
+    };
+    let branch = checked_out_branch(own)?;
+    branch.starts_with(TREE_BRANCH_PREFIX).then(|| {
+        "decision_answer and decision_list are not available to a run of a tree job: answering a decision is the \
+         owner's act, so a node cannot answer its own or another node's question. Record the \
+         question in your handoff and let the conductor answer it."
+            .to_owned()
+    })
+}
+
 /// What a `verify_status` answer becomes in this box. The worktree box reads only tickets of its
 /// own worktree: a ticket of another worktree, or one that names none, is refused with the same
 /// words as a ticket that does not exist, so the refusal does not reveal that it does. The other
@@ -581,6 +603,29 @@ mod tests {
         assert!(refusal.contains("controller"), "{refusal}");
     }
 
+    /// A node of a tree job never answers a decision: the worktree of a `tree/…` branch is refused.
+    #[test]
+    fn decision_answer_is_refused_to_a_tree_run() {
+        let dir = linked_worktree("ref: refs/heads/tree/job-1/api\n");
+        let own = dir.path().join("tree").to_string_lossy().into_owned();
+        let refusal = tree_run_decision_refusal(&McpBox::Worktree(own))
+            .expect("a tree branch worktree refuses decision_answer");
+        assert!(refusal.contains("owner"), "{refusal}");
+    }
+
+    #[test]
+    fn decision_answer_is_allowed_to_the_conductor() {
+        let dir = linked_worktree("ref: refs/heads/feat/thing\n");
+        let own = dir.path().join("tree").to_string_lossy().into_owned();
+        assert_eq!(tree_run_decision_refusal(&McpBox::Worktree(own)), None);
+        assert_eq!(
+            tree_run_decision_refusal(&McpBox::Worktree("/no/such/dir".to_owned())),
+            None
+        );
+        assert_eq!(tree_run_decision_refusal(&McpBox::All), None);
+        assert_eq!(tree_run_decision_refusal(&McpBox::JobNode(1)), None);
+    }
+
     #[test]
     fn verify_is_allowed_in_an_ordinary_worktree_and_in_the_other_boxes() {
         let dir = linked_worktree("ref: refs/heads/feat/thing\n");
@@ -683,6 +728,14 @@ mod tests {
             ("vcs_request", Method::POST, "/vcs/requests", false),
             ("vcs_ticket", Method::GET, "/vcs/requests/{id}", false),
             ("github_read", Method::POST, "/github/requests", false),
+            // Owner-level: answering (and reading) a tree decision is the conductor's act.
+            (
+                "decision_answer",
+                Method::POST,
+                "/tree-decisions/{id}/answer",
+                false,
+            ),
+            ("decision_list", Method::GET, "/tree-decisions", false),
         ];
         for (tool, method, route, reachable) in corpus {
             assert!(

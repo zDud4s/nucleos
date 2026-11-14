@@ -6,6 +6,8 @@ use super::*;
 pub(super) struct RunParams {
     pub(super) project_id: String,
     pub(super) prompt: String,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
 }
 
 /// The body of `POST /trees`, field for field (`TreeBody` in `tree_job/http.rs`).
@@ -23,6 +25,8 @@ pub(super) struct TreeLaunchParams {
     /// `integration` (the default here) lands the finished work into the project's integration
     /// branch; `hold` leaves it on `feature_branch` for the owner to land.
     pub(super) land: Option<String>,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
 }
 
 /// What `tree_launch` sends when the caller names no landing mode. Owner, 2026-11-04: a tree must
@@ -46,13 +50,31 @@ impl TreeLaunchParams {
             "contract": self.contract,
             "dirty_owner_files": self.dirty_owner_files,
             "land": land,
+            "launching_session_id": self.session_id,
         })
     }
 }
 
+/// `tree_status`: the tree job, how much to answer, and optionally one node.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
-pub(super) struct TreeIdParams {
+pub(super) struct TreeStatusParams {
+    /// The tree job id it was launched with.
     pub(super) id: String,
+    /// "summary" (default): a bounded answer. "full": the whole job, uncapped.
+    #[serde(default)]
+    pub(super) detail: Option<String>,
+    /// Answer only the branch bound to this node id (or named this), finished or not.
+    #[serde(default)]
+    pub(super) node_id: Option<String>,
+}
+
+/// `get_run`: the run, and how much to answer.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct RunGetParams {
+    pub(super) id: i64,
+    /// "summary" (default): id, status, timestamps, outcome, long text cut. "full": the whole run.
+    #[serde(default)]
+    pub(super) detail: Option<String>,
 }
 
 /// The body of `POST /trees/{id}/abandon`, with the job id lifted out into the path.
@@ -64,6 +86,24 @@ pub(super) struct TreeAbandonParams {
     pub(super) reason: String,
     /// Abandon even though branches are at work; they are left as they are. Absent is false.
     pub(super) force: Option<bool>,
+}
+
+/// The body of `POST /tree-decisions/{id}/answer`, with the decision id lifted out into the path.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct DecisionAnswerParams {
+    /// The decision to answer (`d-…`, as `decision_list` or `tree_status` shows it).
+    pub(super) id: String,
+    /// The answer: it is handed to the parked branch's node when it resumes.
+    pub(super) answer: String,
+}
+
+/// The query of `GET /tree-decisions`.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct DecisionListParams {
+    /// Only the decisions of this tree job. Absent is every tree.
+    pub(super) tree_id: Option<String>,
+    /// `open` (the default) or `answered`; `all` lists both.
+    pub(super) status: Option<String>,
 }
 
 /// The body of `POST /trees/{id}/branch_start`, with the job id lifted out into the path.
@@ -91,6 +131,9 @@ pub(super) struct TreeBranchStartParams {
     /// Your estimate of the tokens building this piece takes: a positive number. Pass it on every
     /// piece; it decides leaf or orchestrator and is kept on the branch.
     pub(super) estimate_tokens: Option<i64>,
+    /// Files the branch's agent should start from (paths). Default none.
+    #[serde(default)]
+    pub(super) pointers: Vec<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -604,6 +647,9 @@ pub(super) struct NodeOpenParams {
     /// Paths this node owns. They may not overlap a running sibling. Default none.
     #[serde(default)]
     pub(super) owned_paths: Vec<String>,
+    /// Files this node should start from (paths). Default none.
+    #[serde(default)]
+    pub(super) pointers: Vec<String>,
     /// The token budget for this node. Absent takes the daemon default.
     pub(super) budget_tokens: Option<i64>,
     /// The workflow task this node belongs to.
@@ -631,6 +677,8 @@ pub(super) struct NodeUpdateParams {
     /// Globs you need beyond your owned paths; accepted unless a sibling owns them. A glob you
     /// already own, or a shared file, is dropped.
     pub(super) widen_paths: Option<Vec<String>>,
+    /// Files this node should start from (paths); replaces the stored list.
+    pub(super) pointers: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -651,6 +699,9 @@ pub(super) struct NodeTreeParams {
     pub(super) root_id: String,
     /// "brief" (default) or "full".
     pub(super) view: Option<String>,
+    /// "summary" (default): a bounded answer, done nodes counted not listed. "full": uncapped.
+    #[serde(default)]
+    pub(super) detail: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]

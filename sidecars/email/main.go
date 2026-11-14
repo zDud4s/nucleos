@@ -1,4 +1,4 @@
-// Command email-sidecar reads one IMAP mailbox and hands what is new to the núcleo.
+// Command nucleos-email reads one IMAP mailbox and hands what is new to the núcleo.
 //
 // It is deliberately the dumbest process in the system: it holds no state, writes nothing to the
 // mailbox, and makes no decision about what any message means. The cursor lives in the núcleo's
@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	log.SetPrefix("email-sidecar: ")
+	log.SetPrefix("nucleos-email: ")
 	// Stateless (see the package comment), so the orderly shutdown when the daemon is gone is to exit.
 	watchLifeline(os.Getenv, os.Stdin, func() { os.Exit(0) })
 	cfg, err := config.Load()

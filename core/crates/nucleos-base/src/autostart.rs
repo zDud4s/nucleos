@@ -262,13 +262,19 @@ fn repoint_args(exe_path: &Path) -> Vec<String> {
         "/TN".to_owned(),
         TASK_NAME.to_owned(),
         "/TR".to_owned(),
-        format!(
-            "\"{}\" --headless \"{}\" {}",
-            conhost_path(),
-            exe_path.to_string_lossy(),
-            crate::supervise::SUPERVISE_FLAG
-        ),
+        action_command_line(exe_path),
     ]
+}
+
+/// PURE: the `/TR` string: the quoted exe, then the supervising flag. No `conhost`: the supervisor
+/// must be the root of the process tree, and it hides its own console (see `supervisor::run`).
+#[cfg(any(windows, test))]
+fn action_command_line(exe_path: &Path) -> String {
+    format!(
+        "\"{}\" {}",
+        exe_path.to_string_lossy(),
+        crate::supervise::SUPERVISE_FLAG
+    )
 }
 
 /// PURE: `schtasks` arguments that create the boot task. The password is the one argument that
@@ -464,33 +470,29 @@ fn repoint(exe_path: &Path) -> std::io::Result<()> {
 /// A task from an older build (default 72h limit, or the inert `RestartOnFailure` block, no
 /// `--supervise`) names the same exe, so the exe alone would keep it forever; requiring `PT0S` and
 /// the supervising flag at the end of the action's arguments makes it re-register.
-/// `--headless` is required too: a task whose action runs the exe directly (the pre-conhost format)
-/// opens a console window, so it must not count as registered and is re-registered with `/F`.
+/// The action must be the exe itself with exactly the supervising flag: a task from the
+/// `conhost --headless <exe>` era names the same exe but makes conhost the root of the process tree,
+/// so it must not count as registered and is re-registered with `/F`.
 #[cfg(any(windows, test))]
 fn xml_matches_task(xml: &str, exe_path: &Path) -> bool {
     let lower = xml.to_lowercase();
-    // The action must be the conhost launcher and the exe must sit in its arguments; the exe path
-    // appearing anywhere else in the document (a description, a forged action) proves nothing.
-    // If `SystemRoot` differs at the next start, the task simply re-registers.
+    // The exe must be the action's `<Command>`; the exe path appearing anywhere else in the
+    // document (a description, a forged action) proves nothing.
     let (Some(command), Some(arguments)) = (
         element_text(&lower, "command"),
         element_text(&lower, "arguments"),
     ) else {
         return false;
     };
-    let escaped_conhost = xml_escape(&conhost_path()).to_lowercase();
-    let command_is_conhost = command == escaped_conhost
-        || command == escaped_conhost.replace("&apos;", "'")
-        || command == conhost_path().to_lowercase();
     // `schtasks /Query` may echo an apostrophe either escaped or literal.
     let escaped_exe = xml_escape(&exe_path.to_string_lossy()).to_lowercase();
-    let exe_in_arguments =
-        arguments.contains(&escaped_exe) || arguments.contains(&escaped_exe.replace("&apos;", "'"));
-    command_is_conhost
-        && exe_in_arguments
-        && lower.contains("--headless")
+    let command_is_exe = command == escaped_exe
+        || command == escaped_exe.replace("&apos;", "'")
+        || command == exe_path.to_string_lossy().to_lowercase();
+    command_is_exe
         && lower.contains("pt0s")
-        && arguments.ends_with(&format!(" {}", crate::supervise::SUPERVISE_FLAG))
+        && !lower.contains("--headless")
+        && arguments == crate::supervise::SUPERVISE_FLAG
 }
 
 /// PURE: the trimmed text of the first `<tag>…</tag>` in already-lowercased XML.
@@ -594,20 +596,6 @@ fn working_directory_for(exe_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// The console host the task launches the daemon through. `conhost.exe --headless <exe>` runs a
-/// console-subsystem program with no window, so the daemon binary's subsystem stays untouched.
-#[cfg(windows)]
-fn conhost_path() -> String {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    format!(r"{root}\System32\conhost.exe")
-}
-
-/// Test-only stand-in so the task XML is deterministic on every host.
-#[cfg(all(test, not(windows)))]
-fn conhost_path() -> String {
-    r"C:\Windows\System32\conhost.exe".to_string()
-}
-
 /// PURE: the login task, bound to `user` (`DOMAIN\name`). A `LogonTrigger` and a `Principal` with
 /// no `UserId` mean "any user", and registering that needs admin rights.
 #[cfg(any(windows, test))]
@@ -674,12 +662,11 @@ fn task_document(exe_path: &Path, trigger: &str, logon: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{}</Command>
-      <Arguments>--headless "{}" {}</Arguments>
+      <Arguments>{}</Arguments>
       <WorkingDirectory>{}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>"#,
-        xml_escape(&conhost_path()),
         xml_escape(&exe_path.to_string_lossy()),
         crate::supervise::SUPERVISE_FLAG,
         xml_escape(&working_directory.to_string_lossy())
@@ -1094,9 +1081,9 @@ mod tests {
 
     /// The daemon is a long-lived process: the task must never be killed by the default 72h limit.
     /// `<Hidden>true</Hidden>` hides the task in the Task Scheduler UI; the console window is
-    /// suppressed separately, by launching through `conhost.exe --headless`. `RestartOnFailure` is
-    /// gone: measured, it restarts nothing here (the Task Scheduler ignores a non-zero exit code
-    /// and `conhost --headless` returns 0), and `--supervise` does the restarting now, so a block
+    /// suppressed separately, by the supervisor freeing its own console (the exe is the action, so
+    /// the supervisor is the root of the process tree). `RestartOnFailure` is gone: measured, it
+    /// restarts nothing here (the Task Scheduler ignored a non-zero exit code), and `--supervise` does the restarting now, so a block
     /// that could one day start working would run two restart loops on top of each other.
     #[test]
     fn task_xml_has_no_time_limit_is_hidden_and_leaves_restarting_to_the_supervisor() {
@@ -1159,17 +1146,47 @@ mod tests {
     }
 
     #[test]
-    fn the_task_runs_the_daemon_through_conhost_headless_in_supervising_mode() {
+    fn the_task_runs_the_exe_directly_in_supervising_mode_so_the_supervisor_is_the_tree_root() {
         let exe = r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe";
         let xml = task_xml(Path::new(exe));
-        let command = format!("<Command>{}</Command>", conhost_path());
-        assert!(xml.contains(&command));
-        assert!(xml.contains(&format!(
-            "<Arguments>--headless \"{exe}\" --supervise</Arguments>"
-        )));
-        assert!(!xml.contains(&format!("<Command>{exe}</Command>")));
-        #[cfg(not(windows))]
-        assert!(xml.contains(r"<Command>C:\Windows\System32\conhost.exe</Command>"));
+        assert!(xml.contains(&format!("<Command>{exe}</Command>")));
+        assert!(xml.contains("<Arguments>--supervise</Arguments>"));
+        assert!(!xml.to_lowercase().contains("conhost"));
+        assert!(!xml.contains("--headless"));
+    }
+
+    /// The `/TR` string `schtasks /Change` gets for a moved exe: quoted exe, then the flag, nothing
+    /// else in front.
+    #[test]
+    fn the_action_command_line_is_the_quoted_exe_and_the_supervising_flag() {
+        assert_eq!(
+            action_command_line(Path::new(r"C:\new place\nucleos-core.exe")),
+            r#""C:\new place\nucleos-core.exe" --supervise"#
+        );
+    }
+
+    /// The task as the conhost build registered it: right exe, right flag, but conhost is the
+    /// command, so conhost would stay the root of the tree. It must re-register.
+    #[test]
+    fn a_conhost_headless_task_is_re_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let current = task_xml(exe);
+        let conhost = current
+            .replace(
+                r"<Command>C:\x\nucleos-core.exe</Command>",
+                r"<Command>C:\Windows\System32\conhost.exe</Command>",
+            )
+            .replace(
+                "<Arguments>--supervise</Arguments>",
+                r#"<Arguments>--headless "C:\x\nucleos-core.exe" --supervise</Arguments>"#,
+            );
+        assert_ne!(
+            conhost, current,
+            "the fixture must actually change the task"
+        );
+        assert!(conhost.contains("conhost.exe"));
+        assert!(!xml_matches_task(&conhost, exe));
+        assert!(xml_matches_task(&current, exe));
     }
 
     /// The task as the previous build registered it: windowless through conhost, restart block and
@@ -1180,7 +1197,7 @@ mod tests {
         let exe = Path::new(r"C:\x\nucleos-core.exe");
         let current = task_xml(exe);
         let previous = current
-            .replace(" --supervise", "")
+            .replace("<Arguments>--supervise</Arguments>", "<Arguments></Arguments>")
             .replace(
                 "  </Settings>",
                 "    <RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>99</Count>\n    </RestartOnFailure>\n  </Settings>",
@@ -1201,7 +1218,10 @@ mod tests {
         let exe = Path::new(r"C:\x\nucleos-core.exe");
         let genuine = task_xml(exe);
         let forged = genuine
-            .replace(" --supervise</Arguments>", "</Arguments>")
+            .replace(
+                "<Arguments>--supervise</Arguments>",
+                "<Arguments></Arguments>",
+            )
             .replace("</Exec>", "<Description>--supervise</Description></Exec>");
         assert_ne!(forged, genuine, "the fixture must actually change the task");
         assert!(forged.contains("--supervise"));
@@ -1240,49 +1260,38 @@ mod tests {
         ));
     }
 
-    /// RED for the `<Command>` check: the exe path and `--headless` appearing anywhere in the XML
-    /// is not enough, the action must be the conhost launcher.
+    /// The exe path appearing elsewhere in the XML is not enough, the `<Command>` must be the exe.
     #[test]
-    fn a_task_whose_command_is_not_conhost_is_not_registered() {
+    fn a_task_whose_command_is_not_the_exe_is_not_registered() {
         let exe = Path::new(r"C:\x\nucleos-core.exe");
         let genuine = task_xml(exe);
+        // The exe stays in the document (as a comment), only the action's command changes.
         let forged = genuine.replace(
-            &format!("<Command>{}</Command>", conhost_path()),
-            r"<Command>C:\Windows\System32\cmd.exe</Command>",
+            r"<Command>C:\x\nucleos-core.exe</Command>",
+            r"<Command>C:\Windows\System32\cmd.exe</Command><!-- C:\x\nucleos-core.exe -->",
         );
         assert_ne!(
             forged, genuine,
             "the fixture must actually change the command"
         );
-        assert!(forged.contains("--headless"));
+        assert!(forged.contains("--supervise"));
         assert!(forged.contains(r"C:\x\nucleos-core.exe"));
         assert!(!xml_matches_task(&forged, exe));
     }
 
-    /// RED for the `<Arguments>` check: conhost is the command, but the exe path sits in another
-    /// element (here a `<Description>`), so the task would not launch this exe.
+    /// Extra arguments in front of the flag mean the exe is not run the way this build runs it.
     #[test]
-    fn a_task_with_conhost_but_the_exe_outside_arguments_is_not_registered() {
+    fn a_task_with_extra_arguments_is_not_registered() {
         let exe = Path::new(r"C:\x\nucleos-core.exe");
         let genuine = task_xml(exe);
-        let forged = genuine
-            .replace(
-                &format!(
-                    "<Arguments>--headless \"{}\" --supervise</Arguments>",
-                    exe.display()
-                ),
-                "<Arguments>--headless --supervise</Arguments>",
-            )
-            .replace(
-                "</Exec>",
-                r"<Description>C:\x\nucleos-core.exe</Description></Exec>",
-            );
+        let forged = genuine.replace(
+            "<Arguments>--supervise</Arguments>",
+            "<Arguments>--other --supervise</Arguments>",
+        );
         assert_ne!(
             forged, genuine,
             "the fixture must actually change the arguments"
         );
-        assert!(forged.contains(&format!("<Command>{}</Command>", conhost_path())));
-        assert!(forged.contains(r"C:\x\nucleos-core.exe"));
         assert!(!xml_matches_task(&forged, exe));
     }
 
@@ -1317,9 +1326,9 @@ mod tests {
         assert!(xml.contains(r"C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe"));
         assert!(
             xml.contains(
-                r#"<Arguments>--headless "C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe" --supervise</Arguments>"#
+                r#"<Command>C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe</Command>"#
             ),
-            "the escaped path must sit, quoted, in Arguments"
+            "the escaped path must sit in Command"
         );
         assert!(
             !xml.contains("Dev & Ops"),
@@ -1374,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn o_xml_da_tarefa_e_escrito_por_inteiro() {
+    fn the_task_xml_is_written_in_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("task.xml");
         let short_xml = "<a/>";
@@ -1651,7 +1660,7 @@ mod tests {
         assert!(
             args.last()
                 .unwrap()
-                .contains(r#"--headless "C:\new place\nucleos-core.exe" --supervise"#),
+                .contains(r#""C:\new place\nucleos-core.exe" --supervise"#),
             "{args:?}"
         );
         assert!(
@@ -1717,7 +1726,8 @@ mod tests {
             "{xml}"
         );
         assert!(
-            xml.contains(r#"--headless "C:\Apps\nucleos-core.exe" --supervise"#),
+            xml.contains(r#"<Command>C:\Apps\nucleos-core.exe</Command>"#)
+                && xml.contains("<Arguments>--supervise</Arguments>"),
             "{xml}"
         );
         assert!(xml_is_at_boot(&xml));

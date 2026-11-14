@@ -45,7 +45,7 @@ impl NucleosTools {
     /// **`All` must keep meaning "everything except the named job-node tools".** `run_stdio` serves
     /// the cloud assistant and council today and neither passes a box; a default that quietly
     /// filtered further would take tools away with nothing failing loudly, and the symptom — half
-    /// the app going silent — reads as the model behaving oddly. `sem_caixa_o_servidor_serve_tudo`
+    /// the app going silent — reads as the model behaving oddly. `with_no_box_the_server_serves_everything`
     /// is that guard.
     pub fn for_box(client: crate::daemon_client::DaemonClient, served: McpBox) -> Self {
         Self {

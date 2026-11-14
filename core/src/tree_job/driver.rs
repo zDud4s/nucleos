@@ -166,7 +166,11 @@ fn production_gate(state: &AppState) -> Option<GateFn> {
                 .get(&branch)
                 .and_then(|held| held.worktree.clone())
                 .ok_or_else(|| format!("branch {branch} has no worktree to gate"))?;
-            super::gate::gate_branch(&executor, &pool, &job_id, &branch, &worktree, GATE_WAIT).await
+            let ctx = super::checkpoint_ctx::for_branch(&job, &branch, true);
+            super::gate::gate_branch(
+                &executor, &pool, &job_id, &branch, &worktree, GATE_WAIT, &ctx,
+            )
+            .await
         })
     });
     Some(gate)
@@ -303,6 +307,17 @@ async fn branch_step(
     };
     match branch.state.as_str() {
         "building" | "fixing" | "reviewing" => at_work(state, job, name, gate, parks).await,
+        // A manual transition or a restart mid-gate leaves `gating` with no gate in flight:
+        // (re)start it. `spawn_gate` is a no-op while one is already running for the branch.
+        "gating" => {
+            let backing_off = super::retry::gate_backing_off(&branch.extra);
+            if let Some(gate) = gate
+                && !backing_off
+            {
+                spawn_gate(state, gate, &job.id, name);
+            }
+            Ok(())
+        }
         "red" => red(state, job, name, parks).await,
         "green" => merge(state, job, name, parks).await,
         _ => Ok(()),
@@ -392,7 +407,8 @@ async fn at_work(
                     .is_some_and(autofmt::blocked_asks_only_formatter);
             let mut formatted = false;
             if asks_formatter && autofmt::allowed(branch) {
-                let result = autofmt::format_owned(branch).await;
+                let ctx = super::checkpoint_ctx::for_branch(job, name, false);
+                let result = autofmt::format_owned(branch, &ctx).await;
                 // Every attempt is counted, whatever its result, so the budget bounds retries.
                 if let Some(held) = job.manifest.branches.get_mut(name) {
                     autofmt::count_run(held);
@@ -418,10 +434,11 @@ async fn at_work(
         _ => return Ok(()),
     }
     // Rust the branch owns is formatted before its gate, so a rustfmt red does not happen.
+    let owned_ctx = super::checkpoint_ctx::for_branch(job, name, false);
     if let Some(branch) = job.manifest.branches.get(name)
         && branch.layer != "docs"
         && autofmt::allowed(branch)
-        && matches!(autofmt::format_owned(branch).await, Ok(true))
+        && matches!(autofmt::format_owned(branch, &owned_ctx).await, Ok(true))
         && let Some(held) = job.manifest.branches.get_mut(name)
     {
         autofmt::count_run(held);
@@ -511,7 +528,8 @@ fn stopped_question(node: &str, branch: Option<&str>, outcome: &str) -> String {
 /// an implement node leaves its work uncommitted.
 async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, String> {
     if let Some(worktree) = &branch.worktree {
-        crate::execution::worktree::checkpoint(Path::new(worktree))
+        let ctx = super::checkpoint_ctx::for_branch(job, &branch.name, false);
+        crate::execution::worktree::checkpoint_for(Path::new(worktree), &ctx)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -690,7 +708,8 @@ async fn red(
 
     // A rustfmt-only red is deterministic: the daemon formats the branch itself and re-gates the new
     // HEAD (next tick, `at_work` sees the finished run). No leaf run, so no fix is counted.
-    if autofmt::heal_red(branch, &findings).await {
+    let heal_ctx = super::checkpoint_ctx::for_branch(job, name, false);
+    if autofmt::heal_red(branch, &findings, &heal_ctx).await {
         let held = job
             .manifest
             .branches
@@ -966,6 +985,11 @@ async fn merge(
     // Green is not enough: a gate that measured nothing (`unmeasured`) over an empty diff, or any
     // green over one, would merge nothing and read as done. Such a branch goes to the owner.
     if parked_as_no_change(pool, job, name, parks).await? {
+        return Ok(());
+    }
+    // An owner's answer to a fence refusal retries the merge on the head that was refused: when the
+    // head moved meanwhile, it is gated again first.
+    if super::path_fence::regate_if_moved(pool, job, name).await? {
         return Ok(());
     }
     if super::path_fence::parked_by_fence(pool, job, name, node, parks).await? {
@@ -3131,6 +3155,55 @@ pub(super) mod tests {
         fx.wait_branch_state(JOB, "api", "green").await;
         assert_eq!(gate.calls().len(), 1);
         assert_eq!(fx.branch(JOB, "api").await.gates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gating_branch_without_a_gate_in_flight_gets_its_gate_started() {
+        const JOB: &str = "drv-gating-restart";
+        let fx = Fixture::new().await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "gating", Some("api-node"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.run_ended("api-node", Some("done")).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Green]);
+
+        fx.tick(JOB, &gate).await;
+
+        wait_calls(&gate, 1).await;
+        assert_eq!(gate.calls(), vec![(JOB.to_owned(), "api".to_owned())]);
+        fx.wait_branch_state(JOB, "api", "green").await;
+    }
+
+    #[tokio::test]
+    async fn a_gating_branch_with_a_gate_in_flight_is_left_alone() {
+        const JOB: &str = "drv-gating-inflight";
+        let fx = Fixture::new().await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "gating", Some("api-node"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.run_ended("api-node", Some("done")).await;
+        let (gate, release) = FakeGate::held(GateVerdict::Green);
+        let short = Duration::from_secs(2);
+
+        fx.tick_within(JOB, &gate, short).await;
+        wait_calls(&gate, 1).await;
+        fx.tick_within(JOB, &gate, short).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gate.calls().len(), 1, "a gate in flight is not restarted");
+        assert_eq!(fx.branch(JOB, "api").await.state, "gating");
+
+        release.notify_one();
+        fx.wait_branch_state(JOB, "api", "green").await;
+        assert_eq!(gate.calls().len(), 1);
     }
 
     /// `api` (parent, its run done) with the given children as `(name, state)`.

@@ -382,6 +382,14 @@
       "minimum": 0,
       "type": "integer"
     },
+    "release_branch": {
+      "default": null,
+      "description": "The branch that only receives promotions of a commit the post-merge gate proved green; absent means off.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "repo_triggers": {
       "default": [],
       "items": {

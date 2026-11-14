@@ -562,6 +562,13 @@ pub async fn mirror_step(
     (out, next)
 }
 
+/// Where the mirror's turn cursor starts: just before the run that opened the session, so that run
+/// is mirrored; a session with no run yet (opened with the agent from the Web page) starts at 0, so
+/// the owning chat's first turn is mirrored too.
+fn mirror_start(run_id: Option<i64>) -> i64 {
+    run_id.map_or(0, |run| run - 1)
+}
+
 /// The mirror task: only a chat-owned session has a conversation to mirror. Ticks every second and
 /// ends when the row closes.
 async fn mirror(state: &AppState, row_id: i64) {
@@ -572,7 +579,7 @@ async fn mirror(state: &AppState, row_id: i64) {
         std::future::pending::<()>().await;
         return;
     };
-    let before = row.run_id.map_or(0, |run| run - 1);
+    let before = mirror_start(row.run_id);
     let said: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM chat_said_now WHERE chat_id = ?")
             .bind(&chat)
@@ -719,6 +726,65 @@ mod tests {
 
         assert_eq!(row.owner_chat_id.as_deref(), Some("c-web"));
         assert_eq!(owner_of(&db.pool, &row).await, Owner::Chat("c-web".into()));
+        db.close().await;
+    }
+
+    /// When both name a chat and they differ, the session's own `owner_chat_id` wins over the chat of
+    /// the run that opened it — the order `auth.rs` relies on.
+    #[tokio::test]
+    async fn owner_chat_id_is_preferred_over_the_runs_chat() {
+        let db = TempDb::new().await;
+        a_chat(&db.pool, "from-run").await;
+        a_chat(&db.pool, "from-column").await;
+        run_seven(&db.pool, "running", Some("from-run")).await;
+        let row = session_of(&db.pool, Some(7)).await;
+        assert_eq!(
+            owner_of(&db.pool, &row).await,
+            Owner::Chat("from-run".into())
+        );
+        crate::browser::set_owner_chat(&db.pool, row.id, "from-column")
+            .await
+            .expect("set owner");
+        let row = crate::browser::session_row(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner_of(&db.pool, &row).await,
+            Owner::Chat("from-column".into())
+        );
+        db.close().await;
+    }
+
+    /// A run-less session (opened from the Web page) is delivered to its chat with the page's url in
+    /// the prefix — the text is what tells the agent which session the person means.
+    #[tokio::test]
+    async fn a_runless_sessions_panel_text_reaches_its_chat_with_the_url_prefix() {
+        let db = TempDb::new().await;
+        let state = state_over(db.pool.clone(), BrowserRuntime::disabled());
+        let turns = crate::assistant_types::RecordingTurns::install(&state);
+        a_chat(&db.pool, "web-chat").await;
+        let row = session_of(&db.pool, None).await;
+        crate::browser::set_owner_chat(&db.pool, row.id, "web-chat")
+            .await
+            .unwrap();
+        let row = crate::browser::session_row(&db.pool, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        deliver(&state, &row, "look at this").await.expect("sent");
+
+        let calls = turns.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "web-chat");
+        assert_eq!(
+            calls[0].1,
+            format!(
+                "[browser panel · session {} · https://jira.example.org/login] look at this",
+                row.id
+            )
+        );
         db.close().await;
     }
 
@@ -1131,6 +1197,32 @@ mod tests {
 
         let (done, _) = mirror_step(&db.pool, "mirror-chat", cursor).await;
         assert!(done.is_empty(), "{done:?}");
+        db.close().await;
+    }
+
+    /// A session with no run starts the mirror at 0, so the first turn of its chat (which gets run
+    /// id 1 or later) is mirrored once; a session opened by a run starts just before that run.
+    #[tokio::test]
+    async fn a_runless_session_mirrors_from_before_the_first_turn() {
+        assert_eq!(mirror_start(None), 0);
+        assert_eq!(mirror_start(Some(7)), 6);
+
+        let db = TempDb::new().await;
+        a_chat(&db.pool, "fresh-chat").await;
+        let start = mirror_start(None);
+        let cursor = Cursor {
+            run: start,
+            person: start,
+            said: 0,
+        };
+        a_turn(&db.pool, 1, "fresh-chat", "first words", "first answer").await;
+
+        let (first, cursor) = mirror_step(&db.pool, "fresh-chat", cursor).await;
+        let texts: Vec<&str> = first.iter().filter_map(|m| m["text"].as_str()).collect();
+        assert!(texts.contains(&"first words"), "{first:?}");
+        assert!(texts.contains(&"first answer"), "{first:?}");
+        let (again, _) = mirror_step(&db.pool, "fresh-chat", cursor).await;
+        assert!(again.is_empty(), "{again:?}");
         db.close().await;
     }
 }

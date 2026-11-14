@@ -10,7 +10,14 @@ vi.mock("./client", async (original) => ({
 }));
 
 import { createAppQueryClient } from "../app/queryClient";
-import { useAllCaptures, useAnswerCapture, useDismissCapture, useOpenCaptures } from "./captures";
+import {
+  mostUrgentCapture,
+  useAllCaptures,
+  useAnswerCapture,
+  useDismissCapture,
+  useOpenCaptures,
+  type CaptureRequest,
+} from "./captures";
 
 beforeEach(() => {
   client.apiFetch.mockReset();
@@ -21,6 +28,26 @@ function wrapper() {
   return ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
 }
+
+describe("mostUrgentCapture", () => {
+  const row = (job_id: number, deadline: string, state: CaptureRequest["state"] = "open") =>
+    ({ job_id, deadline, state }) as CaptureRequest;
+
+  it("picks the open request with the earliest deadline", () => {
+    const rows = [
+      row(1, "2026-10-08T13:00:00+00:00"),
+      row(2, "2026-10-08T11:00:00+00:00"),
+      row(3, "2026-10-08T09:00:00+00:00", "expired"),
+    ];
+    expect(mostUrgentCapture(rows)).toBe("capture:2");
+  });
+
+  it("is undefined with nothing open or before the list answers", () => {
+    expect(mostUrgentCapture([])).toBeUndefined();
+    expect(mostUrgentCapture(undefined)).toBeUndefined();
+    expect(mostUrgentCapture([row(1, "2026-10-08T13:00:00+00:00", "dismissed")])).toBeUndefined();
+  });
+});
 
 describe("capture hooks", () => {
   it("reads the open requests from the bare route", async () => {

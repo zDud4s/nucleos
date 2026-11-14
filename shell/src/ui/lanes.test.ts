@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FEED_LANES, feedGravityOf, feedKindLeavesOpen, feedLaneKinds, feedLaneOf, feedMarkTone, feedOpenKinds } from "./lanes";
+import { FEED_LANES, feedGravityCounts, feedGravityOf, feedKindLeavesOpen, feedLaneKinds, feedLaneOf, feedMarkTone, feedOpenKinds } from "./lanes";
 import { readState, statesOf } from "./state-map";
 
 describe("the Feed's lanes", () => {
@@ -65,6 +65,46 @@ describe("a line's gravity", () => {
   it("an unknown kind is routine and drawn switched off, never guessed", () => {
     expect(feedGravityOf("nonesuch_kind")).toBe("routine");
     expect(feedMarkTone("nonesuch_kind")).toBe("off");
+  });
+});
+
+describe("gravity counts distinct subjects, not lines", () => {
+  const row = (kind: string, subject: string | null, run_id: number | null = null) => ({ kind, subject, run_id });
+
+  it("the same subject and kind counts once however many lines it wrote", () => {
+    const counts = feedGravityCounts([
+      row("work_tree_parked", "tree:a"),
+      row("work_tree_parked", "tree:a"),
+      row("work_tree_parked", "tree:a"),
+    ]);
+    expect(counts.asks).toBe(1);
+  });
+
+  it("different subjects count separately", () => {
+    const counts = feedGravityCounts([row("work_tree_parked", "tree:a"), row("work_tree_parked", "tree:b")]);
+    expect(counts.asks).toBe(2);
+  });
+
+  it("one subject with different kinds counts once per kind", () => {
+    const counts = feedGravityCounts([
+      row("run_interrupted", "run:1"),
+      row("run_failed_final", "run:1"),
+      row("run_interrupted", "run:1"),
+    ]);
+    expect(counts.held).toBe(1);
+    expect(counts.wrong).toBe(1);
+  });
+
+  it("a line without a subject falls back to its run, then to its kind", () => {
+    const counts = feedGravityCounts([
+      row("run_interrupted", null, 7),
+      row("run_interrupted", "run:7"),
+      row("run_interrupted", null, 8),
+      row("email_urgent", null),
+      row("email_urgent", null),
+    ]);
+    expect(counts.held).toBe(2);
+    expect(counts.asks).toBe(1);
   });
 });
 

@@ -256,7 +256,7 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                             .as_ref()
                             .map(|branch| branch.as_str())
                             .filter(|branch| *branch == target.as_str());
-                        let measured = match gate_the_merge(
+                        let measured = match gate_the_merge_into(
                             self.pool.as_ref(),
                             request.id,
                             &request.project_id,
@@ -267,6 +267,7 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                             land_target,
                             self.verify.as_ref(),
                             !steps.is_empty() && lands_on_the_integration_branch(request, target),
+                            Some(target.as_str()),
                         )
                         .await
                         {
@@ -430,11 +431,168 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 }
                 publish(project_root, target.as_str(), computed, deadline).await
             }
+            // Daemon-only: fast-forwards the release branch to the last green sha of `from`.
+            crate::execution::vcs::Op::Promote { from, to } => {
+                self.promote(request, from.as_str(), to.as_str(), deadline)
+                    .await
+            }
         }
     }
 }
 
 impl GitExecutor {
+    /// Moves the release branch (`to`) to the last sha the post-merge gate proved green on `from`.
+    ///
+    /// `to` must be the project's published `release_branch`. No green sha parks the request
+    /// (`AwaitingGate`, carrying the tip of `from`); the release branch already at the green sha is a
+    /// no-op success; a release branch that is not an ancestor of the green sha is never touched: the
+    /// request fails and the `release-diverged` incident opens. Otherwise it is a fast-forward through
+    /// the ordinary publish path, followed by a best-effort push of the release branch only.
+    async fn promote(
+        &self,
+        request: &crate::execution::vcs::ClaimedRequest,
+        from: &str,
+        to: &str,
+        deadline: std::time::Instant,
+    ) -> Outcome {
+        let fail = |reason: String| Outcome::Failed {
+            reason,
+            exit_code: None,
+            output_tail: String::new(),
+        };
+        let project_root = Path::new(&request.project_root);
+        let Some(pool) = self.pool.as_ref() else {
+            return fail(
+                "a promote needs the daemon's database, and this executor has none".to_owned(),
+            );
+        };
+        let rules = match crate::project::rules::autopilot(&request.project_id) {
+            Ok(rules) => rules,
+            Err(error) => {
+                return fail(format!(
+                    "the stored rules of this project could not be read, so nothing was promoted: {error}"
+                ));
+            }
+        };
+        if rules.release_branch() != Some(to) {
+            return fail(format!(
+                "{to} is not this project's release branch, so nothing was promoted"
+            ));
+        }
+        let from_tip = match revision(project_root, &format!("refs/heads/{from}"), deadline).await {
+            Ok(sha) => sha,
+            Err(outcome) => return outcome,
+        };
+        let green = match crate::verify::postgate::load(pool, &request.project_id).await {
+            Ok(Some(state)) if state.target == from => {
+                state.promotable_green(project_root, deadline).await
+            }
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    vcs_request_id = request.id,
+                    %error,
+                    "could not read the post-land gate's state; parking the promote"
+                );
+                None
+            }
+        };
+        let Some(green) = green else {
+            return Outcome::AwaitingGate {
+                sha: from_tip.clone(),
+                reason: format!(
+                    "{from} is at {from_tip}, and the post-land gate has no green sha for it yet; \
+                     the promote waits for the gate and goes by itself once there is one"
+                ),
+            };
+        };
+        let release_tip = match revision(project_root, &format!("refs/heads/{to}"), deadline).await
+        {
+            Ok(sha) => sha,
+            Err(outcome) => return outcome,
+        };
+        if release_tip == green {
+            return Outcome::Succeeded {
+                sha: Some(green),
+                output_tail: format!("{to} is already at the green sha"),
+            };
+        }
+        match is_ancestor(project_root, &release_tip, &green, deadline).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let detail = serde_json::json!({
+                    "release": to,
+                    "release_sha": release_tip,
+                    "from": from,
+                    "green": green,
+                });
+                if let Err(error) = crate::task_claims::machine::open_release_diverged_ticket(
+                    pool,
+                    &request.project_id,
+                    detail,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    tracing::warn!(vcs_request_id = request.id, %error, "could not open release-diverged");
+                }
+                return fail(format!(
+                    "{to} is at {release_tip}, which is not an ancestor of the green sha {green} of \
+                     {from}; {to} was not touched"
+                ));
+            }
+            Err(error) => return fail(error),
+        }
+        let computed = Computed {
+            old: release_tip,
+            new: green.clone(),
+            output_tail: format!("fast-forwarded {to} to {green}"),
+        };
+        let outcome = publish(project_root, to, computed, deadline).await;
+        if matches!(outcome, Outcome::Succeeded { .. }) {
+            let _ = crate::task_claims::machine::close_release_diverged(
+                pool,
+                &request.project_id,
+                "the release branch was promoted",
+                chrono::Utc::now(),
+            )
+            .await;
+            // Only the release branch leaves the machine, and only through the queue. Best effort:
+            // the promotion itself is already done.
+            if let (Ok(branch), Ok(remote)) = (
+                crate::execution::vcs::Branch::new(to),
+                crate::execution::vcs::Remote::new("origin"),
+            ) {
+                match crate::execution::vcs::resolve_repo(pool, &request.project_id).await {
+                    Ok(repo) => {
+                        if let Err(error) = crate::execution::vcs::submit_declared(
+                            pool,
+                            &repo,
+                            &crate::execution::vcs::Op::Push { remote, branch },
+                            crate::execution::vcs::Origin::Daemon,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                vcs_request_id = request.id,
+                                ?error,
+                                "could not queue the push of the promoted branch"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            vcs_request_id = request.id,
+                            ?error,
+                            "could not resolve the repository to push the promoted branch"
+                        );
+                    }
+                }
+            }
+        }
+        outcome
+    }
+
     /// A push never waits in its caller's face: with `gate_after_land` on, a push of the project's
     /// integration branch goes out at once when the post-land gate has judged the sha green, and
     /// otherwise parks (`Outcome::AwaitingGate`) until the gate turns green - the gate's green writes
@@ -580,6 +738,39 @@ pub(super) async fn gate_the_merge(
     verify: Option<&std::sync::Arc<crate::verify::exec::Executor>>,
     steps_apply: bool,
 ) -> Result<MergeGate, Outcome> {
+    gate_the_merge_into(
+        pool,
+        request_id,
+        project_id,
+        project_root,
+        integration,
+        timeout,
+        scope_wait,
+        land_target,
+        verify,
+        steps_apply,
+        land_target,
+    )
+    .await
+}
+
+/// `gate_the_merge` with the branch the merge publishes to named: an integration step forces the
+/// per-land gate only when that branch IS the release branch (the one nothing proves afterwards);
+/// anywhere else the release branch's post-land gate measures the output instead.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn gate_the_merge_into(
+    pool: Option<&sqlx::SqlitePool>,
+    request_id: i64,
+    project_id: &str,
+    project_root: &Path,
+    integration: &Path,
+    timeout: Duration,
+    scope_wait: Duration,
+    land_target: Option<&str>,
+    verify: Option<&std::sync::Arc<crate::verify::exec::Executor>>,
+    steps_apply: bool,
+    merge_target: Option<&str>,
+) -> Result<MergeGate, Outcome> {
     let refuse = |reason: String| Outcome::Failed {
         reason,
         exit_code: None,
@@ -600,7 +791,10 @@ pub(super) async fn gate_the_merge(
     // An active integration step forces the gate: its output must never be published unmeasured.
     // Only a merge the steps actually apply to is forced; any other keeps `gate_before_publish`.
     let required = if steps_apply {
+        // `merge_gate_required` drops the force once a release branch is set; a merge that
+        // publishes straight to that branch has no later gate, so the force stays.
         rules.merge_gate_required()
+            || (rules.release_branch().is_some() && rules.release_branch() == merge_target)
     } else {
         rules.gate_before_publish
     };

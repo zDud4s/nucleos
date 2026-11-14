@@ -456,6 +456,35 @@ pub(super) fn is_plain_cd(segment: &str) -> bool {
     })
 }
 
+/// Whether the bare `cd <dir>` in `segment` lands inside the project checkout that holds the run's
+/// worktree (`<checkout>/.claude/worktrees/<name>` or `<checkout>/.nucleos/worktrees/<name>`).
+/// Only that checkout is read this way: a `cd` to any other directory, or one whose target is
+/// relative or climbs with `..`, keeps its park.
+pub(super) fn cd_lands_in_the_project_checkout(segment: &str, cwd: &Path) -> bool {
+    let words = shell_words(segment);
+    let [_, target] = words.as_slice() else {
+        return false;
+    };
+    let fold = |text: &str| {
+        text.replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    let target = fold(target);
+    let absolute = target.starts_with('/') || target.as_bytes().get(1) == Some(&b':');
+    if !absolute || target.split('/').any(|part| part == "..") {
+        return false;
+    }
+    let cwd = fold(&cwd.to_string_lossy());
+    let Some(checkout) = ["/.claude/worktrees/", "/.nucleos/worktrees/"]
+        .iter()
+        .find_map(|marker| cwd.find(marker).map(|at| cwd[..at].to_owned()))
+    else {
+        return false;
+    };
+    target == checkout || target.starts_with(&format!("{checkout}/"))
+}
+
 /// Whether a segment the classifier already judged `read-local` is one of the pure reads allowed
 /// after a `cd` elsewhere. Looked at by its first words, so `mkdir` or `cargo fmt` (also
 /// `read-local` inside the workspace) are not.

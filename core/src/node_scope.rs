@@ -136,6 +136,9 @@ pub(crate) fn shared_covers_glob(shared: &[String], glob: &str) -> bool {
     shared.iter().any(|entry| shared_covers(entry, &folded))
 }
 
+/// The report files a node may always write at its worktree root.
+const ROOT_REPORT_FILES: [&str; 2] = [".nucleos-report.md", ".nucleos-root-report.md"];
+
 /// **Pure.** Whether a node owning `owned` may write `file`. `root` is the run's worktree (its
 /// cwd); a relative `file` is relative to it.
 pub fn check(owned: &[String], shared: &[String], root: &str, file: &str) -> ScopeVerdict {
@@ -147,6 +150,14 @@ pub fn check(owned: &[String], shared: &[String], root: &str, file: &str) -> Sco
     };
     let folded = fold_path(&relative);
     if shared.iter().any(|entry| shared_covers(entry, &folded)) {
+        return ScopeVerdict::Allowed;
+    }
+    // The fallback report at the worktree root (used when the state dir is unknown). The daemon
+    // keeps both names out of git (`REPORT_EXCLUDE`), so they are never part of a node's diff.
+    if ROOT_REPORT_FILES
+        .iter()
+        .any(|name| fold_path(name) == folded)
+    {
         return ScopeVerdict::Allowed;
     }
     // A glob that does not normalise covers nothing, as in the containment rule.
@@ -249,6 +260,27 @@ mod tests {
         assert_eq!(
             check(&owned, &shared(), ROOT, "core/src/hooks/pretool.rs"),
             ScopeVerdict::Allowed
+        );
+    }
+
+    #[test]
+    fn the_worktree_root_report_files_are_allowed_but_not_lookalikes() {
+        let owned = strings(&["core/src/hooks/**"]);
+        for file in [".nucleos-report.md", ".nucleos-root-report.md"] {
+            assert_eq!(check(&owned, &shared(), ROOT, file), ScopeVerdict::Allowed);
+            assert_eq!(
+                check(&owned, &shared(), ROOT, &format!(r"C:\work\repo\{file}")),
+                ScopeVerdict::Allowed
+            );
+        }
+        // Only the root file: the same name in a subdirectory, or another dotfile, is refused.
+        assert_eq!(
+            check(&owned, &shared(), ROOT, "core/.nucleos-report.md"),
+            outside("core/.nucleos-report.md")
+        );
+        assert_eq!(
+            check(&owned, &shared(), ROOT, ".handoff-1.md"),
+            outside(".handoff-1.md")
         );
     }
 

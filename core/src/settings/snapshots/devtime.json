@@ -337,6 +337,58 @@
       },
       "type": "object"
     },
+    "DevtimeContextFitConfig": {
+      "additionalProperties": false,
+      "description": "The context-fit card's thresholds. A partial or absent block is valid: every field has the spec default.",
+      "properties": {
+        "o1_unread_share": {
+          "default": 0.5,
+          "format": "double",
+          "type": "number"
+        },
+        "o2_initial_share": {
+          "default": 0.4,
+          "format": "double",
+          "type": "number"
+        },
+        "o3_min_nodes": {
+          "default": 20,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "o3_pct": {
+          "default": 90,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "o3_window_days": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "s2_handoffs": {
+          "default": 2,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "s5_peak_share": {
+          "default": 0.8,
+          "format": "double",
+          "type": "number"
+        },
+        "u1_reads": {
+          "default": 8,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "DevtimeHitRateMin": {
       "additionalProperties": false,
       "description": "The per-action floor on the shadow hit rate (spec 4.1).",
@@ -998,6 +1050,20 @@
         }
       },
       "description": "The automatic actions' thresholds (phase 2, shadow mode first)."
+    },
+    "context_fit": {
+      "$ref": "#/$defs/DevtimeContextFitConfig",
+      "default": {
+        "o1_unread_share": 0.5,
+        "o2_initial_share": 0.4,
+        "o3_min_nodes": 20,
+        "o3_pct": 90,
+        "o3_window_days": 30,
+        "s2_handoffs": 2,
+        "s5_peak_share": 0.8,
+        "u1_reads": 8
+      },
+      "description": "The context-fit thresholds (context-fit spec section 5)."
     },
     "cycle_seconds": {
       "default": 60,

@@ -499,7 +499,8 @@ impl NucleosTools {
                        (6 by default), at most 6 open siblings, and owned_paths may not overlap a running sibling. The \
                        owned_paths of a child must be contained in its parent's; `..` is \
                        refused. A violation \
-                       is refused with the reason. Returns {id, root_id, depth}."
+                       is refused with the reason. `pointers` are optional files the node starts from. \
+                       Returns {id, root_id, depth}."
     )]
     pub(super) async fn node_open(
         &self,
@@ -509,6 +510,7 @@ impl NucleosTools {
             title,
             goal,
             owned_paths,
+            pointers,
             budget_tokens,
             task_id,
             session_id,
@@ -524,6 +526,7 @@ impl NucleosTools {
                     "title": title,
                     "goal": goal,
                     "owned_paths": owned_paths,
+                    "pointers": pointers,
                     "budget_tokens": budget_tokens,
                     "task_id": task_id,
                     "session_id": session_id,
@@ -547,6 +550,7 @@ impl NucleosTools {
             decision,
             context_peak,
             widen_paths,
+            pointers,
         }): Parameters<NodeUpdateParams>,
     ) -> String {
         json_result(
@@ -558,6 +562,7 @@ impl NucleosTools {
                         "decision": decision,
                         "context_peak": context_peak,
                         "widen_paths": widen_paths,
+                        "pointers": pointers,
                     }),
                 )
                 .await,
@@ -594,17 +599,34 @@ impl NucleosTools {
     #[tool(
         description = "Read a work tree from its root. view \"brief\" (default) returns a markdown \
                        `text` ready to paste into a fresh context for rehydration; \"full\" \
-                       returns every node in detail."
+                       returns every node in detail. Answers a bounded SUMMARY by default \
+                       (about 8000 characters: counts per status, every node that is not done, \
+                       done nodes counted, text cut, with a `note` saying what was cut). Pass \
+                       `detail: \"full\"` for the whole answer, which `tree.py` and \
+                       `tree_record.py` need to read each node's `owned_paths`."
     )]
     pub(super) async fn node_tree(
         &self,
-        Parameters(NodeTreeParams { root_id, view }): Parameters<NodeTreeParams>,
+        Parameters(NodeTreeParams {
+            root_id,
+            view,
+            detail,
+        }): Parameters<NodeTreeParams>,
     ) -> String {
-        json_result(
-            self.client
-                .node_tree(&root_id, view.as_deref().unwrap_or("brief"))
-                .await,
-        )
+        let detail = match Detail::parse(detail.as_deref()) {
+            Ok(detail) => detail,
+            Err(msg) => return error_json(msg),
+        };
+        match self
+            .client
+            .node_tree(&root_id, view.as_deref().unwrap_or("brief"))
+            .await
+        {
+            Ok(tree) if detail == Detail::Summary => {
+                json_result(Ok::<_, String>(summarize_node_tree(tree)))
+            }
+            other => json_result(other),
+        }
     }
 
     #[tool(

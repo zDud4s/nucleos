@@ -47,6 +47,19 @@ export function useOpenCaptures() {
   });
 }
 
+/**
+ * The `?item=` reference of the open request closest to its deadline, for the rail's link; `undefined`
+ * when nothing is open (or the list has not answered yet).
+ */
+export function mostUrgentCapture(rows: CaptureRequest[] | undefined): string | undefined {
+  let best: CaptureRequest | undefined;
+  for (const row of rows ?? []) {
+    if (row.state !== "open") continue;
+    if (best === undefined || Date.parse(row.deadline) < Date.parse(best.deadline)) best = row;
+  }
+  return best === undefined ? undefined : `capture:${best.job_id}`;
+}
+
 /** Every request in every state, for the history. */
 export function useAllCaptures() {
   return useQuery({
@@ -74,7 +87,7 @@ function useCaptureMutation<V, R>(mutationFn: (input: V) => Promise<R>) {
 
 export function useAnswerCapture() {
   return useCaptureMutation(({ jobId, text }: { jobId: number; text: string }) =>
-    apiFetch<{ note_id: number; requeued: boolean }>(`/capture-requests/${jobId}/answer`, {
+    apiFetch<{ note_id: number; released: boolean }>(`/capture-requests/${jobId}/answer`, {
       method: "POST",
       body: JSON.stringify({ text, origin: "shell" }),
     }),
