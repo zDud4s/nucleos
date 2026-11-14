@@ -126,7 +126,7 @@ async fn format_worktree_commits_a_format_once_and_then_changes_nothing() {
     write_crate(&repo, UNFORMATTED);
     let before = commit_count(&repo);
 
-    let first = format_worktree(&repo, &root_step()).await;
+    let first = format_worktree(&repo, &root_step(), &ckpt_ctx()).await;
 
     assert_eq!(first, Ok(true));
     assert_eq!(commit_count(&repo), before + 1, "exactly one new commit");
@@ -136,11 +136,42 @@ async fn format_worktree_commits_a_format_once_and_then_changes_nothing() {
         FORMATTED
     );
 
-    let second = format_worktree(&repo, &root_step()).await;
+    let second = format_worktree(&repo, &root_step(), &ckpt_ctx()).await;
 
     assert_eq!(second, Ok(false), "an already formatted tree is left alone");
     assert_eq!(commit_count(&repo), before + 1);
     assert_eq!(autofmt_commits(&repo), 1);
+}
+
+fn ckpt_ctx() -> crate::execution::worktree::CheckpointContext {
+    crate::execution::worktree::CheckpointContext {
+        id: "node-7".to_owned(),
+        title: "api: fix the thing".to_owned(),
+        run_id: None,
+        tree_id: Some("tree-9".to_owned()),
+        gated: false,
+    }
+}
+
+#[tokio::test]
+async fn format_worktree_checkpoints_the_nodes_work_under_the_nodes_name() {
+    let (_container, repo) = init_contained_repo("nucleos-autofmt-ckpt-");
+    write_crate(&repo, UNFORMATTED);
+
+    let changed = format_worktree(&repo, &root_step(), &ckpt_ctx()).await;
+
+    assert_eq!(changed, Ok(true));
+    let subjects = git_out(&repo, &["log", "-2", "--format=%s"]);
+    let mut lines = subjects.lines();
+    assert_eq!(lines.next(), Some(SUBJECT), "the formatter commit");
+    assert_eq!(
+        lines.next(),
+        Some("nucleos(node-7): api: fix the thing"),
+        "the node's own work, checkpointed before the formatter ran"
+    );
+    let body = git_out(&repo, &["log", "-2", "--skip=1", "--format=%B"]);
+    assert!(body.contains("Tree: tree-9"), "{body}");
+    assert!(body.contains("Nucleos-Checkpoint: ungated"), "{body}");
 }
 
 // ---- a red gate --------------------------------------------------------------------------------

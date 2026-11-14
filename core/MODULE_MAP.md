@@ -350,6 +350,7 @@ the contract, not a snapshot.
 | `tree_job/report.rs` | A node's report: parse it, list what makes it unacceptable, and render it as a handoff. No database. |
 | `tree_job/commands.rs` | The closed list of heavy commands the daemon runs for a leaf, scoped to its branch; anything outside it parks the node. |
 | `tree_job/checklist.rs` | The node checklist close rule: a node closes only with all items `[x]` or one `[!]`. No database. |
+| `tree_job/checkpoint_ctx.rs` | The `CheckpointContext` of a tree branch's checkpoint commit: the node (or branch), the goal as title, the tree id. Pure. |
 | `tree_job/docs_paths.rs` | The rules of a docs branch: the paths it may write under `<state_dir>/{specs,spikes,plans,notes}/` and the states it may end in. No database. |
 | `tree_job/engine.rs` | Stub, not implemented yet (wave 5): the branch state machine and the grouping of branches by width and path overlap. |
 | `tree_job/node_run.rs` | Stub, not implemented yet (wave 5): keyed idempotent transitions over `tree_transitions`, launching a node's agent, and reconciling `running` nodes whose run is gone. |
