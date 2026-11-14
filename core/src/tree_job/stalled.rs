@@ -124,6 +124,37 @@ async fn has_live_run(state: &AppState, job: &TreeJob) -> Result<bool, String> {
     Ok(false)
 }
 
+/// The `Branch.extra` keys that hold a verify ticket a branch's gate waits on (see `gate.rs`).
+const TICKET_KEYS: [&str; 3] = ["gate_ticket", "gate_check_ticket", "gate_recheck_ticket"];
+
+/// Whether a branch still in play waits on a verify ticket that is queued or running. That wait is
+/// the verify queue's, not a stall: nothing is nudged, parked or diagnosed until the ticket ends.
+/// Read-only (`classify: false`): no master proof is started by looking.
+async fn waits_on_verify_ticket(state: &AppState, job: &TreeJob) -> Result<bool, String> {
+    for branch in job.manifest.branches.values() {
+        if TERMINAL_STATES.contains(&branch.state.as_str()) {
+            continue;
+        }
+        for key in TICKET_KEYS {
+            let Some(id) = branch
+                .extra
+                .get(key)
+                .and_then(|held| held.get("ticket"))
+                .and_then(serde_json::Value::as_i64)
+            else {
+                continue;
+            };
+            let read = crate::verify::read_ticket_with(&state.pool, None, id, false)
+                .await
+                .map_err(|e| e.to_string())?;
+            if read.is_some_and(|(ticket, _)| !ticket.done) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 async fn has_open_decision(state: &AppState, job: &TreeJob) -> Result<bool, String> {
     let open: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE tree_id = ? AND status = ?")
@@ -159,6 +190,7 @@ pub(super) async fn check(
             || has_live_run(state, &job).await?
             || has_open_decision(state, &job).await?
             || paused_on_quota(state, &job, now).await?
+            || waits_on_verify_ticket(state, &job).await?
         {
             return Ok(());
         }
@@ -585,6 +617,120 @@ mod tests {
         assert_eq!(fx.launches("stall-api", "rescue-").await, 1);
         assert_eq!(fx.open_questions(JOB, "stall-api").await.len(), 1);
         assert_eq!(feed_lines(&fx).await, 1, "one line for the whole episode");
+    }
+
+    /// A verify ticket with one unit, queued; answers `(ticket id, run id)`.
+    async fn queued_ticket(fx: &Fixture) -> (i64, i64) {
+        use crate::verify::{runs, store as verify_store};
+        let run = runs::enqueue(
+            &fx.state.pool,
+            &runs::Request {
+                project_id: None,
+                worktree: "wt".to_owned(),
+                scope: "scope".to_owned(),
+                origin: "test".to_owned(),
+                origin_id: None,
+                requested_by: "test".to_owned(),
+                group_name: Some("core".to_owned()),
+                kind: Some("test".to_owned()),
+                argv: vec!["true".to_owned()],
+                fingerprint: None,
+                priority: 1,
+                weight: 1,
+                timeout_ms: 1000,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+        let ticket = verify_store::insert_request(
+            &fx.state.pool,
+            &verify_store::NewRequest {
+                project_id: "p",
+                worktree: "wt",
+                kind: "test",
+                scope: "scope",
+                base: None,
+                priority: 1,
+                caller: "test",
+                note: None,
+                unclaimed: &[],
+            },
+        )
+        .await
+        .unwrap();
+        verify_store::set_plan(
+            &fx.state.pool,
+            ticket,
+            &[verify_store::PlannedUnit {
+                group: Some("core".to_owned()),
+                argv: vec!["true".to_owned()],
+                why: "test".to_owned(),
+                fingerprint: None,
+                cacheable: false,
+                run_id: Some(run.id),
+                cached_from: None,
+                skipped: None,
+            }],
+        )
+        .await
+        .unwrap();
+        (ticket, run.id)
+    }
+
+    async fn wait_on(fx: &Fixture, key: &str, ticket: i64) {
+        let mut job = fx.job(JOB).await;
+        job.manifest
+            .branches
+            .get_mut("api")
+            .unwrap()
+            .extra
+            .insert(key.to_owned(), json!({ "ticket": ticket, "head": "abc" }));
+        store::update(&fx.state.pool, &job).await.unwrap();
+    }
+
+    /// A branch that only waits on a queued verify ticket is not a stalled tree: no feed line, no
+    /// nudge, no park, no decision run; once the ticket ends, a quiet tree is stalled as any other.
+    /// One fixture per test: a second `Fixture::new` in one test breaks the lock order.
+    async fn waiting_on_a_queued_ticket_is_not_stalled(key: &str) {
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, vec![code_branch("api", "green", None)], None)
+            .await;
+        let (ticket, run) = queued_ticket(&fx).await;
+        wait_on(&fx, key, ticket).await;
+
+        let mut at = Utc::now();
+        for _ in 0..8 {
+            at += chrono::Duration::minutes(STALL_SECS / 60 + 1);
+            check(&fx.state, JOB, at).await.unwrap();
+        }
+        assert_eq!(feed_lines(&fx).await, 0, "{key}");
+        assert_eq!(nudges_spent(&fx.job(JOB).await), 0, "{key}");
+        assert!(fx.open_questions(JOB, &root_node_of(JOB)).await.is_empty());
+
+        sqlx::query("UPDATE verify_runs SET status = 'passed' WHERE id = ?")
+            .bind(run)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        at += chrono::Duration::minutes(STALL_SECS / 60 + 1);
+        check(&fx.state, JOB, at).await.unwrap();
+        assert_eq!(feed_lines(&fx).await, 1, "{key}: stalled once it ended");
+    }
+
+    #[tokio::test]
+    async fn a_branch_waiting_on_a_queued_gate_ticket_is_not_stalled() {
+        waiting_on_a_queued_ticket_is_not_stalled("gate_ticket").await;
+    }
+
+    #[tokio::test]
+    async fn a_branch_waiting_on_a_queued_gate_check_ticket_is_not_stalled() {
+        waiting_on_a_queued_ticket_is_not_stalled("gate_check_ticket").await;
+    }
+
+    #[tokio::test]
+    async fn a_branch_waiting_on_a_queued_gate_recheck_ticket_is_not_stalled() {
+        waiting_on_a_queued_ticket_is_not_stalled("gate_recheck_ticket").await;
     }
 
     #[tokio::test]
