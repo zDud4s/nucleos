@@ -33,6 +33,49 @@ pub(super) fn routes() -> Router<AppState> {
         // `session-git-decision`: it runs library scripts in a directory the body names, and the
         // run token's six routes are a list somebody has to widen on purpose, not by a new route.
         .route("/hooks/bundle", post(crate::workflows::hooks::bundle_hooks))
+        // How a subagent ended, forwarded by the same script on `SubagentStop`. In no scope's table
+        // either, for the reason given above `session-git-decision`: a person's session reports it,
+        // never a run. It only records, and always answers 200.
+        .route("/hooks/agent-outcome", post(agent_outcome))
+}
+
+/// The hook's report of a finished subagent.
+#[derive(serde::Deserialize)]
+pub(super) struct AgentOutcomeRequest {
+    session_id: String,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    error: bool,
+    // The cost would come from summing the transcript's usage; no price helper is reachable from
+    // here yet, so the field is accepted and the cost stays NULL (the report ignores such rows).
+    #[serde(default)]
+    #[allow(dead_code)]
+    transcript_path: Option<String>,
+}
+
+/// `POST /hooks/agent-outcome`: records how a subagent ended. Always 200 (the hook fails open).
+pub(super) async fn agent_outcome(
+    State(state): State<AppState>,
+    Json(body): Json<AgentOutcomeRequest>,
+) -> Json<serde_json::Value> {
+    let outcome = if body.error {
+        crate::models::agent_spawns::SpawnOutcome::Error
+    } else {
+        crate::models::agent_spawns::SpawnOutcome::Ok
+    };
+    let recorded = crate::models::agent_spawns::record_outcome(
+        &state.pool,
+        &body.session_id,
+        body.agent_id.as_deref(),
+        body.agent_type.as_deref(),
+        outcome,
+        None,
+    )
+    .await;
+    Json(serde_json::json!({ "recorded": recorded }))
 }
 
 /// What the hook says while it waits.

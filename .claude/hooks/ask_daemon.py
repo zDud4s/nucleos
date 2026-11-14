@@ -2377,6 +2377,46 @@ def with_context(outputs, event, extra):
     return outputs + [extra]
 
 
+AGENT_OUTCOME_TIMEOUT = 2.0
+
+
+def agent_outcome_body(payload: dict) -> dict:
+    """The `/hooks/agent-outcome` body for a `SubagentStop` payload."""
+    body = {
+        "session_id": str(payload.get("session_id") or ""),
+        "error": bool(payload.get("error") or payload.get("is_error")),
+    }
+    for key in ("agent_id", "agent_type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            body[key] = value
+    path = payload.get("agent_transcript_path") or payload.get("transcript_path")
+    if isinstance(path, str) and path:
+        body["transcript_path"] = path
+    return body
+
+
+def report_agent_outcome(payload: dict) -> None:
+    """Tells the daemon a subagent ended. Fails open: raises nothing, prints nothing, and is bounded
+    by `AGENT_OUTCOME_TIMEOUT` so it can neither delay nor alter the event's own output."""
+    try:
+        cwd = payload.get("cwd") or os.getcwd()
+        token, _why = read_control_token(cwd, total_timeout=1.0)
+        if not token:
+            return
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        request = urllib.request.Request(
+            f"{daemon_url}/hooks/agent-outcome",
+            data=json.dumps(agent_outcome_body(payload)).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=AGENT_OUTCOME_TIMEOUT) as response:
+            response.read()
+    except Exception:
+        pass
+
+
 def bundle_hooks(payload: dict, extra: str = "") -> None:
     """Runs the hooks the project's pinned workflow bundles declare for this session event.
 
@@ -2467,6 +2507,8 @@ def main() -> None:
             extra = claims_context(
                 payload, want_incidents=True, force=True, always_list=(event == "SessionStart"),
             )
+        if event == "SubagentStop" and os.environ.get("NUCLEOS_RUN_ID") is None:
+            report_agent_outcome(payload)
         bundle_hooks(payload, extra)
 
     # Refused for a person's session and for a governed run alike, before either is asked

@@ -41,6 +41,7 @@ tests:
         - .claude/hooks/ask_daemon.py
         - scripts/test-hook-filter.py
         - scripts/test-conductor-hook.py
+        - scripts/test-agent-model-hook.py
         - scripts/test-gates-summary.py
         - scripts/own-cargo-target.sh
         - scripts/test-own-cargo-target.py
