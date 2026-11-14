@@ -180,13 +180,16 @@ pub fn load_calendar_config(path: &Path) -> CalendarConfig {
     }
 }
 
+/// Default queue aging period: a queued verify unit gains one priority level per 30 minutes.
+pub const DEFAULT_VERIFY_AGING_SECONDS: u64 = 1800;
+
 /// The verification executor's machine settings, `~/.nucleos/verify.yaml`.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VerifyConfig {
     /// Weight units that may run at once across the whole machine.
     pub capacity: u32,
-    /// A queued request that has waited this long moves up one priority level.
+    /// A queued request moves up one priority level for every period this long it has waited.
     pub aging_seconds: u64,
     /// The wall clock one unit may take before it is killed.
     pub unit_timeout_seconds: u64,
@@ -239,7 +242,7 @@ impl Default for VerifyConfig {
     fn default() -> Self {
         Self {
             capacity: 4,
-            aging_seconds: 300,
+            aging_seconds: DEFAULT_VERIFY_AGING_SECONDS,
             unit_timeout_seconds: 1800,
             disk_cap_gb: 60,
             broker_prefix: Vec::new(),

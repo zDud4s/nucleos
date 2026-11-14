@@ -3626,7 +3626,7 @@ cycle_seconds: 30
         );
         let defaults = VerifyConfig::default();
         assert_eq!(defaults.capacity, 4);
-        assert_eq!(defaults.aging_seconds, 300);
+        assert_eq!(defaults.aging_seconds, 1800);
         assert_eq!(defaults.unit_timeout_seconds, 1800);
         assert_eq!(defaults.disk_cap_gb, 60);
         assert!(defaults.broker_prefix.is_empty());
