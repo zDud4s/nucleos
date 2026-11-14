@@ -148,8 +148,10 @@ if ($held.Count -gt 0) {
     }
     else {
         $who = if ($daemons.Count -gt 0) { " (pid " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ', ') + ")" } else { "" }
-        # `schtasks /End` is no use here: the task runs the daemon through `conhost --headless`, and
-        # /End kills only that conhost, leaving the daemon alive.
+        # The hint names the daemon's pid. (The task's own process is now the supervisor, so
+        # `schtasks /End` would also work, but only the supervisor would be killed first; its job
+        # object then takes the daemon down. Stop-Process on the daemon alone makes the supervisor
+        # restart it, so stop the supervisor's task for a real stop.)
         $stopHint = if ($daemons.Count -gt 0) {
             "Stop-Process -Id " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ',')
         } else { "Stop-Process -Id <pid>" }
@@ -297,8 +299,8 @@ if ($NoStart) { exit 0 }
 # --- 5. start (foreground, like `cargo run`) ---------------------------------------------------
 
 # The daemon must not be a child of the agent session that ran this script: when that session
-# ends, a child daemon dies with it. The "NucleOS Daemon" logon task (conhost --headless
-# nucleos-core.exe --supervise) is the daemon's real parent, so when it exists and runs the staged
+# ends, a child daemon dies with it. The "NucleOS Daemon" logon task (nucleos-core.exe
+# --supervise, run directly: the supervisor is the root of the process tree) is the daemon's real parent, so when it exists and runs the staged
 # copy, start it through the task. The decision is a pure function, kept apart for testing.
 function Get-DaemonStartMode([bool]$TaskExists, [string]$TaskArguments, [string]$StagedExe, [bool]$Foreground) {
     if ($Foreground) { return 'direct-forced' }
@@ -319,7 +321,7 @@ if (-not $forceDirect) {
     }
     catch { $taskInfo = $null }
 }
-$taskArgs = if ($taskInfo) { [string](@($taskInfo.Actions | ForEach-Object { $_.Arguments }) -join ' ') } else { '' }
+$taskArgs = if ($taskInfo) { [string](@($taskInfo.Actions | ForEach-Object { ($_.Execute + ' ' + $_.Arguments) }) -join ' ') } else { '' }
 $mode = Get-DaemonStartMode ($null -ne $taskInfo) $taskArgs (Join-Path $RunDir 'nucleos-core.exe') $forceDirect
 if ($mode -eq 'task') {
     try {

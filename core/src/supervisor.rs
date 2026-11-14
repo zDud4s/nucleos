@@ -55,9 +55,59 @@ impl Journal {
     }
 }
 
+/// PURE: whether the supervisor owns its console and may free it. The logon task runs the exe
+/// directly, so Windows gives it a console of its own and only this process is attached (`1`). A
+/// supervisor started from a terminal shares the console with the shell (`> 1`) and must leave it
+/// alone. `0` (no console, or the query failed) has nothing to free.
+fn console_is_ours_to_free(attached_processes: u32) -> bool {
+    attached_processes == 1
+}
+
+/// `CREATE_NO_WINDOW`: the daemon gets a console without a window, which sidecars, git and agent
+/// runs inherit, so none of them ever opens a visible one.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+mod console {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetConsoleProcessList(process_list: *mut u32, process_count: u32) -> u32;
+        pub fn FreeConsole() -> i32;
+    }
+}
+
+/// Drops the console the logon task gave this process, so the (windowless-by-then) supervisor does
+/// not keep a console window open. Only when no other process shares it. Windows only.
+#[cfg(windows)]
+fn free_own_console() {
+    let mut pids = [0u32; 4];
+    // SAFETY: the buffer is valid for `pids.len()` entries; the call only writes into it.
+    let attached = unsafe { console::GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    if console_is_ours_to_free(attached) {
+        // SAFETY: no pointers; failure just leaves the console where it was.
+        unsafe { console::FreeConsole() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_is_ours_to_free;
+
+    #[test]
+    fn only_a_console_with_one_attached_process_is_freed() {
+        assert!(console_is_ours_to_free(1));
+        assert!(!console_is_ours_to_free(0), "no console: nothing to free");
+        assert!(!console_is_ours_to_free(2), "shared with a terminal");
+    }
+}
+
 /// Runs until the daemon is stopped on purpose, another daemon owns the port, or the restart budget
 /// is spent. The return value is this process's exit code.
 pub(super) async fn run() -> i32 {
+    // Before the journal opens: it writes to stderr, which is harmless once the console is gone.
+    #[cfg(windows)]
+    free_own_console();
     let journal = Journal::open();
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -94,17 +144,21 @@ pub(super) async fn run() -> i32 {
         }
         let started = origin.elapsed();
         journal.say(&format!("launching {}", exe.display()));
-        let code = match tokio::process::Command::new(&exe)
+        let mut command = tokio::process::Command::new(&exe);
+        command
             .args(&child_args)
-            // The task runs under `conhost --headless`, whose stdin handle may be dead, and the
-            // daemon would hand that to everything it starts.
+            // The standard handles of a supervisor without a console are dead, and the daemon would
+            // hand them to everything it starts.
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             // Tells the daemon that this process relaunches it, so a restart is an exit and not a
             // relauncher of its own (which this job would kill).
             .env(SUPERVISED_VAR, "1")
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let code = match command.spawn() {
             Ok(mut child) => {
                 if let (Some(job), Some(pid)) = (&job, child.id())
                     && !job.adopt(pid)
