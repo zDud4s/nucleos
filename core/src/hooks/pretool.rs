@@ -522,6 +522,8 @@ pub(super) async fn pretooluse_decision_from(
             },
             action_class: "read-local",
             reason: "a leaf's self-check through the broker is allowed".to_owned(),
+            culprit: None,
+            segments: Vec::new(),
         };
     }
     tracing::info!(
