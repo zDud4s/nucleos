@@ -362,6 +362,8 @@ the contract, not a snapshot.
 | `tree_job/branch_start.rs` | `POST /trees/{id}/branch_start`, the whole start of one branch in a single idempotent call for the `tree_branch_start` tool: add, open, node, bind, launch. |
 | `tree_job/ghosts.rs` | The branches a refused start left behind: `is_ghost_of` (PURE), `same_shape`, and `clear_ghosts`, which takes them out of the way of a later start by the same caller. |
 | `tree_job/driver.rs` | The tree-job driver tick: advances every unfinished job one step per pass (gate a reported branch, fix a red one, queue or settle a merge, close finished nodes, land). |
+| `tree_job/no_change_auto_tests.rs` | Tests for dropping a branch whose work is already on its merge target (`present_on_base`). |
+| `tree_job/wrap_auto_tests.rs` | Tests for closing a node that kept ending as done when its branch has commits and a report (`finished_despite_ending`). |
 | `tree_job/no_change.rs` | A code branch that changed nothing: why (`no_change_reason`), the `no_change` record beside its park, and `parked_as_no_change`, which the driver runs before it gates or merges a branch. |
 | `tree_job/root.rs` | The root node of a tree job: its worktree on `tree/<id>/root`, and the run that plans the job. |
 | `tree_job/root_disk.rs` | What the root start does with a refusal the disk alone caused: parse the figures out of the error, retry, and after `DISK_START_CAP` refusals ask the owner once with the GB needed. No database. |
