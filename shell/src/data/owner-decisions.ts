@@ -25,6 +25,8 @@ export interface OwnerDecision {
   status: string;
   answer: string | null;
   kind: OwnerDecisionKind;
+  /** Why the daemon marked it `obsolete`; `null` otherwise. */
+  obsolete_reason?: string | null;
 }
 
 /** The wire row: everything but `id` and `question` may be absent, and unknown fields are ignored. */
@@ -37,6 +39,8 @@ interface WireDecision {
   status?: string | null;
   answer?: string | null;
   kind?: string | null;
+  /** Set only when `status` is `obsolete`. */
+  obsolete_reason?: string | null;
 }
 
 /** A missing or unrecognised `kind` is a decision: the safe reading is the one the owner can act on. */
@@ -50,6 +54,7 @@ export function parseOwnerDecision(row: WireDecision): OwnerDecision {
     status: row.status ?? "open",
     answer: row.answer ?? null,
     kind: row.kind === "notice" ? "notice" : "decision",
+    obsolete_reason: row.obsolete_reason ?? null,
   };
 }
 
@@ -67,7 +72,9 @@ export function useOwnerDecisions() {
     queryKey: keys.ownerDecisions.open,
     queryFn: async () => {
       const rows = await apiFetch<WireDecision[]>("/decisions?status=open");
-      return rows.map(parseOwnerDecision);
+      // The daemon already returns live rows only; filter again so an `obsolete` (or any
+      // unknown) status is never counted or shown as waiting.
+      return rows.map(parseOwnerDecision).filter((d) => d.status === "open");
     },
     refetchInterval: POLL.queue,
   });

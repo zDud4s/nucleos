@@ -103,6 +103,8 @@ pub(super) type Park = (String, String);
 
 /// One pass over every unfinished job. A failure on one job is logged and never stops the others.
 pub async fn tick(state: &AppState) {
+    // Closes the decisions nothing can act on any more; it also runs on the first tick after start.
+    super::obsolete::sweep_logged(&state.pool).await;
     let jobs = match store::list_non_terminal(&state.pool).await {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -1140,7 +1142,9 @@ pub(super) async fn finish_held(pool: &SqlitePool, job: &mut TreeJob) -> Result<
     job.manifest
         .extra
         .insert("landing".to_owned(), Value::String("held".to_owned()));
-    persist(pool, job).await
+    persist(pool, job).await?;
+    super::obsolete::close_tree_logged(pool, &job.id, &super::obsolete::tree_end_reason(job)).await;
+    Ok(())
 }
 
 #[cfg(test)]
