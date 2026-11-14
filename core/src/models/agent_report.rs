@@ -181,7 +181,7 @@ pub fn evaluate(rows: &[SpawnRow], now: i64) -> AgentReport {
     let cost_per_done_actual = per_done(actual);
     let cost_per_done_projected = per_done(projected);
     let projected_saving_pct = match (cost_per_done_actual, cost_per_done_projected) {
-        (Some(a), Some(p)) if a > 0.0 => Some((a - p) / a * 100.0),
+        (Some(a), Some(p)) if a > 0.0 => Some(((a - p) / a * 100.0 * 1e6).round() / 1e6),
         _ => None,
     };
 
