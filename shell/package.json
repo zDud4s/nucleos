@@ -40,7 +40,7 @@
     "motion": "^13.1.1",
     "onnxruntime-web": "^1.27.0",
     "qrcode-generator": "^2.0.4",
-    "radix-ui": "^1.6.7",
+    "radix-ui": "^1.8.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
