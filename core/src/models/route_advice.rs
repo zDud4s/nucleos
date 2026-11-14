@@ -439,6 +439,17 @@ impl Router {
     /// The request, with the daemon's rules in it: `runners` as given (already eligible and clear of
     /// the quota brake), `models` as the union of those runners' globs, and the item's history.
     pub fn build_request(&self, query: &RouteQuery, runners: &[RunnerKind]) -> RouteRequest {
+        self.build_request_for(Surface::Runs, query, runners)
+    }
+
+    /// [`Self::build_request`] for a given surface. Fable is excluded from every request except an
+    /// orchestration stage of the runs surface; the agents surface (subagent spawns) never gets it.
+    pub fn build_request_for(
+        &self,
+        surface: Surface,
+        query: &RouteQuery,
+        runners: &[RunnerKind],
+    ) -> RouteRequest {
         let mut models: Vec<String> = Vec::new();
         for kind in runners {
             if let Some(available) = self.available(*kind) {
@@ -467,7 +478,7 @@ impl Router {
                 .collect(),
             packet: None,
             models,
-            exclude: Vec::new(),
+            exclude: fable_exclusion(surface, query.stage.as_deref()),
         }
     }
 
@@ -688,6 +699,27 @@ pub fn choose(
                 .map(|effort| clamp_effort(effort, ceiling)),
         },
         _ => configured,
+    }
+}
+
+/// The glob that keeps fable out of a request.
+const FABLE_GLOB: &str = "*fable*";
+
+/// Whether `stage` names an orchestration phase (a tree's orchestrator or an orchestrating node).
+fn is_orchestration_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "tree_orchestrate" | "orchestrate_node" | "orchestrate"
+    ) || stage.contains("orchestrator")
+}
+
+/// The `exclude` globs: fable unless this is an orchestration stage of the runs surface.
+fn fable_exclusion(surface: Surface, stage: Option<&str>) -> Vec<String> {
+    let allowed = surface == Surface::Runs && stage.is_some_and(is_orchestration_stage);
+    if allowed {
+        Vec::new()
+    } else {
+        vec![FABLE_GLOB.to_owned()]
     }
 }
 
@@ -1308,6 +1340,38 @@ mod tests {
             effort: None,
             codex_profile: None,
         }
+    }
+
+    fn fable_router() -> Router {
+        Router::new(
+            config(Mode::Apply, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_non_orchestration_run_request_excludes_fable() {
+        let sent = fable_router().build_request(&query(), &[RunnerKind::Claude]);
+        assert_eq!(sent.exclude, vec!["*fable*".to_owned()]);
+    }
+
+    #[test]
+    fn an_orchestration_stage_run_request_may_use_fable() {
+        for stage in ["tree_orchestrate", "orchestrate_node"] {
+            let mut q = query();
+            q.stage = Some(stage.into());
+            let sent = fable_router().build_request(&q, &[RunnerKind::Claude]);
+            assert!(sent.exclude.is_empty(), "{stage}");
+        }
+    }
+
+    #[test]
+    fn an_agents_surface_request_always_excludes_fable() {
+        let mut q = query();
+        q.stage = Some("tree_orchestrate".into());
+        let sent = fable_router().build_request_for(Surface::Agents, &q, &[RunnerKind::Claude]);
+        assert_eq!(sent.exclude, vec!["*fable*".to_owned()]);
     }
 
     fn advice(runner: &str, model: &str, effort: Option<&str>) -> RouteAdvice {
