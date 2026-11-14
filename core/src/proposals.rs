@@ -70,7 +70,7 @@ pub struct Proposal {
     #[sqlx(default)]
     pub job_high_task: Option<String>,
     /// What the classifier said when it parked the line, as `pause_for_approval` stored it. `None`
-    /// on a row written before migration 0305, and from every query but `list_pending`.
+    /// on a row written before migration 0311, and from every query but `list_pending`.
     #[sqlx(default)]
     pub action_class: Option<String>,
     #[sqlx(default)]
