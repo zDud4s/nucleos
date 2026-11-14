@@ -334,8 +334,9 @@ mod tests {
 
     /// The example of "an action that needs a person". Not `git push`: a run's push is refused
     /// outright (`role_policy::PUSH_REFUSAL`), so it never parks. A merge is the same
-    /// `push-merge-deploy` class, is no push, and classifies `pending_approval`.
-    const NEEDS_A_PERSON: &str = "git merge feature";
+    /// `push-merge-deploy` class, is no push, and classifies `pending_approval`. It is `gh pr
+    /// merge`, not `git merge`: a plain `git merge` in a run's own worktree is allowed.
+    const NEEDS_A_PERSON: &str = "gh pr merge 42";
 
     /// As the control token, which is what these tests were written against — they are about what
     /// the classifier decides, not about who is allowed to ask. `decide_as` is for the latter.
@@ -430,8 +431,10 @@ mod tests {
         run_id
     }
 
-    /// A command the classifier parks in a worktree run (a pipe into `tee`).
-    const PARKED: &str = "cargo test --workspace | tee t.log";
+    /// A command the classifier parks in a worktree run (a pipe into a program it does not know).
+    /// Not a `tee`: one into the worktree is allowed now, and one outside it trips the judge's G2
+    /// guard, which would take the judge and the resolver out of every test that uses this.
+    const PARKED: &str = "cargo test --workspace | mystery-filter t.log";
 
     async fn declined(state: &AppState, root: i64, command: &str) {
         let input = serde_json::json!({ "command": command }).to_string();
@@ -530,7 +533,11 @@ mod tests {
         declined(&state, marked, PARKED).await;
         let app = test_router(state.clone());
 
-        let variant = decide(&app, &bash(marked, "cargo test --workspace | tee u.log")).await;
+        let variant = decide(
+            &app,
+            &bash(marked, "cargo test --workspace | mystery-filter u.log"),
+        )
+        .await;
         let elsewhere = decide(&app, &bash(other, PARKED)).await;
 
         assert_eq!(variant.decision, "pending_approval");
@@ -974,9 +981,12 @@ mod tests {
         let first = resolving_run(&state, "enforce").await;
         assert_eq!(decide(&app, &bash(first, PARKED)).await.decision, "deny");
         assert_eq!(
-            decide(&app, &bash(first, "cargo test --workspace | tee v.log"))
-                .await
-                .decision,
+            decide(
+                &app,
+                &bash(first, "cargo test --workspace | mystery-filter v.log")
+            )
+            .await
+            .decision,
             "deny",
             "the second redirect"
         );
@@ -1002,9 +1012,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            decide(&app, &bash(resumed, "cargo test --workspace | tee w.log"))
-                .await
-                .decision,
+            decide(
+                &app,
+                &bash(resumed, "cargo test --workspace | mystery-filter w.log")
+            )
+            .await
+            .decision,
             "pending_approval"
         );
     }
@@ -1377,7 +1390,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1447,7 +1460,7 @@ mod tests {
             &call(
                 asked_run,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1480,7 +1493,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1505,7 +1518,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1526,7 +1539,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1542,7 +1555,7 @@ mod tests {
             PreToolUsePayload {
                 run_id,
                 tool_name: "Bash".to_owned(),
-                tool_input: serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                tool_input: serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
                 agent_id: None,
                 agent_type: None,
                 subagent: false,
@@ -1636,7 +1649,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -1716,7 +1729,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                serde_json::json!({"command": "cargo test --workspace | mystery-filter t.log"}),
             ),
         )
         .await;
@@ -3472,7 +3485,7 @@ mod tests {
         .await;
         let app = test_router(state.clone());
 
-        // A pipe into `tee` is never allowed outright, yet `cargo test` is a recognized kind.
+        // A pipe into an unknown program is never allowed outright, yet `cargo test` is a recognized kind.
         let answer = decide_raw(&app, &bash(run_id, PARKED)).await;
 
         assert_eq!(answer["decision"], "asking", "{answer}");
@@ -7941,7 +7954,7 @@ mod tests {
     async fn a_declared_git_op_is_queued_instead_of_stopping_the_run() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-declared-merge").await;
-        crate::project::policy::declare_git_op(&state.pool, "p", "merge")
+        crate::project::policy::declare_git_op(&state.pool, "p", "rebase")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -7954,7 +7967,7 @@ mod tests {
         .await;
         let app = test_router(state.clone());
 
-        let decision = run_git_decision(&app, run_id, "git merge feature").await;
+        let decision = run_git_decision(&app, run_id, "git rebase feature").await;
 
         assert_eq!(decision.decision, "deny", "{}", decision.reason);
         assert!(
@@ -7966,7 +7979,7 @@ mod tests {
             queued_run_rows(&state).await,
             vec![(
                 1,
-                "merge".to_owned(),
+                "rebase".to_owned(),
                 "run".to_owned(),
                 "queued".to_owned(),
                 Some(run_id),
@@ -7997,7 +8010,7 @@ mod tests {
         crate::project::policy::declare_git_op_with(
             &state.pool,
             "p",
-            "merge",
+            "rebase",
             &crate::role_policy::Permission {
                 roles: None,
                 max_depth: Some(0),
@@ -8025,7 +8038,7 @@ mod tests {
         .unwrap();
         let app = test_router(state.clone());
 
-        let decision = run_git_decision(&app, run_id, "git merge feature").await;
+        let decision = run_git_decision(&app, run_id, "git rebase feature").await;
 
         assert!(
             !decision.reason.contains("git queue"),
@@ -8077,8 +8090,9 @@ mod tests {
         .await;
         let app = test_router(state.clone());
 
-        // Not a push: a run's push is refused outright, so a merge stands for "needs a person".
-        let decision = run_git_decision(&app, run_id, "git merge feature").await;
+        // Not a push: a run's push is refused outright, so a spelling off the worktree's own merge
+        // stands for "needs a person".
+        let decision = run_git_decision(&app, run_id, "git -C . merge feature").await;
 
         assert_eq!(decision.decision, "pending_approval");
         assert!(queued_run_rows(&state).await.is_empty());
@@ -8133,7 +8147,7 @@ mod tests {
     async fn unreadable_rules_stop_a_declared_git_op() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-unreadable-rules").await;
-        crate::project::policy::declare_git_op(&state.pool, "p", "merge")
+        crate::project::policy::declare_git_op(&state.pool, "p", "rebase")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -8150,7 +8164,7 @@ mod tests {
             .unwrap();
         let app = test_router(state.clone());
 
-        let decision = run_git_decision(&app, run_id, "git merge feature").await;
+        let decision = run_git_decision(&app, run_id, "git rebase feature").await;
 
         assert_eq!(decision.decision, "pending_approval");
         assert!(queued_run_rows(&state).await.is_empty());
@@ -8162,7 +8176,7 @@ mod tests {
     async fn a_declared_git_op_is_found_per_segment() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-segmented-merge").await;
-        crate::project::policy::declare_git_op(&state.pool, "p", "merge")
+        crate::project::policy::declare_git_op(&state.pool, "p", "rebase")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -8177,7 +8191,7 @@ mod tests {
 
         // The `cd` is followed, so it names the run's own worktree rather than a directory below it.
         let command = format!(
-            "cd {} && git merge master",
+            "cd {} && git rebase master",
             repo.path().display().to_string().replace('\\', "/")
         );
         let decision = run_git_decision(&app, run_id, &command).await;
@@ -8187,7 +8201,7 @@ mod tests {
             queued_run_rows(&state).await,
             vec![(
                 1,
-                "merge".to_owned(),
+                "rebase".to_owned(),
                 "run".to_owned(),
                 "queued".to_owned(),
                 Some(run_id),
@@ -8201,7 +8215,7 @@ mod tests {
     async fn a_git_op_spelling_the_queue_cannot_build_still_stops_the_run() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-squash-merge").await;
-        crate::project::policy::declare_git_op(&state.pool, "p", "merge")
+        crate::project::policy::declare_git_op(&state.pool, "p", "rebase")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -8214,7 +8228,7 @@ mod tests {
         .await;
         let app = test_router(state.clone());
 
-        let decision = run_git_decision(&app, run_id, "git merge --squash feature").await;
+        let decision = run_git_decision(&app, run_id, "git rebase --onto master feature").await;
 
         assert_eq!(decision.decision, "pending_approval");
         assert!(queued_run_rows(&state).await.is_empty());
@@ -8232,7 +8246,7 @@ mod tests {
             .await
             .unwrap();
         let another_repo = rostered_repo(&state, "hook-run-another-project").await;
-        crate::project::policy::declare_git_op(&state.pool, "other", "merge")
+        crate::project::policy::declare_git_op(&state.pool, "other", "rebase")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -8245,7 +8259,7 @@ mod tests {
         .await;
         let app = test_router(state.clone());
 
-        let decision = run_git_decision(&app, run_id, "git merge feature").await;
+        let decision = run_git_decision(&app, run_id, "git rebase feature").await;
 
         assert_eq!(decision.decision, "pending_approval");
         assert!(queued_run_rows(&state).await.is_empty());

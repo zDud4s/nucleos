@@ -351,13 +351,15 @@ mod tests {
                 "git -C core log --oneline -5",
                 "git -C /c/Projects/nucleos/core status --short",
                 "git -C . branch --no-merged master",
+                // Since CLASSIFIER_VERSION 26 a `-C <path>` show/log/status/diff is a read
+                // wherever the path is (a leaf reads the main checkout from its worktree).
+                "git -C C:/Windows status",
             ],
         );
         assert_allowed("PowerShell", &[r"git -C C:\Projects\nucleos worktree list"]);
         assert_not_allowed(
             "Bash",
             &[
-                "git -C C:/Windows status",
                 "git -C .. status",
                 "git -C ~ status",
                 "git -C $HOME status",

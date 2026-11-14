@@ -1969,7 +1969,7 @@ mod tests {
 
     /// A command that writes a file by redirection: unrecognized by the classifier, so a
     /// `worktree` run is parked for it (`redirects_a_file`).
-    const REDIRECTING_COMMAND: &str = "cat > .nucleos-report.md <<'EOF'\nx\nEOF";
+    const REDIRECTING_COMMAND: &str = "python -c \"open('.nucleos-report.md','w').write('x')\"";
 
     async fn run_status_and_action_approvals(state: &AppState, run_id: i64) -> (String, i64) {
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
