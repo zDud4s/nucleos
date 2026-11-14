@@ -8,6 +8,7 @@ mod autofmt_driver_tests;
 pub mod branch_start;
 pub mod budget;
 pub mod checklist;
+mod checkpoint_ctx;
 pub mod close;
 pub mod commands;
 pub mod decision_tools;
