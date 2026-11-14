@@ -37,6 +37,18 @@ pub(super) fn routes() -> Router<AppState> {
         // either, for the reason given above `session-git-decision`: a person's session reports it,
         // never a run. It only records, and always answers 200.
         .route("/hooks/agent-outcome", post(agent_outcome))
+        // Which model an Agent tool call gets, asked by the PreToolUse hook. In no scope's table,
+        // for the reason given above `agent-outcome`. It never blocks the spawn: every failure
+        // answers `failopen` with a null model, and the hook then leaves the call as it is.
+        .route("/hooks/agent-model", post(agent_model))
+}
+
+/// `POST /hooks/agent-model`: decides and records the model for one subagent spawn. Always 200.
+pub(super) async fn agent_model(
+    State(state): State<AppState>,
+    Json(body): Json<crate::models::agent_decide::AgentModelRequest>,
+) -> Json<crate::models::agent_decide::AgentModelAnswer> {
+    Json(crate::models::agent_decide::decide(&state.pool, state.runner.router(), &body).await)
 }
 
 /// The hook's report of a finished subagent.
