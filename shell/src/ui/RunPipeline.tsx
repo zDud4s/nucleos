@@ -109,12 +109,6 @@ const read = (domain: StateDomain, state: string | null) => readState(domain, st
  */
 export function runStages(run: RunShape): Stage[] {
   const agent = read("run", run.status);
-  const gate = read("gate", run.gate_status);
-  // A NULL gate_status carries two different facts depending on where the run ended up, which
-  // `neverReachedGate` below is the whole of: nobody wrote a suite, or nobody got to run one.
-  const gateMeasured = run.gate_status !== null && run.gate_status.trim() !== "";
-  const reachedGate = gateMeasured || !neverReachedGate(run);
-  const finished = run.exit_code !== null;
 
   return [
     {
@@ -135,29 +129,50 @@ export function runStages(run: RunShape): Stage[] {
       tone: agent?.tone ?? null,
       reached: true,
     },
-    {
-      key: "gate",
-      kind: "GATE",
-      // "not reached" and "no gate configured" are the two absences and they are not the same
-      // one. The map's reading of a NULL gate_status is a fact about the PROJECT — nobody wrote a
-      // suite — and printing it on a run the núcleo stopped at turn nine would answer a question
-      // that was never asked.
-      title: reachedGate ? (gate?.label ?? "gate") : "not reached",
-      sub: run.gate_exit_code === null ? "" : `exit ${run.gate_exit_code}`,
-      tone: reachedGate ? (gate?.tone ?? null) : null,
-      reached: reachedGate,
-    },
-    {
-      key: "result",
-      kind: "RESULT",
-      // Absent is not zero: a run killed before it reported has no exit code, and saying "exit 0"
-      // there would be the page inventing the one number somebody came to check.
-      title: finished ? `exit ${run.exit_code}` : "none recorded",
-      sub: run.successor_run_id === null ? "" : `continued as ${run.successor_run_id}`,
-      tone: null,
-      reached: finished,
-    },
+    gateStage(run),
+    resultStage(run, run.successor_run_id),
   ];
+}
+
+/** The gate stage of a run. Shared with the chain, which reads it off the last leg. */
+export function gateStage(
+  run: Pick<RunShape, "status" | "gate_status" | "gate_exit_code">,
+): Stage {
+  const gate = read("gate", run.gate_status);
+  // A NULL gate_status carries two different facts depending on where the run ended up, which
+  // `neverReachedGate` below is the whole of: nobody wrote a suite, or nobody got to run one.
+  const gateMeasured = run.gate_status !== null && run.gate_status.trim() !== "";
+  const reachedGate = gateMeasured || !neverReachedGate(run);
+  return {
+    key: "gate",
+    kind: "GATE",
+    // "not reached" and "no gate configured" are the two absences and they are not the same
+    // one. The map's reading of a NULL gate_status is a fact about the PROJECT — nobody wrote a
+    // suite — and printing it on a run the núcleo stopped at turn nine would answer a question
+    // that was never asked.
+    title: reachedGate ? (gate?.label ?? "gate") : "not reached",
+    sub: run.gate_exit_code === null ? "" : `exit ${run.gate_exit_code}`,
+    tone: reachedGate ? (gate?.tone ?? null) : null,
+    reached: reachedGate,
+  };
+}
+
+/** The result stage of a run; `continuedAs` is the successor's id, if any. */
+export function resultStage(
+  run: Pick<RunShape, "status" | "exit_code">,
+  continuedAs: number | null,
+): Stage {
+  const finished = run.exit_code !== null;
+  return {
+    key: "result",
+    kind: "RESULT",
+    // Absent is not zero: a run killed before it reported has no exit code, and saying "exit 0"
+    // there would be the page inventing the one number somebody came to check.
+    title: finished ? `exit ${run.exit_code}` : "none recorded",
+    sub: continuedAs === null ? "" : `continued as ${continuedAs}`,
+    tone: null,
+    reached: finished,
+  };
 }
 
 /**
@@ -169,7 +184,7 @@ export function runStages(run: RunShape): Stage[] {
  * page where somebody is deciding whether to wait or to intervene. Every other status ran to the
  * end, and there a NULL really is the project's answer.
  */
-function neverReachedGate(run: RunShape): boolean {
+function neverReachedGate(run: Pick<RunShape, "status">): boolean {
   return ["pending", "running", "interrupted", "cancelled", "timed_out"].includes(run.status);
 }
 

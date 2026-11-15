@@ -55,6 +55,9 @@ function detail(overrides: Partial<RunDetail> = {}): RunDetail {
     successor_run_id: null,
     authored_prompt_estimate: 10_500,
     cli_own_estimate: 18_700,
+    lineage: [],
+    lineage_truncated: false,
+    part_of: null,
     ...overrides,
   };
 }
