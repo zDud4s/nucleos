@@ -99,6 +99,7 @@ async fn create_run_inner_with_mcp_box(
             permission_mode: None,
             account_choice: None,
             resume_session_id: None,
+            denied_tools: Vec::new(),
         },
         None,
         worktree_mcp_box,
@@ -234,9 +235,11 @@ pub async fn create_tree_node_run_resuming(
     project_root: String,
     tree: TreeWorktree,
     resume_session_id: Option<String>,
+    denied_tools: Vec<String>,
 ) -> Result<i64, CreateRunError> {
     let mut run = NewRun::provisioned(prompt, project_id, project_root, Provisioning::Tree(tree));
     run.resume_session_id = resume_session_id;
+    run.denied_tools = denied_tools;
     create_run_with_policy(state, run, None, true).await
 }
 
@@ -417,6 +420,9 @@ pub(super) struct NewRun<'a> {
     pub(super) account_choice: Option<crate::accounts::AccountChoice>,
     /// The CLI session this run continues headless (`-p --resume <id>`), or `None` for a fresh one.
     pub(super) resume_session_id: Option<String>,
+    /// Built-in tools this run's CLI is started without (`--disallowedTools`), on top of its tool
+    /// policy. Empty for every run but a tree leaf, which drops the schemas it never calls.
+    pub(super) denied_tools: Vec<String>,
 }
 
 impl NewRun<'static> {
@@ -452,6 +458,7 @@ impl NewRun<'static> {
             permission_mode: None,
             account_choice: None,
             resume_session_id: None,
+            denied_tools: Vec::new(),
         }
     }
 }
@@ -488,6 +495,7 @@ pub async fn create_no_tools_run(
             permission_mode: None,
             account_choice: None,
             resume_session_id: None,
+            denied_tools: Vec::new(),
         },
         Some(crate::execution::runner::ToolPolicy::None),
         false,
@@ -524,6 +532,7 @@ async fn create_run_with_policy(
         permission_mode,
         account_choice,
         resume_session_id,
+        denied_tools,
     } = run;
     sandbox_gate(&crate::sandbox::status())?;
     let node = provisioning.as_ref().and_then(Provisioning::node);
@@ -1190,6 +1199,10 @@ async fn create_run_with_policy(
             None => mcp,
         })
     };
+    let job_mcp = job_mcp.map(|mut mcp| {
+        mcp.denied_tools = denied_tools;
+        mcp
+    });
     spawn_run(
         state,
         runner,
