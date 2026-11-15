@@ -576,6 +576,13 @@ impl AutopilotRules {
         ))
     }
 
+    /// The command the post-land gate runs: the composed one when `gate_targets` is set, else
+    /// `gate_command`. Other callers keep reading `gate_command`.
+    pub fn postgate_command(&self) -> Option<String> {
+        self.composed_gate_command()
+            .or_else(|| self.gate_command.clone())
+    }
+
     /// Whether the final gate of a job or a run is scoped: the switch AND `gate_after_land`.
     /// A reader rather than a field read, because a caller that took `scoped_final_gate` straight
     /// off the struct would skip the full gate with no post-merge gate behind it.
@@ -1694,6 +1701,22 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             rules.composed_gate_command().as_deref(),
             Some("bash scripts/gate-diff.sh --only core,hooks scripts/gates.sh")
         );
+    }
+
+    #[test]
+    fn postgate_command_prefers_the_composed_one() {
+        let rules =
+            rules_from("gate_command: \"git --version\"\ngate_targets: {core: local}\n").unwrap();
+        assert_eq!(
+            rules.postgate_command().as_deref(),
+            Some("bash scripts/gate-diff.sh --only core scripts/gates.sh")
+        );
+    }
+
+    #[test]
+    fn postgate_command_falls_back_to_gate_command() {
+        let rules = rules_from("gate_command: \"git --version\"\n").unwrap();
+        assert_eq!(rules.postgate_command().as_deref(), Some("git --version"));
     }
 
     #[test]

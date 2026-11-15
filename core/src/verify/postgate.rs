@@ -1244,9 +1244,35 @@ pub async fn set_fix_branch(
 
 /// Whether the recorded green covers every gate target the owner placed locally, so that a `push`
 /// automation may answer it (spec 2026-11-15, decision 6).
-pub(crate) fn covers_local_targets(_state: &State, _rules: &crate::config::AutopilotRules) -> bool {
-    // TODO(plan B): true only when gate_targets exists and the recorded green covers every entry marked local
-    true
+///
+/// True only when `gate_targets` is declared and every local target is in the state's
+/// `green_targets`. Without `gate_targets` the owner never chose what "green" means, so no rule may
+/// push on it; a legacy `NULL` `green_targets` proves no target either (the next gate runs in full,
+/// see `needs_full_run`, and records them).
+pub(crate) fn covers_local_targets(state: &State, rules: &crate::config::AutopilotRules) -> bool {
+    rules.gate_targets.is_some()
+        && state.green_targets.as_ref().is_some_and(|covered| {
+            rules
+                .local_targets()
+                .iter()
+                .all(|target| covered.contains(target))
+        })
+}
+
+/// Some local target is missing from what the last green covered (or no green recorded its
+/// targets): the next gate must run every target once. `false` without `gate_targets`, where
+/// nothing changes.
+pub fn needs_full_run(state: Option<&State>, rules: &crate::config::AutopilotRules) -> bool {
+    if rules.gate_targets.is_none() {
+        return false;
+    }
+    match state.and_then(|state| state.green_targets.as_ref()) {
+        None => true,
+        Some(covered) => rules
+            .local_targets()
+            .iter()
+            .any(|target| !covered.contains(target)),
+    }
 }
 
 #[cfg(test)]
@@ -2372,13 +2398,105 @@ mod tests {
         assert_eq!(transitions(&pool).await.last().unwrap().4, 1);
     }
 
-    #[tokio::test]
-    async fn covers_local_targets_is_true_until_plan_b() {
+    fn targets_rules(placed: &str) -> crate::config::AutopilotRules {
+        let yaml = if placed.is_empty() {
+            "gate_after_land: true\n".to_owned()
+        } else {
+            format!("gate_after_land: true\ngate_targets: {{{placed}}}\n")
+        };
+        crate::config::parse_schedule_rules(&yaml).unwrap()
+    }
+
+    /// The state after a green that covered `targets` (`None` = a green that recorded none).
+    async fn state_green_covering(targets: Option<&[&str]>) -> State {
         let pool = crate::testdb::fresh_pool().await;
-        mark_covered(&pool, "p", "main", "g").await.unwrap();
-        let state = load(&pool, "p").await.unwrap().unwrap();
-        let rules = crate::config::parse_schedule_rules("gate_after_land: true
-").unwrap();
-        assert!(covers_local_targets(&state, &rules));
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = targets.map(names);
+        assert!(
+            finish_green_covering(&pool, "p", "a1", covered.as_deref())
+                .await
+                .unwrap()
+        );
+        load(&pool, "p").await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn covers_is_false_without_gate_targets() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(!covers_local_targets(&state, &targets_rules("")));
+    }
+
+    #[tokio::test]
+    async fn covers_is_true_when_every_local_is_covered() {
+        let state = state_green_covering(Some(&["core", "hooks"])).await;
+        assert!(covers_local_targets(
+            &state,
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn covers_is_false_when_a_local_is_missing() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(!covers_local_targets(
+            &state,
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn covers_ignores_ci_targets() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(covers_local_targets(
+            &state,
+            &targets_rules("core: local, shell: ci")
+        ));
+    }
+
+    #[tokio::test]
+    async fn covers_is_false_for_null_with_gate_targets() {
+        let state = state_green_covering(None).await;
+        assert!(!covers_local_targets(&state, &targets_rules("core: local")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_false_without_gate_targets() {
+        let state = state_green_covering(None).await;
+        assert!(!needs_full_run(Some(&state), &targets_rules("")));
+        assert!(!needs_full_run(None, &targets_rules("")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_true_when_a_local_target_is_missing() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(needs_full_run(
+            Some(&state),
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_false_when_all_covered() {
+        let state = state_green_covering(Some(&["core", "hooks"])).await;
+        assert!(!needs_full_run(
+            Some(&state),
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_true_for_legacy_null_with_gate_targets() {
+        let state = state_green_covering(None).await;
+        assert!(needs_full_run(Some(&state), &targets_rules("core: local")));
+        assert!(needs_full_run(None, &targets_rules("core: local")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_false_when_a_covered_target_turned_ci() {
+        let state = state_green_covering(Some(&["core", "hooks"])).await;
+        assert!(!needs_full_run(
+            Some(&state),
+            &targets_rules("core: local, hooks: ci")
+        ));
     }
 }

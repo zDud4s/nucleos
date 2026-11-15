@@ -456,6 +456,14 @@ async fn submit_with(
             .map_err(internal)?
     };
 
+    // Only the post-land gate runs the composed, targets-only command; every other caller keeps
+    // the whole `gate_command`.
+    let gate_cmd = if caller == Caller::Postgate {
+        rules.postgate_command()
+    } else {
+        rules.gate_command.clone()
+    };
+
     // `true` until a project can declare that it gates after landing (there is no
     // `gate_after_land` yet); the planner already knows how to refuse `full` once there is.
     let planned = match (caller, args.groups.as_deref(), terms.recheck.as_deref()) {
@@ -467,7 +475,7 @@ async fn submit_with(
             args.scope,
             &changed,
             &fillable,
-            rules.gate_command.as_deref(),
+            gate_cmd.as_deref(),
             true,
             // Filters narrow only a session's own iteration run and a tree branch's gate
             // (`submit_narrowed`). A scope run (the daemon's item and merge gates, the evidence a
@@ -566,13 +574,7 @@ async fn submit_with(
             }
         };
         let fingerprint = content.and_then(|content| {
-            unit_fingerprint(
-                &unit,
-                group,
-                map_version,
-                rules.gate_command.as_deref(),
-                &content,
-            )
+            unit_fingerprint(&unit, group, map_version, gate_cmd.as_deref(), &content)
         });
         match fingerprint {
             Ok(fingerprint) => unit.fingerprint = Some(fingerprint),
@@ -1979,6 +1981,51 @@ tests:
         let (ticket, _) = finished(&f.pool, second.unwrap()).await;
         assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
         assert_eq!(ticket.units[0].why, "gate_command");
+    }
+
+    /// `(argv, fingerprint)` of the gate unit a `full` request from `caller` queued under `rules`.
+    /// Nothing runs: the fixture has no worker, the queued row is what the plan decided.
+    async fn queued_gate_unit(rules: &str, caller: Caller) -> (String, Option<String>) {
+        let f = fixture(None, None, false).await;
+        crate::project::rules::testing::publish_rules("alpha", rules);
+        let request = args(Kind::Test, ScopeArg::Full, f.repo.path(), None, None);
+        let id = submit(&f.ex, caller, &request).await.unwrap();
+        sqlx::query_as(
+            "SELECT argv, fingerprint FROM verify_runs WHERE origin = 'verify' AND origin_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    const TARGETED: &str = "gate_command: \"git --version\"\ngate_targets: {core: local}\n";
+
+    #[tokio::test]
+    async fn a_postgate_full_unit_runs_the_composed_command() {
+        let (argv, _) = queued_gate_unit(TARGETED, Caller::Postgate).await;
+        assert!(argv.contains("gate-diff.sh"), "{argv}");
+        assert!(argv.contains("core"), "{argv}");
+        assert!(!argv.contains("--version"), "{argv}");
+    }
+
+    #[tokio::test]
+    async fn a_non_postgate_full_unit_keeps_gate_command() {
+        let (argv, _) = queued_gate_unit(TARGETED, Caller::Owner).await;
+        assert!(argv.contains("--version"), "{argv}");
+        assert!(!argv.contains("gate-diff.sh"), "{argv}");
+    }
+
+    #[tokio::test]
+    async fn the_fingerprint_follows_the_composed_command() {
+        let (_, core_only) = queued_gate_unit(TARGETED, Caller::Postgate).await;
+        let (_, with_hooks) = queued_gate_unit(
+            "gate_command: \"git --version\"\ngate_targets: {core: local, hooks: local}\n",
+            Caller::Postgate,
+        )
+        .await;
+        assert!(core_only.is_some() && with_hooks.is_some());
+        assert_ne!(core_only, with_hooks);
     }
 
     #[tokio::test]

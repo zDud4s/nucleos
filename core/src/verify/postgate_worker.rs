@@ -57,9 +57,9 @@ use crate::verify::postgate::{self as verify_postgate, RedPhase, State};
 use crate::verify::runs::{STATUS_FAILED, STATUS_PASSED};
 use crate::verify::{self, Caller, VerifyArgs};
 
+mod automation_emit;
 mod correction;
 mod incident;
-mod automation_emit;
 mod promotion;
 mod revert;
 
@@ -300,7 +300,8 @@ async fn tick_project(
         // With a release branch, the green sha is promoted to it by the queue.
         promotion::enqueue_promotion_if_due(pool, project_id, project_root, state, rules).await;
         // Without one, the green sha itself is what a `push` automation answers.
-        automation_emit::emit_local_green_if_due(pool, project_id, project_root, state, rules).await;
+        automation_emit::emit_local_green_if_due(pool, project_id, project_root, state, rules)
+            .await;
     }
 
     // A gate is running: finish it from its ticket, never start another. This needs neither the
@@ -1455,9 +1456,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_green_with_gate_targets_records_the_local_ones() {
-        let rules = format!("{GATE_ON}gate_targets: {{core: local, shell: ci}}\n");
-        let f = fixture(Some(&rules)).await;
+        // The gate starts under plain GATE_ON (its command, `git --version`, runs in the fixture);
+        // the targets arrive before it finishes. The worker records the targets of the rules read
+        // at the finishing tick (plan B T2's accepted race), so this pins that path.
+        let f = fixture(Some(GATE_ON)).await;
         tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+        let rules = format!("{GATE_ON}gate_targets: {{core: local, shell: ci}}\n");
+        crate::project::rules::testing::publish_rules("alpha", &rules);
 
         tick_until(&f, |s| matches!(s, Step::Green(_))).await;
 

@@ -485,11 +485,19 @@ impl Executor {
             return Vec::new();
         };
         let deadline = Instant::now() + GATE_BASE_TIMEOUT;
+        // Only the post-land gate runs the composed targets command; a probe runs the whole
+        // `gate_command`, so it never forces the root base on a new local target.
+        let rules = if claimed.requested_by == verify_runs::REQUESTED_BY_POSTGATE {
+            crate::project::rules::autopilot(project).ok()
+        } else {
+            None
+        };
         match resolve::postgate_gate_base(
             &self.pool,
             project,
             Path::new(&claimed.worktree),
             deadline,
+            rules.as_ref(),
         )
         .await
         {
@@ -1560,6 +1568,61 @@ mod tests {
         let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
         let env = ex.gate_env(&claimed).await;
         assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    /// `proj`'s rules, as `gate_env` reads them from the settings snapshot of this thread.
+    fn publish_proj_rules(yaml: &str) -> crate::project::rules::testing::Home {
+        let home = crate::project::rules::testing::Home::scoped();
+        crate::project::rules::testing::publish_rules("proj", yaml);
+        home
+    }
+
+    async fn store_green_covering(pool: &SqlitePool, green: &str, targets: &str) {
+        store_postgate(pool, Some(green), None).await;
+        sqlx::query("UPDATE postgate_state SET green_targets = ? WHERE project_id = 'proj'")
+            .bind(targets)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    const NEW_LOCAL: &str = "gate_command: \"git --version\"\ngate_after_land: true\n\
+                             gate_targets: {core: local, hooks: local}\n";
+
+    #[tokio::test]
+    async fn a_newly_local_target_gets_the_root_as_gate_base() {
+        let _home = publish_proj_rules(NEW_LOCAL);
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_green_covering(&ex.pool, &shas[1], "[\"core\"]").await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_covered_gate_keeps_the_proven_base() {
+        let _home = publish_proj_rules(NEW_LOCAL);
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_green_covering(&ex.pool, &shas[1], "[\"core\",\"hooks\"]").await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_probe_keeps_the_proven_base_even_when_a_target_is_new() {
+        let _home = publish_proj_rules(NEW_LOCAL);
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_green_covering(&ex.pool, &shas[1], "[\"core\"]").await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_PROBE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
     }
 
     #[tokio::test]

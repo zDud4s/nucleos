@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::automations::{self, Event};
 use crate::config::AutopilotRules;
 use crate::execution::git_exec;
-use crate::verify::postgate::{covers_local_targets, State};
+use crate::verify::postgate::{State, covers_local_targets};
 
 /// Emits `local_green` for the gate's green sha when there is one and no release branch.
 pub(super) async fn emit_local_green_if_due(
@@ -40,16 +40,33 @@ pub(super) async fn emit_local_green_if_due(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{Fixture, GATE_ON, RELEASE_ON, fixture};
     use super::*;
     use crate::project::rules::testing::publish_automations;
     use crate::verify::postgate as verify_postgate;
-    use super::super::tests::{fixture, Fixture, GATE_ON, RELEASE_ON};
 
     const RULE_ON: &str = "rules:\n  - name: push-when-green\n    enabled: true\n    on: {event: published_green}\n    do: {action: push, remote: origin}\n";
     const RULE_OFF: &str = "rules:\n  - name: push-when-green\n    enabled: false\n    on: {event: published_green}\n    do: {action: push, remote: origin}\n";
 
-    /// Marks `main`'s tip green and returns it.
+    /// `GATE_ON` plus the owner's placement of the gate targets: `core` runs locally.
+    fn gate_on_with_targets() -> String {
+        format!("{GATE_ON}gate_targets:\n  core: local\n")
+    }
+
+    /// Marks `main`'s tip green and returns it, recording that the green covered `core`.
     async fn main_is_green(f: &Fixture) -> String {
+        let sha = main_is_green_without_targets(f).await;
+        sqlx::query(
+            "UPDATE postgate_state SET green_targets = '[\"core\"]' WHERE project_id = 'alpha'",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        sha
+    }
+
+    /// Marks `main`'s tip green without recording which targets the green covered.
+    async fn main_is_green_without_targets(f: &Fixture) -> String {
         verify_postgate::mark_covered(&f.pool, "alpha", "main", &f.tip)
             .await
             .unwrap();
@@ -85,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_green_sha_with_the_rule_on_queues_one_push_sha() {
-        let f = fixture(Some(GATE_ON)).await;
+        let f = fixture(Some(&gate_on_with_targets())).await;
         publish_automations("alpha", RULE_ON);
         let green = main_is_green(&f).await;
 
@@ -96,7 +113,7 @@ mod tests {
 
     #[tokio::test]
     async fn emitting_the_same_green_on_every_tick_queues_one_push_only() {
-        let f = fixture(Some(GATE_ON)).await;
+        let f = fixture(Some(&gate_on_with_targets())).await;
         publish_automations("alpha", RULE_ON);
         main_is_green(&f).await;
 
@@ -122,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_the_rule_off_nothing_is_queued_even_on_green() {
-        let f = fixture(Some(GATE_ON)).await;
+        let f = fixture(Some(&gate_on_with_targets())).await;
         publish_automations("alpha", RULE_OFF);
         main_is_green(&f).await;
 
@@ -133,8 +150,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_red_or_not_yet_green_state_emits_nothing() {
+    async fn a_push_rule_emits_nothing_while_gate_targets_is_absent() {
         let f = fixture(Some(GATE_ON)).await;
+        publish_automations("alpha", RULE_ON);
+        main_is_green(&f).await;
+
+        emit(&f).await;
+
+        assert_eq!(firings(&f).await, 0);
+        assert!(pushes(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_gate_targets_no_local_green_is_emitted() {
+        let f = fixture(Some(GATE_ON)).await;
+        publish_automations("alpha", RULE_ON);
+        main_is_green_without_targets(&f).await;
+
+        emit(&f).await;
+
+        assert_eq!(firings(&f).await, 0);
+        assert!(pushes(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_local_green_when_a_local_target_is_not_covered() {
+        let f = fixture(Some(&format!(
+            "{GATE_ON}gate_targets:\n  core: local\n  hooks: local\n"
+        )))
+        .await;
+        publish_automations("alpha", RULE_ON);
+        main_is_green(&f).await; // covers only core
+
+        emit(&f).await;
+
+        assert_eq!(firings(&f).await, 0);
+        assert!(pushes(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_red_or_not_yet_green_state_emits_nothing() {
+        let f = fixture(Some(&gate_on_with_targets())).await;
         publish_automations("alpha", RULE_ON);
         main_is_green(&f).await;
         sqlx::query(
