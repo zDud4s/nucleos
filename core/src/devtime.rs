@@ -936,7 +936,8 @@ pub async fn ingest_cycle(
                 worktree,
                 ..
             }) if kind == "project" || kind == "worktree" || kind == "tree_node" => {
-                let account_id = account::resolve_account(&key, &default_dir, &accounts);
+                let account_id =
+                    crate::devtime::account::resolve_account(&key, &default_dir, &accounts);
                 match ingest_file(
                     pool,
                     file,
