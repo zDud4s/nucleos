@@ -165,11 +165,7 @@ pub(super) async fn chain_origin(
     let mut id = run_id;
     let mut hops = 0;
     for _ in 0..WALK_BOUND {
-        let predecessor: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        let predecessor = predecessor_of(pool, id).await?;
         match predecessor {
             Some(earlier) if earlier != id => {
                 id = earlier;
@@ -179,6 +175,14 @@ pub(super) async fn chain_origin(
         }
     }
     Ok((id, hops))
+}
+
+/// The run whose `successor_run_id` is `id`, if any: one step back along a chain.
+pub(super) async fn predecessor_of(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// How far back a chain walk goes before it stops trusting `successor_run_id` (see `chain_origin`).
@@ -199,11 +203,7 @@ async fn chain_turns(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<i64> 
         if step == WALK_BOUND {
             break;
         }
-        let predecessor: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        let predecessor = predecessor_of(pool, id).await?;
         match predecessor {
             Some(earlier) if earlier != id => id = earlier,
             _ => break,

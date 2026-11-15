@@ -10,6 +10,7 @@ pub mod api;
 mod context_given;
 mod create;
 mod handoff;
+mod lineage;
 mod lifecycle;
 mod policy;
 mod resume;
@@ -12269,6 +12270,9 @@ tests:
             advised_effort: None,
             route_failed: None,
             account_id: None,
+            lineage: Vec::new(),
+            lineage_truncated: false,
+            part_of: None,
         }
         .with_prompt_budget();
 
