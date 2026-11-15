@@ -34,16 +34,25 @@ impl TaskKey {
         Self("release-diverged".to_owned())
     }
 
+    /// The `remote-diverged:<branch>` incident key: an automation's push found the remote branch on
+    /// a line of history that neither contains nor is contained by the local green sha.
+    pub fn remote_diverged(branch: &str) -> Self {
+        Self(format!("remote-diverged:{branch}"))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// True for the keys only the daemon opens: `master-red` and `migration:`, `fmt:`, `conflict:`,
-    /// `direct-write:` and `release-diverged`.
+    /// `direct-write:`, `release-diverged` and `remote-diverged:`.
     pub fn is_machine(&self) -> bool {
         matches!(
             self.prefix(),
-            "master-red" | "migration" | "fmt" | "conflict" | "direct-write" | "release-diverged"
+            "master-red" | "migration" | "fmt" | "conflict"
+                | "direct-write"
+                | "release-diverged"
+                | "remote-diverged"
         )
     }
 
@@ -89,7 +98,7 @@ impl std::fmt::Display for KeyError {
             Self::Empty => write!(formatter, "empty task key"),
             Self::UnknownPrefix(prefix) => write!(
                 formatter,
-                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt:, conflict:, direct-write: or release-diverged)"
+                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt:, conflict:, direct-write:, release-diverged or remote-diverged:)"
             ),
             Self::Malformed { prefix, expected } => {
                 write!(formatter, "malformed '{prefix}' key: expected {expected}")
@@ -216,6 +225,12 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
                 return Err(malformed("release-diverged", "no body (one per project)"));
             }
             "release-diverged".to_owned()
+        }
+        "remote-diverged" => {
+            if body.is_empty() {
+                return Err(malformed("remote-diverged", "remote-diverged:<branch>"));
+            }
+            format!("remote-diverged:{body}")
         }
         other => return Err(KeyError::UnknownPrefix(other.to_owned())),
     };
@@ -469,6 +484,19 @@ mod tests {
             key("conflict:fix/a"),
             Err(KeyError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn remote_diverged_key_needs_a_branch_and_is_machine() {
+        assert!(matches!(
+            key("remote-diverged"),
+            Err(KeyError::Malformed { .. })
+        ));
+        let diverged = normalize("remote-diverged:master", Path::new("/repo")).unwrap();
+        assert_eq!(diverged.as_str(), "remote-diverged:master");
+        assert!(diverged.is_machine());
+        assert_eq!(diverged.prefix(), "remote-diverged");
+        assert_eq!(TaskKey::remote_diverged("master"), diverged);
     }
 
     #[test]

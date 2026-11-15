@@ -343,6 +343,54 @@ pub async fn close_release_diverged(
     close_machine_ticket(pool, project_id, &release_diverged_key(), note, now).await
 }
 
+/// The key `remote-diverged:<branch>`.
+pub fn remote_diverged_key(branch: &str) -> TaskKey {
+    TaskKey::remote_diverged(branch)
+}
+
+/// Opens (or reports again) the `remote-diverged:<branch>` ticket: an automation's push found the
+/// remote branch on a history that neither contains nor is contained by the local green sha. Never
+/// auto-launched and never forced over; the owner decides which history wins. `detail` carries
+/// `branch`, `remote`, `local_sha` and `remote_sha`; a non-object is kept under `detail.detail`.
+pub async fn open_remote_diverged_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
+    let fields = match detail {
+        Value::Object(fields) => fields,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut fields = serde_json::Map::new();
+            fields.insert("detail".to_owned(), other);
+            fields
+        }
+    };
+    open_machine_ticket(
+        pool,
+        project_id,
+        remote_diverged_key(branch),
+        format!("the remote branch {branch} diverged from the local green sha"),
+        Value::Object(fields),
+        Vec::new(),
+        now,
+    )
+    .await
+}
+
+/// Closes the live `remote-diverged:<branch>` ticket by resolution. `false` when there is none.
+pub async fn close_remote_diverged(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    note: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    close_machine_ticket(pool, project_id, &remote_diverged_key(branch), note, now).await
+}
+
 /// Why the target moved without the queue: a write the hook did not see (`Violation`) or one it
 /// let through because `NUCLEOS_ALLOW_DIRECT_GIT` was set (`Bypass`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +836,41 @@ mod tests {
                 .await
                 .unwrap(),
             "nothing left to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_remote_diverged_twice_is_one_ticket_with_two_reports() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
+        let detail = |remote_sha: &str| {
+            json!({ "branch": "master", "remote": "origin", "local_sha": "a1", "remote_sha": remote_sha })
+        };
+        let first = open_remote_diverged_ticket(&pool, "proj", "master", detail("r1"), now)
+            .await
+            .unwrap();
+        assert_eq!(first.key.as_str(), "remote-diverged:master");
+        assert!(first.key.is_machine());
+        assert_eq!(first.detail["remote_sha"], json!("r1"));
+        let again = open_remote_diverged_ticket(&pool, "proj", "master", detail("r2"), now)
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id, "one ticket per branch");
+        let live = store::live_by_key(&pool, "proj", &remote_diverged_key("master"), now)
+            .await
+            .unwrap()
+            .expect("the ticket is live");
+        assert_eq!(live.report_count, 2);
+        assert_eq!(ticket_count(&pool).await, 1);
+        assert!(
+            close_remote_diverged(&pool, "proj", "master", "pushed", now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !close_remote_diverged(&pool, "proj", "master", "again", now)
+                .await
+                .unwrap()
         );
     }
 }

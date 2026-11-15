@@ -110,12 +110,15 @@ pub fn launch_kind(task: &TaskRow) -> LaunchKind {
 
 /// False for the keys whose owners are decided elsewhere: `master-red` (verify and the postgate) and
 /// `migration:` (the branch the land gate refused) and `direct-write:` (the owner resolves it), and
-/// `release-diverged` (the release branch moved outside the promotion; the incident needs the owner).
+/// `release-diverged` (the release branch moved outside the promotion; the incident needs the owner),
+/// and `remote-diverged:` (the remote branch split from the local green sha; only the owner decides
+/// which history wins).
 pub fn auto_launchable(key: &str) -> bool {
     key != MASTER_RED_KEY
         && key != crate::task_claims::keys::TaskKey::release_diverged().as_str()
         && !key.starts_with(MIGRATION_PREFIX)
         && !key.starts_with(DIRECT_WRITE_PREFIX)
+        && !key.starts_with("remote-diverged:")
 }
 
 fn parse(at: &str) -> Option<DateTime<Utc>> {
@@ -583,6 +586,12 @@ mod tests {
             due(&row, &launched(2, t0() - mins(60)), true, t0()),
             Due::No
         );
+    }
+
+    #[test]
+    fn a_remote_diverged_ticket_is_never_auto_launched() {
+        assert!(!auto_launchable("remote-diverged:master"));
+        assert!(auto_launchable("file:core/a.rs"));
     }
 
     #[test]
