@@ -407,7 +407,11 @@ async fn at_work(
                 .await
                 .map(|n| n.closed_at.is_some() && n.status == "done")
                 .map_err(|e| e.to_string())?;
-            if closed_done { Some("done") } else { Some("failed") }
+            if closed_done {
+                Some("done")
+            } else {
+                Some("failed")
+            }
         }
         None => None,
     };
@@ -437,7 +441,11 @@ async fn at_work(
             if !formatted {
                 // One rescue run with the failure in its prompt, then the owner is asked.
                 if let Some(run) = &report.run_id {
-                    let ended = if no_report { "without a report" } else { outcome };
+                    let ended = if no_report {
+                        "without a report"
+                    } else {
+                        outcome
+                    };
                     let suffix = rescue::stopped_suffix(ended, handoff.as_deref());
                     if rescue::attempt(state, &node, run, &suffix).await? {
                         return Ok(());
