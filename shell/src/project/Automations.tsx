@@ -29,10 +29,20 @@ export function Automations({ projectId }: { projectId: string }) {
 interface Form {
   /** The index of the rule being edited, or null for a new one. */
   at: number | null;
+  /** The name the rule had when the form opened (null for a new one), to find it again after a reload. */
+  was: string | null;
   draft: Draft;
+  /**
+   * The document version read when the form opened. The save goes out at this version, never at the
+   * live one: a refetch can reorder or delete rules under an open form, and the 409 is what stops the
+   * save from landing on the wrong rule.
+   */
+  version: number;
+  /** A save answered 409: the draft is kept, and the next save re-pins to the latest list. */
+  stale: boolean;
 }
 
-type Notice = { kind: "stale" } | { kind: "failed"; where: "form" | "list"; text: string };
+type Notice = { kind: "stale"; rule: string } | { kind: "failed"; where: "form" | "list"; text: string };
 
 function Editor({ scope }: { scope: string }) {
   const doc = useSettingDoc(scope, NAME);
@@ -48,18 +58,18 @@ function Editor({ scope }: { scope: string }) {
   const rules = readRules(doc.data.body);
   const version = doc.data.version;
 
-  function put(next: Rule[], where: "form" | "list", onDone?: () => void) {
+  function put(next: Rule[], where: "form" | "list", onDone?: () => void, at: number = version, rule = "") {
     setNotice(null);
     write.mutate(
-      { body: { rules: next }, version },
+      { body: { rules: next }, version: at },
       {
         onSuccess: () => onDone?.(),
         onError: (error) => {
           const failure = classifyWriteFailure(error);
           if (failure.kind === "stale") {
-            // The query is already invalidated and reloading; the open form is dropped with the old list.
-            setForm(null);
-            setNotice({ kind: "stale" });
+            // The query is already invalidated and reloading. An open form keeps the owner's draft.
+            setForm((open) => (open === null ? open : { ...open, stale: true }));
+            setNotice({ kind: "stale", rule });
           } else {
             setNotice({ kind: "failed", where, text: sentenceOf(failure) });
           }
@@ -70,9 +80,26 @@ function Editor({ scope }: { scope: string }) {
 
   function save() {
     if (form === null) return;
-    const rule = ruleOf(form.draft, form.at === null ? false : rules[form.at].enabled);
-    const next = form.at === null ? [...rules, rule] : rules.map((old, i) => (i === form.at ? rule : old));
-    put(next, "form", () => setForm(null));
+    let at = form.at;
+    let pinned = form.version;
+    if (form.stale) {
+      // The owner has seen the note and saves again: re-pin to the latest list, finding the rule by name.
+      pinned = version;
+      if (form.was !== null) {
+        at = rules.findIndex((old) => old.name === form.was);
+        if (at < 0) {
+          setNotice({
+            kind: "failed",
+            where: "form",
+            text: `The rule "${form.was}" no longer exists, so nothing was saved.`,
+          });
+          return;
+        }
+      }
+    }
+    const rule = ruleOf(form.draft, at === null ? false : (rules[at]?.enabled ?? false));
+    const next = at === null ? [...rules, rule] : rules.map((old, i) => (i === at ? rule : old));
+    put(next, "form", () => setForm(null), pinned, form.draft.name);
   }
 
   const failureAt = (where: "form" | "list") =>
@@ -87,7 +114,9 @@ function Editor({ scope }: { scope: string }) {
       <p className="text-sm text-text-muted">A new rule starts switched off.</p>
 
       {notice?.kind === "stale" ? (
-        <ConflictNote>Someone else changed the automations. Showing the latest version — try again.</ConflictNote>
+        <ConflictNote>
+          {`Someone else changed the automations${notice.rule === "" ? "" : ` while you were editing "${notice.rule}"`}. Showing the latest version — your draft is kept, so check it and save again.`}
+        </ConflictNote>
       ) : null}
 
       {rules.length === 0 && form === null ? (
@@ -115,7 +144,7 @@ function Editor({ scope }: { scope: string }) {
                   disabled={write.isPending}
                   onClick={() => {
                     setNotice(null);
-                    setForm({ at, draft: draftOf(rule) });
+                    setForm({ at, was: rule.name, draft: draftOf(rule), version, stale: false });
                   }}
                 >
                   {`Edit ${rule.name}`}
@@ -145,7 +174,7 @@ function Editor({ scope }: { scope: string }) {
             variant="ghost"
             onClick={() => {
               setNotice(null);
-              setForm({ at: null, draft: blankDraft() });
+              setForm({ at: null, was: null, draft: blankDraft(), version, stale: false });
             }}
           >
             Add automation

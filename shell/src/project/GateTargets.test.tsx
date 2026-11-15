@@ -35,7 +35,8 @@ function open() {
 const group = (target: string) => screen.getByRole("group", { name: target });
 const pick = (target: string, option: "Local" | "CI only") =>
   fireEvent.click(within(group(target)).getByRole("button", { name: option }));
-const pressed = (target: string, option: string) =>
+const unset = (target: string) => fireEvent.click(within(group(target)).getByRole("button", { name: "Unset" }));
+const pressed =(target: string, option: string) =>
   within(group(target)).getByRole("button", { name: option }).getAttribute("aria-pressed");
 const save = () => fireEvent.click(screen.getByRole("button", { name: "Save targets" }));
 
@@ -95,7 +96,33 @@ describe("GateTargets", () => {
     expect(pressed("core", "Local")).toBe("true");
     expect(pressed("core", "CI only")).toBe("false");
     expect(pressed("tauri", "CI only")).toBe("true");
-    expect(screen.getAllByText("Not set").length).toBe(TARGETS.length - 2);
+    // Once a mapping is stored, a target left out of it runs in CI rather than being undecided.
+    expect(screen.getAllByText("Not set (runs in CI)").length).toBe(TARGETS.length - 2);
+  });
+
+  it("clearing the only stored target and saving omits gate_targets from the body", async () => {
+    const double = world({ gate_command: "scripts/gates.sh", gate_targets: { core: "local" } }, 7);
+    open();
+    await screen.findByRole("group", { name: "core" });
+    unset("core");
+    expect(screen.getAllByText("Not set").length).toBe(TARGETS.length);
+    save();
+
+    await waitFor(() => expect(double.writes.length).toBe(1));
+    expect(double.writes[0].version).toBe(7);
+    expect(double.writes[0].body).toEqual({ gate_command: "scripts/gates.sh" });
+    expect("gate_targets" in (double.writes[0].body as object)).toBe(false);
+  });
+
+  it("clearing one of two stored targets keeps the other", async () => {
+    const double = world({ gate_targets: { core: "local", tauri: "ci" } });
+    open();
+    await screen.findByRole("group", { name: "core" });
+    unset("tauri");
+    save();
+
+    await waitFor(() => expect(double.writes.length).toBe(1));
+    expect(double.writes[0].body).toEqual({ gate_targets: { core: "local" } });
   });
 
   it("shows the núcleo's 422 sentence next to the table and keeps the choices", async () => {

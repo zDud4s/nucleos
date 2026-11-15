@@ -221,7 +221,46 @@ describe("Automations", () => {
 
     expect(await screen.findByText(/changed the automations/)).toBeTruthy();
     expect(await screen.findByText("theirs")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Save rule" })).toBeNull();
+    // The typed draft survives the 409 and the note names the rule.
+    expect(screen.getByRole("button", { name: "Save rule" })).toBeTruthy();
+    expect(box("Name").value).toBe("mine");
+    expect(screen.getByText(/"mine"/)).toBeTruthy();
+    expect(double.writes.length).toBe(0);
+  });
+
+  it("an open form saves at the version it opened at, so a list that moved meanwhile answers 409", async () => {
+    const second: Rule = { ...PUSH, name: "second" };
+    const double = world({ rules: [PUSH, second] }, 3);
+    const { queryClient } = open();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit second" }));
+    // Another writer reorders the rules and the window-focus refetch brings that in.
+    double.external("project:alpha", "automations", { rules: [second, PUSH] });
+    await queryClient.invalidateQueries();
+    await waitFor(() => expect(screen.getAllByRole("listitem")[0].textContent).toContain("second"));
+
+    fireEvent.change(box("Remote"), { target: { value: "upstream" } });
+    press("Save rule");
+
+    expect(await screen.findByText(/changed the automations/)).toBeTruthy();
+    // Nothing was written over the moved document, and the draft is still there.
+    expect(double.writes.length).toBe(0);
+    expect(box("Remote").value).toBe("upstream");
+  });
+
+  it("an open form whose rule was deleted elsewhere does not crash on Save", async () => {
+    const double = world({ rules: [PUSH] }, 3);
+    const { queryClient } = open();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit push-when-green" }));
+    double.external("project:alpha", "automations", { rules: [] });
+    await queryClient.invalidateQueries();
+    await waitFor(() => expect(screen.queryAllByRole("listitem").length).toBe(0));
+
+    fireEvent.change(box("Remote"), { target: { value: "upstream" } });
+    press("Save rule");
+
+    expect(await screen.findByText(/changed the automations/)).toBeTruthy();
     expect(double.writes.length).toBe(0);
   });
 
