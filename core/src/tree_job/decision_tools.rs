@@ -236,6 +236,7 @@ mod tests {
             Path(id.to_owned()),
             Ok(Json(AnswerBody {
                 answer: text.to_owned(),
+                drop: false,
             })),
         )
         .await
