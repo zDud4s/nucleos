@@ -859,10 +859,12 @@ pub async fn ingest_cycle(
 
     // The scan root is `<config dir>/projects`; its parent stands for the default account's dir.
     // A failed read leaves the account column NULL, never blocks the ingest.
-    let accounts = crate::accounts::store::list(pool).await.unwrap_or_else(|error| {
-        tracing::warn!(%error, "devtime: could not read the accounts");
-        Vec::new()
-    });
+    let accounts = crate::accounts::store::list(pool)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "devtime: could not read the accounts");
+            Vec::new()
+        });
     let default_dir = path_key(projects_dir.parent().unwrap_or(projects_dir));
 
     let dir = projects_dir.to_path_buf();

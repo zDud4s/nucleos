@@ -786,12 +786,12 @@ pub async fn set_file_identity(
         "UPDATE devtime_files SET session_id = ?, lane = ?, account_id = COALESCE(?, account_id)
          WHERE path = ?",
     )
-        .bind(session_id)
-        .bind(lane)
-        .bind(account_id)
-        .bind(path)
-        .execute(&mut *conn)
-        .await?;
+    .bind(session_id)
+    .bind(lane)
+    .bind(account_id)
+    .bind(path)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
