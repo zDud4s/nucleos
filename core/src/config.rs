@@ -315,6 +315,31 @@ pub enum VerifyGuardMode {
     Refuse,
 }
 
+/// Where a gate target runs. `Ci` means "not run locally"; CI itself always runs everything.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GatePlace {
+    Local,
+    Ci,
+}
+
+/// The targets `scripts/gate-diff.sh` can select, in its order. Hardcoded because validation runs
+/// at document load, in any cwd, without a reliable `scripts/gates.sh`; a parity test keeps it in
+/// step with both scripts. `security` and `all` are accepted by `gates.sh` but not selected by
+/// `gate-diff.sh`, so they are deliberately absent.
+pub const GATE_TARGETS: [&str; 6] = ["core", "sidecars", "shell", "tauri", "hooks", "broker"];
+
 // `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -326,6 +351,15 @@ pub struct AutopilotRules {
     #[serde(default)]
     #[schemars(extend("x-widget" = "command"))]
     pub gate_command: Option<String>,
+    /// Where each `scripts/gates.sh` target runs: `local` (the postgate runs it) or `ci` (only CI
+    /// does). Keys are drawn from [`GATE_TARGETS`]; at least one must be `local`.
+    ///
+    /// **Absent means the postgate runs `gate_command` whole, exactly as before this key existed.**
+    /// It only affects the postgate: the merge queue, `gate_before_publish`, bisect probes and
+    /// `gate_retry` keep running `gate_command`. Leaving every target `ci` is not expressible here;
+    /// omit the key for that.
+    #[serde(default)]
+    pub gate_targets: Option<BTreeMap<String, GatePlace>>,
     /// How many turns one autonomous run of this project's work may take before it is stopped.
     ///
     /// **Absent means [`crate::execution::runner::DEFAULT_MAX_TURNS`]**, which is what every project
@@ -520,6 +554,28 @@ pub struct CommandKinds {
 }
 
 impl AutopilotRules {
+    /// Local targets in `GATE_TARGETS` order; empty when `gate_targets` is `None`.
+    pub fn local_targets(&self) -> Vec<String> {
+        let Some(targets) = &self.gate_targets else {
+            return Vec::new();
+        };
+        GATE_TARGETS
+            .iter()
+            .filter(|name| targets.get(**name) == Some(&GatePlace::Local))
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    /// `bash scripts/gate-diff.sh --only a,b scripts/gates.sh` when `gate_targets` is set, else
+    /// `None`. `--only` takes a comma-separated list.
+    pub fn composed_gate_command(&self) -> Option<String> {
+        self.gate_targets.as_ref()?;
+        Some(format!(
+            "bash scripts/gate-diff.sh --only {} scripts/gates.sh",
+            self.local_targets().join(",")
+        ))
+    }
+
     /// Whether the final gate of a job or a run is scoped: the switch AND `gate_after_land`.
     /// A reader rather than a field read, because a caller that took `scoped_final_gate` straight
     /// off the struct would skip the full gate with no post-merge gate behind it.
@@ -649,6 +705,36 @@ pub(crate) fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
             "verify_disk_cap_gb must be at least 1; a zero cap would evict all warm state on \
              every unit — leave the key out to use the machine default",
         ));
+    }
+    if let Some(targets) = &rules.gate_targets {
+        let invalid = |reason: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("gate_targets: {reason}"),
+            )
+        };
+        for name in targets.keys() {
+            if name == "security" || name == "all" {
+                return Err(invalid(format!(
+                    "`{name}` cannot be placed: gate-diff.sh does not select it, so marking it \
+                     local would silently do nothing; valid targets are {}",
+                    GATE_TARGETS.join(", ")
+                )));
+            }
+            if !GATE_TARGETS.contains(&name.as_str()) {
+                return Err(invalid(format!(
+                    "unknown target `{name}`; valid targets are {}",
+                    GATE_TARGETS.join(", ")
+                )));
+            }
+        }
+        if !targets.values().any(|place| *place == GatePlace::Local) {
+            return Err(invalid(
+                "at least one target must be `local`, or the postgate would have nothing to run; \
+                 to leave everything to CI, omit gate_targets"
+                    .to_string(),
+            ));
+        }
     }
     validate_integration_steps(&rules.integration_steps)?;
     for rule in &rules.schedules {
@@ -1590,6 +1676,98 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     fn rules_from(yaml: &str) -> std::io::Result<AutopilotRules> {
         parse_schedule_rules(yaml)
+    }
+
+    #[test]
+    fn gate_targets_absent_parses_as_none() {
+        let rules = rules_from("gate_command: bash scripts/gates.sh\n").unwrap();
+        assert_eq!(rules.gate_targets, None);
+        assert!(rules.local_targets().is_empty());
+        assert_eq!(rules.composed_gate_command(), None);
+    }
+
+    #[test]
+    fn gate_targets_parse_and_order() {
+        let rules = rules_from("gate_targets: {shell: ci, hooks: local, core: local}\n").unwrap();
+        assert_eq!(rules.local_targets(), vec!["core", "hooks"]);
+        assert_eq!(
+            rules.composed_gate_command().as_deref(),
+            Some("bash scripts/gate-diff.sh --only core,hooks scripts/gates.sh")
+        );
+    }
+
+    #[test]
+    fn gate_targets_unknown_name_is_refused() {
+        let error = rules_from("gate_targets: {cargo: local}\n").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cargo"), "{message}");
+        assert!(message.contains("core, sidecars, shell"), "{message}");
+    }
+
+    #[test]
+    fn gate_targets_refuses_security_and_all() {
+        for name in ["security", "all"] {
+            let error = rules_from(&format!("gate_targets: {{{name}: local}}\n")).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(name), "{message}");
+            assert!(message.contains("gate-diff.sh"), "{message}");
+        }
+    }
+
+    #[test]
+    fn gate_targets_needs_a_local_target() {
+        assert!(rules_from("gate_targets: {core: ci}\n").is_err());
+        assert!(rules_from("gate_targets: {}\n").is_err());
+    }
+
+    #[test]
+    fn gate_targets_bad_place_is_refused() {
+        assert!(rules_from("gate_targets: {core: remote}\n").is_err());
+    }
+
+    #[test]
+    fn gate_target_list_matches_the_scripts() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts");
+        let gates = std::fs::read_to_string(scripts.join("gates.sh")).unwrap();
+        let diff = std::fs::read_to_string(scripts.join("gate-diff.sh")).unwrap();
+
+        // gates.sh: the `core|sidecars|...|all) ;;` arm that follows `case "$target" in`.
+        let gate_lines: Vec<&str> = gates.lines().map(str::trim).collect();
+        let case_at = gate_lines
+            .iter()
+            .position(|line| *line == "case \"$target\" in")
+            .expect("gates.sh has the target case");
+        let arm = gate_lines[case_at + 1]
+            .strip_suffix(") ;;")
+            .expect("the first arm lists the valid targets");
+        let accepted: Vec<&str> = arm.split('|').collect();
+
+        // gate-diff.sh: the `for t in ...; do` loop that builds `targets`.
+        let diff_lines: Vec<&str> = diff.lines().map(str::trim).collect();
+        let loop_at = diff_lines
+            .iter()
+            .position(|line| line.starts_with("for t in ") && line.ends_with("; do"))
+            .and_then(|_| {
+                diff_lines.iter().enumerate().position(|(i, line)| {
+                    line.starts_with("for t in ")
+                        && line.ends_with("; do")
+                        && diff_lines
+                            .get(i + 1)
+                            .is_some_and(|next| next.contains("targets=\"$targets $t\""))
+                })
+            })
+            .expect("gate-diff.sh has the targets loop");
+        let selected: Vec<&str> = diff_lines[loop_at]
+            .strip_prefix("for t in ")
+            .and_then(|rest| rest.strip_suffix("; do"))
+            .unwrap()
+            .split_whitespace()
+            .collect();
+
+        for name in GATE_TARGETS {
+            assert!(accepted.contains(&name), "gates.sh does not accept {name}");
+        }
+        assert_eq!(selected, GATE_TARGETS.to_vec());
     }
 
     #[test]
