@@ -10,6 +10,7 @@ pub mod api;
 mod context_given;
 mod create;
 mod handoff;
+mod lineage;
 mod lifecycle;
 mod policy;
 mod resume;
@@ -4043,6 +4044,44 @@ pub mod tests {
             Some(resume_run_id),
             "a superseded run must name the run that continues it"
         );
+    }
+
+    #[tokio::test]
+    async fn approve_resume_records_approval_approved_as_the_successor_reason() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (original_run_id, proposal_id, _worktree_path) =
+            seed_resumable_action_approval(&state, Some("sess-a")).await;
+
+        resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT successor_reason FROM runs WHERE id = ?")
+                .bind(original_run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("approval_approved"));
+    }
+
+    #[tokio::test]
+    async fn decline_records_approval_declined_as_the_successor_reason() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "git push origin HEAD").await;
+        let paused = count(&state.pool, PAUSED).await;
+
+        decline_action(&state, proposal_id).await.unwrap();
+        wait_for_the_resume(&runner).await;
+
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT successor_reason FROM runs WHERE id = ?")
+                .bind(paused)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("approval_declined"));
     }
 
     #[tokio::test]
@@ -12231,6 +12270,9 @@ tests:
             advised_effort: None,
             route_failed: None,
             account_id: None,
+            lineage: Vec::new(),
+            lineage_truncated: false,
+            part_of: None,
         }
         .with_prompt_budget();
 

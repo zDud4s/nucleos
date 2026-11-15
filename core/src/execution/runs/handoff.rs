@@ -129,9 +129,10 @@ GATE_OUTPUT>>>
 /// that would nest one note inside another and push the real task one level further away on every
 /// hop, until a third successor was reading mostly framing.
 ///
-/// **And not a resume note either**, which `task_to_carry` is what strips: an approval breaks the
-/// `successor_run_id` chain — a resume is a new row nothing points at — so the walk below stops at
-/// the resume rather than at the task, and what it stops on is a sentence about a proposal.
+/// **And not a resume note either.** A resume writes the link now (`resume.rs` records
+/// `successor_run_id` for an approval or a decline), so the walk below passes through resumes. What
+/// it ends on can still be a resume's prompt, and `task_to_carry` is what strips the resume note
+/// from that prompt.
 ///
 /// Bounded rather than trusting the links: `successor_run_id` is an ordinary column and a cycle in
 /// it would hang a run's completion path, which is not a place to discover one.
@@ -164,11 +165,7 @@ pub(super) async fn chain_origin(
     let mut id = run_id;
     let mut hops = 0;
     for _ in 0..WALK_BOUND {
-        let predecessor: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        let predecessor = predecessor_of(pool, id).await?;
         match predecessor {
             Some(earlier) if earlier != id => {
                 id = earlier;
@@ -178,6 +175,14 @@ pub(super) async fn chain_origin(
         }
     }
     Ok((id, hops))
+}
+
+/// The run whose `successor_run_id` is `id`, if any: one step back along a chain.
+pub(super) async fn predecessor_of(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// How far back a chain walk goes before it stops trusting `successor_run_id` (see `chain_origin`).
@@ -198,11 +203,7 @@ async fn chain_turns(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<i64> 
         if step == WALK_BOUND {
             break;
         }
-        let predecessor: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        let predecessor = predecessor_of(pool, id).await?;
         match predecessor {
             Some(earlier) if earlier != id => id = earlier,
             _ => break,
