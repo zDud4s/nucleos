@@ -35,7 +35,7 @@ const ROOTS: &[&str] = &["src", "crates/nucleos-base/src"];
 
 /// The production functions allowed to hold `INSERT INTO proposals`.
 const LISTED: &[(&str, &str)] = &[
-    ("src/proposals.rs", "create_action_approval"),
+    ("src/proposals.rs", "create_action_approval_with_context"),
     ("src/proposals.rs", "create_refused_action"),
     ("src/proposals.rs", "create_skipped_item"),
     ("src/proposals.rs", "create_contact_merge"),
@@ -52,7 +52,7 @@ const LISTED: &[(&str, &str)] = &[
 
 /// Creators that must call `bump(` in their own body.
 const BUMP_IN_BODY: &[(&str, &str)] = &[
-    ("src/proposals.rs", "create_action_approval"),
+    ("src/proposals.rs", "create_action_approval_with_context"),
     ("src/proposals.rs", "create_refused_action"),
     ("src/proposals.rs", "create_skipped_item"),
     ("src/proposals.rs", "create_contact_merge"),

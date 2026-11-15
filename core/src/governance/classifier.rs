@@ -16,6 +16,8 @@ pub struct Decision {
 mod area;
 mod grammar;
 mod judge_guard;
+mod leaf_allows;
+mod leaf_self_check;
 mod paths;
 mod reads;
 mod shell_shape;
@@ -23,12 +25,13 @@ mod write_guards;
 
 pub use self::area::{Area, conversation_area, within};
 pub use self::judge_guard::*;
+pub use self::leaf_self_check::{leaf_self_check_form, leaf_self_check_scripts_intact};
 pub use self::paths::*;
 pub use self::shell_shape::*;
 use self::write_guards::*;
 pub use self::write_guards::{heavy_wrapper_arguments, path_has_suffix, split_first_token};
 
-pub const CLASSIFIER_VERSION: u32 = 25;
+pub const CLASSIFIER_VERSION: u32 = 26;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -119,6 +122,10 @@ const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
 /// classifier admitting the tool call does not widen what the run may do: a key bound to no node,
 /// or to another tree, takes a 403 from the route. Left unrecognized, an unattended tree run was
 /// refused every one of them and could neither delegate nor close its node.
+///
+/// Since CLASSIFIER_VERSION 26 the list also holds the leaf's `task_report`, `tree_status`,
+/// `task_claim` and `spec_backlog` doors and the `Monitor` tool, which only watches the output of a
+/// background command the run already started.
 const TREE_AGENT_TOOLS: &[&str] = &[
     "mcp__nucleos__tree_branch_start",
     "mcp__nucleos__node_open",
@@ -131,7 +138,13 @@ const TREE_AGENT_TOOLS: &[&str] = &[
     "mcp__nucleos__verify_status",
     // A node files an out-of-scope problem with it instead of fixing a path it does not own
     // (the node prompt says so); the `/tasks/report` door takes the holder from the run's key.
+    // A leaf also reads the tree and the backlog and claims a task; `Monitor` only watches a
+    // background command's output. The route behind each is the real gate, as above.
     "mcp__nucleos__task_report",
+    "mcp__nucleos__tree_status",
+    "mcp__nucleos__task_claim",
+    "mcp__nucleos__spec_backlog",
+    "Monitor",
 ];
 
 /// Files whose CONTENTS are the policy, matched as a path suffix wherever they sit.
@@ -516,10 +529,98 @@ const SAFE_EXACT_COMMANDS: &[&str] = &[
     "git version",
 ];
 
+/// The piece of a parked line that stopped it, and why, in words a person can act on.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Culprit {
+    pub segment: String,
+    pub reason: String,
+}
+
 pub struct Classification {
     pub decision: Decision,
     pub action_class: &'static str,
     pub reason: String,
+    /// Set on every park, `None` on an allow (and on a deny, which is not a question).
+    pub culprit: Option<Culprit>,
+    /// The shell line split into its segments, so a UI can show where the cut fell. Empty for a
+    /// tool that is not a shell.
+    pub segments: Vec<String>,
+}
+
+impl Classification {
+    /// Names the segment and the reason it parked.
+    fn with_culprit(mut self, segment: &str, reason: String) -> Self {
+        self.culprit = Some(Culprit {
+            segment: segment.to_owned(),
+            reason,
+        });
+        self
+    }
+}
+
+/// The text of `segment` as the owner wrote it in `command`. The parser stands a placeholder where
+/// each command substitution was; a culprit must show the original, so the pieces between
+/// placeholders are located in `command` and the balanced `$(…)` / backtick span skipped. A segment
+/// with no placeholder, or one that cannot be located, comes back unchanged.
+fn original_segment_text(command: &str, segment: &str) -> String {
+    let placeholder = crate::command_reader::SUBSTITUTION_PLACEHOLDER;
+    if !segment.contains(placeholder) {
+        return segment.to_owned();
+    }
+    let first = segment.split(placeholder).next().unwrap_or("");
+    let mut search_from = 0;
+    'start: while let Some(rel) = command[search_from..].find(first) {
+        let start = search_from + rel;
+        search_from = start + first.len().max(1);
+        let mut cur = start + first.len();
+        for piece in segment.split(placeholder).skip(1) {
+            let rest = &command[cur..];
+            let bytes = rest.as_bytes();
+            let end = if rest.starts_with("$(") {
+                let mut depth = 0usize;
+                let mut found = None;
+                for (i, b) in bytes.iter().enumerate() {
+                    match b {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                found = Some(i + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                found
+            } else if let Some(stripped) = rest.strip_prefix('`') {
+                stripped.find('`').map(|i| i + 2)
+            } else {
+                None
+            };
+            let Some(end) = end else { continue 'start };
+            cur += end;
+            if !command[cur..].starts_with(piece) {
+                continue 'start;
+            }
+            cur += piece.len();
+        }
+        return command[start..cur].to_owned();
+    }
+    segment.to_owned()
+}
+
+/// The path a write tool names, for a culprit's reason.
+fn target_of(tool_input: &Value) -> &str {
+    ["file_path", "notebook_path", "path"]
+        .iter()
+        .find_map(|key| tool_input.get(key).and_then(Value::as_str))
+        .unwrap_or("(no path)")
+}
+
+/// The non-shell parks have no segment to point at: the tool call itself is the culprit.
+fn parked_tool(class: &'static str, reason: &str, what: &str, why: String) -> Classification {
+    classification("pending_approval", class, reason).with_culprit(what, why)
 }
 
 /// Whether this tool can only READ this machine — it changes nothing, anywhere.
@@ -689,18 +790,26 @@ pub fn classify(
     // need a cwd: a governance file is recognised by its path suffix either way, and the scoreboard
     // reads these classes, so the narrower one is the one worth recording.
     if WRITE_TOOLS.contains(&tool_name) && targets_self_governing_file(tool_input, cwd) {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "self-governing-file",
             "changes to autopilot governance files require approval",
+            tool_name,
+            format!(
+                "`{}` changes an autopilot governance file",
+                target_of(tool_input)
+            ),
         );
     }
 
     if WRITE_TOOLS.contains(&tool_name) && targets_file_that_runs_on_next_command(tool_input, cwd) {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "executes-on-next-command",
             "writes to files that run on the next allowed command require approval",
+            tool_name,
+            format!(
+                "`{}` is a file that runs on the next allowed command",
+                target_of(tool_input)
+            ),
         );
     }
 
@@ -710,10 +819,14 @@ pub fn classify(
     // left `run_handles`, so this is an ordinary state rather than a corner case. A boundary we
     // cannot establish is a reason to ask a human, not a reason to skip the check.
     if WRITE_TOOLS.contains(&tool_name) && cwd.is_none() {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "no-workspace",
             "writes without a known workspace require approval",
+            tool_name,
+            format!(
+                "`{}` is written without a known workspace",
+                target_of(tool_input)
+            ),
         );
     }
 
@@ -772,10 +885,11 @@ pub fn classify(
     // guard whose correctness depended on an earlier `return` rather than on what it says — the
     // kind of thing that holds until somebody reorders the chain for an unrelated reason.
     if !reads_github_policy(tool_name) {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "unrecognized-tool",
             &format!("unrecognized tool actions require approval. {ALT_TOOL}"),
+            tool_name,
+            format!("`{tool_name}` is not a tool this classifier knows"),
         );
     }
 
@@ -792,14 +906,19 @@ pub fn classify(
     let spelled = (shell == crate::command_reader::Shell::PowerShell)
         .then(|| area::spelled_out_powershell(command))
         .flatten();
-    classify_shell_command(
+    let mut verdict = classify_shell_command(
         spelled.as_deref().unwrap_or(command),
         cwd,
         policy,
         rules,
         shell,
         unrecognized,
-    )
+    );
+    verdict.segments = crate::command_reader::segments(command, shell)
+        .iter()
+        .map(|piece| piece.to_string())
+        .collect();
+    verdict
 }
 
 /// PURE but for the active area: the text each command of a parsed POSIX line is judged (and
@@ -1011,15 +1130,17 @@ fn classify_shell_command(
         return classification("deny", "project-denied", "this project denies this command");
     }
 
-    if texts.iter().any(|text| {
-        matches_any_phrase(&normalize_command(text), APPROVAL_COMMAND_PATTERNS)
-            || runs_an_approval_command_word(text, shell)
-    }) {
+    if texts
+        .iter()
+        .any(|text| text_needs_approval(text, shell, cwd))
+    {
+        let piece = approval_segment(&texts, shell, cwd);
         return classification(
             "pending_approval",
             "push-merge-deploy",
             "push, merge, deploy, publish, and tag actions require approval",
-        );
+        )
+        .with_culprit(&piece, format!("`{piece}` is push/merge/deploy"));
     }
 
     // Read the RAW command, not `normalized`. `normalize_command` collapses every whitespace
@@ -1043,9 +1164,23 @@ fn classify_shell_command(
                 "pending_approval",
                 "unrecognized",
                 &unreadable_line_reason(reason),
-            );
+            )
+            .with_culprit(command, format!("line can't be parsed: {reason}"));
         }
-        None => match crate::command_reader::read(command, shell) {
+        None => match crate::command_reader::read(
+            // PowerShell's call operator: the reader refuses a lone `&` (it backgrounds in POSIX),
+            // so the one line that is nothing but the verification client is read without it.
+            // `is_verify_client_call` is strict about every word, so nothing else gets this.
+            command
+                .trim_start()
+                .strip_prefix("& ")
+                .filter(|rest| {
+                    shell == crate::command_reader::Shell::PowerShell
+                        && is_verify_client_call(&normalize_command(rest), rest)
+                })
+                .unwrap_or(command),
+            shell,
+        ) {
             crate::command_reader::Reading::Sequence(segments) => {
                 segments.into_iter().map(str::to_owned).collect()
             }
@@ -1058,24 +1193,28 @@ fn classify_shell_command(
                     "pending_approval",
                     "unrecognized",
                     &unreadable_line_reason(reason),
-                );
+                )
+                .with_culprit(command, format!("line can't be parsed: {reason}"));
             }
         },
     };
     if segments.is_empty() {
-        return classification("pending_approval", "unrecognized", &unrecognized_reason());
+        return classification("pending_approval", "unrecognized", &unrecognized_reason())
+            .with_culprit(command, "no command could be found in the line".to_owned());
     }
 
     let mut touches_vcs = false;
     let mut touches_github = false;
     let mut confined = false;
     let mut declared = false;
+    let mut cd_elsewhere: Option<(String, String)> = None;
+    let mut after_cd_reads = 0usize;
     // PowerShell only: the names `$b = git merge-base ...` assigned earlier on this line, see
     // `reads::powershell_git_assignment`.
     let mut variables: Vec<String> = Vec::new();
-    for segment in segments
+    for (raw_segment, segment) in segments
         .iter()
-        .map(|s| crate::command_reader::escapes_masked(s, shell))
+        .map(|s| (s, crate::command_reader::escapes_masked(s, shell)))
     {
         let segment = segment.to_string();
         let segment = if shell == crate::command_reader::Shell::PowerShell {
@@ -1098,17 +1237,61 @@ fn classify_shell_command(
             && crate::command_reader::without_quoted_text(&segment).is_none_or(|outside| {
                 outside.contains(crate::command_reader::SUBSTITUTION_PLACEHOLDER)
             });
-        match classify_segment(&segment, cwd, policy, rules, shell, unrecognized) {
-            Segment::Unrecognized => {
-                return classification("pending_approval", "unrecognized", &unrecognized_reason());
+        let verdict = leaf_allows::shell_edit_verdict(command, &segment, cwd, rules, shell)
+            .unwrap_or_else(|| classify_segment(&segment, cwd, policy, rules, shell, unrecognized));
+        // A `cd` out of the workspace followed only by pure reads: the `cd` is held back here and
+        // settled below (`cd_elsewhere`), so `cd C:/x && git status` reads and a bare `cd C:/x`
+        // keeps its park.
+        if cwd.is_some()
+            && cd_elsewhere.is_none()
+            && let Segment::Unrecognized(why) = &verdict
+            && why.ends_with("leaves the run's workspace")
+            && leaf_allows::is_plain_cd(&segment)
+            && cwd.is_some_and(|cwd| leaf_allows::cd_lands_in_the_project_checkout(&segment, cwd))
+        {
+            let shown = original_segment_text(command, raw_segment);
+            cd_elsewhere = Some((
+                shown,
+                why.replace(
+                    raw_segment.as_str(),
+                    &original_segment_text(command, raw_segment),
+                ),
+            ));
+            continue;
+        }
+        if cd_elsewhere.is_some() && !matches!(verdict, Segment::Unrecognized(_)) {
+            let pure = matches!(verdict, Segment::ReadLocal)
+                && !unquoted_substitution
+                && leaf_allows::is_pure_read(&normalize_command(&segment));
+            if !pure {
+                let shown = original_segment_text(command, raw_segment);
+                return classification("pending_approval", "unrecognized", &unrecognized_reason())
+                    .with_culprit(
+                        &shown,
+                        format!("`{shown}` is not a pure read after `cd` outside the workspace"),
+                    );
+            }
+            after_cd_reads += 1;
+            continue;
+        }
+        match verdict {
+            Segment::Unrecognized(why) => {
+                let shown = original_segment_text(command, raw_segment);
+                return classification("pending_approval", "unrecognized", &unrecognized_reason())
+                    .with_culprit(&shown, why.replace(raw_segment.as_str(), &shown));
             }
             _ if unquoted_substitution => {
+                let raw_segment = &original_segment_text(command, raw_segment);
                 return classification(
                     "pending_approval",
                     "unrecognized",
                     &format!(
                         "a command substitution outside quotes becomes several arguments. {ALT_SUBSTITUTION}"
                     ),
+                )
+                .with_culprit(
+                    raw_segment,
+                    format!("`{raw_segment}` has a command substitution outside quotes"),
                 );
             }
             Segment::VcsLocal => touches_vcs = true,
@@ -1117,6 +1300,12 @@ fn classify_shell_command(
             Segment::ProjectAllowed => declared = true,
             Segment::ReadLocal => {}
         }
+    }
+    if let Some((shown, why)) = cd_elsewhere
+        && after_cd_reads == 0
+    {
+        return classification("pending_approval", "unrecognized", &unrecognized_reason())
+            .with_culprit(&shown, why);
     }
 
     // Ahead of every other class, and for the reason `github-read` is ahead of `vcs-local`: the
@@ -1213,7 +1402,74 @@ enum Segment {
     /// decided outside this file, and a scoreboard that could not tell it from `ReadLocal` could
     /// not tell a compiled policy from an edited one.
     ProjectAllowed,
-    Unrecognized,
+    /// Not allowed; carries the concrete reason this segment is the culprit.
+    Unrecognized(String),
+}
+
+/// The segment of a line that matched an approval pattern, falling back to the whole text.
+fn approval_segment(
+    texts: &[&str],
+    shell: crate::command_reader::Shell,
+    cwd: Option<&Path>,
+) -> String {
+    for text in texts {
+        let hits = |piece: &str| {
+            let normalized = normalize_command(&strip_fd_duplications(piece));
+            (matches_any_phrase(&normalized, APPROVAL_COMMAND_PATTERNS)
+                || names_approval_command_word(&normalized))
+                && !(cwd.is_some() && leaf_allows::is_plain_git_merge(&normalized))
+        };
+        if let Some(piece) = crate::command_reader::segments(text, shell)
+            .iter()
+            .find(|piece| hits(piece))
+        {
+            return piece.trim().to_owned();
+        }
+    }
+    texts.first().map_or_else(String::new, |t| (*t).to_owned())
+}
+
+/// Whether one command text needs the push/merge/deploy approval. Whole-text pattern hits and
+/// approval command words count as before, with ONE exemption: when every piece that hits is a
+/// plain `git merge` and the run has a workspace, the merge lands in the run's own worktree and is
+/// not the approval's business (`git push`, `gh pr merge`, publishes and tags keep it). Without a
+/// workspace nothing is exempt.
+fn text_needs_approval(
+    text: &str,
+    shell: crate::command_reader::Shell,
+    cwd: Option<&Path>,
+) -> bool {
+    let hit = matches_any_phrase(&normalize_command(text), APPROVAL_COMMAND_PATTERNS)
+        || runs_an_approval_command_word(text, shell);
+    if !hit {
+        return false;
+    }
+    if cwd.is_none() {
+        return true;
+    }
+    let pieces = crate::command_reader::segments(text, shell);
+    let hitting: Vec<String> = pieces
+        .iter()
+        .map(|piece| normalize_command(&strip_fd_duplications(piece)))
+        .filter(|normalized| {
+            matches_any_phrase(normalized, APPROVAL_COMMAND_PATTERNS)
+                || names_approval_command_word(normalized)
+        })
+        .collect();
+    hitting.is_empty()
+        || !hitting
+            .iter()
+            .all(|normalized| leaf_allows::is_plain_git_merge(normalized))
+}
+
+/// Whether a segment is a directory change (`cd`, `pushd`, `Set-Location`, `sl`).
+fn is_directory_change(segment: &str) -> bool {
+    segment.split_whitespace().next().is_some_and(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "cd" | "pushd" | "chdir" | "set-location" | "sl"
+        )
+    })
 }
 
 /// What happens to a command this file has no opinion about.
@@ -1317,134 +1573,6 @@ fn names_approval_command_word(normalized: &str) -> bool {
     }
 }
 
-/// PURE: whether `command` is exactly one of the forms a leaf run may self-check with, each wrapped
-/// by `python scripts/heavy.py`: `cargo fmt -p <crate>`, `python scripts/check_invariants.py`, and
-/// (only with `self_check`) `cargo check -p <crate> --tests`. Anything with a shell metacharacter,
-/// a quote or another shape is `false`. Says nothing about whether the scripts are trustworthy:
-/// see `leaf_self_check_scripts_intact`.
-pub fn leaf_self_check_form(command: &str, self_check: bool) -> bool {
-    // The harmless dressing a leaf puts around the call: a `timeout N` prefix, a `2>&1` fold, a
-    // `| tail -N` / `| head -N` cut and the `; echo rc=$?` / `; git status` tail. Each is parsed as
-    // a whole piece, never as a stray metacharacter, so the core below still sees none.
-    let mut pieces = command.split(';');
-    let main = pieces.next().unwrap_or("");
-    let dressing_ok = pieces.all(|piece| {
-        let words: Vec<&str> = piece.split_whitespace().collect();
-        matches!(
-            words.as_slice(),
-            ["echo", "rc=$?"] | ["git", "status"] | ["git", "status", "--short" | "-s"]
-        )
-    });
-    if !dressing_ok {
-        return false;
-    }
-    let is_count = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
-    let mut stages = main.split('|');
-    let core = stages.next().unwrap_or("");
-    let cut_ok = match (stages.next(), stages.next()) {
-        (None, _) => true,
-        (Some(cut), None) => {
-            let words: Vec<&str> = cut.split_whitespace().collect();
-            match words.as_slice() {
-                ["tail" | "head", n] => n.strip_prefix('-').is_some_and(is_count),
-                ["tail" | "head", "-n", n] => is_count(n),
-                _ => false,
-            }
-        }
-        _ => false,
-    };
-    if !cut_ok {
-        return false;
-    }
-    let mut core_words: Vec<&str> = core.split_whitespace().collect();
-    if core_words.last() == Some(&"2>&1") {
-        core_words.pop();
-    }
-    if core_words.first() == Some(&"timeout") && core_words.get(1).is_some_and(|n| is_count(n)) {
-        core_words.drain(..2);
-    }
-    leaf_self_check_core(&core_words.join(" "), self_check)
-}
-
-/// PURE: the bare wrapped form, with no dressing around it. See `leaf_self_check_form`.
-fn leaf_self_check_core(command: &str, self_check: bool) -> bool {
-    const FORBIDDEN: &[char] = &[
-        ';', '|', '&', '<', '>', '$', '`', '\n', '\r', '(', ')', '{', '}', '*', '?', '~', '!', '#',
-        '\'', '"',
-    ];
-    if command.contains(FORBIDDEN) {
-        return false;
-    }
-    let script_is = |token: &str, name: &str| {
-        let token = token.replace('\\', "/");
-        token.strip_prefix("./").unwrap_or(&token) == name
-    };
-    let is_python = |token: &str| {
-        let program = program_name(token).to_ascii_lowercase();
-        program.starts_with("python") || program == "py"
-    };
-    let Some((program, rest)) = split_first_token(command) else {
-        return false;
-    };
-    let Some((script, rest)) = split_first_token(rest) else {
-        return false;
-    };
-    if !is_python(&program) || !script_is(&script, "scripts/heavy.py") {
-        return false;
-    }
-    let Some(wrapped) = heavy_wrapper_arguments(rest) else {
-        return false;
-    };
-    let words: Vec<&str> = wrapped.split_whitespace().collect();
-    let crate_name_ok = |name: &str| {
-        !name.starts_with('-')
-            && !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    };
-    match words.as_slice() {
-        ["cargo", "fmt", "-p", name] => crate_name_ok(name),
-        ["cargo", "check", "-p", name, "--tests"] => self_check && crate_name_ok(name),
-        [py, script] => is_python(py) && script_is(script, "scripts/check_invariants.py"),
-        _ => false,
-    }
-}
-
-/// Whether the scripts a self-check line would run are byte-identical to the main checkout's. The
-/// worktree's copy is a file the run could have rewritten, so it is trusted only when it equals the
-/// copy the run cannot touch. Any failure to resolve or read is `false`.
-pub fn leaf_self_check_scripts_intact(cwd: &Path, command: &str) -> bool {
-    let Some(main) = main_checkout_of(cwd) else {
-        return false;
-    };
-    let Some(tree) = cwd.ancestors().find(|a| a.join(".git").exists()) else {
-        return false;
-    };
-    let (main_scripts, tree_scripts) = (Path::new(&main).join("scripts"), tree.join("scripts"));
-    let mut names = vec!["heavy.py".to_owned()];
-    if command.contains("check_invariants") {
-        names.push("check_invariants.py".to_owned());
-    }
-    if let Ok(entries) = std::fs::read_dir(&main_scripts) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("heavy_") && name.ends_with(".py") && !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    names.iter().all(|name| {
-        match (
-            std::fs::read(main_scripts.join(name)),
-            std::fs::read(tree_scripts.join(name)),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        }
-    })
-}
-
 /// Whether `command` is exactly `nucleos-core --verify-ticket <digits>` or `nucleos-core --verify`,
 /// each optionally followed by `--verify-wait <digits>` (and the `=` spellings of both flags).
 ///
@@ -1469,17 +1597,27 @@ fn is_verify_client_call(command: &str, raw: &str) -> bool {
     if has_ansi_c_or_locale_quote(command) || has_ansi_c_or_locale_quote(raw) {
         return false;
     }
+    // PowerShell runs a quoted path with its call operator: `& "C:/x/nucleos-core.exe" --verify`.
+    let command = command.trim_start().strip_prefix("& ").unwrap_or(command);
+    let raw = raw.trim_start().strip_prefix("& ").unwrap_or(raw);
     let Some((program, arguments)) = split_program(command) else {
         return false;
     };
-    let named_as_written = split_program(raw).is_some_and(|(word, _)| is_daemon_exe(&word));
+    let named_as_written = split_program(raw).is_some_and(|(word, _)| {
+        is_daemon_exe(&word)
+            || word
+                .replace('\\', "/")
+                .eq_ignore_ascii_case("c:/nucleos-dev/run/nucleos-core.exe")
+    });
     if program != "nucleos-core" && !named_as_written {
         return false;
     }
     let words = flag_words(arguments);
     let mut rest: &[String] = &words;
-    // The command proper: `--verify`, `--verify-ticket <n>` or `--verify-ticket=<n>`.
+    // The command proper: `--verify` (optionally `--full`), `--verify-ticket <n>` or
+    // `--verify-ticket=<n>`.
     rest = match rest {
+        [flag, full, tail @ ..] if flag == "--verify" && full == "--full" => tail,
         [flag, tail @ ..] if flag == "--verify" => tail,
         [flag, id, tail @ ..] if flag == "--verify-ticket" && digits(id) => tail,
         [flag, tail @ ..] if flag.strip_prefix("--verify-ticket=").is_some_and(digits) => tail,
@@ -1542,7 +1680,7 @@ fn classify_segment(
     // the semicolon after it, and refusing the whole line was the only answer available to it. By
     // this point the separators have been cut away and the token stands on its own.
     if redirects_a_file(segment) {
-        return Segment::Unrecognized;
+        return Segment::Unrecognized(format!("`{segment}` redirects output to a file"));
     }
     // Only now, and only inside one command: what is left of a `>` here cannot reach a file, so it
     // is noise to every check below — `has_shell_control` among them, which reads the `>` and
@@ -1572,6 +1710,19 @@ fn classify_segment(
     if is_safe_command(&normalized) {
         return Segment::ReadLocal;
     }
+    // `date`, `gofmt -l`, `sed -n`, `git -C <path> show|log|status|diff`: reads that need a shape
+    // check, not a prefix (`leaf_allows`).
+    if shell_form_is_readable(&normalized) && leaf_allows::is_added_read(segment) {
+        return Segment::ReadLocal;
+    }
+    // A new local branch, and a merge into the run's own worktree (the approval gate above already
+    // let a plain `git merge` through, and only with a workspace).
+    if shell_form_is_readable(&normalized)
+        && (leaf_allows::is_new_branch(segment)
+            || (cwd.is_some() && leaf_allows::is_plain_git_merge(&normalized)))
+    {
+        return Segment::VcsLocal;
+    }
     // The daemon's own verification client: it only asks the running daemon and waits. Beside
     // `is_safe_command` and behind the same shape guards, so nothing extra rides on the line.
     if shell_form_is_readable(&normalized) && is_verify_client_call(&normalized, segment) {
@@ -1591,7 +1742,7 @@ fn classify_segment(
     // declared `cp` getting `cp x ~/.nucleos/github.yaml` for free, or a job node's `cp x
     // .nucleos/github.yaml` counting as confined to its workspace. See `names_machine_settings`.
     if segment_names_machine_settings(segment) {
-        return Segment::Unrecognized;
+        return Segment::Unrecognized(format!("`{segment}` names this machine's own settings"));
     }
     // The same for the governance files inside the workspace, and for every widening below rather
     // than for confinement alone, where it first lived. A `Write` to `.claude/settings.json` asks
@@ -1600,7 +1751,7 @@ fn classify_segment(
     // nor an owner's `gh` list a read that names one. A project allow rule is a widening the
     // project wrote, and the governance it would widen onto is the one thing it may not author.
     if segment_names_self_governing(segment, cwd) {
-        return Segment::Unrecognized;
+        return Segment::Unrecognized(format!("`{segment}` names an autopilot governance file"));
     }
     // Decision #3's widening half. After every compiled permission, so it only ever changes the
     // answer for a command this file had no opinion about; after `shell_form_is_readable`, so a
@@ -1660,7 +1811,10 @@ fn classify_segment(
         return Segment::Confined;
     }
 
-    Segment::Unrecognized
+    if is_directory_change(segment) {
+        return Segment::Unrecognized(format!("`{segment}` leaves the run's workspace"));
+    }
+    Segment::Unrecognized(format!("`{segment}` is not in the safe list"))
 }
 
 /// Which shell will run a tool call's command line.
@@ -5962,9 +6116,12 @@ mod tests {
     ///
     /// 25: `deploy` and `git tag` match as the command word, `npm test` and `npx vitest run` are
     /// allowed, a run's own task tools are allowed, and refusals name their alternative.
+    /// 26: a leaf's shell edits inside its own worktree, `cd` elsewhere followed by pure reads,
+    /// `git merge` in the worktree, `date`/`gofmt -l`/`sed -n`/`git -C` reads, new branches, the
+    /// task tools and the `--verify --full` client are allowed.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 25);
+        assert_eq!(CLASSIFIER_VERSION, 26);
     }
 
     /// `(decision, action_class)` of a Bash line, with the cwd every test in this group uses.
@@ -7826,6 +7983,9 @@ mod tests {
             "verify",
             "verify_status",
             "task_report",
+            "tree_status",
+            "task_claim",
+            "spec_backlog",
         ] {
             let tool = format!("mcp__nucleos__{name}");
             let result = classify(&tool, &json!({}), Some(Path::new("C:/work/repo")));
@@ -7850,6 +8010,361 @@ mod tests {
                 "pending_approval",
                 "unrecognized-tool",
             );
+        }
+    }
+
+    #[test]
+    fn a_leafs_task_and_watch_tools_are_allowed() {
+        for tool in [
+            "mcp__nucleos__task_report",
+            "mcp__nucleos__tree_status",
+            "mcp__nucleos__task_claim",
+            "mcp__nucleos__spec_backlog",
+            "Monitor",
+        ] {
+            let result = classify(tool, &json!({}), Some(Path::new("C:/work/repo")));
+            assert_eq!(result.decision.decision, "allow", "{tool}");
+            assert_ne!(result.action_class, "unrecognized-tool", "{tool}");
+        }
+        for tool in [
+            "mcp__nucleos__task_report_all",
+            "mcp__other__task_claim",
+            "Monitors",
+        ] {
+            assert_eq!(
+                classify(tool, &json!({}), Some(Path::new("C:/work/repo")))
+                    .decision
+                    .decision,
+                "pending_approval",
+                "{tool}"
+            );
+        }
+    }
+
+    // ---- CLASSIFIER_VERSION 26: what a leaf does in its own worktree ---------------------------
+
+    const LEAF_CWD: &str = "C:/Projects/nucleos/.nucleos/worktrees/job-26";
+
+    fn leaf_bash(command: &str) -> Classification {
+        classify(
+            "Bash",
+            &json!({ "command": command }),
+            Some(Path::new(LEAF_CWD)),
+        )
+    }
+
+    fn assert_leaf_allows(commands: &[&str]) {
+        for command in commands {
+            assert_eq!(leaf_bash(command).decision.decision, "allow", "{command}");
+        }
+    }
+
+    /// Each of these parks, and the park names the segment that did it.
+    fn assert_leaf_parks(commands: &[(&str, &str)]) {
+        for (command, culprit) in commands {
+            let verdict = leaf_bash(command);
+            assert_eq!(verdict.decision.decision, "pending_approval", "{command}");
+            assert_eq!(culprit_of(&verdict).0, *culprit, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_cd_elsewhere_followed_only_by_pure_reads_is_allowed() {
+        assert_leaf_allows(&[
+            "cd C:/Projects/nucleos && git status",
+            "cd C:/Projects/nucleos && git log --oneline | head -5",
+            "cd C:/Projects/nucleos && git diff && ls && cat README.md",
+            "cd C:/Projects/nucleos && git branch --list && wc -l README.md && grep -n foo README.md",
+            "cd C:/Projects/nucleos && tail -n 5 README.md",
+        ]);
+    }
+
+    #[test]
+    fn a_cd_elsewhere_still_parks_unless_only_reads_follow() {
+        assert_leaf_parks(&[
+            ("cd C:/Projects/nucleos", "cd C:/Projects/nucleos"),
+            (
+                "cd C:/Projects/nucleos && git commit -m x",
+                "git commit -m x",
+            ),
+            ("cd C:/Projects/nucleos && touch f", "touch f"),
+            ("cd C:/Projects/nucleos && mkdir -p a", "mkdir -p a"),
+            ("cd C:/Projects/nucleos && cd C:/other && ls", "cd C:/other"),
+        ]);
+        // No workspace, no exemption.
+        let verdict = classify(
+            "Bash",
+            &json!({"command": "cd C:/Projects/nucleos && git status"}),
+            None,
+        );
+        assert_eq!(verdict.decision.decision, "pending_approval");
+    }
+
+    #[test]
+    fn a_cd_into_credentials_or_with_a_rewritten_target_still_parks() {
+        for command in [
+            "cd ~/.ssh && ls",
+            "cd $HOME && ls",
+            "cd C:/Users/x/.aws && ls",
+            "cd ../.. && ls",
+            "cd -P C:/x && ls",
+            // Only the checkout that holds the leaf's worktree is read this way.
+            "cd C:/Windows && git status --short | head",
+            "cd C:/Projects/other && ls",
+            "cd /tmp && cat x",
+        ] {
+            assert_eq!(
+                leaf_bash(command).decision.decision,
+                "pending_approval",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_gofmt_list_and_sed_print_are_safe_reads() {
+        assert_leaf_allows(&[
+            "date",
+            "date -u",
+            "date +%Y-%m-%d",
+            "gofmt -l .",
+            "gofmt -l cmd internal",
+            "sed -n 5,10p README.md",
+            "sed -n 1p README.md",
+        ]);
+        assert_leaf_parks(&[
+            ("date -s 12:00", "date -s 12:00"),
+            ("gofmt -w main.go", "gofmt -w main.go"),
+            ("gofmt -l -w .", "gofmt -l -w ."),
+            ("sed -n w/out.txt README.md", "sed -n w/out.txt README.md"),
+            ("sed -n -i 5p README.md", "sed -n -i 5p README.md"),
+        ]);
+    }
+
+    #[test]
+    fn mkdir_p_inside_the_worktree_is_allowed_and_outside_parks() {
+        assert_leaf_allows(&["mkdir -p core/src/new_dir", "mkdir -p a/b/c"]);
+        assert_leaf_parks(&[
+            ("mkdir -p C:/elsewhere/x", "mkdir -p C:/elsewhere/x"),
+            ("mkdir -p ../x", "mkdir -p ../x"),
+        ]);
+    }
+
+    #[test]
+    fn git_dash_c_reads_are_allowed_and_the_other_shapes_park() {
+        assert_leaf_allows(&[
+            "git -C C:/Projects/nucleos status",
+            "git -C C:/Projects/nucleos log --oneline -5",
+            "git -C C:/Projects/nucleos show HEAD",
+            "git -C C:/Projects/nucleos diff --stat",
+        ]);
+        assert_leaf_parks(&[
+            ("git -C C:/x commit -m y", "git -C C:/x commit -m y"),
+            (
+                "git -C C:/x -c core.pager=x log",
+                "git -C C:/x -c core.pager=x log",
+            ),
+            (
+                "git -C C:/x diff --output=out.txt",
+                "git -C C:/x diff --output=out.txt",
+            ),
+            ("git -C C:/x checkout main", "git -C C:/x checkout main"),
+        ]);
+    }
+
+    #[test]
+    fn a_new_local_branch_is_allowed_and_anything_wider_parks() {
+        assert_leaf_allows(&[
+            "git checkout -b fix/thing",
+            "git switch -c fix/thing",
+            "git checkout -b fix/thing master",
+        ]);
+        assert_leaf_parks(&[
+            ("git checkout -b a --force", "git checkout -b a --force"),
+            ("git switch -c a -f", "git switch -c a -f"),
+            ("git checkout -b a b c", "git checkout -b a b c"),
+            ("git switch main", "git switch main"),
+        ]);
+    }
+
+    #[test]
+    fn a_shell_edit_inside_the_worktree_is_allowed() {
+        assert_leaf_allows(&[
+            "sed -i 's/old/new/g' src/lib.rs",
+            "sed -i -E 's|a|b|' src/a.rs src/b.rs",
+            "echo hi | tee notes.txt",
+            "echo hi | tee -a notes.txt",
+            "cat > notes.txt <<'EOF'\nhello $HOME `x`\nEOF",
+            "cat > notes.txt <<EOF\nplain text\nEOF",
+            "cat >> notes.txt <<EOF\nmore\nEOF",
+            "python - <<'EOF'\nimport re\nopen(\"src/a.txt\", \"w\").write(\"x\")\nEOF",
+            "python3 - <<'EOF'\nprint(1 + 1)\nEOF",
+        ]);
+    }
+
+    #[test]
+    fn a_shell_edit_outside_the_worktree_or_on_governance_still_parks() {
+        assert_leaf_parks(&[
+            (
+                "sed -i 's/a/b/' C:/other/a.rs",
+                "sed -i 's/a/b/' C:/other/a.rs",
+            ),
+            ("sed -i 's/a/b/' ../a.rs", "sed -i 's/a/b/' ../a.rs"),
+            (
+                "sed -i 's/a/b/' .claude/settings.json",
+                "sed -i 's/a/b/' .claude/settings.json",
+            ),
+            (
+                "sed -i 's/a/b/' .githooks/pre-commit",
+                "sed -i 's/a/b/' .githooks/pre-commit",
+            ),
+            ("sed -i 's/a/b/' .git/config", "sed -i 's/a/b/' .git/config"),
+            (
+                "sed -i 's/a/b/' .cargo/config.toml",
+                "sed -i 's/a/b/' .cargo/config.toml",
+            ),
+            ("sed -i.bak 's/a/b/' a.rs", "sed -i.bak 's/a/b/' a.rs"),
+            ("sed -i 's/a/b/e' a.rs", "sed -i 's/a/b/e' a.rs"),
+            ("sed -i -e 's/a/b/' a.rs", "sed -i -e 's/a/b/' a.rs"),
+            ("echo x | tee C:/other/f", "tee C:/other/f"),
+            ("echo x | tee .claude/hooks/h.py", "tee .claude/hooks/h.py"),
+            ("echo x | tee ~/f", "tee ~/f"),
+        ]);
+        for command in [
+            "cat > C:/other/f <<'EOF'\nx\nEOF",
+            "cat > .claude/settings.json <<'EOF'\nx\nEOF",
+            "cat > .githooks/pre-commit <<'EOF'\nx\nEOF",
+            "cat > .git/hooks/pre-commit <<'EOF'\nx\nEOF",
+            "cat > .cargo/config.toml <<'EOF'\nx\nEOF",
+            "cat > $HOME/f <<'EOF'\nx\nEOF",
+            "cat > notes.txt <<EOF\nvalue $HOME\nEOF",
+            "cat > a.txt > b.txt <<'EOF'\nx\nEOF",
+        ] {
+            assert_eq!(
+                leaf_bash(command).decision.decision,
+                "pending_approval",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_edit_never_widens_without_a_workspace() {
+        for command in [
+            "sed -i 's/a/b/' a.rs",
+            "echo x | tee a.txt",
+            "cat > a.txt <<'EOF'\nx\nEOF",
+        ] {
+            let verdict = classify("Bash", &json!({ "command": command }), None);
+            assert_eq!(verdict.decision.decision, "pending_approval", "{command}");
+        }
+    }
+
+    #[test]
+    fn python_stays_parked_unless_it_only_edits_files_in_the_worktree() {
+        for command in [
+            "python -c 'print(1)'",
+            "python3 -c \"open('a','w').write('x')\"",
+            "python - <<'EOF'\nimport os\nos.remove(\"a\")\nEOF",
+            "python - <<'EOF'\nimport subprocess\nsubprocess.run([\"ls\"])\nEOF",
+            "python - <<'EOF'\np = \"a.txt\"\nopen(p, \"w\").write(\"x\")\nEOF",
+            "python - <<'EOF'\nopen(\"C:/other/a.txt\", \"w\").write(\"x\")\nEOF",
+            "python - <<'EOF'\nopen(\"../a.txt\", \"w\").write(\"x\")\nEOF",
+            "python - <<'EOF'\nopen(\".claude/settings.json\", \"w\").write(\"x\")\nEOF",
+            "python - <<'EOF'\nfrom pathlib import Path\nPath(\"a\") / \"b\"\nEOF",
+            "python - <<'EOF'\nexec(\"print(1)\")\nEOF",
+            "python script.py",
+        ] {
+            let verdict = leaf_bash(command);
+            assert_eq!(verdict.decision.decision, "pending_approval", "{command}");
+            assert!(verdict.culprit.is_some(), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_shell_edit_on_nucleos_data_is_not_a_worktree_edit() {
+        for command in [
+            "sed -i 's/a/b/' C:/Users/x/.nucleos/nucleos.db",
+            "echo x | tee .nucleos/state.yaml",
+        ] {
+            assert_eq!(
+                leaf_bash(command).decision.decision,
+                "pending_approval",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_merge_is_allowed_in_the_worktree_and_pushes_still_park() {
+        assert_leaf_allows(&[
+            "git merge tree/x/leaf",
+            "git merge --no-ff tree/x/leaf",
+            "git status && git merge tree/x/leaf",
+        ]);
+        assert_leaf_parks(&[
+            ("git push origin master", "git push origin master"),
+            ("gh pr merge 12 --squash", "gh pr merge 12 --squash"),
+            ("npm publish", "npm publish"),
+            ("cargo publish", "cargo publish"),
+            ("git merge tree/x && git push", "git push"),
+            (
+                "git -C C:/other merge tree/x",
+                "git -C C:/other merge tree/x",
+            ),
+        ]);
+        // No workspace, no exemption.
+        let verdict = classify("Bash", &json!({"command": "git merge tree/x"}), None);
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        assert_eq!(verdict.action_class, "push-merge-deploy");
+    }
+
+    #[test]
+    fn worktree_adds_moves_python_inline_and_background_jobs_still_park() {
+        assert_leaf_parks(&[
+            (
+                "git worktree add C:/scratch/wt master",
+                "git worktree add C:/scratch/wt master",
+            ),
+            (
+                "git worktree add --detach C:/scratch/wt",
+                "git worktree add --detach C:/scratch/wt",
+            ),
+            ("git mv a.rs b.rs", "git mv a.rs b.rs"),
+            ("python -c 'print(1)'", "python -c 'print(1)'"),
+        ]);
+        assert_eq!(
+            leaf_bash("sleep 5 & git status").decision.decision,
+            "pending_approval"
+        );
+    }
+
+    #[test]
+    fn the_verify_client_is_allowed_through_powershell_with_full() {
+        for command in [
+            "& \"C:/nucleos-dev/run/nucleos-core.exe\" --verify --full",
+            "& \"C:\\nucleos-dev\\run\\nucleos-core.exe\" --verify --full",
+            "& \"C:/nucleos-dev/run/nucleos-core.exe\" --verify --full --verify-wait 600",
+            "& \"C:/nucleos-dev/run/nucleos-core.exe\" --verify",
+        ] {
+            let verdict = classify(
+                "PowerShell",
+                &json!({ "command": command }),
+                Some(Path::new(LEAF_CWD)),
+            );
+            assert_eq!(verdict.decision.decision, "allow", "{command}");
+        }
+        for command in [
+            "& \"C:/other/nucleos-core.exe\" --verify --full",
+            "& \"C:/nucleos-dev/run/nucleos-core.exe\" --verify --full --force",
+            "& \"C:/nucleos-dev/run/nucleos-core.exe\" --serve",
+        ] {
+            let verdict = classify(
+                "PowerShell",
+                &json!({ "command": command }),
+                Some(Path::new(LEAF_CWD)),
+            );
+            assert_eq!(verdict.decision.decision, "pending_approval", "{command}");
         }
     }
 
@@ -8171,5 +8686,126 @@ mod tests {
                 "{command} was allowed"
             );
         }
+    }
+
+    // ---- the culprit: a park says WHICH piece of the line is the reason -----------------------
+
+    fn culprit_of(class: &Classification) -> (&str, &str) {
+        let culprit = class.culprit.as_ref().expect("a park carries a culprit");
+        (culprit.segment.as_str(), culprit.reason.as_str())
+    }
+
+    #[test]
+    fn an_unrecognized_command_is_the_culprit_with_its_own_text() {
+        let verdict = classify("Bash", &json!({"command": "mkdir -p y"}), None);
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("mkdir -p y", "`mkdir -p y` is not in the safe list")
+        );
+        assert_eq!(verdict.segments, vec!["mkdir -p y".to_owned()]);
+    }
+
+    #[test]
+    fn the_culprit_is_the_one_segment_of_a_chain_that_parks() {
+        let verdict = classify(
+            "Bash",
+            &json!({"command": "git status && mkdir -p y"}),
+            None,
+        );
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("mkdir -p y", "`mkdir -p y` is not in the safe list")
+        );
+        assert_eq!(
+            verdict.segments,
+            vec!["git status".to_owned(), "mkdir -p y".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_directory_change_out_of_the_workspace_names_the_cd() {
+        let cwd = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
+        let verdict = classify("Bash", &json!({"command": "cd C:/x"}), Some(cwd));
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("cd C:/x", "`cd C:/x` leaves the run's workspace")
+        );
+    }
+
+    #[test]
+    fn push_merge_deploy_names_the_piece_that_pushes() {
+        let verdict = classify("Bash", &json!({"command": "git status && git push"}), None);
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        assert_eq!(verdict.action_class, "push-merge-deploy");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("git push", "`git push` is push/merge/deploy")
+        );
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_parsed_is_its_own_culprit() {
+        let verdict = classify("Bash", &json!({"command": "sleep 5 & git status"}), None);
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        let (segment, reason) = culprit_of(&verdict);
+        assert_eq!(segment, "sleep 5 & git status");
+        assert!(
+            reason.starts_with("line can't be parsed: "),
+            "reason was {reason}"
+        );
+    }
+
+    #[test]
+    fn an_output_redirect_names_the_segment_that_redirects() {
+        let verdict = classify("Bash", &json!({"command": "echo hi > out.txt"}), None);
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        let (segment, reason) = culprit_of(&verdict);
+        assert_eq!(segment, "echo hi > out.txt");
+        assert_eq!(reason, "`echo hi > out.txt` redirects output to a file");
+    }
+
+    #[test]
+    fn a_substitution_outside_quotes_names_its_segment() {
+        let verdict = classify("Bash", &json!({"command": "grep x $(ls)"}), None);
+        assert_eq!(verdict.decision.decision, "pending_approval");
+        let (segment, reason) = culprit_of(&verdict);
+        assert_eq!(segment, "grep x $(ls)");
+        assert_eq!(
+            reason,
+            "`grep x $(ls)` has a command substitution outside quotes"
+        );
+    }
+
+    #[test]
+    fn a_tool_park_names_the_tool_and_leaves_segments_empty() {
+        let cwd = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
+        let unknown = classify("Teleport", &json!({"path": "x"}), Some(cwd));
+        assert_eq!(unknown.decision.decision, "pending_approval");
+        assert_eq!(unknown.action_class, "unrecognized-tool");
+        assert_eq!(
+            culprit_of(&unknown),
+            ("Teleport", "`Teleport` is not a tool this classifier knows")
+        );
+        assert!(unknown.segments.is_empty());
+
+        let no_workspace = classify("Write", &json!({"file_path": "src/a.rs"}), None);
+        assert_eq!(no_workspace.decision.decision, "pending_approval");
+        assert_eq!(no_workspace.action_class, "no-workspace");
+        assert_eq!(
+            culprit_of(&no_workspace),
+            ("Write", "`src/a.rs` is written without a known workspace")
+        );
+        assert!(no_workspace.segments.is_empty());
+    }
+
+    #[test]
+    fn an_allow_has_no_culprit() {
+        let allowed = classify("Bash", &json!({"command": "git status"}), None);
+        assert_eq!(allowed.decision.decision, "allow");
+        assert_eq!(allowed.culprit, None);
+        assert_eq!(allowed.segments, vec!["git status".to_owned()]);
     }
 }

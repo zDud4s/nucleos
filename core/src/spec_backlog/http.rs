@@ -579,6 +579,50 @@ mod tests {
         assert_eq!(row("pending-http-1")["kind"], "notice");
     }
 
+    #[tokio::test]
+    async fn decisions_route_lists_obsolete_rows_with_reason_and_keeps_them_out_of_open() {
+        let state = state().await;
+        for id in ["d-http-live", "d-http-stale"] {
+            sqlx::query(
+                "INSERT INTO decisions (id, tree_id, node_id, question, origin, at, status) \
+                 VALUES (?, 'tree-h', 'node-h', 'Q?', 'agent', '2026-10-30T09:00:00+00:00', 'open')",
+            )
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        assert!(
+            crate::tree_job::decisions::mark_obsolete(&state.pool, "d-http-stale", "tree gone")
+                .await
+                .unwrap()
+        );
+
+        let (_, open) = request(&app(&state), "GET", "/decisions?status=open", Value::Null).await;
+        let open_ids: Vec<&str> = open
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert!(open_ids.contains(&"d-http-live"));
+        assert!(!open_ids.contains(&"d-http-stale"));
+
+        let (status, obsolete) = request(
+            &app(&state),
+            "GET",
+            "/decisions?status=obsolete",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = obsolete.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "d-http-stale");
+        assert_eq!(rows[0]["status"], "obsolete");
+        assert_eq!(rows[0]["obsolete_reason"], "tree gone");
+    }
+
     /// A spec that is not waiting on the owner, so answering never reopens it and no run starts.
     async fn seed_question(state: &AppState, id: &str, status: &str) {
         sqlx::query(

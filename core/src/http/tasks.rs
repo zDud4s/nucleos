@@ -190,7 +190,8 @@ fn valid_session_id(id: &str) -> bool {
 
 /// Who the caller is, as a claim holder. The run's identity comes from the key's scope, the
 /// session's from the id the hook stamped, and only if `session_seen_in` has seen it in this very
-/// worktree, which catches an id copied wrong or left over from another session.
+/// project, which catches an id copied wrong or left over from another session. The worktree is not
+/// compared: the session's last hook cwd may be another worktree of the project.
 pub(super) async fn holder_for(
     pool: &sqlx::SqlitePool,
     scope: &Scope,
@@ -226,15 +227,18 @@ pub(super) async fn holder_for(
                     "session_id has an unexpected shape".to_owned(),
                 ));
             }
-            let seen = sessions::session_seen_in(pool, session, &at.root)
+            let seen = sessions::session_seen_in(pool, session, &at.project_id)
                 .await
                 .map_err(internal)?;
             if !seen {
                 return Err((
                     StatusCode::FORBIDDEN,
                     format!(
-                        "session {session} has not been seen in {}; the first tool call registers it, retry",
-                        at.root
+                        "session not seen: no hook has registered session {session} in project {} \
+                         (its checkout is {}). Call any other tool once so the hook registers it, \
+                         then retry; if it still fails the session runs outside a registered \
+                         checkout of this project or the hooks are not installed",
+                        at.project_id, at.root
                     ),
                 ));
             }
@@ -1289,7 +1293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_is_only_believed_where_it_was_seen() {
+    async fn a_session_is_only_believed_in_the_project_it_was_seen_in() {
         let pool = crate::testdb::fresh_pool().await;
         let now = chrono::Utc::now();
         sessions::touch_session(&pool, "s1", "/w", "alpha", now)
@@ -1304,17 +1308,30 @@ mod tests {
             (HolderKind::Session, "s1", "/w")
         );
 
-        let elsewhere = holder_for(
+        // A session whose last hook cwd was another worktree of the project can still claim from
+        // the worktree its MCP box serves (the claim is placed in the box's worktree).
+        let sibling = holder_for(
             &pool,
             &Scope::Control,
             &located("alpha", "/other"),
             Some("s1"),
         )
-        .await;
-        assert_eq!(
-            elsewhere.unwrap_err().0,
-            StatusCode::FORBIDDEN,
-            "seen in /w, not in /other"
+        .await
+        .unwrap();
+        assert_eq!(sibling.worktree, "/other");
+        let foreign = holder_for(
+            &pool,
+            &Scope::Control,
+            &located("beta", "/other"),
+            Some("s1"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign.0, StatusCode::FORBIDDEN, "seen in alpha, not beta");
+        assert!(
+            foreign.1.starts_with("session not seen"),
+            "the refusal says what to do: {}",
+            foreign.1
         );
         let unknown = holder_for(
             &pool,
@@ -1973,7 +1990,11 @@ mod tests {
             second["notices"].as_array().unwrap().is_empty(),
             "the cursor advanced"
         );
-        assert!(sessions::session_seen_in(&pool, "s1", "/w").await.unwrap());
+        assert!(
+            sessions::session_seen_in(&pool, "s1", "alpha")
+                .await
+                .unwrap()
+        );
         assert!(
             first.get("incidents").is_none() || first["incidents"].as_array().unwrap().is_empty()
         );

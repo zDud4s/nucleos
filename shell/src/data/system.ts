@@ -144,6 +144,22 @@ export interface Proposal {
   team_request?: string | null;
   asked_by?: string | null;
   asked_for?: string | null;
+  /**
+   * Which part of a held action stopped it, on an action approval: the class of action, the one
+   * segment of a compound command that tripped the classifier and why, and every segment in order.
+   * Absent on rows written before the daemon split commands; the card then shows the flat command.
+   */
+  action_class?: string | null;
+  culprit_segment?: string | null;
+  culprit_reason?: string | null;
+  segments?: string[] | null;
+  /** Where the run sits: its mode and title, the tree node and branch, and either its worktree or the project it targets. */
+  run_mode?: string | null;
+  run_title?: string | null;
+  node_id?: string | null;
+  branch?: string | null;
+  worktree_path?: string | null;
+  project_target?: string | null;
   /** What each job in a fleet-exclusion request is doing: its prompt's opening, or its rule. */
   job_low_task?: string | null;
   job_high_task?: string | null;

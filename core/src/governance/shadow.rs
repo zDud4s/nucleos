@@ -768,6 +768,8 @@ mod tests {
             },
             action_class,
             reason: "classified reason".to_owned(),
+            culprit: None,
+            segments: Vec::new(),
         }
     }
 

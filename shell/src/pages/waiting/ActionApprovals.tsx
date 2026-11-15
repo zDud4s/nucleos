@@ -3,9 +3,17 @@ import { Link } from "@tanstack/react-router";
 import type { Proposal } from "../../data/system";
 import { useApproveProposal, useDeclineAction, useRejectProposal } from "../../data/waiting";
 import { Button, Callout, ConfirmButton, RelativeTime, Row, Rows } from "../../ui";
+import "./approval-card.css";
 import type { Reading } from "./reading";
 import { DecisionNotes, DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
-import { ReadFrom, ToolInput, readEntries } from "./ToolInput";
+import {
+  CommandSegments,
+  CulpritLead,
+  ReadFrom,
+  ToolInput,
+  hasSegments,
+  readEntries,
+} from "./ToolInput";
 
 /* ----------------------------------------------------- 2. action approvals -- */
 
@@ -317,8 +325,10 @@ export function taskLine(prompt: string | null | undefined): string | null {
  */
 function ApprovalDecision({ proposal }: { proposal: Proposal }) {
   const status = proposal.run_status ?? null;
+  const split = hasSegments(proposal.segments);
   return (
     <>
+      <CulpritLead segment={proposal.culprit_segment} reason={proposal.culprit_reason} />
       <div>
         <p className="waiting-approval-label">held because</p>
         <Reasoning>
@@ -327,13 +337,50 @@ function ApprovalDecision({ proposal }: { proposal: Proposal }) {
             : proposal.reasoning}
         </Reasoning>
       </div>
-      <ToolInput raw={proposal.tool_input} />
+      {split ? (
+        <CommandSegments
+          id={proposal.id}
+          segments={proposal.segments}
+          culprit={proposal.culprit_segment}
+        />
+      ) : (
+        <ToolInput raw={proposal.tool_input} />
+      )}
+      <ApprovalWhere proposal={proposal} />
       {status !== null && status !== "awaiting_approval" && (
         <Callout tone="pending" role="status">
           The run is {status.replace(/_/g, " ")}, not waiting on this, so approving resumes nothing.
         </Callout>
       )}
     </>
+  );
+}
+
+/**
+ * Which run, mode, node and branch asked, and whether it works in a worktree or straight on the
+ * project. Renders nothing for rows that carry none of it.
+ */
+function ApprovalWhere({ proposal }: { proposal: Proposal }) {
+  const rows: Array<[string, string | null | undefined]> = [
+    ["run", proposal.run_title],
+    ["mode", proposal.run_mode],
+    ["node", proposal.node_id],
+    ["branch", proposal.branch],
+    proposal.worktree_path
+      ? ["worktree", proposal.worktree_path]
+      : ["project target", proposal.project_target],
+  ];
+  const shown = rows.filter(([, value]) => value !== null && value !== undefined && value !== "");
+  if (shown.length === 0) return null;
+  return (
+    <dl className="waiting-input">
+      {shown.map(([name, value]) => (
+        <div className="waiting-input-line" key={name}>
+          <dt className="waiting-input-name">{name}</dt>
+          <dd className="waiting-input-value">{value}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
