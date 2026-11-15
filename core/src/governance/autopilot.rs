@@ -2773,7 +2773,9 @@ pub mod tests {
     #[tokio::test]
     async fn a_verbatim_root_is_recorded_plain() {
         let pool = test_pool().await;
-        let root = tempfile::tempdir().unwrap();
+        // Rooted under the canonical temp dir: CI's TEMP is an 8.3 short name (`RUNNER~1`), which
+        // `canonicalize` expands, and the unit config dir is keyed by one lexical spelling.
+        let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         write_nucleos_hook(&root);
         onboard(&root, "project-a");
         let verbatim = fs::canonicalize(root.path()).unwrap();
