@@ -4,15 +4,15 @@
 
 # NucleOS
 
-**An autonomous engineering colleague for your desktop.**<br>
-NucleOS runs coding agents on your projects in the background, within the limits you set.
+**Write the spec. NucleOS runs the agents, verifies the work, lands it — and only wakes you for the decisions that are yours.**
 
 [![CI](https://github.com/zDud4s/nucleos/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/zDud4s/nucleos/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 ![Status](https://img.shields.io/badge/status-pre--release-orange)
 
-[Features](#features) ·
+[From spec to master](#from-spec-to-master) ·
+[Why not just the agent CLI?](#why-not-just-the-agent-cli) ·
 [Architecture](#architecture) ·
 [Getting started](#getting-started) ·
 [Development](#development) ·
@@ -23,33 +23,60 @@ NucleOS runs coding agents on your projects in the background, within the limits
 
 ---
 
+NucleOS is the daemon your coding-agent CLIs are missing. It breaks a spec into a tree of
+[Claude Code](https://docs.claude.com/en/docs/claude-code), [Codex](https://github.com/openai/codex)
+or local-model ([Ollama](https://ollama.com)) agents, each in its own git worktree, that survives
+restarts and dropped connections. A verification gate and a single merge queue land every branch;
+red gates, flaky failures and conflicts get handled on their own, and only product, cost or
+irreversible calls reach you — in the app, on Telegram, or in your terminal.
+
 > [!IMPORTANT]
-> NucleOS is **pre-release software**. There are no packaged builds yet, and its interfaces may
-> change between commits. Windows is the primary platform; every commit is also built and tested on
-> Linux and macOS in CI.
+> NucleOS is **pre-release software**. No release has been published yet (the release workflow and
+> install scripts are described in [`RELEASING.md`](RELEASING.md)), so for now you build from
+> source, and interfaces may change between commits. Windows is the primary platform; every commit
+> is also built and tested on Linux and macOS in CI.
 
-## Overview
+## From spec to master
 
-Most agent tools wait for a prompt. NucleOS keeps working after you stop typing: it handles routine
-upkeep, makes progress on real issues, and asks you only when something warrants a decision.
+1. **Write a spec.** You answer a spec session one question at a time until the design is pinned down.
+   NucleOS keeps the answers as the spec the agents will work from.
+2. **Launch it.** `spec_finish` closes the session and `tree_launch` starts the tree (daemon tools your agent session calls).
+   NucleOS creates the root node and the worktree it works in.
+3. **A tree of agents works in parallel.** Each node decides for itself whether to execute or to
+   split into children, and every node runs in its own git worktree.
+   Nodes are daemon runs, so the tree resumes headless after a restart or a dropped connection.
 
-It does this without replacing your agent. NucleOS is a model-agnostic harness: it drives existing
-agent CLIs, such as [Claude Code](https://docs.claude.com/en/docs/claude-code),
-[Codex CLI](https://github.com/openai/codex) or a local model through [Ollama](https://ollama.com).
-Around them it adds what unattended work needs: scheduling, isolation, a risk model and an audit
-trail.
+<p align="center"><img src=".github/readme/fleet-tree.png" width="800" alt="The Fleet view: a PDF export root agent splits into Render and Storage branches, each with two leaves. Of the four leaves, two are done and dimmed, one is running and one, Pick backend, is waiting for the owner."></p>
+4. **The verify gate runs.** When a node finishes, the scoped checks for what it touched run in the
+   daemon, not in the agent.
+   A red gate is retried once before anyone is asked.
+5. **The merge queue lands it.** One branch at a time reaches `master`; agents never push. If
+   `master` goes red, the merge is reverted and becomes an incident that launches its own fix tree.
+6. **What is yours reaches you.** Owner decisions (product, cost, irreversible calls) and risky
+   actions held for approval go to the app, Telegram or your terminal. Everything else keeps going.
+   Answering wakes the tree where it stopped.
 
-## Features
+<p align="center"><img src=".github/readme/waiting.png" width="800" alt="The Waiting page: one action approval held for the owner, an agent asking to add the S3 SDK before the storage choice is made, with the command, why it was held and the Approve and Decline buttons."></p>
+
+<p align="center"><img src=".github/readme/home.png" width="800" alt="The Home view: one decision waiting, all subsystems healthy, spend well under budget and a short feed of recent activity."></p>
+
+The Home view answers "is everything fine?" at a glance.
+
+*Screenshots use the shell's preview mode with a fictional demo project.*
+
+## Why not just the agent CLI?
 
 | | |
 |---|---|
-| **Autopilot** | Starts runs from schedules, events or rules. Covers triage, dependency upkeep, flaky tests, and feature and bug work. |
-| **Risk classification** | The daemon checks every tool call an agent makes before it runs. Risky actions are held as proposals until you approve or reject them. |
-| **Worktree isolation** | Each run works in its own git worktree. A queue merges one branch at a time, and a failed merge leaves no conflicted state behind. |
-| **Shadow mode** | A project can be set to propose only, so you can watch what NucleOS would do before it acts. |
-| **Budgets and kill switch** | Spend is capped per window, and one switch stops all activity. |
-| **Isolated integrations** | Email, web fetch, a fenced browser and quota tracking each run as a separate Go sidecar that can fail and restart on its own. Messaging channels (Telegram first) are channel adapters: a Go sidecar built on `channelkit` that the núcleo's `channels/` module supervises and routes. |
-| **Desktop shell** | A tray app shows what ran, what is waiting on you, and whether anything needs attention. |
+| **Durable agent trees** | Adaptive depth: a node executes or splits. Nodes are daemon runs and resume headless after a restart. |
+| **Gate and merge queue in the daemon** | Agents never push. A red `master` is reverted and becomes an incident. The resolver retries a failed gate before asking a person. A risk classifier holds risky tool calls as proposals; in shadow mode a project only proposes and never acts. |
+| **Decisions as a queue** | The tree stops only for owner calls. Everything waiting on you lands in one place to approve, reject or answer. |
+| **Accounts and cost** | A multi-account pool per provider, quota-aware pause and resume, a model chosen per task, spend budgets and a kill switch. |
+| **The agent lives on the tower** | Sessions are hosted by the daemon. Use them from a phone or laptop over Tailscale, with voice dictation. See [`REMOTE_ACCESS.md`](REMOTE_ACCESS.md). |
+
+## Built with itself
+
+NucleOS is developed with NucleOS: its own specs run as agent trees and land through its own gate and merge queue, so every feature described here is exercised daily on this repository.
 
 ## Architecture
 
@@ -65,9 +92,9 @@ trail.
        │ spawns                │ supervises
 ┌──────▼───────────┐   ┌───────▼──────────────────────────────────┐
 │ agent runner     │   │ sidecars/  (Go)                          │
-│ Claude Code,     │   │ email · web · browser · quota · channels │
-│ Codex, local …   │   └──────────────────────────────────────────┘
-│ one per run, in  │
+│ Claude Code,     │   │ email · web · browser · quota · remote   │
+│ Codex, local …   │   │ telegram (channel adapter)               │
+│ one per run, in  │   └──────────────────────────────────────────┘
 │ its own worktree │
 └──────────────────┘
 ```
@@ -79,6 +106,9 @@ trail.
   plain files.
 - The local API binds to localhost and requires a bearer token.
 - Each integration is its own process and fails on its own.
+
+The daemon is a Cargo workspace: `core/` plus the `nucleos-base`, `nucleos-app` and `nucleos-daemon`
+crates under `core/crates/`. The `nucleos-daemon` package builds the `nucleos-core` executable.
 
 The module map and extension points are documented in [`core/MODULE_MAP.md`](core/MODULE_MAP.md) and [`core/AGENTS.md`](core/AGENTS.md). The
 threat model is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
@@ -143,11 +173,11 @@ autopilot will not act on it.
 
 | Path | Contents |
 |---|---|
-| [`core/`](core) | The daemon, `nucleos-core` (Rust) |
+| [`core/`](core) | The daemon, `nucleos-core` (Rust), and its crates under `core/crates/` |
 | [`core/hooks/`](core/hooks) | Source of the classifier hook, compiled into the daemon |
 | [`sidecars/`](sidecars) | One Go module per integration |
 | [`shell/`](shell) | Desktop client (Tauri + React) |
-| [`scripts/`](scripts) | Quality gates, diagnostics and build helpers |
+| [`scripts/`](scripts) | Quality gates, diagnostics, build and install helpers |
 
 ## Development
 
@@ -155,9 +185,10 @@ autopilot will not act on it.
 
 ```sh
 scripts/gates.sh            # everything
-scripts/gates.sh core       # one target: core | sidecars | shell | tauri | hooks | security
+scripts/gates.sh core       # one target: core | sidecars | shell | tauri | hooks | security | broker
 ```
 
+What works on each operating system is tracked in [`PLATFORM_SUPPORT.md`](PLATFORM_SUPPORT.md).
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## Security

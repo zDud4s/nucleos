@@ -245,7 +245,7 @@ await mkdir(SHOTS, { recursive: true });
  * that reads well above the fold and falls apart below it is exactly the defect
  * a viewport-sized screenshot hides.
  */
-async function shoot(name, { path, tab, press, drag, hover, window: windowKind, viewport, waitFor, theme = "dark" }) {
+async function shoot(name, { path, tab, press, drag, hover, story, window: windowKind, viewport, waitFor, theme = "dark" }) {
   await send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-color-scheme", value: theme }],
   }, sessionId);
@@ -280,6 +280,8 @@ async function shoot(name, { path, tab, press, drag, hover, window: windowKind, 
     /* Which face of the bundle to mount: absent is the router, `notch` is the floating quota
        window `?window=notch` opens in the packaged app. See `preview/main.tsx` and `main.tsx`. */
     ...(windowKind === undefined ? {} : { window: windowKind }),
+    /* A named dataset instead of the design-QA fixtures: `demo` is the README story. See `preview/story.ts`. */
+    ...(story === undefined ? {} : { story }),
   });
   await send("Page.navigate", { url: `${origin}/preview.html?${query}` }, sessionId);
 
@@ -660,6 +662,10 @@ const SHOTS_TO_TAKE = [
   // The browser is the page: no native webview here, so the placeholder shows the area it gets.
   ["99-web-browser", { path: "/web" }],
   ["99a-web-browser-archive", { path: "/web/archive" }],
+  /* The README story (`?story=demo`, `preview/story.ts`): one project, one tree, one decision. */
+  ["readme-fleet-tree", { path: "/fleet", story: "demo", viewport: { width: 1440, height: 900 } }],
+  ["readme-waiting", { path: "/waiting", story: "demo", viewport: { width: 1440, height: 900 } }],
+  ["readme-home", { path: "/", story: "demo", viewport: { width: 1440, height: 900 } }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));
