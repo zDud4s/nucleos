@@ -305,6 +305,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     postgate_red: { tone: "danger", label: "target went red after a merge" },
     // The post-merge gate did not run, and says why: a daemon verification already passed on the same tree, waiting for the interval, or waiting for an idle machine (`verify/postgate.rs`). A fact, not a question.
     postgate_held: { tone: "info", label: "post-merge gate held" },
+    // A project automation fired, or refused to (`automations/firings.rs`): what it did or why not. A fact.
+    automation_firing: { tone: "info", label: "an automation fired" },
     // The target branch moved with nothing in the queue behind it: the hook was missing, skipped or beaten (`task_claims/direct_write.rs`).
     direct_write_violation: { tone: "danger", label: "target moved outside the queue" },
     // The same move, but through the `NUCLEOS_ALLOW_DIRECT_GIT` escape, which the owner took on purpose. No "warning" tone exists, so paused.
