@@ -103,6 +103,22 @@ function detail(overrides: Partial<RunDetail> = {}): RunDetail {
     // omitted a field the type promises is a row that could not come back.
     authored_prompt_estimate: null,
     cli_own_estimate: null,
+    // A loose run is a chain of one: its own leg.
+    lineage: [
+      {
+        id: 77,
+        status: "completed",
+        num_turns: 3,
+        started_at: null,
+        ended_at: null,
+        ended_because: null,
+        gate_status: "passed",
+        gate_exit_code: 0,
+        exit_code: 0,
+      },
+    ],
+    lineage_truncated: false,
+    part_of: null,
     ...overrides,
   };
 }

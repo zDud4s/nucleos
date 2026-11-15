@@ -129,7 +129,41 @@ export interface RunDetail {
    * router: an absent `route_decision_id` under a mode is that.
    */
   route_failed?: string | null;
+  /** The chain of runs this one belongs to, oldest first (the run itself included). */
+  lineage: LineageLeg[];
+  /** True when the daemon cut the chain at its cap or at a cycle. */
+  lineage_truncated: boolean;
+  /** The tree node or job the chain belongs to; `null` for a loose run. */
+  part_of: PartOf | null;
 }
+
+/** One run of a chain, as the daemon serializes it. */
+export interface LineageLeg {
+  id: number;
+  status: string;
+  num_turns: number | null;
+  started_at: string | null;
+  ended_at: string | null;
+  /**
+   * Why this leg was followed by the next: `context_full`, `approval_approved`,
+   * `approval_declined`. `null` for the last leg and for a reason this build does not know.
+   */
+  ended_because: string | null;
+  gate_status: string | null;
+  gate_exit_code: number | null;
+  exit_code: number | null;
+}
+
+/** What a chain belongs to. `item_id`/`item_ordinal` are null for a job run with no item. */
+export type PartOf =
+  | { kind: "tree"; tree_id: string; tree_title: string; node_id: string; node_title: string }
+  | {
+      kind: "job";
+      job_id: number;
+      job_title: string;
+      item_id: number | null;
+      item_ordinal: number | null;
+    };
 
 /** What a run has written since a byte offset, while it is still writing. */
 export interface RunTailChunk {
