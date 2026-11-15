@@ -296,6 +296,113 @@ impl PoolState {
         self.mark_exhausted(account, &hit, now);
         Some(hit)
     }
+
+    /// The decision `decide_and_reserve` would take, without taking a slot.
+    pub fn decide(&self, req: &PickRequest, doc: &AccountPoolDoc, now: DateTime<Utc>) -> Decision {
+        let candidates: Vec<Candidate> = self
+            .view()
+            .candidates
+            .into_iter()
+            .filter(|c| c.account.engine == req.engine && c.account.provider == req.provider)
+            .collect();
+        choose_account(&ChooseInput {
+            provider: &req.provider,
+            candidates: &candidates,
+            session: &req.session,
+            weights: &doc.weights,
+            portability: req.portability,
+            mid_switch_enabled: doc.mid_switch.get(&req.engine).copied().unwrap_or(true),
+            cache_model: req.cache_model,
+            now,
+        })
+    }
+}
+
+/// Outcome of [`exhaust_and_repick`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Repick {
+    /// Another account has room: launch on it.
+    Switch(AccountId),
+    /// No other account can take the work. `resets_at` is the earliest moment one is usable
+    /// again, when known.
+    AllExhausted { resets_at: Option<DateTime<Utc>> },
+}
+
+/// Marks `account` exhausted in the pool and re-picks among the others (in-memory part, no
+/// persistence). Never returns the failed account: if the pick lands on it, or on nothing, the
+/// pool is `AllExhausted`.
+pub fn mark_and_repick(
+    pool: &PoolState,
+    account: &AccountId,
+    engine: &str,
+    hit: &LimitHit,
+    doc: &AccountPoolDoc,
+    now: DateTime<Utc>,
+) -> Repick {
+    pool.mark_exhausted(account, hit, now);
+    let Some(adapter) = super::adapters::adapter_for(engine) else {
+        return Repick::AllExhausted {
+            resets_at: hit.resets_at,
+        };
+    };
+    let req = PickRequest {
+        engine: engine.to_owned(),
+        provider: adapter.provider().to_owned(),
+        session: SessionView::default(),
+        holder: Holder::Chat(String::new()),
+        portability: adapter.session_portability(),
+        cache_model: adapter.cache_model(),
+    };
+    match pool.decide(&req, doc, now) {
+        Decision::Use { account: next, .. } if next != *account => Repick::Switch(next),
+        Decision::AllExhausted { earliest_resets_at } => Repick::AllExhausted {
+            resets_at: earliest_resets_at,
+        },
+        _ => Repick::AllExhausted {
+            resets_at: hit.resets_at,
+        },
+    }
+}
+
+/// The pool-level answer to a usage-limit failure of `account`: marks it exhausted (in memory
+/// and in `account_exhaustions`, like `note_limit_and_announce`, with the once-per-window feed
+/// row) and re-picks. `Switch(account)` means relaunch there; `AllExhausted` means park until
+/// `resets_at`.
+#[allow(clippy::too_many_arguments)]
+pub async fn exhaust_and_repick(
+    db: &sqlx::SqlitePool,
+    pool: &PoolState,
+    project_id: Option<&str>,
+    account: &AccountId,
+    engine: &str,
+    hit: &LimitHit,
+    doc: &AccountPoolDoc,
+    now: DateTime<Utc>,
+) -> Repick {
+    let outcome = mark_and_repick(pool, account, engine, hit, doc, now);
+    if super::launch_chat::limit_notice_due(account, hit, now) {
+        let window = hit.window.as_deref().unwrap_or("a usage window");
+        let summary = format!(
+            "Account {} ({engine}) hit its limit on {window}; new work goes to other accounts",
+            account.as_str()
+        );
+        if let Err(error) =
+            crate::feed::append(db, project_id, super::LIMIT_HIT_KIND, &summary, None, None).await
+        {
+            tracing::warn!(%error, "could not write the account limit notice");
+        }
+    }
+    let mark = super::store::Exhaustion {
+        account_id: account.clone(),
+        window: hit.window.clone().unwrap_or_default(),
+        resets_at: hit.resets_at,
+        until: hit.resets_at.unwrap_or(now + Duration::hours(5)),
+        announced_at: now,
+    };
+    if let Err(error) = super::store::upsert_exhaustion(db, &mark).await {
+        tracing::warn!(%error, "could not store the account exhaustion mark");
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -451,6 +558,90 @@ mod tests {
         assert_eq!(hit.window.as_deref(), Some("1h"));
         let (decision, _held) = pool.decide_and_reserve(&request(Holder::Run(2)), &doc, now);
         assert!(matches!(&decision, Decision::Use { account, .. } if account.as_str() == "fake:b"));
+    }
+
+    fn claude_account(id: &str) -> Account {
+        Account {
+            engine: "claude".into(),
+            provider: "anthropic".into(),
+            ..account(id)
+        }
+    }
+
+    fn five_hour_hit(now: DateTime<Utc>) -> LimitHit {
+        LimitHit {
+            window: Some("5h".into()),
+            resets_at: Some(now + Duration::hours(2)),
+        }
+    }
+
+    #[test]
+    fn exhausting_one_account_switches_to_the_other() {
+        let pool = PoolState::new();
+        pool.set_accounts(vec![claude_account("claude:a"), claude_account("claude:b")]);
+        let now = Utc::now();
+        let a = AccountId("claude:a".into());
+        let outcome = mark_and_repick(
+            &pool,
+            &a,
+            "claude",
+            &five_hour_hit(now),
+            &AccountPoolDoc::default(),
+            now,
+        );
+        assert_eq!(outcome, Repick::Switch(AccountId("claude:b".into())));
+        assert_eq!(pool.live_sessions(&AccountId("claude:b".into())), 0);
+    }
+
+    #[test]
+    fn exhausting_the_only_account_is_all_exhausted_with_its_reset() {
+        let pool = PoolState::new();
+        pool.set_accounts(vec![claude_account("claude:a")]);
+        let now = Utc::now();
+        let hit = five_hour_hit(now);
+        let outcome = mark_and_repick(
+            &pool,
+            &AccountId("claude:a".into()),
+            "claude",
+            &hit,
+            &AccountPoolDoc::default(),
+            now,
+        );
+        assert_eq!(
+            outcome,
+            Repick::AllExhausted {
+                resets_at: hit.resets_at
+            }
+        );
+    }
+
+    #[test]
+    fn when_both_are_out_the_earliest_reset_is_reported() {
+        let pool = PoolState::new();
+        pool.set_accounts(vec![claude_account("claude:a"), claude_account("claude:b")]);
+        let now = Utc::now();
+        let doc = AccountPoolDoc::default();
+        let later = LimitHit {
+            window: Some("7d".into()),
+            resets_at: Some(now + Duration::days(3)),
+        };
+        let b = AccountId("claude:b".into());
+        mark_and_repick(&pool, &b, "claude", &later, &doc, now);
+        let hit = five_hour_hit(now);
+        let outcome = mark_and_repick(
+            &pool,
+            &AccountId("claude:a".into()),
+            "claude",
+            &hit,
+            &doc,
+            now,
+        );
+        assert_eq!(
+            outcome,
+            Repick::AllExhausted {
+                resets_at: hit.resets_at
+            }
+        );
     }
 
     #[test]
