@@ -896,4 +896,39 @@ mod tests {
         let (_, run) = root_run(&state).await;
         assert!(run.is_some(), "the answer gave the start a fresh try");
     }
+
+    /// Past its allowance (or once the owner is asked) a failed root start is exhausted, so
+    /// `root_pending::retry` leaves it to `retry_failed_starts` instead of retrying blindly.
+    #[tokio::test]
+    async fn start_exhausted_is_true_past_the_cap_or_once_asked() {
+        let container = space_free_tempdir("tree-root-exhausted-");
+        let missing = container.path().join("repo");
+        let (state, _runner) = start_tree(&missing, Some(Duration::from_secs(5))).await;
+        let load = || async {
+            crate::tree_job::store::load(&state.pool, TREE)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        let mut job = load().await;
+        job.manifest.extra.remove(super::ROOT_START_KEY);
+        assert!(!super::start_exhausted(&job), "no failed start recorded");
+        job.manifest.extra.insert(
+            super::ROOT_START_KEY.to_owned(),
+            serde_json::json!({"attempts": 1, "error": "boom"}),
+        );
+        assert!(!super::start_exhausted(&job), "attempts left");
+        job.manifest.extra.insert(
+            super::ROOT_START_KEY.to_owned(),
+            serde_json::json!({"attempts": super::ROOT_START_CAP, "error": "boom"}),
+        );
+        assert!(super::start_exhausted(&job), "cap reached");
+
+        for _ in 0..10 {
+            age_start_record(&state).await;
+            crate::tree_job::wrap::tick(&state).await;
+        }
+        assert!(super::start_exhausted(&load().await), "owner asked");
+    }
 }
