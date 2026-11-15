@@ -312,7 +312,7 @@ async fn tick_project(
             // Started but never submitted (a crash between the two): submit it now.
             return launch(executor, project_id, project_root, sha, deadline).await;
         };
-        return follow(pool, project_id, sha, request).await;
+        return follow(pool, project_id, sha, request, rules).await;
     }
 
     // A red is being handled: see it through before looking at the tip, so a merge that lands
@@ -548,7 +548,16 @@ async fn machine_idle(command: &str, root: &Path) -> Result<(), String> {
 }
 
 /// Reads the ticket of the gate running for `sha` and records its verdict once it is done.
-async fn follow(pool: &sqlx::SqlitePool, project_id: &str, sha: &str, request: i64) -> Step {
+///
+/// `rules` is the read taken at the start of this tick, not a fresh one: the targets a green is
+/// recorded as covering must not be re-read at the moment of recording.
+async fn follow(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    sha: &str,
+    request: i64,
+    rules: &crate::config::AutopilotRules,
+) -> Step {
     let ticket = match verify::read_ticket(pool, request).await {
         Ok(Some((ticket, _))) => ticket,
         Ok(None) => {
@@ -562,10 +571,16 @@ async fn follow(pool: &sqlx::SqlitePool, project_id: &str, sha: &str, request: i
         };
     }
     match ticket.verdict.as_deref() {
-        Some("passed") => match verify_postgate::finish_green(pool, project_id, sha).await {
-            Ok(_) => Step::Green(sha.to_owned()),
-            Err(error) => Step::Failed(format!("cannot record the green: {error}")),
-        },
+        Some("passed") => {
+            // `None` (NULL) without `gate_targets`: the command ran whole, as before the key.
+            let covered = rules.gate_targets.is_some().then(|| rules.local_targets());
+            match verify_postgate::finish_green_covering(pool, project_id, sha, covered.as_deref())
+                .await
+            {
+                Ok(_) => Step::Green(sha.to_owned()),
+                Err(error) => Step::Failed(format!("cannot record the green: {error}")),
+            }
+        }
         Some("failed") => {
             let mut groups: Vec<String> = Vec::new();
             for unit in ticket.units.iter().filter(|u| u.status == "failed") {
@@ -1436,6 +1451,35 @@ mod tests {
         assert_eq!(s.running_sha, None);
         assert_eq!(s.running_request_id, None);
         assert!(s.red_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_green_with_gate_targets_records_the_local_ones() {
+        let rules = format!("{GATE_ON}gate_targets: {{core: local, shell: ci}}\n");
+        let f = fixture(Some(&rules)).await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+
+        tick_until(&f, |s| matches!(s, Step::Green(_))).await;
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.green_targets, Some(vec!["core".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn a_green_without_gate_targets_stays_null() {
+        let f = fixture(Some(GATE_ON)).await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+
+        tick_until(&f, |s| matches!(s, Step::Green(_))).await;
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.green_targets, None);
     }
 
     #[tokio::test]

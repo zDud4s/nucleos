@@ -126,6 +126,9 @@ pub struct State {
     /// The newest tip proven by a daemon verification over a green-or-covered base (F3-12). It
     /// never replaces `last_green_sha`.
     pub covered_sha: Option<String>,
+    /// Targets the last green covered; `None` = recorded before this column (whatever
+    /// `gate_command` ran).
+    pub green_targets: Option<Vec<String>>,
     /// Why a gate start is being held right now (`"interval"` / `"busy"`), until a gate starts.
     pub held_note: Option<String>,
     /// How many gates of `last_attempted_sha` ended without a verdict.
@@ -246,6 +249,7 @@ struct Row {
     fix_branch: Option<String>,
     fix_run_id: Option<i64>,
     covered_sha: Option<String>,
+    green_targets: Option<String>,
     held_note: Option<String>,
     unmeasured_runs: i64,
 }
@@ -290,6 +294,18 @@ impl From<Row> for State {
             .collect();
         let candidates = decode_list(&row.project_id, "candidates", &row.candidates);
         let also_suspect = decode_list(&row.project_id, "also_suspect", &row.also_suspect);
+        // Unreadable reads as `None`, never as an empty list: "covers nothing" would be a claim.
+        let green_targets = row.green_targets.as_deref().and_then(|raw| {
+            serde_json::from_str::<Vec<String>>(raw)
+                .map_err(|error| {
+                    tracing::warn!(
+                        project = %row.project_id,
+                        %error,
+                        "undecodable green_targets in postgate_state; reading it as none"
+                    );
+                })
+                .ok()
+        });
         State {
             project_id: row.project_id,
             target: row.target,
@@ -315,6 +331,7 @@ impl From<Row> for State {
             fix_branch: row.fix_branch,
             fix_run_id: row.fix_run_id,
             covered_sha: row.covered_sha,
+            green_targets,
             held_note: row.held_note,
             unmeasured_runs: row.unmeasured_runs,
         }
@@ -328,7 +345,7 @@ pub async fn load(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<St
                 running_request_id, red_groups, red_since_sha, red_phase, red_sha, red_base_sha, \
                 probe_sha, probe_request_id, probes, reported_sha, culprit_sha, candidates, \
                 also_suspect, revert_merge_sha, revert_request_id, revert_sha, fix_branch, \
-                fix_run_id, covered_sha, held_note, unmeasured_runs \
+                fix_run_id, covered_sha, green_targets, held_note, unmeasured_runs \
          FROM postgate_state WHERE project_id = ?",
     )
     .bind(project_id)
@@ -478,6 +495,18 @@ pub async fn record_transition(
 /// `→ green` transition in the same transaction when the project was red (spec
 /// analytics-pipeline §5.4).
 pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Result<bool> {
+    finish_green_covering(pool, project_id, sha, None).await
+}
+
+/// `finish_green`, also recording which targets the command ran (`None` stores NULL). The targets
+/// come from the same rules read that composed the command, not from a later read.
+pub async fn finish_green_covering(
+    pool: &SqlitePool,
+    project_id: &str,
+    sha: &str,
+    targets: Option<&[String]>,
+) -> sqlx::Result<bool> {
+    let encoded = targets.map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
     let mut tx = pool.begin().await?;
     let before = read_before(&mut tx, project_id).await?;
     let done = sqlx::query(
@@ -488,10 +517,12 @@ pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sql
              red_phase = NULL, red_sha = NULL, red_base_sha = NULL, probe_sha = NULL, \
              probe_request_id = NULL, probes = '[]', reported_sha = NULL, culprit_sha = NULL, \
              candidates = '[]', also_suspect = '[]', \
+             green_targets = ?, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE project_id = ? AND running_sha = ?",
     )
     .bind(sha)
+    .bind(encoded)
     .bind(project_id)
     .bind(sha)
     .execute(&mut *tx)
@@ -1354,6 +1385,87 @@ mod tests {
         assert_eq!(s.last_attempted_sha.as_deref(), Some("b2"));
     }
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn finish_green_records_the_targets_it_covered() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = names(&["core", "hooks"]);
+        assert!(
+            finish_green_covering(&pool, "p", "a1", Some(&covered))
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, Some(covered));
+    }
+
+    #[tokio::test]
+    async fn finish_green_without_targets_stores_null() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, None);
+    }
+
+    #[tokio::test]
+    async fn a_red_keeps_the_last_green_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = names(&["core"]);
+        assert!(
+            finish_green_covering(&pool, "p", "a1", Some(&covered))
+                .await
+                .unwrap()
+        );
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        assert!(
+            finish_red(&pool, "p", "b2", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, Some(covered));
+    }
+
+    #[tokio::test]
+    async fn a_late_finish_does_not_overwrite_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = names(&["core"]);
+        assert!(
+            finish_green_covering(&pool, "p", "a1", Some(&covered))
+                .await
+                .unwrap()
+        );
+        // "zz" is not the running sha (nothing is running), so the finish is refused.
+        let other = names(&["shell"]);
+        assert!(
+            !finish_green_covering(&pool, "p", "zz", Some(&other))
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, Some(covered));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_green_targets_reads_as_none() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        sqlx::query("UPDATE postgate_state SET green_targets = 'x' WHERE project_id = 'p'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, None);
+    }
+
     #[tokio::test]
     async fn finish_red_records_the_groups_and_keeps_the_first_red_sha() {
         let pool = crate::testdb::fresh_pool().await;
@@ -1758,6 +1870,7 @@ mod tests {
             fix_branch: None,
             fix_run_id: None,
             covered_sha: None,
+            green_targets: None,
             held_note: None,
             unmeasured_runs: 0,
         };

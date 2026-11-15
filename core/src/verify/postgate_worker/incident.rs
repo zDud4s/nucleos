@@ -770,6 +770,7 @@ mod tests {
             fix_branch: None,
             fix_run_id: None,
             covered_sha: None,
+            green_targets: None,
             held_note: None,
             unmeasured_runs: 0,
         }
