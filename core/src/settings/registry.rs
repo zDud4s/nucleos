@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::decode::{self, Erased, Prepared};
 use super::scope::Kind;
+use crate::automations::Automations;
 use crate::channels::registry::ChannelConfig;
 use crate::config::{
     AutopilotRules, BackgroundConfig, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig,
@@ -18,7 +19,6 @@ use crate::config::{
 use crate::engines::agy::AgyDoc;
 use crate::machine_config as files;
 use crate::models::route_doc::RouterDoc;
-use crate::automations::Automations;
 use crate::workflows::Pins;
 
 /// A configuration document: a typed value stored as JSON under `(scope, NAME)`.
@@ -396,7 +396,8 @@ mod tests {
     fn the_automations_document_is_validated_on_the_way_in() {
         let rule = json!({"name":"a","enabled":true,"on":{"event":"published_green"},"do":{"action":"push","remote":"origin"}});
         assert!(prepared_text("automations", &json!({"rules":[rule.clone()]})).is_ok());
-        let error = prepared_text("automations", &json!({"rules":[rule.clone(), rule]})).unwrap_err();
+        let error =
+            prepared_text("automations", &json!({"rules":[rule.clone(), rule]})).unwrap_err();
         assert!(error.contains("twice"), "{error}");
     }
 

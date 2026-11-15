@@ -487,19 +487,20 @@ impl GitExecutor {
                 "a push-sha needs the daemon's database, and this executor has none".to_owned(),
             );
         };
-        let rule: Option<String> =
-            match sqlx::query_scalar("SELECT automation_rule FROM vcs_requests WHERE id = ?")
-                .bind(request.id)
-                .fetch_optional(pool)
-                .await
-            {
-                Ok(rule) => rule.flatten(),
-                Err(error) => {
-                    return fail(format!(
-                        "the automation rule of this push-sha could not be read, so nothing was pushed: {error}"
-                    ));
-                }
-            };
+        let rule: Option<String> = match sqlx::query_scalar(
+            "SELECT automation_rule FROM vcs_requests WHERE id = ?",
+        )
+        .bind(request.id)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(rule) => rule.flatten(),
+            Err(error) => {
+                return fail(format!(
+                    "the automation rule of this push-sha could not be read, so nothing was pushed: {error}"
+                ));
+            }
+        };
         let Some(rule) = rule else {
             return fail(
                 "this push-sha names no automation rule, so nothing was pushed".to_owned(),

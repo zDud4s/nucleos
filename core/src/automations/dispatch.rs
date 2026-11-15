@@ -115,7 +115,11 @@ async fn conditions_hold(
     let Some(when) = &rule.when else {
         return true;
     };
-    if when.branch.as_deref().is_some_and(|branch| branch != event.branch()) {
+    if when
+        .branch
+        .as_deref()
+        .is_some_and(|branch| branch != event.branch())
+    {
         return false;
     }
     let Event::CiFinished { conclusion, .. } = event else {
@@ -229,8 +233,7 @@ async fn push(
     use crate::execution::vcs::{Branch, CommitSha, Op, Origin, Remote};
     let branch = event.branch();
     let key = crate::task_claims::machine::remote_diverged_key(branch);
-    match crate::task_claims::store::live_by_key(pool, project_id, &key, chrono::Utc::now()).await
-    {
+    match crate::task_claims::store::live_by_key(pool, project_id, &key, chrono::Utc::now()).await {
         Ok(Some(_)) => return Some((firings::PAUSED, format!("{key} is open"))),
         Ok(None) => {}
         Err(error) => {
@@ -370,9 +373,11 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let _repo = rostered(&pool).await;
 
-        assert!(dispatch(&pool, PROJECT, green(SHA_A, "integ"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
         assert!(queued(&pool).await.is_empty());
         assert_eq!(firing_count(&pool).await, 0);
     }
@@ -413,9 +418,11 @@ mod tests {
             dispatch(&pool, PROJECT, green(SHA_A, "integ")).await.len(),
             1
         );
-        assert!(dispatch(&pool, PROJECT, green(SHA_A, "integ"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
         assert_eq!(queued(&pool).await.len(), 1);
         assert_eq!(firing_count(&pool).await, 1);
     }
@@ -441,9 +448,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(dispatch(&reopened, PROJECT, green(SHA_A, "integ"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&reopened, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
         assert_eq!(queued(&reopened).await.len(), 1);
         reopened.close().await;
     }
@@ -455,9 +464,11 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let _repo = rostered(&pool).await;
 
-        assert!(dispatch(&pool, PROJECT, promoted(SHA_A, "master"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&pool, PROJECT, promoted(SHA_A, "master"))
+                .await
+                .is_empty()
+        );
         assert_eq!(
             dispatch(&pool, PROJECT, green(SHA_B, "integ")).await.len(),
             1
@@ -472,9 +483,11 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let _repo = rostered(&pool).await;
 
-        assert!(dispatch(&pool, PROJECT, green(SHA_A, "integ"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
         assert_eq!(
             dispatch(&pool, PROJECT, promoted(SHA_B, "master"))
                 .await
@@ -493,9 +506,11 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let _repo = rostered(&pool).await;
 
-        assert!(dispatch(&pool, PROJECT, green(SHA_A, "other"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "other"))
+                .await
+                .is_empty()
+        );
         assert_eq!(
             dispatch(&pool, PROJECT, green(SHA_B, "integ")).await.len(),
             1
@@ -509,15 +524,19 @@ mod tests {
 
         publish_unreadable(PROJECT, "automations", "broken on purpose");
         without_release_branch();
-        assert!(dispatch(&pool, PROJECT, green(SHA_A, "integ"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
 
         publish_automations(PROJECT, &push_rule(true, ""));
         publish_unreadable(PROJECT, "autopilot", "broken on purpose");
-        assert!(dispatch(&pool, PROJECT, green(SHA_A, "integ"))
-            .await
-            .is_empty());
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
 
         assert!(queued(&pool).await.is_empty());
         assert_eq!(firing_count(&pool).await, 0);
@@ -541,9 +560,11 @@ mod tests {
         assert_eq!(fired[0].detail, "remote-diverged:integ is open");
         assert!(queued(&pool).await.is_empty());
 
-        assert!(close_remote_diverged(&pool, PROJECT, "integ", "fixed", now)
-            .await
-            .unwrap());
+        assert!(
+            close_remote_diverged(&pool, PROJECT, "integ", "fixed", now)
+                .await
+                .unwrap()
+        );
         let next = dispatch(&pool, PROJECT, green(SHA_B, "integ")).await;
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].outcome, "queued");

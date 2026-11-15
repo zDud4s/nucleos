@@ -6087,13 +6087,23 @@ integration_steps:
     }
 
     /// Promotes a green `integ` to `master` with `automations` (if any) published first.
-    async fn promote_green_integ(automations: Option<&str>) -> (tempfile::TempDir, sqlx::SqlitePool, String) {
+    async fn promote_green_integ(
+        automations: Option<&str>,
+    ) -> (tempfile::TempDir, sqlx::SqlitePool, String) {
         let (container, repo, pool) = promote_fixture().await;
         if let Some(yaml) = automations {
             crate::project::rules::testing::publish_automations("alpha", yaml);
         }
-        commit_on(&repo, "integ", &[("green.txt", "green
-")], "green work");
+        commit_on(
+            &repo,
+            "integ",
+            &[(
+                "green.txt",
+                "green
+",
+            )],
+            "green work",
+        );
         let green = sha_of(&repo, "refs/heads/integ");
         crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
             .await
@@ -6101,7 +6111,11 @@ integration_steps:
 
         let outcome = execute_promote(&repo, &pool, "integ", "master").await;
         assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
-        assert_eq!(sha_of(&repo, "refs/heads/master"), green, "the promote itself works");
+        assert_eq!(
+            sha_of(&repo, "refs/heads/master"),
+            green,
+            "the promote itself works"
+        );
         (container, pool, green)
     }
 
@@ -6217,8 +6231,7 @@ integration_steps:
         let newer = sha_of(&repo, "refs/heads/master");
         move_origin_master(&repo, &newer);
 
-        let (outcome, verdict) =
-            push_sha_ff(&repo, "origin", "master", old, push_deadline()).await;
+        let (outcome, verdict) = push_sha_ff(&repo, "origin", "master", old, push_deadline()).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
         assert_eq!(verdict, PushVerdict::Rejected);

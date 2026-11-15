@@ -6416,7 +6416,11 @@ mod tests {
         let absolute = r"C:\Users\someone\.nucleos\projects\alpha\automations.yaml";
         for tool in ["Edit", "Write"] {
             assert_classification(
-                classify(tool, &json!({ "file_path": "~/.nucleos/projects/alpha/automations.yaml" }), cwd),
+                classify(
+                    tool,
+                    &json!({ "file_path": "~/.nucleos/projects/alpha/automations.yaml" }),
+                    cwd,
+                ),
                 "pending_approval",
                 "self-governing-file",
             );

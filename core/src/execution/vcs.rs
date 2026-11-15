@@ -5039,13 +5039,12 @@ mod tests {
         )
         .await
         .expect("an automation's push-sha is admitted");
-        let (origin, rule, status): (String, Option<String>, String) = sqlx::query_as(
-            "SELECT origin, automation_rule, status FROM vcs_requests WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (origin, rule, status): (String, Option<String>, String) =
+            sqlx::query_as("SELECT origin, automation_rule, status FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(origin, "daemon");
         assert_eq!(rule.as_deref(), Some("push-quando-verde"));
         assert_eq!(status, "queued");
@@ -5055,7 +5054,11 @@ mod tests {
     async fn a_run_cannot_queue_a_push_sha() {
         let pool = test_pool().await;
         let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "alpha");
-        assert!(submit(&pool, &repo, &push_sha(), Origin::Run(1)).await.is_err());
+        assert!(
+            submit(&pool, &repo, &push_sha(), Origin::Run(1))
+                .await
+                .is_err()
+        );
         assert!(
             submit_declared(&pool, &repo, &push_sha(), Origin::Job(1))
                 .await

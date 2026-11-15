@@ -39,7 +39,9 @@ pub enum Origin {
     /// Stored as `daemon`, because that is what it is — the daemon on a standing order of the owner —
     /// and the `origin` column's CHECK knows five words; the rule's name goes to
     /// `vcs_requests.automation_rule` ([`Origin::automation_rule`]).
-    Automation { rule: String },
+    Automation {
+        rule: String,
+    },
     Run(i64),
     // Constructed by Chunk 4, when jobs submit requests of their own.
     Job(i64),

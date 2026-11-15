@@ -49,7 +49,10 @@ impl TaskKey {
     pub fn is_machine(&self) -> bool {
         matches!(
             self.prefix(),
-            "master-red" | "migration" | "fmt" | "conflict"
+            "master-red"
+                | "migration"
+                | "fmt"
+                | "conflict"
                 | "direct-write"
                 | "release-diverged"
                 | "remote-diverged"

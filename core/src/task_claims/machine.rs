@@ -843,9 +843,7 @@ mod tests {
     async fn opening_remote_diverged_twice_is_one_ticket_with_two_reports() {
         let pool = crate::testdb::fresh_pool().await;
         let now = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
-        let detail = |remote_sha: &str| {
-            json!({ "branch": "master", "remote": "origin", "local_sha": "a1", "remote_sha": remote_sha })
-        };
+        let detail = |remote_sha: &str| json!({ "branch": "master", "remote": "origin", "local_sha": "a1", "remote_sha": remote_sha });
         let first = open_remote_diverged_ticket(&pool, "proj", "master", detail("r1"), now)
             .await
             .unwrap();

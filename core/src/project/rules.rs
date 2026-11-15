@@ -437,7 +437,9 @@ pub mod testing {
     pub fn publish_automations(project_id: &str, yaml: &str) {
         let automations: crate::automations::Automations =
             serde_yaml::from_str(yaml).expect("a fixture's automations parse");
-        automations.validate().expect("a fixture's automations are valid");
+        automations
+            .validate()
+            .expect("a fixture's automations are valid");
         edit(|snapshot| snapshot.with_document(&Scope::project(project_id), automations));
     }
 
