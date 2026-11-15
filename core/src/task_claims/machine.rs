@@ -391,6 +391,51 @@ pub async fn close_remote_diverged(
     close_machine_ticket(pool, project_id, &remote_diverged_key(branch), note, now).await
 }
 
+/// The key `ci-red:<branch>`; `None` for an empty branch.
+pub fn ci_red_key(branch: &str) -> Option<TaskKey> {
+    TaskKey::ci_red(branch)
+}
+
+/// Opens (or reports again) the `ci-red:<branch>` ticket: the CI of a pushed sha finished red. One
+/// live ticket per branch. The title is fixed and never carries log text; `detail` is kept as is
+/// (a non-object is kept under `detail.detail`).
+pub async fn open_ci_red_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    title: String,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
+    let key = ci_red_key(branch).ok_or_else(|| {
+        sqlx::Error::Protocol(format!("empty branch for a ci-red ticket: '{branch}'"))
+    })?;
+    let detail = match detail {
+        Value::Null => Value::Object(serde_json::Map::new()),
+        object @ Value::Object(_) => object,
+        other => {
+            let mut fields = serde_json::Map::new();
+            fields.insert("detail".to_owned(), other);
+            Value::Object(fields)
+        }
+    };
+    open_machine_ticket(pool, project_id, key, title, detail, Vec::new(), now).await
+}
+
+/// Closes the live `ci-red:<branch>` ticket by resolution. `false` when there is none.
+pub async fn close_ci_red_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    note: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let Some(key) = ci_red_key(branch) else {
+        return Ok(false);
+    };
+    close_machine_ticket(pool, project_id, &key, note, now).await
+}
+
 /// Why the target moved without the queue: a write the hook did not see (`Violation`) or one it
 /// let through because `NUCLEOS_ALLOW_DIRECT_GIT` was set (`Bypass`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,6 +882,87 @@ mod tests {
                 .unwrap(),
             "nothing left to close"
         );
+    }
+
+    #[tokio::test]
+    async fn a_ci_red_ticket_is_one_per_branch_and_closes() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
+        let title = "CI is red on master".to_owned();
+        let first = open_ci_red_ticket(
+            &pool,
+            "proj",
+            "master",
+            title.clone(),
+            json!({ "auto_fix": true }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.key.as_str(), "ci-red:master");
+        assert!(first.key.is_machine());
+        let again = open_ci_red_ticket(
+            &pool,
+            "proj",
+            "master",
+            title,
+            json!({ "auto_fix": true }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.id, first.id, "one ticket per branch");
+        let live = store::live_by_key(&pool, "proj", &ci_red_key("master").unwrap(), now)
+            .await
+            .unwrap()
+            .expect("the ticket is live");
+        assert_eq!(live.report_count, 2);
+        let other = open_ci_red_ticket(
+            &pool,
+            "proj",
+            "fix/x",
+            "CI is red on fix/x".to_owned(),
+            json!({}),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_ne!(other.id, first.id, "another branch is another ticket");
+        assert!(
+            close_ci_red_ticket(&pool, "proj", "master", "green again", now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !close_ci_red_ticket(&pool, "proj", "master", "again", now)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_ci_red_after_the_close_is_a_new_ticket() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
+        let open = || {
+            open_ci_red_ticket(
+                &pool,
+                "proj",
+                "master",
+                "CI is red on master".to_owned(),
+                json!({ "auto_fix": true }),
+                now,
+            )
+        };
+        let first = open().await.unwrap();
+        assert!(
+            close_ci_red_ticket(&pool, "proj", "master", "green", now)
+                .await
+                .unwrap()
+        );
+        let second = open().await.unwrap();
+        assert_ne!(second.id, first.id, "a closed ticket is never reopened");
+        assert_eq!(second.key, first.key, "same key, so the history still counts");
     }
 
     #[tokio::test]

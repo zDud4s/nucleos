@@ -5,6 +5,7 @@
 //! the owner writes; a rule never grants an agent anything. Its actions run through the daemon's own machinery
 //! (the git queue for `push`), never through an agent.
 
+pub mod ci_watch;
 pub mod dispatch;
 pub mod firings;
 
