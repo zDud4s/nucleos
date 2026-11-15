@@ -313,7 +313,7 @@ async fn tick_project(
             // Started but never submitted (a crash between the two): submit it now.
             return launch(executor, project_id, project_root, sha, deadline).await;
         };
-        return follow(pool, project_id, sha, request, rules).await;
+        return follow(pool, project_id, sha, request).await;
     }
 
     // A red is being handled: see it through before looking at the tip, so a merge that lands
@@ -550,15 +550,10 @@ async fn machine_idle(command: &str, root: &Path) -> Result<(), String> {
 
 /// Reads the ticket of the gate running for `sha` and records its verdict once it is done.
 ///
-/// `rules` is the read taken at the start of this tick, not a fresh one: the targets a green is
-/// recorded as covering must not be re-read at the moment of recording.
-async fn follow(
-    pool: &sqlx::SqlitePool,
-    project_id: &str,
-    sha: &str,
-    request: i64,
-    rules: &crate::config::AutopilotRules,
-) -> Step {
+/// No rules are read here: the targets a green covers were stored at submit time
+/// (`running_targets`), from the rules read that composed the command, and `finish_green` copies
+/// them.
+async fn follow(pool: &sqlx::SqlitePool, project_id: &str, sha: &str, request: i64) -> Step {
     let ticket = match verify::read_ticket(pool, request).await {
         Ok(Some((ticket, _))) => ticket,
         Ok(None) => {
@@ -572,16 +567,10 @@ async fn follow(
         };
     }
     match ticket.verdict.as_deref() {
-        Some("passed") => {
-            // `None` (NULL) without `gate_targets`: the command ran whole, as before the key.
-            let covered = rules.gate_targets.is_some().then(|| rules.local_targets());
-            match verify_postgate::finish_green_covering(pool, project_id, sha, covered.as_deref())
-                .await
-            {
-                Ok(_) => Step::Green(sha.to_owned()),
-                Err(error) => Step::Failed(format!("cannot record the green: {error}")),
-            }
-        }
+        Some("passed") => match verify_postgate::finish_green(pool, project_id, sha).await {
+            Ok(_) => Step::Green(sha.to_owned()),
+            Err(error) => Step::Failed(format!("cannot record the green: {error}")),
+        },
         Some("failed") => {
             let mut groups: Vec<String> = Vec::new();
             for unit in ticket.units.iter().filter(|u| u.status == "failed") {
@@ -1455,15 +1444,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_green_with_gate_targets_records_the_local_ones() {
-        // The gate starts under plain GATE_ON (its command, `git --version`, runs in the fixture);
-        // the targets arrive before it finishes. The worker records the targets of the rules read
-        // at the finishing tick (plan B T2's accepted race), so this pins that path.
-        let f = fixture(Some(GATE_ON)).await;
-        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+    async fn a_green_with_gate_targets_records_the_launch_time_ones() {
+        // The gate launches under `gate_targets {core: local}`, so its command runs `--only core`.
+        // The composed `gate-diff.sh` command cannot run in this fixture repo, so no executor is
+        // started: the test settles the queued unit as passed itself. Mid-run the owner adds
+        // `hooks: local`; the green must still cover only what the command was composed from.
+        let f = fixture(Some(&format!(
+            "{GATE_ON}gate_targets: {{core: local, shell: ci}}\n"
+        )))
+        .await;
         tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
-        let rules = format!("{GATE_ON}gate_targets: {{core: local, shell: ci}}\n");
-        crate::project::rules::testing::publish_rules("alpha", &rules);
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.running_targets,
+            Some(vec!["core".to_owned()]),
+            "the launch stores the targets its command was composed from"
+        );
+
+        let later = format!("{GATE_ON}gate_targets: {{core: local, hooks: local}}\n");
+        crate::project::rules::testing::publish_rules("alpha", &later);
+        sqlx::query(
+            "UPDATE verify_runs SET status = 'passed', finished_at = ? WHERE status = 'queued'",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&f.pool)
+        .await
+        .unwrap();
 
         tick_until(&f, |s| matches!(s, Step::Green(_))).await;
 
@@ -1471,7 +1480,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(s.green_targets, Some(vec!["core".to_owned()]));
+        assert_eq!(
+            s.green_targets,
+            Some(vec!["core".to_owned()]),
+            "a mid-run rules change must not add a target the gate never ran"
+        );
+        assert_eq!(s.running_targets, None);
     }
 
     #[tokio::test]

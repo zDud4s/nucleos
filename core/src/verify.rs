@@ -464,6 +464,16 @@ async fn submit_with(
         rules.gate_command.clone()
     };
 
+    // Persist the local targets this very command was composed from, from the same `rules` read,
+    // so the green that follows covers exactly them (`None` = the command runs whole). Stored
+    // before the request exists: a request never runs without its targets on record.
+    if caller == Caller::Postgate {
+        let composed = rules.gate_targets.is_some().then(|| rules.local_targets());
+        verify_postgate::set_running_targets(pool, &project_id, composed.as_deref())
+            .await
+            .map_err(internal)?;
+    }
+
     // `true` until a project can declare that it gates after landing (there is no
     // `gate_after_land` yet); the planner already knows how to refuse `full` once there is.
     let planned = match (caller, args.groups.as_deref(), terms.recheck.as_deref()) {

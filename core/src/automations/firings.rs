@@ -51,9 +51,25 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Records a firing. `None` means this rule already fired for this event: nothing was written.
-pub async fn record(pool: &SqlitePool, new: &NewFiring<'_>) -> sqlx::Result<Option<Firing>> {
-    sqlx::query_as::<_, Firing>(
+/// A firing taken for an event, and what it held before when it was taken over from an earlier
+/// attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub firing: Firing,
+    /// `(outcome, detail)` the firing had when this claim re-took it (`paused` or `failed`);
+    /// `None` for a firing created by this claim.
+    pub previous: Option<(String, String)>,
+}
+
+/// Takes the firing of `(project, rule, event_key)`.
+///
+/// A new key creates the row. A key whose row ended `paused` or `failed` is re-taken: the earlier
+/// attempt never queued a push that could land (a `paused` rule waited on an open incident, a
+/// `failed` one hit an error), and the postgate re-emits the same green, so a later dispatch must
+/// get another try. Any other stored outcome (`queued`, `pushed`, `rejected`, `diverged`,
+/// `skipped`, `ok`...) is terminal for the key: `None`, nothing written, so a sha is pushed once.
+pub async fn claim(pool: &SqlitePool, new: &NewFiring<'_>) -> sqlx::Result<Option<Claim>> {
+    let created = sqlx::query_as::<_, Firing>(
         "INSERT INTO automation_firings
              (project_id, rule, event_key, branch, sha, action, outcome, detail, at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -70,7 +86,54 @@ pub async fn record(pool: &SqlitePool, new: &NewFiring<'_>) -> sqlx::Result<Opti
     .bind(new.detail)
     .bind(now())
     .fetch_optional(pool)
-    .await
+    .await?;
+    if let Some(firing) = created {
+        return Ok(Some(Claim {
+            firing,
+            previous: None,
+        }));
+    }
+    let previous: Option<(String, String)> = sqlx::query_as(
+        "SELECT outcome, detail FROM automation_firings
+         WHERE project_id = ? AND rule = ? AND event_key = ? AND outcome IN ('paused', 'failed')",
+    )
+    .bind(new.project_id)
+    .bind(new.rule)
+    .bind(new.event_key)
+    .fetch_optional(pool)
+    .await?;
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    // The outcome guard makes the re-take exclusive: of two racing claims, one finds the row
+    // already moved off `paused`/`failed` and gets `None`.
+    let retaken = sqlx::query_as::<_, Firing>(
+        "UPDATE automation_firings
+         SET branch = ?, sha = ?, action = ?, outcome = ?, detail = ?, at = ?
+         WHERE project_id = ? AND rule = ? AND event_key = ? AND outcome IN ('paused', 'failed')
+         RETURNING id, project_id, rule, event_key, branch, sha, action, outcome, detail, at",
+    )
+    .bind(new.branch)
+    .bind(new.sha)
+    .bind(new.action)
+    .bind(new.outcome)
+    .bind(new.detail)
+    .bind(now())
+    .bind(new.project_id)
+    .bind(new.rule)
+    .bind(new.event_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(retaken.map(|firing| Claim {
+        firing,
+        previous: Some(previous),
+    }))
+}
+
+/// Records a firing, see [`claim`]. `None` means this rule already fired for this event and that
+/// firing is final: nothing was written.
+pub async fn record(pool: &SqlitePool, new: &NewFiring<'_>) -> sqlx::Result<Option<Firing>> {
+    Ok(claim(pool, new).await?.map(|claim| claim.firing))
 }
 
 /// Moves the newest still-`queued` push firing of `(project, rule, sha)` to `outcome`. `None` when there is none.
@@ -180,6 +243,60 @@ mod tests {
         assert_eq!(first.outcome, QUEUED);
         assert_eq!(first.event_key, "local_green:abc");
         assert!(record(&pool, &new).await.unwrap().is_none());
+    }
+
+    /// Moves the firing of key `k` of rule `r` to `outcome` by its id, whatever it was.
+    async fn force_outcome(pool: &SqlitePool, outcome: &str) {
+        sqlx::query(
+            "UPDATE automation_firings SET outcome = ?, detail = 'why' WHERE event_key = 'k'",
+        )
+        .bind(outcome)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_paused_or_failed_firing_is_retaken_by_the_same_key() {
+        for outcome in [PAUSED, FAILED] {
+            let pool = crate::testdb::fresh_pool().await;
+            let new = push("p", "r", "k", "master", "abc");
+            let first = record(&pool, &new).await.unwrap().expect("first firing");
+            force_outcome(&pool, outcome).await;
+
+            let again = claim(&pool, &new).await.unwrap().expect("retaken");
+            assert_eq!(again.firing.id, first.id, "the same row, not a second one");
+            assert_eq!(again.firing.outcome, QUEUED);
+            assert_eq!(again.firing.detail, "");
+            assert_eq!(again.previous, Some((outcome.to_owned(), "why".to_owned())));
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM automation_firings")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, 1);
+            // Queued again, so it is final until it is settled.
+            assert!(record(&pool, &new).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_other_outcome_stays_final_for_its_key() {
+        for outcome in [QUEUED, PUSHED, REJECTED, DIVERGED, SKIPPED, UNSUPPORTED, OK] {
+            let pool = crate::testdb::fresh_pool().await;
+            let new = push("p", "r", "k", "master", "abc");
+            record(&pool, &new).await.unwrap().expect("first firing");
+            force_outcome(&pool, outcome).await;
+
+            assert!(
+                record(&pool, &new).await.unwrap().is_none(),
+                "{outcome} must not be retaken"
+            );
+            let stored: String = sqlx::query_scalar("SELECT outcome FROM automation_firings")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(stored, outcome);
+        }
     }
 
     #[tokio::test]

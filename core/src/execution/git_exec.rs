@@ -6031,6 +6031,45 @@ integration_steps:
     }
 
     #[tokio::test]
+    async fn promote_when_master_already_equals_green_still_dispatches_promoted_once() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        crate::project::rules::testing::publish_automations("alpha", PUSH_RULE_ON);
+        // The state a crash after the publish leaves: the release is at the green sha, no event sent.
+        let tip = sha_of(&repo, "refs/heads/master");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &tip)
+            .await
+            .expect("the master tip is the green sha");
+
+        for attempt in 1..=2 {
+            let outcome = execute_promote(&repo, &pool, "integ", "master").await;
+            assert!(
+                matches!(outcome, Outcome::Succeeded { .. }),
+                "attempt {attempt}: {outcome:?}"
+            );
+            let firings: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM automation_firings WHERE event_key = ?")
+                    .bind(format!("green:{tip}"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                firings, 1,
+                "attempt {attempt}: one firing for the green sha"
+            );
+            let pushes: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM vcs_requests WHERE op IN ('push', 'push-sha')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pushes, 1, "attempt {attempt}: one push queued, never two");
+        }
+    }
+
+    #[tokio::test]
     async fn promote_refuses_when_master_diverged_and_leaves_master_untouched() {
         let _lock = crate::execution::worktree::test_env_lock();
         let roots = space_free_tempdir("nucleos-gitexec-wt-");

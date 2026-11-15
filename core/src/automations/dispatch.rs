@@ -162,7 +162,9 @@ async fn conditions_hold(
 }
 
 /// Records the firing and carries out its action. `None` when the rule already fired for this
-/// event (or the log could not be written).
+/// event with a final outcome (or the log could not be written). A firing that ended `paused` or
+/// `failed` is taken again by a later dispatch of the same event, so the same green is retried
+/// once the obstacle is gone; every other outcome keeps the key, so a sha is pushed once.
 async fn fire(
     pool: &SqlitePool,
     project_id: &str,
@@ -175,7 +177,7 @@ async fn fire(
         Action::OpenIncident { .. } => "open_incident",
     };
     let key = event.key();
-    let recorded = firings::record(
+    let recorded = firings::claim(
         pool,
         &NewFiring {
             project_id,
@@ -189,8 +191,8 @@ async fn fire(
         },
     )
     .await;
-    let firing = match recorded {
-        Ok(Some(firing)) => firing,
+    let (firing, previous) = match recorded {
+        Ok(Some(claim)) => (claim.firing, claim.previous),
         Ok(None) => return None,
         Err(error) => {
             tracing::warn!(project_id, rule = %rule.name, %error, "could not record a firing");
@@ -206,16 +208,23 @@ async fn fire(
     let Some((outcome, detail)) = settled else {
         return Some(firing);
     };
-    let row = firing_row(pool, &firing, outcome, &detail).await;
+    // A re-taken firing that ends exactly as before (the same pause, the same error) is the
+    // postgate's per-tick re-emit: settle it quietly, with no new feed line and no new firing.
+    let repeat = previous.is_some_and(|(was, why)| was == outcome && why == detail);
+    let row = firing_row(pool, &firing, outcome, &detail, !repeat).await;
+    if repeat {
+        return None;
+    }
     Some(row.unwrap_or(firing))
 }
 
-/// Settles a non-queued firing by id and announces it.
+/// Settles a non-queued firing by id and, when `announce`, writes its feed line.
 async fn firing_row(
     pool: &SqlitePool,
     firing: &Firing,
     outcome: &str,
     detail: &str,
+    announce: bool,
 ) -> Option<Firing> {
     let settled = sqlx::query_as::<_, Firing>(
         "UPDATE automation_firings SET outcome = ?, detail = ? WHERE id = ?
@@ -228,7 +237,9 @@ async fn firing_row(
     .await;
     match settled {
         Ok(Some(row)) => {
-            firings::announce(pool, &row).await;
+            if announce {
+                firings::announce(pool, &row).await;
+            }
             Some(row)
         }
         Ok(None) => None,
@@ -578,15 +589,68 @@ mod tests {
         assert_eq!(fired[0].detail, "remote-diverged:integ is open");
         assert!(queued(&pool).await.is_empty());
 
+        // The postgate re-emits the paused green every tick: still paused, and quiet about it.
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
+        assert!(queued(&pool).await.is_empty());
+        assert_eq!(firing_count(&pool).await, 1);
+        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ?")
+            .bind(firings::FEED_KIND)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(lines, 1, "a repeated pause writes no second feed line");
+
         assert!(
             close_remote_diverged(&pool, PROJECT, "integ", "fixed", now)
                 .await
                 .unwrap()
         );
+        // The SAME green that was paused queues now: its key was not consumed by the pause.
+        let same = dispatch(&pool, PROJECT, green(SHA_A, "integ")).await;
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].outcome, "queued");
+        assert_eq!(same[0].sha, SHA_A);
+        assert_eq!(queued(&pool).await.len(), 1);
+        assert_eq!(
+            firing_count(&pool).await,
+            1,
+            "the same firing row is reused"
+        );
+        // And once queued it is final again: one push per sha.
+        assert!(
+            dispatch(&pool, PROJECT, green(SHA_A, "integ"))
+                .await
+                .is_empty()
+        );
+        assert_eq!(queued(&pool).await.len(), 1);
+
         let next = dispatch(&pool, PROJECT, green(SHA_B, "integ")).await;
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].outcome, "queued");
+        assert_eq!(queued(&pool).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_firing_is_retried_by_the_same_green() {
+        publish_automations(PROJECT, &push_rule(true, ""));
+        without_release_branch();
+        let pool = crate::testdb::fresh_pool().await;
+        // Not rostered: the repository cannot be resolved, so the first attempt ends `failed`.
+        let fired = dispatch(&pool, PROJECT, green(SHA_A, "integ")).await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].outcome, "failed");
+        assert!(queued(&pool).await.is_empty());
+
+        let _repo = rostered(&pool).await;
+        let again = dispatch(&pool, PROJECT, green(SHA_A, "integ")).await;
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].outcome, "queued");
         assert_eq!(queued(&pool).await.len(), 1);
+        assert_eq!(firing_count(&pool).await, 1);
     }
 
     #[tokio::test]

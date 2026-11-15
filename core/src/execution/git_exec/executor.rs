@@ -662,6 +662,17 @@ impl GitExecutor {
             Err(outcome) => return outcome,
         };
         if release_tip == green {
+            // A crash, or a failed dispatch, after the publish leaves the release here with no
+            // event sent. The retry sends it: the firing key (`green:<sha>`) makes it idempotent.
+            let _ = crate::automations::dispatch(
+                pool,
+                &request.project_id,
+                crate::automations::Event::Promoted {
+                    sha: green.clone(),
+                    branch: to.to_owned(),
+                },
+            )
+            .await;
             return Outcome::Succeeded {
                 sha: Some(green),
                 output_tail: format!("{to} is already at the green sha"),

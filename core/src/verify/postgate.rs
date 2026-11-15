@@ -129,6 +129,9 @@ pub struct State {
     /// Targets the last green covered; `None` = recorded before this column (whatever
     /// `gate_command` ran).
     pub green_targets: Option<Vec<String>>,
+    /// The local targets the running gate's command was composed from (stored at submit time);
+    /// `None` = no gate runs, or its command ran whole.
+    pub running_targets: Option<Vec<String>>,
     /// Why a gate start is being held right now (`"interval"` / `"busy"`), until a gate starts.
     pub held_note: Option<String>,
     /// How many gates of `last_attempted_sha` ended without a verdict.
@@ -250,6 +253,7 @@ struct Row {
     fix_run_id: Option<i64>,
     covered_sha: Option<String>,
     green_targets: Option<String>,
+    running_targets: Option<String>,
     held_note: Option<String>,
     unmeasured_runs: i64,
 }
@@ -295,17 +299,22 @@ impl From<Row> for State {
         let candidates = decode_list(&row.project_id, "candidates", &row.candidates);
         let also_suspect = decode_list(&row.project_id, "also_suspect", &row.also_suspect);
         // Unreadable reads as `None`, never as an empty list: "covers nothing" would be a claim.
-        let green_targets = row.green_targets.as_deref().and_then(|raw| {
-            serde_json::from_str::<Vec<String>>(raw)
-                .map_err(|error| {
-                    tracing::warn!(
-                        project = %row.project_id,
-                        %error,
-                        "undecodable green_targets in postgate_state; reading it as none"
-                    );
-                })
-                .ok()
-        });
+        let target_list = |column: &str, raw: Option<&str>| {
+            raw.and_then(|raw| {
+                serde_json::from_str::<Vec<String>>(raw)
+                    .map_err(|error| {
+                        tracing::warn!(
+                            project = %row.project_id,
+                            column,
+                            %error,
+                            "undecodable target list in postgate_state; reading it as none"
+                        );
+                    })
+                    .ok()
+            })
+        };
+        let green_targets = target_list("green_targets", row.green_targets.as_deref());
+        let running_targets = target_list("running_targets", row.running_targets.as_deref());
         State {
             project_id: row.project_id,
             target: row.target,
@@ -332,6 +341,7 @@ impl From<Row> for State {
             fix_run_id: row.fix_run_id,
             covered_sha: row.covered_sha,
             green_targets,
+            running_targets,
             held_note: row.held_note,
             unmeasured_runs: row.unmeasured_runs,
         }
@@ -345,7 +355,8 @@ pub async fn load(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<St
                 running_request_id, red_groups, red_since_sha, red_phase, red_sha, red_base_sha, \
                 probe_sha, probe_request_id, probes, reported_sha, culprit_sha, candidates, \
                 also_suspect, revert_merge_sha, revert_request_id, revert_sha, fix_branch, \
-                fix_run_id, covered_sha, green_targets, held_note, unmeasured_runs \
+                fix_run_id, covered_sha, green_targets, running_targets, held_note, \
+                unmeasured_runs \
          FROM postgate_state WHERE project_id = ?",
     )
     .bind(project_id)
@@ -381,6 +392,7 @@ pub async fn start(
              running_started_at = CURRENT_TIMESTAMP, \
              last_started_at = CURRENT_TIMESTAMP, \
              submit_floor = excluded.submit_floor, \
+             running_targets = NULL, \
              held_note = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE postgate_state.running_sha IS NULL AND postgate_state.red_phase IS NULL",
@@ -393,6 +405,26 @@ pub async fn start(
     .execute(pool)
     .await?;
     Ok(done.rows_affected() > 0)
+}
+
+/// Records the local targets the running gate's command is composed from (`None` = the command
+/// runs whole). Called at submit time with the rules that composed the command; `finish_green`
+/// copies it into `green_targets`. Changes nothing while no gate runs for the project.
+pub async fn set_running_targets(
+    pool: &SqlitePool,
+    project_id: &str,
+    targets: Option<&[String]>,
+) -> sqlx::Result<()> {
+    let encoded = targets.map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
+    sqlx::query(
+        "UPDATE postgate_state SET running_targets = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND running_sha IS NOT NULL",
+    )
+    .bind(encoded)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// A project's post-merge gate colour, as `postgate_transitions.to_state` spells it.
@@ -494,19 +526,11 @@ pub async fn record_transition(
 /// nothing and returns `false`, so a late finish cannot overwrite newer state. Writes the
 /// `→ green` transition in the same transaction when the project was red (spec
 /// analytics-pipeline §5.4).
+///
+/// The green covers exactly the targets the running command was composed from: `running_targets`
+/// (stored by `set_running_targets` at submit time) is copied into `green_targets`, so no later
+/// read of the rules can claim a target the gate did not run. NULL stays NULL.
 pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Result<bool> {
-    finish_green_covering(pool, project_id, sha, None).await
-}
-
-/// `finish_green`, also recording which targets the command ran (`None` stores NULL). The targets
-/// come from the same rules read that composed the command, not from a later read.
-pub async fn finish_green_covering(
-    pool: &SqlitePool,
-    project_id: &str,
-    sha: &str,
-    targets: Option<&[String]>,
-) -> sqlx::Result<bool> {
-    let encoded = targets.map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
     let mut tx = pool.begin().await?;
     let before = read_before(&mut tx, project_id).await?;
     let done = sqlx::query(
@@ -517,12 +541,11 @@ pub async fn finish_green_covering(
              red_phase = NULL, red_sha = NULL, red_base_sha = NULL, probe_sha = NULL, \
              probe_request_id = NULL, probes = '[]', reported_sha = NULL, culprit_sha = NULL, \
              candidates = '[]', also_suspect = '[]', \
-             green_targets = ?, \
+             green_targets = running_targets, running_targets = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE project_id = ? AND running_sha = ?",
     )
     .bind(sha)
-    .bind(encoded)
     .bind(project_id)
     .bind(sha)
     .execute(&mut *tx)
@@ -1262,16 +1285,18 @@ pub(crate) fn covers_local_targets(state: &State, rules: &crate::config::Autopil
 /// Some local target is missing from what the last green covered (or no green recorded its
 /// targets): the next gate must run every target once. `false` without `gate_targets`, where
 /// nothing changes.
+///
+/// A running gate's own `running_targets` (what its command was composed from at submit time)
+/// win over `rules`, which this reads later and may have moved: the base must match the command.
 pub fn needs_full_run(state: Option<&State>, rules: &crate::config::AutopilotRules) -> bool {
-    if rules.gate_targets.is_none() {
-        return false;
-    }
+    let local = match state.and_then(|state| state.running_targets.clone()) {
+        Some(composed) => composed,
+        None if rules.gate_targets.is_none() => return false,
+        None => rules.local_targets(),
+    };
     match state.and_then(|state| state.green_targets.as_ref()) {
         None => true,
-        Some(covered) => rules
-            .local_targets()
-            .iter()
-            .any(|target| !covered.contains(target)),
+        Some(covered) => local.iter().any(|target| !covered.contains(target)),
     }
 }
 
@@ -1415,18 +1440,49 @@ mod tests {
         list.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    /// The running gate's command was composed from `targets`, and the gate for `sha` then passes.
+    async fn green_composed_from(pool: &SqlitePool, sha: &str, targets: Option<&[String]>) -> bool {
+        set_running_targets(pool, "p", targets).await.unwrap();
+        finish_green(pool, "p", sha).await.unwrap()
+    }
+
     #[tokio::test]
     async fn finish_green_records_the_targets_it_covered() {
         let pool = crate::testdb::fresh_pool().await;
         start(&pool, "p", "master", "a1", None).await.unwrap();
         let covered = names(&["core", "hooks"]);
-        assert!(
-            finish_green_covering(&pool, "p", "a1", Some(&covered))
-                .await
-                .unwrap()
-        );
+        assert!(green_composed_from(&pool, "a1", Some(&covered)).await);
         let s = load(&pool, "p").await.unwrap().unwrap();
         assert_eq!(s.green_targets, Some(covered));
+        assert_eq!(s.running_targets, None, "a finished gate keeps no targets");
+    }
+
+    #[tokio::test]
+    async fn a_new_gate_start_forgets_the_previous_running_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        set_running_targets(&pool, "p", Some(&names(&["core"])))
+            .await
+            .unwrap();
+        abandon_unmeasured(&pool, "p", "a1").await.unwrap();
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.running_targets, None);
+        assert!(finish_green(&pool, "p", "b2").await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, None);
+    }
+
+    #[tokio::test]
+    async fn running_targets_are_only_stored_while_a_gate_runs() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        set_running_targets(&pool, "p", Some(&names(&["core"])))
+            .await
+            .unwrap();
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.running_targets, None);
     }
 
     #[tokio::test]
@@ -1443,11 +1499,7 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         start(&pool, "p", "master", "a1", None).await.unwrap();
         let covered = names(&["core"]);
-        assert!(
-            finish_green_covering(&pool, "p", "a1", Some(&covered))
-                .await
-                .unwrap()
-        );
+        assert!(green_composed_from(&pool, "a1", Some(&covered)).await);
         start(&pool, "p", "master", "b2", None).await.unwrap();
         assert!(
             finish_red(&pool, "p", "b2", &["core".to_owned()])
@@ -1463,18 +1515,10 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         start(&pool, "p", "master", "a1", None).await.unwrap();
         let covered = names(&["core"]);
-        assert!(
-            finish_green_covering(&pool, "p", "a1", Some(&covered))
-                .await
-                .unwrap()
-        );
+        assert!(green_composed_from(&pool, "a1", Some(&covered)).await);
         // "zz" is not the running sha (nothing is running), so the finish is refused.
         let other = names(&["shell"]);
-        assert!(
-            !finish_green_covering(&pool, "p", "zz", Some(&other))
-                .await
-                .unwrap()
-        );
+        assert!(!green_composed_from(&pool, "zz", Some(&other)).await);
         let s = load(&pool, "p").await.unwrap().unwrap();
         assert_eq!(s.green_targets, Some(covered));
     }
@@ -1897,6 +1941,7 @@ mod tests {
             fix_run_id: None,
             covered_sha: None,
             green_targets: None,
+            running_targets: None,
             held_note: None,
             unmeasured_runs: 0,
         };
@@ -2412,11 +2457,7 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         start(&pool, "p", "master", "a1", None).await.unwrap();
         let covered = targets.map(names);
-        assert!(
-            finish_green_covering(&pool, "p", "a1", covered.as_deref())
-                .await
-                .unwrap()
-        );
+        assert!(green_composed_from(&pool, "a1", covered.as_deref()).await);
         load(&pool, "p").await.unwrap().unwrap()
     }
 
@@ -2489,6 +2530,21 @@ mod tests {
         let state = state_green_covering(None).await;
         assert!(needs_full_run(Some(&state), &targets_rules("core: local")));
         assert!(needs_full_run(None, &targets_rules("core: local")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_follows_the_running_gates_composed_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(green_composed_from(&pool, "a1", Some(&names(&["core"]))).await);
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        // The command was composed with `hooks` in it, which the last green never covered.
+        set_running_targets(&pool, "p", Some(&names(&["core", "hooks"])))
+            .await
+            .unwrap();
+        let state = load(&pool, "p").await.unwrap().unwrap();
+        // The rules read now have dropped `hooks`: they alone would say "covered".
+        assert!(needs_full_run(Some(&state), &targets_rules("core: local")));
     }
 
     #[tokio::test]
