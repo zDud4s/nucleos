@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { render } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render } from "@testing-library/react";
 
-import { RunPipeline, runStages, type RunShape } from "./RunPipeline";
+import { RunPipeline } from "./RunPipeline";
+import type { ChainLeg, ChainRun } from "./runChain";
+import { runStages, type RunShape } from "./runStages";
 import { readState } from "./state-map";
 
 /**
@@ -13,7 +15,9 @@ import { readState } from "./state-map";
  * are decided in `runStages`, which is why it is pure and asserted here without rendering.
  */
 
-const RUN: RunShape = {
+const RUN: RunShape & ChainRun = {
+  id: 1,
+  lineage: [],
   status: "running",
   project_id: "nucleos",
   steerable: true,
@@ -24,7 +28,7 @@ const RUN: RunShape = {
   successor_run_id: null,
 };
 
-const run = (over: Partial<RunShape> = {}): RunShape => ({ ...RUN, ...over });
+const run = (over: Partial<RunShape> = {}): RunShape & ChainRun => ({ ...RUN, ...over });
 const stage = (over: Partial<RunShape>, key: string) =>
   runStages(run(over)).find((found) => found.key === key)!;
 
@@ -94,7 +98,7 @@ describe("runStages", () => {
 });
 
 describe("RunPipeline", () => {
-  const drawn = (props: { run?: RunShape; alive: boolean }) =>
+  const drawn = (props: { run?: RunShape & ChainRun; alive: boolean }) =>
     render(<RunPipeline run={props.run ?? RUN} alive={props.alive} />).container;
 
   it("moves only while the run is going", () => {
@@ -141,5 +145,126 @@ describe("RunPipeline", () => {
 
     expect(label).toContain("agent running");
     expect(label).toContain("prompt nucleos");
+  });
+});
+
+describe("RunPipeline chain", () => {
+  const leg = (id: number, over: Partial<ChainLeg> = {}): ChainLeg => ({
+    id,
+    status: "completed",
+    num_turns: 7,
+    started_at: null,
+    ended_at: null,
+    ended_because: null,
+    gate_status: null,
+    gate_exit_code: null,
+    exit_code: 0,
+    ...over,
+  });
+  const chain = (
+    legs: ChainLeg[],
+    currentId: number,
+    extra: Partial<ChainRun> = {},
+    over: Partial<RunShape> = {},
+  ): RunShape & ChainRun => ({
+    ...RUN,
+    status: "completed",
+    exit_code: 0,
+    ...over,
+    id: currentId,
+    lineage: legs,
+    ...extra,
+  });
+  const many = (n: number) => Array.from({ length: n }, (_, i) => leg(i + 1));
+  const drawn = (run: RunShape & ChainRun, onOpenRun?: (id: number) => void, alive = false) =>
+    render(<RunPipeline run={run} alive={alive} onOpenRun={onOpenRun} />).container;
+  const legFor = (container: HTMLElement, id: number) =>
+    [...container.querySelectorAll(".ui-runpipe-leg")].find((g) =>
+      g.querySelector(".ui-runpipe-kind")?.textContent === `RUN ${id}`,
+    )!;
+  const kinds = (container: HTMLElement) =>
+    [...container.querySelectorAll(".ui-runpipe-kind")].map((t) => t.textContent);
+
+  it("a single-leg chain renders the four classic stages", () => {
+    for (const lineage of [[leg(1)], []]) {
+      const container = drawn(chain(lineage, 1));
+      expect(container.querySelectorAll(".ui-runpipe-stage")).toHaveLength(4);
+      expect(kinds(container)).toEqual(["PROMPT", "AGENT", "GATE", "RESULT"]);
+      expect(container.querySelector('[role="link"]')).toBeNull();
+    }
+  });
+
+  it("draws every leg of a short chain, highlights this run and ends with GATE and RESULT", () => {
+    const legs = [leg(1, { status: "superseded", ended_because: "context_full" }), leg(2), leg(3)];
+    const container = drawn(chain(legs, 2));
+
+    expect(container.querySelectorAll(".ui-runpipe-leg")).toHaveLength(3);
+    const current = legFor(container, 2);
+    expect(current.getAttribute("class")).toContain("ui-runpipe-current");
+    expect(current.getAttribute("aria-current")).toBe("step");
+    expect(legFor(container, 1).getAttribute("aria-current")).toBeNull();
+    expect(kinds(container).slice(-2)).toEqual(["GATE", "RESULT"]);
+    expect(container.textContent!.match(/context full/g)).toHaveLength(1);
+  });
+
+  it("legs are links except the current one", () => {
+    const onOpenRun = vi.fn();
+    const container = drawn(chain(many(3), 2), onOpenRun);
+
+    expect(container.querySelectorAll('[role="link"]')).toHaveLength(2);
+    fireEvent.click(legFor(container, 3));
+    expect(onOpenRun).toHaveBeenLastCalledWith(3);
+    fireEvent.keyDown(legFor(container, 1), { key: "Enter" });
+    expect(onOpenRun).toHaveBeenLastCalledWith(1);
+    onOpenRun.mockClear();
+    fireEvent.click(legFor(container, 2));
+    expect(onOpenRun).not.toHaveBeenCalled();
+  });
+
+  it("a leg wears its tone from the map", () => {
+    const container = drawn(chain([leg(1, { status: "superseded" }), leg(2)], 2));
+
+    expect(legFor(container, 1).getAttribute("class")).toContain("ui-runpipe-off");
+    expect(container.querySelector('[fill^="#"], [stroke^="#"]')).toBeNull();
+  });
+
+  it("collapses the middle of a long chain and expands on click", () => {
+    const container = drawn(chain(many(12), 6));
+
+    expect(container.querySelectorAll(".ui-runpipe-leg")).toHaveLength(3);
+    expect(container.textContent).toContain("… 4 runs");
+    expect(container.textContent).toContain("… 5 runs");
+    fireEvent.click(container.querySelector(".ui-runpipe-gap")!);
+    expect(container.querySelectorAll(".ui-runpipe-leg")).toHaveLength(12);
+    expect(container.querySelector(".ui-runpipe-gap")).toBeNull();
+  });
+
+  it("the last leg alive draws GATE and RESULT as outlines saying not reached", () => {
+    const legs = [leg(1, { ended_because: "context_full", status: "superseded" }), leg(2, { status: "running", exit_code: null })];
+    const container = drawn(chain(legs, 2, {}, { status: "running", exit_code: null }), undefined, true);
+    const gate = [...container.querySelectorAll(".ui-runpipe-stage")].find(
+      (g) => g.querySelector(".ui-runpipe-kind")?.textContent === "GATE",
+    )!;
+
+    expect(gate.getAttribute("class")).toContain("ui-runpipe-unreached");
+    expect(gate.textContent).toContain("not reached");
+    expect(container.querySelectorAll(".ui-runpipe-workdot").length).toBeGreaterThan(0);
+  });
+
+  it("a long title is cut and the full text stays in the aria-label", () => {
+    const long = "x".repeat(80);
+    const container = drawn(chain([leg(1, { status: long }), leg(2)], 2));
+    const titles = [...container.querySelectorAll(".ui-runpipe-title")].map((t) => t.textContent!);
+
+    expect(titles.some((t) => t.endsWith("…"))).toBe(true);
+    const label = container.querySelector("svg")!.getAttribute("aria-label")!;
+    expect(label).toContain("run 1");
+    expect(label).toContain("run 2");
+  });
+
+  it("a truncated chain says so", () => {
+    const container = drawn(chain([leg(1), leg(2)], 2, { lineage_truncated: true }));
+
+    expect(container.textContent).toContain("chain truncated");
   });
 });

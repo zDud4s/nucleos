@@ -1,8 +1,15 @@
-import { readState, type StateDomain } from "./state-map";
-import type { BadgeTone } from "./Badge";
+import { useState, type KeyboardEvent } from "react";
+
+import { chainLegs, type ChainItem, type ChainRun } from "./runChain";
+import { runStages, type RunShape, type Stage, type StageKey } from "./runStages";
+
+// The stage reading lives in `runStages.ts` so imports run one way (RunPipeline -> runChain ->
+// runStages); these re-exports keep the public names where they always were.
+export { runStages, type RunShape, type Stage, type StageKey };
 
 /**
- * A run's four stages, drawn as the line they are.
+ * A run's four stages, drawn as the line they are — and, when the run was one leg of a longer
+ * piece of work, the whole chain of runs it went through.
  *
  * The page already says everything about a run and nothing about its SHAPE: which stage it
  * reached, and where it is standing now. That is the question somebody opens a run to answer
@@ -10,10 +17,18 @@ import type { BadgeTone } from "./Badge";
  * now it was assembled by reading a badge, a second badge and an exit code in three different
  * blocks.
  *
+ * **A chain replaces PROMPT and AGENT with one box per leg.** A run that filled its context, or
+ * waited on an approval, is continued by a successor; the legs are drawn left to right, the one
+ * being viewed is highlighted, the others open their own page, and GATE and RESULT are the LAST
+ * leg's — the outcome of the work, not of the run the reader happens to be on. A long chain
+ * collapses its middle into a "… N runs" box that expands on click. A chain of one (or an old
+ * response with no lineage) is drawn exactly as the four stages.
+ *
  * **Nothing here is a second reading of a number.** `Instruments` above it carries the cost, the
  * token counts and the context bar, and a figure that changes every three seconds must have
  * exactly one place on a page or the two drift by a poll and read as a contradiction. This draws
- * the stages and their states; it never draws a total.
+ * the stages and their states; it never draws a total (a leg shows its turns, which are fixed
+ * once the leg ended, and never a cost).
  *
  * **It authors no tone.** Every colour on it comes out of `state-map.ts` through `readState`, for
  * the same reason every badge does: the run and gate vocabularies are §7 distinctions, and a
@@ -21,10 +36,11 @@ import type { BadgeTone } from "./Badge";
  * that are not núcleo states — the prompt that went in and the exit code that came out — are
  * drawn in the neutral grey that makes no claim at all, because neither of them is a state.
  *
- * **Hand-drawn SVG, not React Flow.** The graph is four boxes on a straight line with no
- * interaction; the canvas library on the other side of this app exists for graphs that are
- * panned and dragged, and shipping its machinery to draw a fixed row would be paying for a
- * runtime this never uses.
+ * **Hand-drawn SVG, not React Flow.** The graph is a few boxes on a straight line with no
+ * panning or dragging; the canvas library on the other side of this app exists for graphs that
+ * are panned and dragged, and shipping its machinery to draw a fixed row would be paying for a
+ * runtime this never uses. Because an `<svg>` cannot hold a router `<Link>`, a leg that opens
+ * another run is a `role="link"` group that calls `onOpenRun`.
  */
 
 /* --------------------------------------------------------------- geometry -- */
@@ -47,6 +63,12 @@ const MID = 50;
 /** The agent box is the tall one: it is where a live run actually is. */
 const TALL = 88;
 const SHORT = 66;
+const GAP = 40;
+const MARGIN = 8;
+/** Chain box widths: a leg, the "… N runs" box, and the closing gate/result boxes. */
+const LEG_W = 150;
+const HIDDEN_W = 90;
+const END_W = 130;
 
 /**
  * Where each line sits inside its box, from the box's top. Three lines and, in the agent box, the
@@ -58,6 +80,8 @@ const LINES = {
   short: { kind: 19, title: 40, sub: 56 },
   tall: { kind: 20, title: 43, sub: 60, dots: 76 },
 };
+/** A leg can carry two under-lines (why it ended, its turns); the second sits this far below the first. */
+const SUB_STEP = 15;
 
 /** Roughly how wide a character of the title is at `--text-sm` (13px, medium) — enough to cut a long name before the edge. */
 const TITLE_CHAR = 7.2;
@@ -68,144 +92,243 @@ function fit(text: string, width: number): string {
   return text.length <= room ? text : `${text.slice(0, Math.max(1, room - 1))}…`;
 }
 
-export type StageKey = "prompt" | "agent" | "gate" | "result";
-
-export interface Stage {
-  key: StageKey;
-  /** The stage's name, in the small caps line above the reading. */
-  kind: string;
-  /** The reading itself — a mapped label where the stage is a state, a fact where it is not. */
-  title: string;
-  /** The line under it: a count, an exit code, a qualifier. Empty when there is nothing to add. */
-  sub: string;
-  /**
-   * The tone from the map, or `null` for a stage that is not a state and must not borrow one.
-   */
-  tone: BadgeTone | null;
-  /** Whether the run got this far. A stage it never reached is drawn as an outline. */
-  reached: boolean;
-}
-
-/** What this component needs off a run. A subset, so a test does not have to build thirty fields. */
-export interface RunShape {
-  status: string;
-  project_id: string | null;
-  steerable: boolean;
-  num_turns: number | null;
-  gate_status: string | null;
-  gate_exit_code: number | null;
-  exit_code: number | null;
-  successor_run_id: number | null;
-}
-
-const read = (domain: StateDomain, state: string | null) => readState(domain, state);
-
-/**
- * The four stages, as a pure function of the run.
- *
- * Pure and exported so the reading of each stage can be asserted without rendering anything —
- * the interesting failures here are "a run with no gate is drawn as a failure" and "a run that
- * never reached the gate is drawn as having passed it", and both are decided in this function.
- */
-export function runStages(run: RunShape): Stage[] {
-  const agent = read("run", run.status);
-
-  return [
-    {
-      key: "prompt",
-      kind: "PROMPT",
-      title: run.project_id ?? "no project",
-      sub: run.steerable ? "steerable" : "not steerable",
-      tone: null,
-      reached: true,
-    },
-    {
-      key: "agent",
-      kind: "AGENT",
-      // The status literal itself when the map has no reading for it — the same admission of
-      // ignorance `StateBadge` makes, rather than a plausible-looking label nobody can trust.
-      title: agent?.label ?? run.status,
-      sub: run.num_turns === null ? "no turns recorded" : `${run.num_turns} turns`,
-      tone: agent?.tone ?? null,
-      reached: true,
-    },
-    gateStage(run),
-    resultStage(run, run.successor_run_id),
-  ];
-}
-
-/** The gate stage of a run. Shared with the chain, which reads it off the last leg. */
-export function gateStage(
-  run: Pick<RunShape, "status" | "gate_status" | "gate_exit_code">,
-): Stage {
-  const gate = read("gate", run.gate_status);
-  // A NULL gate_status carries two different facts depending on where the run ended up, which
-  // `neverReachedGate` below is the whole of: nobody wrote a suite, or nobody got to run one.
-  const gateMeasured = run.gate_status !== null && run.gate_status.trim() !== "";
-  const reachedGate = gateMeasured || !neverReachedGate(run);
-  return {
-    key: "gate",
-    kind: "GATE",
-    // "not reached" and "no gate configured" are the two absences and they are not the same
-    // one. The map's reading of a NULL gate_status is a fact about the PROJECT — nobody wrote a
-    // suite — and printing it on a run the núcleo stopped at turn nine would answer a question
-    // that was never asked.
-    title: reachedGate ? (gate?.label ?? "gate") : "not reached",
-    sub: run.gate_exit_code === null ? "" : `exit ${run.gate_exit_code}`,
-    tone: reachedGate ? (gate?.tone ?? null) : null,
-    reached: reachedGate,
-  };
-}
-
-/** The result stage of a run; `continuedAs` is the successor's id, if any. */
-export function resultStage(
-  run: Pick<RunShape, "status" | "exit_code">,
-  continuedAs: number | null,
-): Stage {
-  const finished = run.exit_code !== null;
-  return {
-    key: "result",
-    kind: "RESULT",
-    // Absent is not zero: a run killed before it reported has no exit code, and saying "exit 0"
-    // there would be the page inventing the one number somebody came to check.
-    title: finished ? `exit ${run.exit_code}` : "none recorded",
-    sub: continuedAs === null ? "" : `continued as ${continuedAs}`,
-    tone: null,
-    reached: finished,
-  };
-}
-
-/**
- * The statuses where an absent gate means *the run never got there*.
- *
- * A run still going has not reached its gate yet, and one that was interrupted, cancelled or
- * timed out never will. Reading the map's *no gate configured* onto either — solid, settled, a
- * fact about how the PROJECT is set up — claims something nobody measured, and claims it on the
- * page where somebody is deciding whether to wait or to intervene. Every other status ran to the
- * end, and there a NULL really is the project's answer.
- */
-function neverReachedGate(run: Pick<RunShape, "status">): boolean {
-  return ["pending", "running", "interrupted", "cancelled", "timed_out"].includes(run.status);
-}
-
 /** A stage's tone as a class suffix. `neutral` is the grey that claims nothing, not an eighth tone. */
-function tone(stage: Stage): string {
+function tone(stage: { tone: Stage["tone"] }): string {
   return stage.tone ?? "neutral";
 }
 
 /* ------------------------------------------------------------- component -- */
 
 export interface RunPipelineProps {
-  run: RunShape;
+  run: RunShape & ChainRun;
   /**
    * Whether the run is still going. The only thing on this component that moves, and it moves
    * for one reason: a stage that is *happening* is not the same fact as a stage that finished,
    * and on a still image the two are identical.
    */
   alive: boolean;
+  /** Opens another leg of the chain. Without it the legs are drawn but are not links. */
+  onOpenRun?: (id: number) => void;
 }
 
-export function RunPipeline({ run, alive }: RunPipelineProps) {
+export function RunPipeline({ run, alive, onOpenRun }: RunPipelineProps) {
+  const [expanded, setExpanded] = useState(false);
+  const chain = chainLegs(run, expanded);
+  if (chain.items.length <= 1) return <SingleRun run={run} alive={alive} />;
+
+  // Lay the row out from the item count: legs and gaps, then GATE and RESULT.
+  const cells: { x: number; width: number }[] = [];
+  let cursor = MARGIN;
+  const widths = [
+    ...chain.items.map((item) => (item.kind === "leg" ? LEG_W : HIDDEN_W)),
+    END_W,
+    END_W,
+  ];
+  for (const width of widths) {
+    cells.push({ x: cursor, width });
+    cursor += width + GAP;
+  }
+  const viewW = cursor - GAP + MARGIN;
+  const ends: Stage[] = [chain.gate, chain.result];
+  const nItems = chain.items.length;
+
+  const label = `Chain of runs: ${chain.items
+    .map((item) =>
+      item.kind === "leg"
+        ? `run ${item.id} ${item.title}${item.current ? " (this run)" : ""}`
+        : `runs ${item.hiddenIds.join(", ")} hidden`,
+    )
+    .join(", ")}, gate ${chain.gate.title}, result ${chain.result.title}${chain.truncated ? ", chain truncated" : ""}`;
+
+  /** What is drawn at position `i` of the row, with the facts an edge into it needs. */
+  const reachedAt = (i: number): boolean =>
+    i < nItems ? true : ends[i - nItems].reached;
+
+  return (
+    <div className="ui-runchain">
+      <svg
+        className="ui-runpipe"
+        style={{ width: viewW }}
+        viewBox={`0 0 ${viewW} ${VIEW_H}`}
+        role="img"
+        aria-label={label}
+      >
+        {cells.slice(0, -1).map((cell, i) => {
+          const next = cells[i + 1];
+          const from = cell.x + cell.width;
+          const reached = reachedAt(i + 1);
+          const into = chain.items[i + 1];
+          // The mark travels only into a leg that is going, in that leg's tone.
+          const target = into !== undefined && into.kind === "leg" && into.alive ? into : null;
+          return (
+            <g key={`edge-${i}`}>
+              <path
+                className={`ui-runpipe-edge${reached ? "" : " ui-runpipe-unreached"}`}
+                d={`M${from},${MID} L${next.x - 4},${MID}`}
+              />
+              <path
+                className={`ui-runpipe-edge${reached ? "" : " ui-runpipe-unreached"}`}
+                d={`M${next.x - 9},${MID - 4} L${next.x - 3},${MID} L${next.x - 9},${MID + 4}`}
+              />
+              {target !== null && (
+                <g className={`ui-runpipe-${tone(target)}`} transform={`translate(${from} ${MID})`}>
+                  <circle className="ui-runpipe-flow" r={2.6} />
+                  <circle className="ui-runpipe-flow" r={2} />
+                  <circle className="ui-runpipe-flow" r={1.5} />
+                </g>
+              )}
+            </g>
+          );
+        })}
+
+        {chain.items.map((item, i) =>
+          item.kind === "leg" ? (
+            <LegBox
+              key={`leg-${item.id}`}
+              item={item}
+              x={cells[i].x}
+              width={cells[i].width}
+              onOpenRun={onOpenRun}
+            />
+          ) : (
+            <GapBox
+              key={`gap-${item.hiddenIds[0]}`}
+              hidden={item.hiddenIds}
+              x={cells[i].x}
+              width={cells[i].width}
+              onExpand={() => setExpanded(true)}
+            />
+          ),
+        )}
+
+        {ends.map((stage, j) => (
+          <StageBox key={stage.key} stage={stage} x={cells[nItems + j].x} width={END_W} />
+        ))}
+      </svg>
+      {chain.truncated && <p className="ui-runchain-note">chain truncated</p>}
+    </div>
+  );
+}
+
+/** Enter and Space activate a group that is a link or a button, as they would a real one. */
+function activateOnKey(action: () => void) {
+  return (event: KeyboardEvent) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      action();
+    }
+  };
+}
+
+function LegBox({
+  item,
+  x,
+  width,
+  onOpenRun,
+}: {
+  item: Extract<ChainItem, { kind: "leg" }>;
+  x: number;
+  width: number;
+  onOpenRun?: (id: number) => void;
+}) {
+  const tall = item.current;
+  const height = tall ? TALL : SHORT;
+  const y = MID - height / 2;
+  const cx = x + width / 2;
+  const at = tall ? LINES.tall : LINES.short;
+  const open = !item.current && onOpenRun !== undefined ? () => onOpenRun(item.id) : null;
+  const subs = item.sub === "" ? [] : item.sub.split(" / ");
+  return (
+    <g
+      className={`ui-runpipe-stage ui-runpipe-leg ui-runpipe-${tone(item)}${item.current ? " ui-runpipe-current" : ""}`}
+      aria-current={item.current ? "step" : undefined}
+      {...(open
+        ? {
+            role: "link",
+            tabIndex: 0,
+            "aria-label": `Open run ${item.id}`,
+            onClick: open,
+            onKeyDown: activateOnKey(open),
+          }
+        : {})}
+    >
+      <rect className="ui-runpipe-box" x={x} y={y} width={width} height={height} rx={tall ? 10 : 8} />
+      <text className="ui-runpipe-kind" x={cx} y={y + at.kind} textAnchor="middle">
+        {`RUN ${item.id}`}
+      </text>
+      <text className="ui-runpipe-title" x={cx} y={y + at.title} textAnchor="middle">
+        {fit(item.title, width)}
+      </text>
+      {subs.map((line, n) => (
+        <text key={n} className="ui-runpipe-sub" x={cx} y={y + at.sub + n * SUB_STEP} textAnchor="middle">
+          {line}
+        </text>
+      ))}
+      {tall && item.alive && (
+        <g className="ui-runpipe-work">
+          {[-12, 0, 12].map((dx) => (
+            <circle key={dx} className="ui-runpipe-workdot" cx={cx + dx} cy={y + LINES.tall.dots} r={2.6} />
+          ))}
+        </g>
+      )}
+    </g>
+  );
+}
+
+function GapBox({
+  hidden,
+  x,
+  width,
+  onExpand,
+}: {
+  hidden: number[];
+  x: number;
+  width: number;
+  onExpand: () => void;
+}) {
+  const y = MID - SHORT / 2;
+  return (
+    <g
+      className="ui-runpipe-stage ui-runpipe-gap"
+      role="button"
+      tabIndex={0}
+      aria-label={`Show ${hidden.length} hidden runs: ${hidden.join(", ")}`}
+      onClick={onExpand}
+      onKeyDown={activateOnKey(onExpand)}
+    >
+      <rect className="ui-runpipe-box" x={x} y={y} width={width} height={SHORT} rx={8} />
+      <text className="ui-runpipe-title" x={x + width / 2} y={MID + 4} textAnchor="middle">
+        {`… ${hidden.length} run${hidden.length === 1 ? "" : "s"}`}
+      </text>
+    </g>
+  );
+}
+
+function StageBox({ stage, x, width }: { stage: Stage; x: number; width: number }) {
+  const y = MID - SHORT / 2;
+  const cx = x + width / 2;
+  return (
+    <g
+      className={`ui-runpipe-stage ui-runpipe-${tone(stage)}${stage.reached ? "" : " ui-runpipe-unreached"}`}
+    >
+      <rect className="ui-runpipe-box" x={x} y={y} width={width} height={SHORT} rx={8} />
+      <text className="ui-runpipe-kind" x={cx} y={y + LINES.short.kind} textAnchor="middle">
+        {stage.kind}
+      </text>
+      <text className="ui-runpipe-title" x={cx} y={y + LINES.short.title} textAnchor="middle">
+        {fit(stage.title, width)}
+      </text>
+      {stage.sub !== "" && (
+        <text className="ui-runpipe-sub" x={cx} y={y + LINES.short.sub} textAnchor="middle">
+          {stage.sub}
+        </text>
+      )}
+    </g>
+  );
+}
+
+/** The four classic stages of a run that is not part of a longer chain. */
+function SingleRun({ run, alive }: { run: RunShape; alive: boolean }) {
   const stages = runStages(run);
   const order: StageKey[] = ["prompt", "agent", "gate", "result"];
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { COLLAPSE_AT, chainLegs, partOfText, reasonLabel, type ChainLeg } from "./runChain";
-import { runStages } from "./RunPipeline";
+import { runStages } from "./runStages";
 import { readState } from "./state-map";
 
 function leg(id: number, over: Partial<ChainLeg> = {}): ChainLeg {

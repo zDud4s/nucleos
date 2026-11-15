@@ -1,5 +1,5 @@
 import type { BadgeTone } from "./Badge";
-import { gateStage, resultStage, type Stage } from "./RunPipeline";
+import { gateStage, resultStage, type Stage } from "./runStages";
 import { readState } from "./state-map";
 
 /**

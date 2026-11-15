@@ -400,6 +400,64 @@ describe("RunDetail — the gate", () => {
     expect(screen.getByText(/no gate configured for it/)).toBeDefined();
   });
 
+  it("draws the chain of a run that was continued and opens a leg on click", async () => {
+    const legBase = {
+      num_turns: 4,
+      started_at: null,
+      ended_at: null,
+      gate_status: null,
+      gate_exit_code: null,
+    };
+    const run = detail({
+      id: 5,
+      lineage: [
+        { ...legBase, id: 4, status: "superseded", ended_because: "context_full", exit_code: 0 },
+        { ...legBase, id: 5, status: "completed", ended_because: null, exit_code: 0 },
+      ],
+      successor_run_id: null,
+    });
+    daemon.apiFetch.mockImplementation(detailFetch(run, NO_TAIL, []));
+
+    const app = await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByText("context full")).toBeDefined();
+    const link = screen.getByRole("link", { name: "Open run 4" });
+    fireEvent.click(link);
+    await waitFor(() => expect(app.router.state.location.pathname).toBe("/runs/4"));
+  });
+
+  it("shows what the run is part of as plain text", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(
+        detail({
+          part_of: {
+            kind: "tree",
+            tree_id: "t1",
+            tree_title: "Tree A",
+            node_id: "n1",
+            node_title: "Leaf B",
+          },
+        }),
+        NO_TAIL,
+        [],
+      ),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const line = await screen.findByText('Part of tree "Tree A" > node "Leaf B"');
+    expect(line.closest("a")).toBeNull();
+  });
+
+  it("says nothing about a tree or job for a loose run", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail({ part_of: null }), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+    await screen.findByText("This run");
+
+    expect(screen.queryByText(/^Part of /)).toBeNull();
+  });
+
   it("keeps a gate that could not run apart from one that failed", async () => {
     const asked: string[] = [];
     daemon.apiFetch.mockImplementation(

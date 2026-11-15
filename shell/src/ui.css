@@ -3650,6 +3650,57 @@ ol.ui-well {
   stroke-dasharray: 4 4;
 }
 
+/* The chain of runs: natural width inside a scroller, so a long chain scrolls
+   instead of shrinking its type below the size it was chosen at. */
+.ui-runchain {
+  margin: 0 0 var(--space-4);
+  overflow-x: auto;
+}
+
+.ui-runchain .ui-runpipe {
+  max-width: none;
+  margin: 0;
+}
+
+.ui-runchain-note {
+  margin: var(--space-1) 0 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+/* The leg being viewed is the one with the heavier outline; no new colour. */
+.ui-runpipe-current .ui-runpipe-box {
+  stroke-width: 2.5;
+}
+
+.ui-runpipe-leg[role="link"],
+.ui-runpipe-gap {
+  cursor: pointer;
+}
+
+.ui-runpipe-leg[role="link"]:hover .ui-runpipe-box,
+.ui-runpipe-gap:hover .ui-runpipe-box {
+  stroke: var(--border-strong);
+}
+
+.ui-runpipe-leg:focus-visible,
+.ui-runpipe-gap:focus-visible {
+  outline: none;
+}
+
+.ui-runpipe-leg:focus-visible .ui-runpipe-box,
+.ui-runpipe-gap:focus-visible .ui-runpipe-box {
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+/* "… N runs": an outline, like a stage not reached, because it stands for runs not drawn. */
+.ui-runpipe-gap .ui-runpipe-box {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-dasharray: 4 4;
+}
+
 /**
  * The marks travelling into the working stage, and the three dots inside it.
  *
