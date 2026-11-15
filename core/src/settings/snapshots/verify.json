@@ -68,8 +68,8 @@
       "description": "The admission book bounding how many heavy commands runs launch at once."
     },
     "aging_seconds": {
-      "default": 300,
-      "description": "A queued request that has waited this long moves up one priority level.",
+      "default": 1800,
+      "description": "A queued request moves up one priority level for every period this long it has waited.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
