@@ -269,6 +269,33 @@ fn map_failure(failure: Failure) -> CiError {
     }
 }
 
+/// What `gh` prints (lowercase) when the token is revoked or expired, or when the repository is not
+/// visible to it: not a fault of the CI, so the watch reports `ci_unavailable` and stays on.
+const AUTH_MARKERS: [&str; 7] = [
+    "http 401",
+    "http 403",
+    "http 404",
+    "authentication",
+    "gh auth login",
+    "bad credentials",
+    "could not resolve to a repository",
+];
+
+/// PURE: a non-zero `gh` exit, in the watch's two-way vocabulary. An auth-ish message is
+/// `Unavailable`; anything else is a `Failed`.
+fn classify_exit(kind: &str, exit_code: Option<i32>, output: &str) -> CiError {
+    let message = format!(
+        "gh {kind} exited with {exit_code:?}: {}",
+        tail_utf8(output.trim(), 1024)
+    );
+    let lowered = output.to_lowercase();
+    if AUTH_MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        CiError::Unavailable(message)
+    } else {
+        CiError::Failed(message)
+    }
+}
+
 pub struct RealCiGh {
     pub runtime: Arc<GithubRuntime>,
 }
@@ -295,12 +322,11 @@ impl RealCiGh {
             .await
             .map_err(map_failure)?;
         if outcome.exit_code != Some(0) {
-            return Err(CiError::Failed(format!(
-                "gh {} exited with {:?}: {}",
+            return Err(classify_exit(
                 op.kind(),
                 outcome.exit_code,
-                tail_utf8(outcome.output_tail.trim(), 1024)
-            )));
+                &outcome.output_tail,
+            ));
         }
         Ok(outcome)
     }
@@ -530,6 +556,36 @@ mod tests {
         }
         for failure in [Failure::TimedOut, Failure::Unknown("boom".to_owned())] {
             assert!(matches!(map_failure(failure), CiError::Failed(_)));
+        }
+    }
+
+    /// Fails against the old code, which made every non-zero exit a `Failed`.
+    #[test]
+    fn an_auth_failure_exit_is_unavailable_and_any_other_exit_is_failed() {
+        for stderr in [
+            "HTTP 401: Bad credentials (https://api.github.com/)",
+            "gh: HTTP 403: Resource not accessible by personal access token",
+            "To get started with GitHub CLI, please run:  gh auth login",
+            "authentication required",
+            "GraphQL: Could not resolve to a Repository with the name 'o/n'.",
+            "HTTP 404: Not Found",
+        ] {
+            assert!(
+                matches!(
+                    classify_exit("run_jobs", Some(1), stderr),
+                    CiError::Unavailable(_)
+                ),
+                "{stderr}"
+            );
+        }
+        for stderr in ["", "HTTP 500: server error", "run 7 cannot be rerun"] {
+            assert!(
+                matches!(
+                    classify_exit("rerun_failed", Some(1), stderr),
+                    CiError::Failed(_)
+                ),
+                "{stderr}"
+            );
         }
     }
 

@@ -25,6 +25,7 @@ pub struct FakeCiGh {
     reruns: Mutex<Vec<u64>>,
     jobs: Mutex<Option<Result<Vec<FailedJob>, CiError>>>,
     log: Mutex<Option<Result<String, CiError>>>,
+    rerun_error: Mutex<Option<CiError>>,
 }
 
 impl FakeCiGh {
@@ -35,7 +36,13 @@ impl FakeCiGh {
             reruns: Mutex::new(Vec::new()),
             jobs: Mutex::new(None),
             log: Mutex::new(None),
+            rerun_error: Mutex::new(None),
         }
+    }
+
+    /// Makes every `rerun_failed` fail with `error` (the call is still counted).
+    pub fn fail_reruns(&self, error: CiError) {
+        *self.rerun_error.lock().unwrap() = Some(error);
     }
 
     /// Appends the answers `runs_for_commit` gives for `sha`.
@@ -116,7 +123,10 @@ impl CiGh for FakeCiGh {
 
     async fn rerun_failed(&self, _repo: &Repo, run: u64) -> Result<(), CiError> {
         self.reruns.lock().unwrap().push(run);
-        Ok(())
+        match self.rerun_error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 

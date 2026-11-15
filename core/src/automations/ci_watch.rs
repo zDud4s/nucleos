@@ -83,6 +83,10 @@ pub enum Step {
     RerunFailed {
         run: u64,
     },
+    /// The run was skipped: no outcome, nothing is dispatched and nothing is closed.
+    Skipped {
+        run: u64,
+    },
     Finished {
         run: u64,
         conclusion: CiConclusion,
@@ -133,10 +137,13 @@ pub fn decide(w: &Watched, runs: &[RunSummary], now: DateTime<Utc>) -> Step {
         return Step::Wait;
     }
     match run.conclusion.as_deref().unwrap_or("") {
-        "success" | "neutral" | "skipped" => Step::Finished {
+        "success" | "neutral" => Step::Finished {
             run: run.id,
             conclusion: CiConclusion::Success,
         },
+        // A skipped run (path filter, `if:`) verified nothing: it is not a green, and must not close
+        // an incident.
+        "skipped" => Step::Skipped { run: run.id },
         "cancelled" => Step::Finished {
             run: run.id,
             conclusion: CiConclusion::Cancelled,
@@ -471,6 +478,12 @@ async fn tick_project(
             }
             Err(CiError::Failed(reason)) => {
                 tracing::warn!(project_id, sha = %w.sha, %reason, "could not list the CI runs; trying again next tick");
+                let text = format!(
+                    "CI watch of {} on {}: could not list the CI runs ({reason}); trying again next tick",
+                    short(&w.sha),
+                    w.branch
+                );
+                warn(pool, &w, "ci_error", text, now, report).await?;
                 continue;
             }
         };
@@ -531,27 +544,52 @@ async fn tick_project(
                     unavailable(pool, &w, &reason, now, report).await?;
                 }
                 Err(CiError::Failed(reason)) => {
-                    tracing::warn!(project_id, run, %reason, "could not rerun the failed jobs; trying again next tick");
+                    // The one rerun is spent: retrying it every tick would hold the red back
+                    // forever. The red is final now.
+                    tracing::warn!(project_id, run, %reason, "could not rerun the failed jobs; the red is final");
+                    w.rerun_from_attempt = runs
+                        .iter()
+                        .find(|seen| seen.id == run)
+                        .map(|seen| seen.attempt)
+                        .or(Some(1));
+                    finish(pool, gh, &mut w, run, CiConclusion::Failure, report).await?;
                 }
             },
-            Step::Finished { run, conclusion } => {
-                // Dispatch first, then record `done`: a restart in between re-emits, and the
-                // firing log's unique key makes that harmless.
-                let event = Event::CiFinished {
-                    sha: w.sha.clone(),
-                    branch: w.branch.clone(),
-                    workflow: w.workflow.clone(),
-                    conclusion,
-                    run_id: run,
-                };
-                super::dispatch_with(pool, project_id, event, gh).await;
+            Step::Skipped { run } => {
                 w.state = WatchState::Done;
                 w.run_id = Some(run);
-                save(pool, &w, Some("finished")).await?;
-                report.finished += 1;
+                save(pool, &w, Some("skipped")).await?;
+            }
+            Step::Finished { run, conclusion } => {
+                finish(pool, gh, &mut w, run, conclusion, report).await?;
             }
         }
     }
+    Ok(())
+}
+
+/// Dispatches the final `ci_finished` of a watched sha, then records `done`: a restart in between
+/// re-emits, and the firing log's unique key makes that harmless.
+async fn finish(
+    pool: &SqlitePool,
+    gh: &dyn CiGh,
+    w: &mut Watched,
+    run: u64,
+    conclusion: CiConclusion,
+    report: &mut TickReport,
+) -> sqlx::Result<()> {
+    let event = Event::CiFinished {
+        sha: w.sha.clone(),
+        branch: w.branch.clone(),
+        workflow: w.workflow.clone(),
+        conclusion,
+        run_id: run,
+    };
+    super::dispatch_with(pool, &w.project_id, event, gh).await;
+    w.state = WatchState::Done;
+    w.run_id = Some(run);
+    save(pool, w, Some("finished")).await?;
+    report.finished += 1;
     Ok(())
 }
 
@@ -562,6 +600,8 @@ pub async fn run_ci_watch_loop(state: AppState) {
         runtime: state.github.clone(),
     };
     let mut interval = tokio::time::interval(INTERVAL);
+    // A tick that ran long must not be followed by a burst of catch-up ticks.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         if let Err(error) = tick(&state.pool, &gh, Utc::now()).await {
@@ -766,6 +806,24 @@ mod tests {
         w.wants_rerun = true;
         assert_eq!(
             decide(&w, &[done("success", 1)], t0() + mins(5)),
+            Step::Finished {
+                run: 7,
+                conclusion: CiConclusion::Success
+            }
+        );
+    }
+
+    /// Fails against the old code, which mapped `skipped` to a success.
+    #[test]
+    fn a_skipped_run_is_no_outcome_and_neutral_is_success() {
+        let mut w = watched();
+        w.wants_rerun = true;
+        assert_eq!(
+            decide(&w, &[done("skipped", 1)], t0() + mins(5)),
+            Step::Skipped { run: 7 }
+        );
+        assert_eq!(
+            decide(&w, &[done("neutral", 1)], t0() + mins(5)),
             Step::Finished {
                 run: 7,
                 conclusion: CiConclusion::Success
@@ -1113,6 +1171,83 @@ mod tests {
         let third = tick(&pool, &gh, soon()).await.unwrap();
         assert_eq!(third.finished, 1);
         assert_eq!(state_of(&pool, project, SHA_1).await, WatchState::Done);
+    }
+
+    /// Fails against the old code: a generic `gh` failure only reached `tracing`, so the feed stayed
+    /// empty.
+    #[tokio::test]
+    async fn a_generic_gh_failure_posts_one_feed_line_per_sha() {
+        let project = "ciw-gh-failed";
+        let (pool, _dir, gh) = ready(project).await;
+        gh.script(
+            SHA_1,
+            vec![Err(CiError::Failed(
+                "gh run_list exited with Some(1): boom".to_owned(),
+            ))],
+        );
+
+        let first = tick(&pool, &gh, soon()).await.unwrap();
+        let second = tick(&pool, &gh, soon()).await.unwrap();
+
+        assert_eq!(first.warned, 1);
+        assert_eq!(second.warned, 0, "one line per sha");
+        assert_eq!(feed_lines(&pool).await, 1);
+        assert_eq!(state_of(&pool, project, SHA_1).await, WatchState::Watching);
+    }
+
+    /// Fails against the old code: the failed rerun left the row Watching with no rerun recorded,
+    /// so the red was never dispatched and the rerun was retried forever.
+    #[tokio::test]
+    async fn a_failing_rerun_spends_the_rerun_and_dispatches_the_red() {
+        let project = "ciw-rerun-fails";
+        let (pool, _dir, gh) = ready(project).await;
+        gh.fail_reruns(CiError::Failed(
+            "gh rerun_failed exited with Some(1)".to_owned(),
+        ));
+        gh.script(SHA_1, vec![ended(SHA_1, "failure", 1)]);
+
+        let first = tick(&pool, &gh, soon()).await.unwrap();
+        let second = tick(&pool, &gh, soon()).await.unwrap();
+
+        assert_eq!(first.finished, 1);
+        assert_eq!(second.finished, 0);
+        assert_eq!(gh.reruns(), vec![7], "the rerun is tried once");
+        assert_eq!(incident_firings(&pool).await, 1);
+        assert_eq!(tickets(&pool).await, 1);
+        assert_eq!(state_of(&pool, project, SHA_1).await, WatchState::Done);
+    }
+
+    /// Fails against the old code: `skipped` was a success and closed the live incident.
+    #[tokio::test]
+    async fn a_skipped_run_does_not_close_an_open_incident() {
+        let project = "ciw-skipped";
+        let (pool, _dir, gh) = ready(project).await;
+        gh.script(
+            SHA_1,
+            vec![ended(SHA_1, "failure", 1), ended(SHA_1, "failure", 2)],
+        );
+        tick(&pool, &gh, soon()).await.unwrap();
+        tick(&pool, &gh, soon()).await.unwrap();
+        assert!(incident_is_live(&pool, project).await);
+
+        pushed(&pool, project, "master", SHA_2).await;
+        gh.script(SHA_2, vec![ended(SHA_2, "skipped", 1)]);
+        let report = tick(&pool, &gh, soon()).await.unwrap();
+
+        assert_eq!(report.finished, 0, "a skipped run is no outcome");
+        assert_eq!(state_of(&pool, project, SHA_2).await, WatchState::Done);
+        assert!(
+            incident_is_live(&pool, project).await,
+            "the incident stays open"
+        );
+    }
+
+    async fn incident_is_live(pool: &SqlitePool, project: &str) -> bool {
+        let key = crate::task_claims::machine::ci_red_key("master").unwrap();
+        crate::task_claims::store::live_by_key(pool, project, &key, Utc::now())
+            .await
+            .unwrap()
+            .is_some()
     }
 
     #[tokio::test]

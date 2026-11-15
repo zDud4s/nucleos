@@ -27,6 +27,32 @@ pub async fn open_machine_ticket(
     now: DateTime<Utc>,
 ) -> sqlx::Result<TaskRow> {
     let report_text = title.clone();
+    open_machine_ticket_reporting(
+        pool,
+        project_id,
+        key,
+        title,
+        report_text,
+        detail,
+        hint_paths,
+        now,
+    )
+    .await
+}
+
+/// [`open_machine_ticket`] with its own report text, for a ticket whose launch goal needs more than
+/// the title (the goal is built from the title and the stored reports only).
+#[allow(clippy::too_many_arguments)]
+async fn open_machine_ticket_reporting(
+    pool: &SqlitePool,
+    project_id: &str,
+    key: TaskKey,
+    title: String,
+    report_text: String,
+    detail: Value,
+    hint_paths: Vec<String>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
     let new = NewTask {
         key,
         kind: TaskKind::Incident,
@@ -407,6 +433,21 @@ pub async fn open_ci_red_ticket(
     detail: Value,
     now: DateTime<Utc>,
 ) -> sqlx::Result<TaskRow> {
+    let report_text = title.clone();
+    open_ci_red_ticket_reporting(pool, project_id, branch, title, report_text, detail, now).await
+}
+
+/// [`open_ci_red_ticket`] with its own report text: the launch goal carries the title and the reports,
+/// so the sha, run and failed jobs the agent needs go here (never the log: that stays in `detail`).
+pub async fn open_ci_red_ticket_reporting(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    title: String,
+    report_text: String,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
     let key = ci_red_key(branch).ok_or_else(|| {
         sqlx::Error::Protocol(format!("empty branch for a ci-red ticket: '{branch}'"))
     })?;
@@ -419,7 +460,17 @@ pub async fn open_ci_red_ticket(
             Value::Object(fields)
         }
     };
-    open_machine_ticket(pool, project_id, key, title, detail, Vec::new(), now).await
+    open_machine_ticket_reporting(
+        pool,
+        project_id,
+        key,
+        title,
+        report_text,
+        detail,
+        Vec::new(),
+        now,
+    )
+    .await
 }
 
 /// Closes the live `ci-red:<branch>` ticket by resolution. `false` when there is none.
