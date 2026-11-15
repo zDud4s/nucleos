@@ -722,6 +722,7 @@ async fn ingest_file(
     file: &Found,
     project: &str,
     worktree: Option<&str>,
+    account_id: Option<&str>,
     vocab: &Arc<ParseVocab>,
     stats: &mut CycleStats,
     touched: &mut BTreeSet<String>,
@@ -805,7 +806,8 @@ async fn ingest_file(
         counters.lines_failed += chunk.lines_failed;
         counters.unknown_records += chunk.unknown;
         devtime_store::save_offset(&mut tx, &key, offset, size, Some(&mtime), &counters).await?;
-        devtime_store::set_file_identity(&mut tx, &key, &file.session, &file.lane).await?;
+        devtime_store::set_file_identity(&mut tx, &key, &file.session, &file.lane, account_id)
+            .await?;
         if needs_ok {
             devtime_store::mark_file_status(&mut tx, &key, "ok").await?;
         }
@@ -854,6 +856,14 @@ pub async fn ingest_cycle(
                 Vec::new()
             }
         };
+
+    // The scan root is `<config dir>/projects`; its parent stands for the default account's dir.
+    // A failed read leaves the account column NULL, never blocks the ingest.
+    let accounts = crate::accounts::store::list(pool).await.unwrap_or_else(|error| {
+        tracing::warn!(%error, "devtime: could not read the accounts");
+        Vec::new()
+    });
+    let default_dir = path_key(projects_dir.parent().unwrap_or(projects_dir));
 
     let dir = projects_dir.to_path_buf();
     let found = tokio::task::spawn_blocking(move || walk(&dir))
@@ -923,11 +933,13 @@ pub async fn ingest_cycle(
                 worktree,
                 ..
             }) if kind == "project" || kind == "worktree" || kind == "tree_node" => {
+                let account_id = account::resolve_account(&key, &default_dir, &accounts);
                 match ingest_file(
                     pool,
                     file,
                     project,
                     worktree.as_deref(),
+                    account_id.as_deref(),
                     &vocab,
                     &mut stats,
                     &mut touched,

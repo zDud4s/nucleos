@@ -779,10 +779,16 @@ pub async fn set_file_identity(
     path: &str,
     session_id: &str,
     lane: &str,
+    account_id: Option<&str>,
 ) -> sqlx::Result<()> {
-    sqlx::query("UPDATE devtime_files SET session_id = ?, lane = ? WHERE path = ?")
+    // COALESCE: a later cycle that cannot resolve the account never erases one already stored.
+    sqlx::query(
+        "UPDATE devtime_files SET session_id = ?, lane = ?, account_id = COALESCE(?, account_id)
+         WHERE path = ?",
+    )
         .bind(session_id)
         .bind(lane)
+        .bind(account_id)
         .bind(path)
         .execute(&mut *conn)
         .await?;
