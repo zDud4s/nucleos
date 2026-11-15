@@ -725,6 +725,28 @@ mod decision_run_tests {
         assert_eq!(answer_of("completed", Some(&stream)), None);
     }
 
+    #[test]
+    fn a_stream_json_run_answers_with_its_last_result_trimmed() {
+        let stream = format!(
+            "{HOOK_LINE}\n{}\n{}\n",
+            r#"{"type":"result","subtype":"success","result":"first"}"#,
+            r#"{"type":"result","subtype":"success","result":"  go right \n"}"#
+        );
+        assert_eq!(
+            answer_of("completed", Some(&stream)).as_deref(),
+            Some("go right")
+        );
+    }
+
+    #[test]
+    fn a_stream_json_run_with_an_empty_result_is_not_an_answer() {
+        let stream = format!(
+            "{HOOK_LINE}\n{}\n",
+            r#"{"type":"result","subtype":"success","result":"  "}"#
+        );
+        assert_eq!(answer_of("completed", Some(&stream)), None);
+    }
+
     // ----- database -----
 
     const TREE: &str = "dr-job";
