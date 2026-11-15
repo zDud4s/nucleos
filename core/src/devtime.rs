@@ -19,6 +19,7 @@
 //! - A `bg_ref` is looked for by comparing short string values of a tool call's input against the
 //!   background task ids the session already holds. The values are compared, never stored.
 
+pub mod account;
 pub mod actions;
 pub mod lanes;
 pub mod map;
