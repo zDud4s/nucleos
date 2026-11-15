@@ -913,20 +913,10 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         )
         .await;
         if let Some(decision) = pick.blocked.take() {
-            use crate::accounts::choose::Decision;
-            // A pinned account that cannot run, or a session stuck on an exhausted one, fails the
-            // turn with the reason. No candidate at all falls back to today's turn.
-            let reason = match decision {
-                Decision::PinnedBlocked { pinned, why, .. } => Some(format!(
-                    "the pinned account {} cannot take this turn ({why:?})",
-                    pinned.as_str()
-                )),
-                Decision::SessionStuck { current, .. } => Some(format!(
-                    "the account {} holding this session is at its limit",
-                    current.as_str()
-                )),
-                _ => None,
-            };
+            // A pinned account that cannot run, a session stuck on an exhausted one, or a pool
+            // with every account exhausted fails the turn with the reason. No candidate at all
+            // falls back to today's turn.
+            let reason = crate::accounts::launch_chat::refusal_reason(&decision);
             if let Some(reason) = reason {
                 tracing::warn!(run_id = id, chat_id = %turn.slot.chat_id, %reason, "refusing the turn");
                 let failed = sqlx::query(
