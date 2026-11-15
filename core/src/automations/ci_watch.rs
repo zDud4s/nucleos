@@ -80,8 +80,13 @@ pub enum Step {
     /// 120 minutes since the run was created and still not completed.
     Stuck,
     /// First failure, `wants_rerun`, not rerun yet.
-    RerunFailed { run: u64 },
-    Finished { run: u64, conclusion: CiConclusion },
+    RerunFailed {
+        run: u64,
+    },
+    Finished {
+        run: u64,
+        conclusion: CiConclusion,
+    },
 }
 
 fn parse_time(text: &str) -> Option<DateTime<Utc>> {
@@ -123,8 +128,7 @@ pub fn decide(w: &Watched, runs: &[RunSummary], now: DateTime<Utc>) -> Step {
     }
     let rerun_requested = w.state == WatchState::RerunWaiting || w.rerun_from_attempt.is_some();
     if w.state == WatchState::RerunWaiting
-        && w.rerun_from_attempt
-            .is_some_and(|from| run.attempt <= from)
+        && w.rerun_from_attempt.is_some_and(|from| run.attempt <= from)
     {
         return Step::Wait;
     }
@@ -575,6 +579,29 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap()
     }
 
+    /// The CI watch only reads: neither it nor the incident opener may write or submit git.
+    /// (`project_repo` runs one read-only `git remote get-url`, which is allowed.)
+    #[test]
+    fn ci_watch_never_runs_git() {
+        for (name, source) in [
+            ("ci_watch.rs", include_str!("ci_watch.rs")),
+            ("ci_incident.rs", include_str!("ci_incident.rs")),
+        ] {
+            let production = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("split yields at least one part")
+                // Reading the shared timeout constant runs nothing.
+                .replace("git_exec::OPERATION_TIMEOUT", "");
+            for forbidden in ["git_exec", "vcs::submit"] {
+                assert!(
+                    !production.contains(forbidden),
+                    "{name} must not mention {forbidden}"
+                );
+            }
+        }
+    }
+
     fn mins(n: i64) -> Duration {
         Duration::minutes(n)
     }
@@ -787,12 +814,19 @@ mod tests {
         ensure_row(&pool, "p", "master", "ghi", "ci.yml", t0() + mins(10))
             .await
             .unwrap();
-        assert_eq!(mark_superseded(&pool, "p", "master", "ghi").await.unwrap(), 1);
+        assert_eq!(
+            mark_superseded(&pool, "p", "master", "ghi").await.unwrap(),
+            1
+        );
         let live = active(&pool).await.unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].sha, "ghi");
         assert_eq!(
-            load(&pool, "p", "abc", "ci.yml").await.unwrap().unwrap().state,
+            load(&pool, "p", "abc", "ci.yml")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             WatchState::Done,
             "a done row stays done"
         );
@@ -829,7 +863,11 @@ mod tests {
     }
 
     async fn feed_lines(pool: &SqlitePool) -> i64 {
-        count(pool, "SELECT COUNT(*) FROM feed WHERE kind = 'automation_firing'").await
+        count(
+            pool,
+            "SELECT COUNT(*) FROM feed WHERE kind = 'automation_firing'",
+        )
+        .await
     }
 
     async fn tickets(pool: &SqlitePool) -> i64 {
@@ -889,7 +927,10 @@ mod tests {
         pushed(&pool, project, "master", SHA_2).await;
         tick(&pool, &gh, soon()).await.unwrap();
 
-        assert_eq!(state_of(&pool, project, SHA_1).await, WatchState::Superseded);
+        assert_eq!(
+            state_of(&pool, project, SHA_1).await,
+            WatchState::Superseded
+        );
         assert_eq!(state_of(&pool, project, SHA_2).await, WatchState::Watching);
         assert_eq!(
             gh.polled_shas(),
@@ -947,11 +988,22 @@ mod tests {
         let first = tick(&pool, &gh, soon()).await.unwrap();
         assert_eq!(first.reruns, 1);
         assert_eq!(gh.reruns(), vec![7]);
-        assert_eq!(incident_firings(&pool).await, 0, "no event on the first red");
-        assert_eq!(state_of(&pool, project, SHA_1).await, WatchState::RerunWaiting);
+        assert_eq!(
+            incident_firings(&pool).await,
+            0,
+            "no event on the first red"
+        );
+        assert_eq!(
+            state_of(&pool, project, SHA_1).await,
+            WatchState::RerunWaiting
+        );
 
         let second = tick(&pool, &gh, soon()).await.unwrap();
-        assert_eq!(second, TickReport::default(), "the stale result is not accepted");
+        assert_eq!(
+            second,
+            TickReport::default(),
+            "the stale result is not accepted"
+        );
 
         let third = tick(&pool, &gh, soon()).await.unwrap();
         assert_eq!(third.finished, 1);
@@ -992,7 +1044,10 @@ mod tests {
 
         assert_eq!(report.finished, 0);
         assert_eq!(incident_firings(&pool).await, 0);
-        assert_eq!(state_of(&pool, project, SHA_1).await, WatchState::Superseded);
+        assert_eq!(
+            state_of(&pool, project, SHA_1).await,
+            WatchState::Superseded
+        );
     }
 
     #[tokio::test]

@@ -141,9 +141,9 @@ pub fn build_detail(prev: Option<&Value>, red: Red, auto_fix: bool, local: &[Str
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let known = reds
-        .iter()
-        .any(|seen| seen.get("sha") == summary.get("sha") && seen.get("run_id") == summary.get("run_id"));
+    let known = reds.iter().any(|seen| {
+        seen.get("sha") == summary.get("sha") && seen.get("run_id") == summary.get("run_id")
+    });
     if !known {
         reds.push(summary.clone());
     }
@@ -311,10 +311,7 @@ pub async fn close_on_green(
     let Some(row) = store::live_by_key(pool, project_id, &key, now).await? else {
         return Ok(false);
     };
-    let red_sha = row
-        .detail
-        .pointer("/last_red/sha")
-        .and_then(Value::as_str);
+    let red_sha = row.detail.pointer("/last_red/sha").and_then(Value::as_str);
     if red_sha == Some(sha.as_str()) {
         return Ok(false);
     }
@@ -443,7 +440,10 @@ mod tests {
         let jobs = [failed("core (windows-latest)"), failed("shell")];
         assert_eq!(local_targets_in(&jobs, Some(&targets)), vec!["core"]);
         assert!(local_targets_in(&jobs, None).is_empty());
-        let twice = [failed("core (windows-latest)"), failed("core (ubuntu-latest)")];
+        let twice = [
+            failed("core (windows-latest)"),
+            failed("core (ubuntu-latest)"),
+        ];
         assert_eq!(
             local_targets_in(&twice, Some(&targets)),
             vec!["core"],
@@ -459,14 +459,22 @@ mod tests {
         assert_eq!(first["last_red"]["sha"], SHA_1);
         assert_eq!(first["reds"].as_array().unwrap().len(), 1);
         let second = build_detail(Some(&first), a_red(SHA_2, 2, None), false, &[]);
-        assert_eq!(second["auto_fix"], Value::Bool(false), "the last red's auto_fix wins");
+        assert_eq!(
+            second["auto_fix"],
+            Value::Bool(false),
+            "the last red's auto_fix wins"
+        );
         assert_eq!(second["last_red"]["sha"], SHA_2);
         let reds = second["reds"].as_array().unwrap();
         assert_eq!(reds.len(), 2);
         assert_eq!(reds[0]["sha"], SHA_1);
         assert_eq!(reds[1]["sha"], SHA_2);
         let again = build_detail(Some(&second), a_red(SHA_2, 2, None), false, &[]);
-        assert_eq!(again["reds"].as_array().unwrap().len(), 2, "the same run is not added twice");
+        assert_eq!(
+            again["reds"].as_array().unwrap().len(),
+            2,
+            "the same run is not added twice"
+        );
     }
 
     #[test]
@@ -532,7 +540,10 @@ mod tests {
                 .unwrap()
                 .contains("the build broke")
         );
-        assert!(!ticket.title.contains("broke"), "log text never reaches the title");
+        assert!(
+            !ticket.title.contains("broke"),
+            "log text never reaches the title"
+        );
     }
 
     #[tokio::test]
@@ -564,14 +575,20 @@ mod tests {
 
         dispatch_with(&pool, project, red(SHA_1, 11), &gh).await;
         let launchable = live(&pool, project).await.unwrap();
-        assert_eq!(due(&launchable, &KeyHistory::default(), false, later), Due::Launch);
+        assert_eq!(
+            due(&launchable, &KeyHistory::default(), false, later),
+            Due::Launch
+        );
 
         // The owner turns auto_fix off between two reds: the same ticket stops being launchable.
         publish_automations(project, &rule(true, false, ""));
         dispatch_with(&pool, project, red(SHA_2, 12), &gh).await;
         let reporting = live(&pool, project).await.unwrap();
         assert_eq!(reporting.detail["auto_fix"], Value::Bool(false));
-        assert_eq!(due(&reporting, &KeyHistory::default(), false, later), Due::No);
+        assert_eq!(
+            due(&reporting, &KeyHistory::default(), false, later),
+            Due::No
+        );
     }
 
     #[tokio::test]
@@ -659,7 +676,10 @@ mod tests {
     #[tokio::test]
     async fn the_engine_dispatches_open_incident_end_to_end() {
         let project = "ci-inc-e2e";
-        publish_automations(project, &rule(true, true, "    when: {conclusion: failure}\n"));
+        publish_automations(
+            project,
+            &rule(true, true, "    when: {conclusion: failure}\n"),
+        );
         let pool = crate::testdb::fresh_pool().await;
         let _repo = github_project(&pool, project).await;
         let gh = FakeCiGh::new();
@@ -686,7 +706,11 @@ mod tests {
         let off = "ci-inc-e2e-off";
         publish_automations(off, &rule(false, true, ""));
         let _off_repo = github_project(&pool, off).await;
-        assert!(dispatch_with(&pool, off, red(SHA_2, 12), &gh).await.is_empty());
+        assert!(
+            dispatch_with(&pool, off, red(SHA_2, 12), &gh)
+                .await
+                .is_empty()
+        );
         assert!(live(&pool, off).await.is_none());
     }
 
@@ -695,7 +719,11 @@ mod tests {
         let project = "ci-inc-manual";
         publish_automations(
             project,
-            &rule(true, true, "    when: {pushed_by: automation, conclusion: failure}\n"),
+            &rule(
+                true,
+                true,
+                "    when: {pushed_by: automation, conclusion: failure}\n",
+            ),
         );
         let pool = crate::testdb::fresh_pool().await;
         let _repo = github_project(&pool, project).await;

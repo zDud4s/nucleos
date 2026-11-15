@@ -150,7 +150,12 @@ pub async fn github_project(pool: &SqlitePool, project_id: &str) -> tempfile::Te
     let dir = tempfile::tempdir().expect("a temp dir");
     for args in [
         vec!["init", "-q"],
-        vec!["remote", "add", "origin", "https://github.com/acme/widgets.git"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
     ] {
         let out = std::process::Command::new("git")
             .arg("-C")

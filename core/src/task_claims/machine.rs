@@ -962,7 +962,10 @@ mod tests {
         );
         let second = open().await.unwrap();
         assert_ne!(second.id, first.id, "a closed ticket is never reopened");
-        assert_eq!(second.key, first.key, "same key, so the history still counts");
+        assert_eq!(
+            second.key, first.key,
+            "same key, so the history still counts"
+        );
     }
 
     #[tokio::test]
