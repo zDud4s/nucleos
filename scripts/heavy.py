@@ -10,7 +10,7 @@ scheme and appends one telemetry line per run.
 
 Admission is a machine token queue: every request has a weight (heavy_classify) and a
 priority; the head of the queue (priority, then arrival) is admitted by the admission mode
-(`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS (default 8) jobs are held
+(`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS (default 12; ceiling also limited by RAM: total/6 GB, floor 4) jobs are held
 and the live probe shows room (free RAM, default min(10 GB, a quarter of total), idle cores, and
 a settle window since the last admission when that room is close to the floors),
 or nothing is held; an unreadable probe falls back to `static`, the held weights plus its own
@@ -1157,9 +1157,15 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                                 since = float("inf")
                             # Held records at weight 1 are past their compile (test phase):
                             # their predicted share is no longer pending.
-                            held_pred = sum(float(r["pred_cores"]) for r in held_recs
-                                            if hc._num(r.get("pred_cores"))
-                                            and int(r.get("weight") or 1) > 1)
+                            # The class prediction is a p90 of per-run p90s (25 cores for a
+                            # core test, whose median run averages ~1): taken at face value it
+                            # empties a 32-thread machine with two jobs. Measured 2026-11-15
+                            # (log.jsonl): nextest runs ~20% slower with 4 held than alone, so
+                            # NUCLEOS_HEAVY_PRED_CORES_FACTOR (default 0.5) discounts it.
+                            held_pred = hc._env_pos("NUCLEOS_HEAVY_PRED_CORES_FACTOR", 0.5) * sum(
+                                float(r["pred_cores"]) for r in held_recs
+                                if hc._num(r.get("pred_cores"))
+                                and int(r.get("weight") or 1) > 1)
                             fit, adm = hc.dynamic_fit(len(held_recs), pr, since,
                                                       hc.dynamic_max_jobs(pr), static_fit,
                                                       disk=dk, held_pred_cores=held_pred)
@@ -2626,9 +2632,9 @@ def injected_target_dir(argv: list[str], root: str, cwd: str | None = None) -> s
 
 def target_slots() -> int:
     try:
-        return max(1, int(os.environ.get("NUCLEOS_HEAVY_TARGET_SLOTS") or 3))
+        return max(1, int(os.environ.get("NUCLEOS_HEAVY_TARGET_SLOTS") or 4))
     except ValueError:
-        return 3
+        return 4
 
 
 def slot_dir(k: int) -> Path:
