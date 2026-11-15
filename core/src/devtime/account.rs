@@ -12,7 +12,11 @@ fn parts(path: &str) -> Vec<String> {
         .filter(|c| !matches!(c, Component::CurDir))
         .map(|c| {
             let text = c.as_os_str().to_string_lossy().into_owned();
-            if cfg!(windows) { text.to_lowercase() } else { text }
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text
+            }
         })
         .collect()
 }
@@ -71,7 +75,11 @@ mod tests {
 
     #[test]
     fn default_dir_maps_to_the_default_account() {
-        let got = resolve_account("/home/u/.claude/projects/p/s.jsonl", "/home/u/.claude", &pool());
+        let got = resolve_account(
+            "/home/u/.claude/projects/p/s.jsonl",
+            "/home/u/.claude",
+            &pool(),
+        );
         assert_eq!(got.as_deref(), Some("default:claude"));
     }
 
@@ -90,7 +98,11 @@ mod tests {
         let got = resolve_account("/elsewhere/projects/p/s.jsonl", "/home/u/.claude", &pool());
         assert_eq!(got, None);
         // A sibling dir sharing a name prefix is not inside the account dir.
-        let got = resolve_account("/data/acc/work2/projects/s.jsonl", "/home/u/.claude", &pool());
+        let got = resolve_account(
+            "/data/acc/work2/projects/s.jsonl",
+            "/home/u/.claude",
+            &pool(),
+        );
         assert_eq!(got, None);
     }
 }
