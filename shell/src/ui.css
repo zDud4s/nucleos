@@ -3690,7 +3690,7 @@ ol.ui-well {
 
 .ui-runpipe-leg:focus-visible .ui-runpipe-box,
 .ui-runpipe-gap:focus-visible .ui-runpipe-box {
-  stroke: var(--accent);
+  stroke: var(--focus-ring);
   stroke-width: 2.5;
 }
 
