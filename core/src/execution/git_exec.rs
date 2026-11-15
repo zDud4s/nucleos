@@ -6086,13 +6086,14 @@ integration_steps:
         assert_eq!(sha_of(&repo, "refs/heads/other"), other_before);
     }
 
-    #[tokio::test]
-    async fn promote_success_queues_a_push_of_master_only() {
-        let _lock = crate::execution::worktree::test_env_lock();
-        let roots = space_free_tempdir("nucleos-gitexec-wt-");
-        let _env = WorktreeRootEnv::set(roots.path());
-        let (_container, repo, pool) = promote_fixture().await;
-        commit_on(&repo, "integ", &[("green.txt", "green\n")], "green work");
+    /// Promotes a green `integ` to `master` with `automations` (if any) published first.
+    async fn promote_green_integ(automations: Option<&str>) -> (tempfile::TempDir, sqlx::SqlitePool, String) {
+        let (container, repo, pool) = promote_fixture().await;
+        if let Some(yaml) = automations {
+            crate::project::rules::testing::publish_automations("alpha", yaml);
+        }
+        commit_on(&repo, "integ", &[("green.txt", "green
+")], "green work");
         let green = sha_of(&repo, "refs/heads/integ");
         crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
             .await
@@ -6100,23 +6101,50 @@ integration_steps:
 
         let outcome = execute_promote(&repo, &pool, "integ", "master").await;
         assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+        assert_eq!(sha_of(&repo, "refs/heads/master"), green, "the promote itself works");
+        (container, pool, green)
+    }
 
-        let pushes: Vec<(String, String, String)> =
-            sqlx::query_as("SELECT op, args, origin FROM vcs_requests WHERE op = 'push'")
-                .fetch_all(&pool)
-                .await
-                .expect("read the queue");
-        assert_eq!(pushes.len(), 1, "exactly one push is queued: {pushes:?}");
-        let args: serde_json::Value = serde_json::from_str(&pushes[0].1).unwrap();
-        assert_eq!(args["branch"].as_str(), Some("master"));
-        assert_eq!(pushes[0].2, "daemon", "the daemon queued it");
-        let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vcs_requests WHERE op = 'push' AND args LIKE '%integ%'",
+    #[tokio::test]
+    async fn promote_success_with_no_automation_rule_queues_no_push() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, pool, _green) = promote_green_integ(None).await;
+
+        let pushes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vcs_requests WHERE op IN ('push', 'push-sha')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(others, 0, "the integration branch is never pushed");
+        assert_eq!(pushes, 0, "nothing leaves the machine without a rule");
+    }
+
+    #[tokio::test]
+    async fn promote_success_with_the_push_rule_on_queues_one_push_sha_of_the_release_branch() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, pool, green) = promote_green_integ(Some(PUSH_RULE_ON)).await;
+
+        let pushes: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT op, args, origin, automation_rule FROM vcs_requests WHERE op IN ('push', 'push-sha')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read the queue");
+        assert_eq!(pushes.len(), 1, "exactly one push is queued: {pushes:?}");
+        assert_eq!(pushes[0].0, "push-sha");
+        let args: serde_json::Value = serde_json::from_str(&pushes[0].1).unwrap();
+        assert_eq!(args["branch"].as_str(), Some("master"));
+        assert_eq!(args["sha"].as_str(), Some(green.as_str()));
+        assert_eq!(pushes[0].2, "daemon", "the daemon queued it");
+        assert_eq!(pushes[0].3.as_deref(), Some("push-when-green"));
+        assert!(
+            !pushes[0].1.contains("integ"),
+            "the integration branch is never pushed"
+        );
     }
 
     // ---- `Op::PushSha`: an automation's fast-forward push (plan 2026-11-15 A, T4) ---------------

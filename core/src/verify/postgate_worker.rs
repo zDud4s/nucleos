@@ -59,6 +59,7 @@ use crate::verify::{self, Caller, VerifyArgs};
 
 mod correction;
 mod incident;
+mod automation_emit;
 mod promotion;
 mod revert;
 
@@ -298,6 +299,8 @@ async fn tick_project(
         incident::close_if_green(pool, project_id, project_root, state).await;
         // With a release branch, the green sha is promoted to it by the queue.
         promotion::enqueue_promotion_if_due(pool, project_id, project_root, state, rules).await;
+        // Without one, the green sha itself is what a `push` automation answers.
+        automation_emit::emit_local_green_if_due(pool, project_id, project_root, state, rules).await;
     }
 
     // A gate is running: finish it from its ticket, never start another. This needs neither the
@@ -1209,12 +1212,12 @@ mod tests {
     /// Counts the fixtures built, so each repository gets commits no other fixture's repository has.
     static FIXTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    struct Fixture {
-        pool: sqlx::SqlitePool,
+    pub(super) struct Fixture {
+        pub(super) pool: sqlx::SqlitePool,
         ex: Arc<Executor>,
-        root: PathBuf,
+        pub(super) root: PathBuf,
         /// The tip of `main`.
-        tip: String,
+        pub(super) tip: String,
         _env: crate::execution::worktree::WorktreeRootOverride,
         _roots: tempfile::TempDir,
         /// The stand-in home, and the rules this test thread reads.
@@ -1232,7 +1235,7 @@ mod tests {
     /// Every fixture is project `alpha`, so what the process-wide caches key by `(project, sha)`
     /// (`probe::PASSES`/`ABORTS`) is kept apart by giving each repository a root commit of its own:
     /// no two fixtures share a sha.
-    async fn fixture(rules: Option<&str>) -> Fixture {
+    pub(super) async fn fixture(rules: Option<&str>) -> Fixture {
         let machine = crate::project::rules::testing::Home::scoped();
         let repo = space_free_tempdir("nucleos-postgate-");
         let root = repo.path().to_path_buf();
@@ -1335,7 +1338,7 @@ mod tests {
             .unwrap()
     }
 
-    const GATE_ON: &str = "gate_command: \"git --version\"\ngate_after_land: true\n";
+    pub(super) const GATE_ON: &str = "gate_command: \"git --version\"\ngate_after_land: true\n";
 
     async fn assert_a_switched_off_tick_does_nothing(rules: Option<&str>) {
         let f = fixture(rules).await;
@@ -3494,7 +3497,7 @@ gate_after_land: true
 
     // ---- Promotion of the integration branch to the release branch (spec 2026-11-11, D4) -------
 
-    const RELEASE_ON: &str =
+    pub(super) const RELEASE_ON: &str =
         "gate_command: \"git --version\"\ngate_after_land: true\nrelease_branch: main\n";
 
     /// Creates `integ` on `main`'s tip with one more commit, and returns its tip. The checkout

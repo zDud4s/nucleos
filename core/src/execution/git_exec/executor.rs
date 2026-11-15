@@ -706,38 +706,17 @@ impl GitExecutor {
                 chrono::Utc::now(),
             )
             .await;
-            // Only the release branch leaves the machine, and only through the queue. Best effort:
-            // the promotion itself is already done.
-            if let (Ok(branch), Ok(remote)) = (
-                crate::execution::vcs::Branch::new(to),
-                crate::execution::vcs::Remote::new("origin"),
-            ) {
-                match crate::execution::vcs::resolve_repo(pool, &request.project_id).await {
-                    Ok(repo) => {
-                        if let Err(error) = crate::execution::vcs::submit_declared(
-                            pool,
-                            &repo,
-                            &crate::execution::vcs::Op::Push { remote, branch },
-                            crate::execution::vcs::Origin::Daemon,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                vcs_request_id = request.id,
-                                ?error,
-                                "could not queue the push of the promoted branch"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            vcs_request_id = request.id,
-                            ?error,
-                            "could not resolve the repository to push the promoted branch"
-                        );
-                    }
-                }
-            }
+            // Whether the promoted sha leaves the machine is the owner's call, made in the project's
+            // automations (a `push` rule on `published_green`). Best effort: the promotion is done.
+            let _ = crate::automations::dispatch(
+                pool,
+                &request.project_id,
+                crate::automations::Event::Promoted {
+                    sha: green,
+                    branch: to.to_owned(),
+                },
+            )
+            .await;
         }
         outcome
     }

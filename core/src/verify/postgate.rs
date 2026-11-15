@@ -1211,6 +1211,13 @@ pub async fn set_fix_branch(
     Ok(true)
 }
 
+/// Whether the recorded green covers every gate target the owner placed locally, so that a `push`
+/// automation may answer it (spec 2026-11-15, decision 6).
+pub(crate) fn covers_local_targets(_state: &State, _rules: &crate::config::AutopilotRules) -> bool {
+    // TODO(plan B): true only when gate_targets exists and the recorded green covers every entry marked local
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2250,5 +2257,15 @@ mod tests {
         start(&pool, "p", "master", "v1", None).await.unwrap();
         assert!(finish_green(&pool, "p", "v1").await.unwrap());
         assert_eq!(transitions(&pool).await.last().unwrap().4, 1);
+    }
+
+    #[tokio::test]
+    async fn covers_local_targets_is_true_until_plan_b() {
+        let pool = crate::testdb::fresh_pool().await;
+        mark_covered(&pool, "p", "main", "g").await.unwrap();
+        let state = load(&pool, "p").await.unwrap().unwrap();
+        let rules = crate::config::parse_schedule_rules("gate_after_land: true
+").unwrap();
+        assert!(covers_local_targets(&state, &rules));
     }
 }
