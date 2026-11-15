@@ -13,6 +13,10 @@ pub const PAUSED: &str = "paused";
 pub const SKIPPED: &str = "skipped";
 pub const FAILED: &str = "failed";
 pub const UNSUPPORTED: &str = "unsupported";
+/// An `open_incident` firing that carried out its action.
+pub const OK: &str = "ok";
+/// An `open_incident` firing that could not reach `gh`: no incident, the rule stays on.
+pub const CI_UNAVAILABLE: &str = "ci_unavailable";
 
 /// The feed kind of a firing's line.
 pub const FEED_KIND: &str = "automation_firing";

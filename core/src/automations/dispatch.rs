@@ -5,8 +5,10 @@
 
 use sqlx::SqlitePool;
 
+use super::ci_incident::{self, NoCiGh};
 use super::firings::{self, Firing, NewFiring};
 use super::{Action, AutomationRule, CiConclusion, PushedBy, Trigger};
+use crate::integrations::github::CiGh;
 
 /// What happened, as the engine hears it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +66,22 @@ pub fn automation_enabled(project_id: &str, rule: &str) -> bool {
 /// created (empty when nothing matched or everything was a repeat). An unreadable `automations` or
 /// `autopilot` document fires nothing.
 pub async fn dispatch(pool: &SqlitePool, project_id: &str, event: Event) -> Vec<Firing> {
+    // The local events never reach `open_incident` (`validate` forbids the pairing), so a client
+    // that is always unavailable is the honest one here.
+    dispatch_with(pool, project_id, event, &NoCiGh).await
+}
+
+/// [`dispatch`] with the `gh` client an `open_incident` action reads the failed run through. A green
+/// CI first closes the branch's live `ci-red` incident, whether or not a rule that opens one is on.
+pub async fn dispatch_with(
+    pool: &SqlitePool,
+    project_id: &str,
+    event: Event,
+    gh: &dyn CiGh,
+) -> Vec<Firing> {
+    if let Err(error) = ci_incident::close_on_green(pool, project_id, &event).await {
+        tracing::warn!(project_id, %error, "could not close the ci-red incident on a green run");
+    }
     let automations = match crate::project::rules::automations(project_id) {
         Ok(automations) => automations,
         Err(error) => {
@@ -86,7 +104,7 @@ pub async fn dispatch(pool: &SqlitePool, project_id: &str, event: Event) -> Vec<
         if !conditions_hold(pool, project_id, rule, &event).await {
             continue;
         }
-        if let Some(firing) = fire(pool, project_id, rule, &event).await {
+        if let Some(firing) = fire(pool, project_id, rule, &event, gh).await {
             fired.push(firing);
         }
     }
@@ -150,6 +168,7 @@ async fn fire(
     project_id: &str,
     rule: &AutomationRule,
     event: &Event,
+    gh: &dyn CiGh,
 ) -> Option<Firing> {
     let action = match &rule.action {
         Action::Push { .. } => "push",
@@ -180,10 +199,9 @@ async fn fire(
     };
     let settled = match &rule.action {
         Action::Push { remote } => push(pool, project_id, rule, event, remote).await,
-        Action::OpenIncident { .. } => Some((
-            firings::UNSUPPORTED,
-            "open_incident is executed by the CI watcher (plan C)".to_owned(),
-        )),
+        Action::OpenIncident { auto_fix } => {
+            Some(ci_incident::run(pool, project_id, &rule.name, event, *auto_fix, gh).await)
+        }
     };
     let Some((outcome, detail)) = settled else {
         return Some(firing);
@@ -633,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_incident_is_recorded_unsupported_in_this_plan() {
+    async fn open_incident_through_the_plain_dispatch_has_no_gh_and_opens_nothing() {
         publish_automations(
             PROJECT,
             "rules:\n  - name: watch-ci\n    enabled: true\n    on: {event: ci_finished, workflow: gates}\n    do: {action: open_incident, auto_fix: false}\n",
@@ -645,11 +663,8 @@ mod tests {
 
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].action, "open_incident");
-        assert_eq!(fired[0].outcome, "unsupported");
-        assert_eq!(
-            fired[0].detail,
-            "open_incident is executed by the CI watcher (plan C)"
-        );
+        // The end-to-end behaviour lives in `ci_incident::tests`; this entry point has no `gh`.
+        assert_eq!(fired[0].outcome, firings::CI_UNAVAILABLE);
         assert!(queued(&pool).await.is_empty());
     }
 
