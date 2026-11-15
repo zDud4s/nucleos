@@ -902,7 +902,10 @@ mod tests {
             let stored = crate::project::rules::automations("p1").expect("readable");
             // Nothing stored: the reader still serves the two shipped presets, never the refused rules.
             assert!(
-                stored.rules.iter().all(|rule| rule.name != "first" && rule.name != "second"),
+                stored
+                    .rules
+                    .iter()
+                    .all(|rule| rule.name != "first" && rule.name != "second"),
                 "nothing stored: {stored:?}"
             );
         }
