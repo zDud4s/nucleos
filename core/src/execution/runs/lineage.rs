@@ -42,8 +42,10 @@ pub enum PartOf {
     Job {
         job_id: i64,
         job_title: String,
-        item_id: i64,
-        item_ordinal: i64,
+        /// `None` when the run carries no item (a non-team item's run, 0145).
+        item_id: Option<i64>,
+        /// `None` when there is no item, or the node sits outside a fan-out.
+        item_ordinal: Option<i64>,
     },
 }
 
@@ -169,14 +171,16 @@ pub(super) async fn part_of(
         }));
     }
 
-    let job: Option<(i64, String, i64, i64)> = sqlx::query_as(
+    // `job_nodes` (0229) replaced `job_items`. The node is a LEFT JOIN: a non-team item's runs carry
+    // `runs.item_id = NULL` (0145), and a node outside a fan-out has a NULL `ordinal`.
+    let job: Option<(i64, String, Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT j.id,
                 COALESCE(NULLIF(j.rule_name, ''), NULLIF(substr(j.prompt, 1, 80), ''),
                          'Job ' || j.id),
-                i.id, i.ordinal
+                n.id, n.ordinal
          FROM runs r
          JOIN jobs j ON j.id = r.job_id
-         JOIN job_items i ON i.id = r.item_id
+         LEFT JOIN job_nodes n ON n.id = r.item_id
          WHERE r.id = ?",
     )
     .bind(run_id)
@@ -362,8 +366,8 @@ mod tests {
         .await
         .unwrap();
         let item: i64 = sqlx::query_scalar(
-            "INSERT INTO job_items (job_id, ordinal, description, status)
-             VALUES (?, 3, 'd', 'running') RETURNING id",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status)
+             VALUES (?, 'implement', 3, 'd', 'running') RETURNING id",
         )
         .bind(job)
         .fetch_one(pool)
@@ -389,8 +393,8 @@ mod tests {
             Some(PartOf::Job {
                 job_id: job,
                 job_title: "nightly".into(),
-                item_id: item,
-                item_ordinal: 3
+                item_id: Some(item),
+                item_ordinal: Some(3)
             })
         );
         let (job2, _) = job_run(&pool, 2, None, None).await;
@@ -400,6 +404,25 @@ mod tests {
         }
         insert(&pool, 3, "completed").await;
         assert_eq!(part_of(&pool, 3, &[3]).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn part_of_names_the_job_when_the_run_has_no_item() {
+        let pool = crate::testdb::fresh_pool().await;
+        let (job, _) = job_run(&pool, 1, Some("nightly"), None).await;
+        sqlx::query("UPDATE runs SET item_id = NULL WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            part_of(&pool, 1, &[1]).await.unwrap(),
+            Some(PartOf::Job {
+                job_id: job,
+                job_title: "nightly".into(),
+                item_id: None,
+                item_ordinal: None
+            })
+        );
     }
 
     #[tokio::test]
@@ -415,6 +438,7 @@ mod tests {
             .oneshot(Request::get("/runs/2").body(Body::empty()).unwrap())
             .await
             .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
