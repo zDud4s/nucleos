@@ -222,7 +222,7 @@ func (r pipeReader) Close() error { return r.closer() }
 // SPIKE FINDING: killing the pid we launched is not enough. Chromium hands the session to processes
 // the launcher does not own, so the parent dies, the browser keeps running with our argv, the
 // profile stays locked, and the next launch silently inherits it (see ErrInheritedInstance). Spec
-// §9.3 says "mata-se a árvore" and this is the line that has to mean it.
+// §9.3 says "kill the whole tree" and this is the line that has to mean it.
 func (p *Process) Stop() {
 	if p == nil {
 		return

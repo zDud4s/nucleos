@@ -790,6 +790,12 @@ def claims_exchange(payload, want_incidents=False, force=False, now=None):
 # `node_open` records the agent that opened the node. The model cannot write `agent_id` into a hook
 # input, so the hook stamps it into the tool call itself, over whatever the model passed.
 NODE_OPEN_TOOL = "mcp__nucleos__node_open"
+# The launching tools: the hook stamps the session id into them so the daemon records which Claude
+# Code session launched the run / tree (`runs.launching_session_id`, the root's
+# `work_nodes.launching_session_id`). Same stamp as the task tools, same overwrite of model values.
+# `node_open` is not one: its `session_id` is also the binding the scope fence reads, so stamping it
+# would bind every child a session opens; a root opened with its own `session_id` is recorded anyway.
+LAUNCH_TOOLS = ("mcp__nucleos__create_run", "mcp__nucleos__tree_launch")
 TASK_TOOLS = tuple(f"mcp__nucleos__task_{name}" for name in ("list", "claim", "release", "done", "report", "decline"))
 INCIDENTS_HEADER = (
     "Live incidents in this project. Before fixing anything outside your own task, claim it with "
@@ -1095,10 +1101,11 @@ CONDUCTOR_HEAVY_PROGRAMS = ("cargo", "cargo.exe", "go", "go.exe", "npx", "npx.cm
 CONDUCTOR_REFUSAL = (
     "This session is a conductor: launch an agent (`Agent`, `create_run`) or a tree (`tree_launch`) "
     "instead of doing this by hand. The root may itself run `scripts/gates.sh`, "
-    "`python scripts/heavy.py cargo|go|npx|npm ...`, `python <workflow bundle>/scripts/spec_loop.py start ...`, "
+    "`python scripts/heavy.py cargo|go|npx|npm ...`, `<workflow bundle>/scripts/spec_loop.py start`, "
     "read-only git, `nucleos-core.exe --land` / "
-    "`--verify-ticket N`, `scripts/run-daemon.ps1`, Read/Grep/Glob up to ~15k tokens per call, and small "
-    "Edit/Write changes (at most 2 files and 40 changed lines per owner prompt). "
+    "`--verify-ticket N`, `scripts/run-daemon.ps1`, Read/Grep/Glob up to ~15k tokens per call, small "
+    "Edit/Write changes inside the project (at most 2 files and 40 changed lines per owner prompt) "
+    "and plain read-only shell (`ls`, `pwd`, `cat`/`head`/`tail`/`wc` of a named file). "
     "If you are the owner, start the prompt with `manual:` (one prompt) or `manual:on` (until "
     "`manual:off`) for what neither the root nor an agent may do."
 )
@@ -1728,7 +1735,10 @@ def _conductor_git_accepts(tokens, cwd):
         # Only the yes/no question; the other forms print or walk, and stay with an agent.
         return len(args) == 3 and args[0] == "--is-ancestor" and not any(a.startswith("-") for a in args[1:])
     if verb == "branch":
-        return args[:1] == ["--list"] and not any(arg.startswith("-") for arg in args[1:])
+        if args[:1] == ["--list"]:
+            return not any(arg.startswith("-") for arg in args[1:])
+        # Bare listing forms only: no name (create), no -d/-m/-c/-D.
+        return all(arg in ("-a", "-r", "-v", "-vv", "--all", "--remotes", "--show-current") for arg in args)
     if verb == "worktree":
         if args[:1] == ["list"]:
             return True
@@ -1781,6 +1791,8 @@ def _conductor_small_accepts(tokens):
         return not args or (len(args) == 1 and args[0].startswith("+"))
     if name == "get-date":
         return not args or (len(args) == 2 and args[0].lower() == "-format" and not args[1].startswith("-"))
+    if name in ("pwd", "get-location"):
+        return not args
     if name in ("sleep", "start-sleep"):
         if args[:1] and args[0].lower() == "-seconds":
             args = args[1:]
@@ -1816,6 +1828,7 @@ CONDUCTOR_STATE_READERS = {
     "type": ((), (), False),
     "head": ((), ("-n",), False),
     "tail": ((), ("-n",), False),
+    "wc": (("-l", "-w", "-c", "-m"), (), False),
     "get-content": (("-raw",), ("-path", "-literalpath", "-totalcount", "-head", "-first", "-tail",
                                 "-last", "-encoding"), False),
     "select-string": (("-simplematch", "-casesensitive", "-quiet", "-list", "-notmatch", "-raw"),
@@ -1841,7 +1854,21 @@ def _conductor_state_read_target(path, state, cwd):
     return "tool-results" in os.path.relpath(target, claude_projects).split(os.sep)[:-1]
 
 
-def _conductor_state_read_accepts(tokens, state, cwd):
+def _conductor_plain_read_target(path, name, cwd):
+    """An existing, wildcard-free file anywhere (the Read tool is not confined either). `cat`-like
+    readers print the whole file, so they carry the Read call budget; `head`/`tail`/`wc` are bounded."""
+    if not path or any(mark in path for mark in "*?["):
+        return False
+    target = _conductor_path(path, cwd)
+    if not os.path.isfile(target):
+        return False
+    if name in ("cat", "type", "get-content"):
+        size = os.path.getsize(target)
+        return size <= CONDUCTOR_READ_CALL_TOKENS * CONDUCTOR_READ_BYTES_PER_TOKEN
+    return True
+
+
+def _conductor_state_read_accepts(tokens, state, cwd, anywhere=False):
     """`cat|type|head|tail|Get-Content|Select-String <file>...` whose every file is state.
 
     The caller has already refused redirects, pipes (but a closing `| tail|head -N`) and any
@@ -1849,7 +1876,7 @@ def _conductor_state_read_accepts(tokens, state, cwd):
     """
     name, args = tokens[0].lower(), tokens[1:]
     spec = CONDUCTOR_STATE_READERS.get(name)
-    if spec is None:
+    if spec is None or (anywhere and name == "select-string"):
         return False
     switches, valued, pattern_first = spec
     paths, pattern_seen, index = [], not pattern_first, 0
@@ -1881,7 +1908,61 @@ def _conductor_state_read_accepts(tokens, state, cwd):
         else:
             pattern_seen = True
         index += 1
+    if anywhere:
+        return bool(paths) and all(_conductor_plain_read_target(path, name, cwd) for path in paths)
     return bool(paths) and all(_conductor_state_read_target(path, state, cwd) for path in paths)
+
+
+# `ls`-style listings: no recursion (`-R`, `-Recurse`), so the output stays one folder deep.
+CONDUCTOR_LISTERS = ("ls", "dir", "get-childitem", "gci")
+CONDUCTOR_LIST_SWITCHES = ("-name", "-force", "-file", "-directory")
+CONDUCTOR_LIST_VALUED = ("-path", "-literalpath", "-filter")
+
+
+def _conductor_list_accepts(tokens):
+    name, args, index = tokens[0].lower(), tokens[1:], 0
+    if name not in CONDUCTOR_LISTERS:
+        return False
+    while index < len(args):
+        arg, low = args[index], args[index].lower()
+        if name in ("ls", "dir"):
+            if arg.startswith("-") and len(arg) > 1:
+                if re.fullmatch(r"-[a-zA-Z1]+", arg) is None or "R" in arg:
+                    return False
+        elif low.startswith("-") and len(low) > 1:
+            if low in CONDUCTOR_LIST_SWITCHES:
+                pass
+            elif low in CONDUCTOR_LIST_VALUED and index + 1 < len(args):
+                index += 1
+            else:
+                return False
+        index += 1
+    return True
+
+
+# What may follow a pipe: filters that read the previous command's output and name no file.
+CONDUCTOR_FILTER_GREP_SWITCHES = re.compile(r"-[ivcEnF]+")
+
+
+def _conductor_filter_accepts(tokens):
+    name, args = tokens[0].lower(), tokens[1:]
+    if name in ("head", "tail"):
+        return (len(args) == 2 and args[0] == "-n" and re.fullmatch(r"[0-9]+", args[1]) is not None) or (
+            len(args) == 1 and re.fullmatch(r"-[0-9]+", args[0]) is not None
+        )
+    if name == "wc":
+        return all(arg in ("-l", "-w", "-c", "-m") for arg in args)
+    if name == "select-object":
+        return (
+            len(args) == 2
+            and args[0].lower() in ("-first", "-last")
+            and re.fullmatch(r"[0-9]+", args[1]) is not None
+        )
+    if name == "grep":
+        # Switches, then exactly one pattern: no file to read, no `-f`/`-r`.
+        rest = [arg for arg in args if CONDUCTOR_FILTER_GREP_SWITCHES.fullmatch(arg) is None]
+        return len(rest) == 1 and not rest[0].startswith("-")
+    return False
 
 
 def _conductor_part_accepts(part, cwd, state=None, reads=True):
@@ -1917,7 +1998,9 @@ def _conductor_part_accepts(part, cwd, state=None, reads=True):
         or _conductor_env_prefix_accepts(tokens, cwd)
         or _conductor_git_accepts(tokens, cwd)
         or _conductor_small_accepts(tokens)
+        or _conductor_list_accepts(tokens)
         or (reads and _conductor_state_read_accepts(tokens, state, cwd))
+        or (reads and _conductor_state_read_accepts(tokens, state, cwd, anywhere=True))
     ), cwd
 
 
@@ -1946,7 +2029,20 @@ def _conductor_command_accepted(command, state, cwd):
     if not ok or len(parts) > CONDUCTOR_MAX_PARTS:
         return False
     for part in parts:
-        accepted, cwd = _conductor_part_accepts(part.strip(), cwd, state, reads=not redirected)
+        part = part.strip()
+        if "|" in part and "||" not in part:
+            # `a | filter | filter`: the first is judged like any part, the rest must be filters.
+            pieces = [piece.strip() for piece in part.split("|")]
+            if not all(pieces):
+                return False
+            accepted, _ = _conductor_part_accepts(pieces[0], cwd, state, reads=not redirected)
+            if not accepted or any(
+                not (tokens := _conductor_part_tokens(piece)) or not _conductor_filter_accepts(tokens)
+                for piece in pieces[1:]
+            ):
+                return False
+            continue
+        accepted, cwd = _conductor_part_accepts(part, cwd, state, reads=not redirected)
         if not accepted:
             return False
     return True
@@ -2004,6 +2100,25 @@ def conductor_verdict(payload, state):
     except Exception as exc:
         sys.stderr.write(f"conductor: guard failed, allowing the call ({exc})\n")
         return allowed
+
+
+CONDUCTOR_CONTEXT = (
+    "Conductor session: by hand you may use Agent/create_run/tree_launch, Read/Grep/Glob (small), "
+    "up to 2 file Edits of 40 lines inside the project, `ls`/`pwd`/`cat`/`head`/`tail`/`wc`, read-only "
+    "git, scripts/gates.sh and scripts/heavy.py. Anything else (other shell, edits outside the project) "
+    "goes to an agent."
+)
+
+
+def conductor_context(payload):
+    """The one line SessionStart tells a conductor root about what it may do by hand, or "".
+    Silent on every error and when the policy is not `on` for this session."""
+    try:
+        if payload.get("hook_event_name") != "SessionStart" or not is_root_call(payload):
+            return ""
+        return CONDUCTOR_CONTEXT if conductor_mode(conductor_state(payload)) == "on" else ""
+    except Exception:
+        return ""
 
 
 def _conductor_probe(payload):
@@ -2296,6 +2411,19 @@ def interactive_session(payload: dict) -> None:
     )
     # A task tool forces the registration: the daemon only believes a session id it has seen.
     claims = claims_context(payload, force=stamping)
+    if (
+        tool in LAUNCH_TOOLS
+        and isinstance(session_id, str)
+        and SESSION_ID_SHAPE.fullmatch(session_id) is not None
+        and isinstance(tool_input, dict)
+    ):
+        # Records the launching session. Like the task tools, the stamp overwrites the model's own
+        # `session_id`; the tool is approved because a rewrite rides only on an allow.
+        approve(
+            "launch: stamp the launching session id",
+            {**tool_input, "session_id": session_id},
+            claims or None,
+        )
     if stamping:
         # The ONE approval this hook ever gives, and the reason it is safe to give: the four task
         # tools only write claim rows in the daemon's own table (idempotent, no effect outside it).
@@ -2570,6 +2698,9 @@ def main() -> None:
             extra = claims_context(
                 payload, want_incidents=True, force=True, always_list=(event == "SessionStart"),
             )
+            hint = conductor_context(payload)
+            if hint:
+                extra = f"{extra}\n\n{hint}" if extra else hint
         if event == "SubagentStop" and os.environ.get("NUCLEOS_RUN_ID") is None:
             report_agent_outcome(payload)
         bundle_hooks(payload, extra)

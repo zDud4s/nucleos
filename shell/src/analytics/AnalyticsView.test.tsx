@@ -142,13 +142,14 @@ function choose(name: "Summary" | "Pipeline" | "Development time") {
 }
 
 describe("one section at a time", () => {
-  it("offers Summary, Pipeline and Development time, opens on Summary and mounts only that one", async () => {
+  it("offers Summary, Pipeline, Development time and Context fit, opens on Summary and mounts only that one", async () => {
     await mount(busy());
     const group = await screen.findByRole("group", { name: "Section" });
     expect(within(group).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "Summary",
       "Pipeline",
       "Development time",
+      "Context fit",
     ]);
     expect(within(group).getByRole("button", { name: "Summary" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.queryByRole("region", { name: "Pipeline" })).toBeNull();
@@ -494,13 +495,14 @@ describe("refused and stale", () => {
     expect(screen.getAllByText(/Loading analytics/).length).toBeGreaterThan(0);
   });
 
-  it("offers the three sections as one choice and gives the summary a heading of its own", async () => {
+  it("offers the four sections as one choice and gives the summary a heading of its own", async () => {
     await mount(busy());
     const group = await screen.findByRole("group", { name: "Section" });
     expect(within(group).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "Summary",
       "Pipeline",
       "Development time",
+      "Context fit",
     ]);
     expect(screen.getByRole("heading", { level: 2, name: "Summary" })).toBeTruthy();
   });

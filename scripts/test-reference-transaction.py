@@ -376,8 +376,7 @@ def test_escape_logs_both_branches_in_one_transaction():
             ["git", "update-ref", "--stdin"],
             cwd=repo,
             env=env_with(NUCLEOS_ALLOW_DIRECT_GIT="1"),
-            # Bytes, not text: text mode turns "\n" into "\r\n" on Windows and
-            # git then rejects "start\r" as an unknown command.
+            # Bytes, not text: in text mode Windows writes CRLF and git reads "start" plus a CR.
             input=script.encode(),
             capture_output=True,
         )

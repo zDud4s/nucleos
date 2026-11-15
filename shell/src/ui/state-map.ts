@@ -57,6 +57,7 @@ export type StateDomain =
   | "rule"
   | "folder"
   | "knowledge"
+  | "context_fit"
   | "sidecar"
   | "channel";
 
@@ -229,6 +230,11 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     work_tree_descent: { tone: "info", label: "node tree descended" },
     // An expired default answer was applied to an owner question (`tree_job/auto_default.rs`): a fact, said once.
     work_tree_auto_default: { tone: "info", label: "default answer applied" },
+    // A decision the driver settled itself, an ended-N-times or no-change case (`tree_job/auto_resolve.rs`,
+    // `no_change.rs`): a fact, said once.
+    work_tree_auto_resolve: { tone: "info", label: "decision auto-resolved" },
+    // A closed node whose context did not fit (`context_fit/store.rs`): a fact, said once per node.
+    work_tree_context_fit: { tone: "info", label: "node context fit" },
     // A tree with no live run, no open decision and no change for 30 minutes (`tree_job/stalled.rs`):
     // it walks a retry ladder, then asks the owner, so it is held.
     work_tree_stalled: { tone: "paused", label: "node tree stalled" },
@@ -364,6 +370,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * A healthy folder is the absence of a fact, so `ok` is absent rather than a map row nobody renders.
    */
   folder: { missing: { tone: "danger", label: "gone" }, unset: { tone: "off", label: "not named" } },
+  /** Context-fit verdicts are shell derivations of the analytics read: under is a fault, over and split are costs, fit is fine. */
+  context_fit: { under: { tone: "danger", label: "Under" }, over: { tone: "pending", label: "Over" }, split: { tone: "paused", label: "Split" }, fit: { tone: "active", label: "Fit" } },
   /** The four kinds are facts, not a severity scale, so all four use Stated Blue. */
   knowledge: { prompt: { tone: "info", label: "instruction" }, memory: { tone: "info", label: "fact" }, skill: { tone: "info", label: "how-to" }, subagent: { tone: "info", label: "delegation" } },
   /**

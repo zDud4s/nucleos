@@ -69,9 +69,18 @@ node_modules/
 *.db-journal
 sidecars/**/*.exe
 # The same binaries off Windows, where Go writes no extension (`go env GOEXE` is empty):
-# `scripts/build-sidecars.sh` names them `<name>-sidecar`, and a bare `go build` inside a sidecar
+# `scripts/build-sidecars.sh` names them `nucleos-<name>`, and a bare `go build` inside a sidecar
 # names its output after the last element of that module's path (each `sidecars/*/go.mod`).
 sidecars/*/*-sidecar
+# Generated per build by scripts/build-sidecars.sh (Windows version resource).
+sidecars/*/*.syso
+sidecars/*/nucleos-browser
+sidecars/*/nucleos-echo
+sidecars/*/nucleos-email
+sidecars/*/nucleos-quota
+sidecars/*/nucleos-remote
+sidecars/*/nucleos-telegram
+sidecars/*/nucleos-web
 /sidecars/browser/nucleosbrowser
 /sidecars/echo/echo
 /sidecars/email/nucleosemail
@@ -169,3 +178,12 @@ __pycache__/
 /core/crates/*/http-land-*/
 /core/crates/*/http-land-claims-*/
 /core/http-land-*/
+# More prefixes the gate checkpoint committed before the base moved to the dev home (2026-11-08):
+# branch-start- (tree_branch_start tests), spec-audit- (spec_backlog audit tests) and
+# hook-session-never-allow (a file, not a directory, under the app crate).
+/core/branch-start-*/
+/core/spec-audit-*/
+/core/crates/*/hook-session-*
+# A leaf that writes its node report beside the code instead of `<state_dir>/nodes/` leaves a
+# `.handoff-<label>.md` there, and the gate checkpoint commits it (three branches, 2026-11-13).
+.handoff-*.md

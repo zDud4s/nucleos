@@ -21,7 +21,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// Stateless, so the orderly shutdown when the daemon is gone is simply to exit.
 	watchLifeline(os.Getenv, os.Stdin, func() { os.Exit(0) })
-	log.Println("echo-sidecar listening on 127.0.0.1:8792")
+	log.Println("nucleos-echo listening on 127.0.0.1:8792")
 	if err := http.ListenAndServe("127.0.0.1:8792", buildMux()); err != nil {
 		log.Fatal(err)
 	}

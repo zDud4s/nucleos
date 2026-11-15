@@ -528,6 +528,8 @@ export interface SidebarProps {
    * nobody while still taking the eye.
    */
   badges?: Partial<Record<NavBadge, number>>;
+  /** `?item=` value of the most urgent open capture request; the Brain row opens it when it has a count. */
+  urgentCapture?: string;
   /**
    * The project roster, for the switcher — the one list of projects.
    *
@@ -594,7 +596,7 @@ export interface SidebarProps {
  *    Drawing them would be an invented affordance, which is the one failure mode
  *    an adoption like this makes easy.
  */
-export function Sidebar({ badges, projects, systemAlert, besideSystem, children }: SidebarProps) {
+export function Sidebar({ badges, urgentCapture, projects, systemAlert, besideSystem, children }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(readCollapsed);
   /**
    * What is *drawn* at icon width, as opposed to what the rail is currently wide.
@@ -743,6 +745,12 @@ export function Sidebar({ badges, projects, systemAlert, besideSystem, children 
     return (
       <Link
         to={entry.path}
+        // The Brain's counter leads to the open request that expires first, not to the page's top.
+        search={
+          entry.badge === "captures" && counted && urgentCapture !== undefined
+            ? ({ item: urgentCapture } as never)
+            : undefined
+        }
         data-nav-path={entry.path}
         {...prefetchHandlers(entry.path)}
         className={classes.join(" ")}

@@ -11,7 +11,7 @@ import (
 	"unsafe"
 )
 
-// The Windows half of "mata-se a árvore" (spec §9.3) for the case Stop never gets to run.
+// The Windows half of "kill the whole tree" (spec §9.3) for the case Stop never gets to run.
 //
 // Stop's taskkill /T only helps when this sidecar is alive to call it. When the sidecar panics, is
 // hard-killed by the daemon or loses its lifeline, chrome.exe and every helper it spawned survive,

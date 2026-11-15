@@ -82,18 +82,21 @@ pub async fn register_pseudo(
     Ok(())
 }
 
-/// Was `session_id` registered from this worktree? Plan B validates a session id passed by an agent
-/// against this: the id must have been seen coming from the very worktree the MCP box serves.
+/// Was `session_id` registered from a checkout of this project? Plan B validates a session id passed
+/// by an agent against this: the id must have been seen by a hook in the project the MCP box serves.
+/// The worktree is NOT compared: `task_sessions` keeps the cwd of the session's LAST hook call, and an
+/// interactive session that `cd`s into another worktree of the project (a conductor driving one)
+/// would otherwise never match the worktree its MCP box serves, whatever it retried.
 pub async fn session_seen_in(
     pool: &SqlitePool,
     session_id: &str,
-    worktree: &str,
+    project_id: &str,
 ) -> sqlx::Result<bool> {
     let found: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM task_sessions WHERE session_id = ? AND worktree = ?)",
+        "SELECT EXISTS(SELECT 1 FROM task_sessions WHERE session_id = ? AND project_id = ?)",
     )
     .bind(session_id)
-    .bind(worktree)
+    .bind(project_id)
     .fetch_one(pool)
     .await?;
     Ok(found != 0)
@@ -612,12 +615,12 @@ mod tests {
             Some(stamp(t0() - secs(5))),
             "a lapsed lease is not revived"
         );
-        assert!(session_seen_in(&pool, "s1", "/wt/s1").await.unwrap());
+        assert!(session_seen_in(&pool, "s1", "p").await.unwrap());
         assert!(
-            !session_seen_in(&pool, "s1", "/wt/elsewhere").await.unwrap(),
-            "only the worktree it was seen in"
+            !session_seen_in(&pool, "s1", "other-project").await.unwrap(),
+            "only the project it was seen in"
         );
-        assert!(!session_seen_in(&pool, "ghost", "/wt/s1").await.unwrap());
+        assert!(!session_seen_in(&pool, "ghost", "p").await.unwrap());
     }
 
     #[tokio::test]

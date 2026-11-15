@@ -99,7 +99,10 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   "execution/job/spawn.rs": { kind: [] },
   "integrations/notify.rs": { kind: [] },
   "execution/runner/auth_watch.rs": { kind: ["run_on_api_key", "run_on_subscription", "run_rate_limited"] },
-  "execution/runs/spawn.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
+  // `fail_provisioning` also writes `feed_kind_for("worktree_provision_failed", ..)`, bound to a local `kind`.
+  "execution/runs/spawn.rs": {
+    kind: ["shadow_run_completed", "worktree_run_completed", "worktree_provision_failed"],
+  },
   // `announce_once` binds `crate::execution::land::RESOLUTION_FAILED_KIND` to a local first.
   "resolver.rs": { kind: ["land_resolution_failed"] },
   // The channels' own `say` queues a chat reply in `channel_outbox`; it is no feed writer, so it names no kind.
@@ -125,6 +128,9 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
   // `announce_close` writes the kind `work_nodes::feed_line` picked for the closed node.
   "http/nodes.rs": { kind: ["work_tree_parked", "work_tree_finished"] },
+  // `start` appends the line for a root run that did not start under `feed_kind_for(ROOT_START_FAILED_KIND, ..)`,
+  // which keeps that kind or holds it.
+  "tree_job/http.rs": { kind: ["work_tree_root_start_failed"] },
 };
 
 const EMAIL_CLASS_KINDS = ["email_urgent"];

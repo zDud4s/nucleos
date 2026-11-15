@@ -1,14 +1,18 @@
 //! Tree jobs: the daemon-side driver of a tree of work nodes, from manifest to landing.
 
+mod already_landed;
 mod auto_default;
+pub mod auto_resolve;
 mod autofmt;
 #[cfg(test)]
 mod autofmt_driver_tests;
 pub mod branch_start;
 pub mod budget;
 pub mod checklist;
+mod checkpoint_ctx;
 pub mod close;
 pub mod commands;
+pub mod decision_tools;
 pub mod decisions;
 pub mod docs_paths;
 pub mod driver;
@@ -32,6 +36,7 @@ pub mod nesting;
 mod nesting_e2e;
 mod no_change;
 pub mod node_run;
+pub mod obsolete;
 pub mod open;
 pub mod partition;
 mod path_fence;

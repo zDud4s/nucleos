@@ -166,6 +166,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/analytics/context-fit",
+        purpose: "Get analytics context fit.",
+        body: Body::None,
+        handler: "get_analytics_context_fit",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/analytics/devtime",
         purpose: "Get devtime.",
         body: Body::None,

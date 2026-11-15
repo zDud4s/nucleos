@@ -981,7 +981,7 @@ mod tests {
     /// `brain: "local"` entry -- the whole point of this packet: a machine with a dozen models
     /// pulled offers more than the one name in the config file.
     #[test]
-    fn o_catalogo_lista_os_modelos_instalados_nesta_maquina() {
+    fn the_catalogue_lists_the_models_installed_on_this_machine() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -1010,7 +1010,7 @@ mod tests {
     /// rather than a hand-written expectation, so "no behaviour change without a reachable Ollama"
     /// is a fact this test enforces rather than a claim in a comment.
     #[test]
-    fn um_api_tags_mudo_degrada_para_o_configurado_e_nunca_para_um_menu_vazio() {
+    fn a_silent_api_tags_degrades_to_the_configured_model_and_never_to_an_empty_menu() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -1024,7 +1024,7 @@ mod tests {
     /// A model can be configured and not yet pulled. The daemon must not hide the one entry it was
     /// explicitly told about just because Ollama's own list disagrees with the config file.
     #[test]
-    fn o_modelo_configurado_aparece_mesmo_que_o_api_tags_nao_o_liste() {
+    fn the_configured_model_appears_even_if_api_tags_does_not_list_it() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -1044,7 +1044,7 @@ mod tests {
     /// The configured model and an installed model can name the same id. That must produce ONE
     /// entry, not two rows a person cannot tell apart in the picker.
     #[test]
-    fn um_modelo_instalado_que_ja_e_o_configurado_nao_aparece_duas_vezes() {
+    fn an_installed_model_that_is_already_the_configured_one_does_not_appear_twice() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -1069,7 +1069,7 @@ mod tests {
     /// ship-dark true, and exactly what `assistants::resolve_model` needs to stay correct, since it
     /// refuses `RouteNotConfigured` whatever a pin says when the route itself has no model.
     #[test]
-    fn sem_modelo_local_configurado_os_instalados_nao_entram_no_menu() {
+    fn with_no_local_model_configured_the_installed_ones_do_not_enter_the_menu() {
         let config = ModelsConfig::default();
         let installed = vec!["qwen3.5:4b".to_string(), "llama3.2:3b".to_string()];
 
@@ -1090,7 +1090,7 @@ mod tests {
     /// guarantee has to survive the SAME models arriving in a DIFFERENT order, not just the same
     /// slice handed back twice.
     #[test]
-    fn a_ordem_dos_modelos_no_menu_nao_muda_entre_duas_leituras_iguais() {
+    fn the_order_of_the_models_in_the_menu_does_not_change_between_two_identical_reads() {
         let config = ModelsConfig {
             local_assistant_model: Some("qwen3.5:4b".to_string()),
             ..ModelsConfig::default()
@@ -1920,7 +1920,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     }
 
     #[test]
-    fn sem_pasta_de_enviados_o_pilar_arranca() {
+    fn without_a_sent_folder_the_pillar_starts() {
         let config = email_config_from("enabled: true\nhost: imap.example.com\n");
 
         assert!(
@@ -3292,7 +3292,7 @@ resolve_effort: \"  \"
     /// `Some(true)` for a model that declared tools, `Some(false)` for one that explicitly did
     /// not — never guessed for either, and never the same answer for two different models.
     #[test]
-    fn o_catalogo_marca_quem_nao_declara_ferramentas() {
+    fn the_catalogue_flags_whoever_does_not_declare_tools() {
         let choices = vec![
             unmarked_choice("qwen3.5:4b"),
             unmarked_choice("llama3.2:3b"),
@@ -3342,7 +3342,7 @@ resolve_effort: \"  \"
     /// broken. `AssistantChoice::tools`'s own doc is the reason: "declares no tools" and "we have
     /// not asked" are different facts, and only one of them is worth warning anybody about.
     #[test]
-    fn um_modelo_de_capacidades_desconhecidas_nao_e_marcado_de_lado_nenhum() {
+    fn a_model_of_unknown_capabilities_is_flagged_on_neither_side() {
         let choices = vec![unmarked_choice("novo-modelo")];
         let declared = std::collections::HashMap::new();
 
@@ -3626,7 +3626,7 @@ cycle_seconds: 30
         );
         let defaults = VerifyConfig::default();
         assert_eq!(defaults.capacity, 4);
-        assert_eq!(defaults.aging_seconds, 300);
+        assert_eq!(defaults.aging_seconds, 1800);
         assert_eq!(defaults.unit_timeout_seconds, 1800);
         assert_eq!(defaults.disk_cap_gb, 60);
         assert!(defaults.broker_prefix.is_empty());

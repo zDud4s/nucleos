@@ -137,7 +137,7 @@ impl NucleosTools {
     // control that must not be self-served: every other brake (`budget`, the WIP ceiling, the kill
     // switch) is a limit ON an active project, and this is the gate INTO being one. The reasoning
     // is `LOCAL_TOOLS`'s, applied where it matters most — approvals "stay where the person can see
-    // what they are agreeing to". `o_veredicto_do_shadow_nao_e_uma_ferramenta` is what pins it.
+    // what they are agreeing to". `the_shadow_verdict_is_not_a_tool` is what pins it.
 
     #[tool(
         description = "The shadow scoreboard for one project: for each action class, what the \
@@ -227,9 +227,17 @@ impl NucleosTools {
     #[tool(description = "Create a NucleOS run for a project")]
     pub(super) async fn create_run(
         &self,
-        Parameters(RunParams { project_id, prompt }): Parameters<RunParams>,
+        Parameters(RunParams {
+            project_id,
+            prompt,
+            session_id,
+        }): Parameters<RunParams>,
     ) -> String {
-        match self.client.create_run(&project_id, &prompt).await {
+        match self
+            .client
+            .create_run_in_session(&project_id, &prompt, session_id.as_deref())
+            .await
+        {
             Ok(id) => serde_json::json!({"run_id": id}).to_string(),
             Err(msg) => error_json(msg),
         }
@@ -328,12 +336,25 @@ impl NucleosTools {
         json_result(self.client.cancel_job(id).await)
     }
 
-    #[tool(description = "Get a NucleOS run by ID")]
+    #[tool(
+        description = "Get a NucleOS run by ID. Answers a bounded SUMMARY by default (id, status, \
+                       timestamps, outcome; long logs, transcripts and text cut, with a \
+                       `truncated` note). Pass `detail: \"full\"` for the whole run."
+    )]
     pub(super) async fn get_run(
         &self,
-        Parameters(IdParams { id }): Parameters<IdParams>,
+        Parameters(RunGetParams { id, detail }): Parameters<RunGetParams>,
     ) -> String {
-        json_result(self.client.get_run(id).await)
+        let detail = match Detail::parse(detail.as_deref()) {
+            Ok(detail) => detail,
+            Err(msg) => return error_json(msg),
+        };
+        match self.client.get_run(id).await {
+            Ok(run) if detail == Detail::Summary => {
+                json_result(Ok::<_, String>(summarize_run(run)))
+            }
+            other => json_result(other),
+        }
     }
 
     #[tool(description = "Cancel a NucleOS run by ID")]
@@ -750,6 +771,7 @@ impl NucleosTools {
             node_id,
             kind,
             estimate_tokens,
+            pointers,
         }): Parameters<TreeBranchStartParams>,
     ) -> String {
         json_result(
@@ -766,6 +788,7 @@ impl NucleosTools {
                         "node_id": node_id,
                         "kind": kind,
                         "estimate_tokens": estimate_tokens,
+                        "pointers": pointers,
                     }),
                 )
                 .await,
@@ -793,17 +816,70 @@ impl NucleosTools {
     }
 
     #[tool(
+        description = "Answer an open tree decision (`d-…`), the same way the shell does: the \
+                       parked branch resumes, or its node is relaunched with your answer. The \
+                       answer is recorded with origin `conductor`. Owner-level: refused from a \
+                       run of a tree job. Unknown id is 404, an already answered decision 409."
+    )]
+    pub(super) async fn decision_answer(
+        &self,
+        Parameters(DecisionAnswerParams { id, answer }): Parameters<DecisionAnswerParams>,
+    ) -> String {
+        if let Some(refusal) = tree_run_decision_refusal(&self.served) {
+            return json_result::<serde_json::Value>(Err(refusal));
+        }
+        json_result(self.client.decision_answer(&id, &answer).await)
+    }
+
+    #[tool(
+        description = "List tree decisions: [{id, tree, node, branch, question, status}]. Only \
+                       open ones by default; `status` is `open`, `answered` or `all`, `tree_id` \
+                       narrows to one tree job. Owner-level: refused from a run of a tree job."
+    )]
+    pub(super) async fn decision_list(
+        &self,
+        Parameters(DecisionListParams { tree_id, status }): Parameters<DecisionListParams>,
+    ) -> String {
+        if let Some(refusal) = tree_run_decision_refusal(&self.served) {
+            return json_result::<serde_json::Value>(Err(refusal));
+        }
+        json_result(
+            self.client
+                .decision_list(tree_id.as_deref(), status.as_deref())
+                .await,
+        )
+    }
+
+    #[tool(
         description = "Read one tree job by the id it was launched with: its state, root node \
                        and progress. `nodes[]` lists each branch's node with `nodes[].depth`, \
                        its parent and `nodes[].descent.reason` (why it became an orchestrator, \
                        or `degraded`/`kind_reason` when it opened as a leaf); `start_refusals` \
-                       lists the recent `tree_branch_start` calls that were refused and why."
+                       lists the recent `tree_branch_start` calls that were refused and why. \
+                       Answers a bounded SUMMARY by default: ids, states, `counts` per state, \
+                       every unfinished branch with its reason and latest gate/review, finished \
+                       branches collapsed to `finished_collapsed`, long text cut, and a \
+                       `truncated` note when capped. `node_id` narrows it to one node's branch. \
+                       `detail: \"full\"` answers the whole job."
     )]
     pub(super) async fn tree_status(
         &self,
-        Parameters(TreeIdParams { id }): Parameters<TreeIdParams>,
+        Parameters(TreeStatusParams {
+            id,
+            detail,
+            node_id,
+        }): Parameters<TreeStatusParams>,
     ) -> String {
-        json_result(self.client.tree_status(&id).await)
+        let detail = match Detail::parse(detail.as_deref()) {
+            Ok(detail) => detail,
+            Err(msg) => return error_json(msg),
+        };
+        match self.client.tree_status(&id).await {
+            Ok(status) if detail == Detail::Summary => {
+                json_result(Ok::<_, String>(summarize_tree(status, node_id.as_deref())))
+            }
+            other => json_result(other),
+        }
     }
 
     #[tool(

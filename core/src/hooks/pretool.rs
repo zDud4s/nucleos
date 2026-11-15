@@ -2,12 +2,17 @@
 
 use super::*;
 
+mod filter_rewrite;
 mod job_tools;
+mod leaf_self_check;
 mod node_context;
+mod own_merge;
 mod run_cache;
 mod web_builtin;
 
+use filter_rewrite::filter_rewrite;
 use job_tools::{job_id_of, job_node_web_builtin};
+use leaf_self_check::leaf_self_check_admitted;
 
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
@@ -41,7 +46,7 @@ pub async fn pretooluse_decision(
                 tracing::warn!(run_id, %error, "pretooluse-decision: could not read the run's ticket notices");
                 Vec::new()
             });
-        parts.extend(node_context::warn_hint(&state, run_id).await);
+        parts.extend(node_context::hints(&state, run_id, &tool_name, &tool_input).await);
         (!parts.is_empty()).then(|| parts.join("\n\n"))
     } else {
         None
@@ -51,65 +56,6 @@ pub async fn pretooluse_decision(
         updated_input,
         additional_context,
     })
-}
-
-/// PURE: `autonomy.leaf_self_check` of a `speed.yaml` text. Absent, mistyped or unreadable is
-/// `false`, the closed side.
-pub(super) fn leaf_self_check_from_yaml(text: &str) -> bool {
-    serde_yaml::from_str::<serde_yaml::Value>(text)
-        .ok()
-        .and_then(|doc| doc.get("autonomy")?.get("leaf_self_check")?.as_bool())
-        .unwrap_or(false)
-}
-
-/// Whether the project's `speed.yaml` turns the leaf's `cargo check -p <crate> --tests` on. Read
-/// from the MAIN checkout, never from the run's own worktree: the run could flip a switch it holds.
-fn leaf_self_check_enabled(cwd: &Path) -> bool {
-    cwd.ancestors()
-        .find_map(crate::governance::autopilot::main_checkout_of)
-        .is_some_and(|main| {
-            std::fs::read_to_string(main.join(".nucleos/workflow/speed.yaml"))
-                .is_ok_and(|text| leaf_self_check_from_yaml(&text))
-        })
-}
-
-/// Whether this call is a tree leaf's self-check (S2): an `unrecognized` shell line that is exactly
-/// one of the broker-wrapped forms `classifier::leaf_self_check_form` admits, run by a `Leaf`, with
-/// the broker scripts byte-identical to the main checkout's. The cheap pure parse goes first, and
-/// the role is read only once it matched. Never lifts a `deny` or a destructive class.
-async fn leaf_self_check_admitted(
-    state: &AppState,
-    payload: &PreToolUsePayload,
-    run_id: i64,
-    cwd: Option<&str>,
-    classification: &classifier::Classification,
-) -> bool {
-    if classification.action_class != "unrecognized"
-        || !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
-    {
-        return false;
-    }
-    let (Some(command), Some(cwd)) = (
-        payload.tool_input.get("command").and_then(Value::as_str),
-        cwd.map(Path::new),
-    ) else {
-        return false;
-    };
-    if !classifier::leaf_self_check_form(command, leaf_self_check_enabled(cwd))
-        || !classifier::leaf_self_check_scripts_intact(cwd, command)
-    {
-        return false;
-    }
-    let caller = crate::role_policy::Caller {
-        agent_id: payload.agent_id.clone(),
-        agent_type: payload.agent_type.clone(),
-        // A call with subagent markers but no usable `agent_id` must not resolve to a leaf (D12).
-        subagent: payload.subagent,
-    };
-    matches!(
-        crate::role_policy::resolve(&state.pool, &caller, Some(run_id)).await,
-        crate::role_policy::Role::Leaf
-    )
 }
 
 /// Whether any simple command of the line is `git [global options] push ...`. Deliberately wider
@@ -135,51 +81,6 @@ fn command_runs_git_push(command: &str) -> bool {
             }
             false
         })
-}
-
-/// The replacement input that routes a recognized test/check/build command of an in-flight run
-/// through `--filter-run`, or `None` for anything else. Best effort: never panics, and a failure
-/// to read anything simply leaves the command untouched.
-pub(super) async fn filter_rewrite(
-    state: &AppState,
-    run_id: i64,
-    tool_name: &str,
-    tool_input: &Value,
-) -> Option<Value> {
-    if !state
-        .run_handles
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains_key(&run_id)
-    {
-        return None;
-    }
-    let project_id: Option<String> = run_cache::run_facts(state, run_id, true)
-        .await
-        .ok()??
-        .project_id
-        .clone();
-    let kinds = match project_id.as_deref() {
-        Some(pid) => crate::project::rules::autopilot(pid)
-            .map(|r| r.command_kinds)
-            .unwrap_or_default(),
-        None => crate::config::CommandKinds::default(),
-    };
-    let command = tool_input.get("command").and_then(Value::as_str)?;
-    if crate::governance::command_kind::kind_of(command, classifier::shell_for(tool_name), &kinds)
-        == crate::governance::command_kind::Kind::Other
-    {
-        return None;
-    }
-    // A replaced binary names a path that no longer exists (Linux: "<path> (deleted)"): fail open.
-    let exe = std::env::current_exe().ok().filter(|p| p.is_file())?;
-    let data = crate::daemon_client::data_dir()?;
-    crate::execution::output_filter::rewrite_input(
-        tool_name,
-        tool_input,
-        &exe,
-        &crate::execution::output_filter::run_log_dir(&data, run_id),
-    )
 }
 
 /// `pretooluse_decision` with the moment the request began taken as a parameter, so the budget the
@@ -420,6 +321,13 @@ pub(super) async fn pretooluse_decision_from(
         return decision;
     }
 
+    // A node's own handoff report lives in the state dir, outside its worktree: allow exactly that
+    // path, at any fill, before the classifier (which refuses writes outside the cwd) and the
+    // node scope fence.
+    if let Some(decision) = node_context::own_report_decision(&state, &payload, run_id).await {
+        return decision;
+    }
+
     // The retired `.ai/` layout takes no new writes from any run: its material lives under
     // `<state_dir>` now. Before the docs rule, so a docs run is told where to write instead.
     if let Some(decision) =
@@ -455,6 +363,7 @@ pub(super) async fn pretooluse_decision_from(
         )
         .await
         {
+            node_context::record_fence_refusal(&state, run_id, &payload).await;
             let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
             return Json(Decision {
                 decision: "deny".to_owned(),
@@ -522,6 +431,8 @@ pub(super) async fn pretooluse_decision_from(
             },
             action_class: "read-local",
             reason: "a leaf's self-check through the broker is allowed".to_owned(),
+            culprit: None,
+            segments: Vec::new(),
         };
     }
     tracing::info!(
@@ -777,11 +688,9 @@ pub(super) async fn pretooluse_decision_from(
             let declared_git_decision: Option<Decision> = async {
                 let project_id = project_id.as_deref()?;
                 let declared = crate::project::policy::git_ops(&state.pool, project_id).await;
-                if declared.is_empty() {
-                    return None;
-                }
 
                 let cwd = cwd.as_deref()?;
+                let run_cwd = cwd;
                 let command = payload.tool_input.get("command").and_then(Value::as_str)?;
                 // The branch is read where the segment RUNS, not where the run stands: `cd x &&`
                 // and `git -C x` move it. A directory change this reader cannot follow is not
@@ -790,6 +699,16 @@ pub(super) async fn pretooluse_decision_from(
                 let segment = segments
                     .iter()
                     .find(|segment| queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).is_some())?;
+                // A project that declared nothing pays no git probe for anything but a merge: that
+                // is the only shape a tree leaf may sync its own worktree with (`own_merge`).
+                if declared.is_empty()
+                    && !matches!(
+                        queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH),
+                        Some(crate::execution::vcs::Op::Merge { .. })
+                    )
+                {
+                    return None;
+                }
                 let cwd = match &segment.dir {
                     crate::execution::vcs::SegmentDir::Session => std::path::PathBuf::from(cwd),
                     crate::execution::vcs::SegmentDir::Steps(steps) => {
@@ -818,11 +737,32 @@ pub(super) async fn pretooluse_decision_from(
                     .ok()?;
 
                 let op = queue_op(&segment.command, &branch)?;
-                let (_, permission) = declared.iter().find(|(kind, _)| kind == op.kind())?;
+                let declaration = declared.iter().find(|(kind, _)| kind == op.kind());
+                // No declaration, but a tree leaf merging its tree's feature branch or the
+                // integration branch into its own worktree is queued all the same.
+                let leaf_sync = match (&op, declaration) {
+                    (crate::execution::vcs::Op::Merge { source, target }, None) => {
+                        own_merge::is_leaf_sync_merge(
+                            &state.pool,
+                            run_id,
+                            project_id,
+                            Path::new(run_cwd),
+                            &root,
+                            source.as_str(),
+                            target.as_str(),
+                        )
+                        .await
+                    }
+                    _ => false,
+                };
+                if declaration.is_none() && !leaf_sync {
+                    return None;
+                }
                 // The declaration is a grant. One that does not cover this requester is not a
                 // refusal: it simply does not apply, and the call takes the normal path, which
                 // means "ask as before". The push refusal below stays unconditional.
-                if *permission != crate::role_policy::Permission::default()
+                if let Some((_, permission)) = declaration
+                    && *permission != crate::role_policy::Permission::default()
                     && !matches!(op, crate::execution::vcs::Op::Push { .. })
                 {
                     let caller = crate::role_policy::Caller {
@@ -855,13 +795,16 @@ pub(super) async fn pretooluse_decision_from(
                 )
                 .await
                 .ok()?;
+                let why = if declaration.is_some() {
+                    format!("{project_id} declared {} in advance", op.kind())
+                } else {
+                    "a tree leaf may bring its tree's base into its own worktree".to_owned()
+                };
                 Some(Decision {
                     decision: "deny".to_owned(),
                     reason: format!(
                         "this action was handed to the daemon's git queue as request {request_id} \
-                         because {project_id} declared {} in advance, and will be carried out \
-                         there — do not attempt it again",
-                        op.kind()
+                         because {why}, and will be carried out there — do not attempt it again"
                     ),
                 })
             }
@@ -1422,12 +1365,19 @@ pub(super) async fn pretooluse_decision_from(
             // dropped request drops the handler future exactly the way `abort()` does. Awaiting the
             // JoinHandle keeps the response as synchronous as before; dropping a JoinHandle only
             // detaches its task, so the pause still gets recorded when the request goes away.
+            let park = crate::proposals::ParkContext {
+                action_class: Some(classification.action_class.to_string()),
+                culprit_segment: classification.culprit.as_ref().map(|c| c.segment.clone()),
+                culprit_reason: classification.culprit.as_ref().map(|c| c.reason.clone()),
+                segments: classification.segments.clone(),
+            };
             let _ = tokio::spawn(pause_for_approval(
                 state.clone(),
                 run_id,
                 payload.tool_name.clone(),
                 payload.tool_input.to_string(),
                 classification.reason.clone(),
+                park,
             ))
             .await;
         } else {
@@ -1463,6 +1413,8 @@ mod tests {
 
     #[test]
     fn the_leaf_self_check_flag_is_off_unless_the_yaml_says_true() {
+        use super::leaf_self_check::leaf_self_check_from_yaml;
+
         assert!(leaf_self_check_from_yaml(
             "autonomy:\n  leaf_self_check: true\n"
         ));
@@ -1742,6 +1694,100 @@ mod tests {
         assert!(!context.contains("split the rest"), "got {context:?}");
     }
 
+    async fn context_warning_rows(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions WHERE reason = 'context_warning'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn set_context_warning_mode(state: &AppState, mode: &str) {
+        sqlx::query(
+            "INSERT INTO devtime_action_state (action, rule_id, mode, since, changed_by)
+             VALUES ('inject', 'CTX', ?, '2026-11-12T00:00:00Z', 'test')",
+        )
+        .bind(mode)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_looping_node_run_in_shadow_records_the_warning_and_says_nothing() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(answer(&state, run_id, "Read", read_input()).await);
+        }
+        let last = last.unwrap();
+
+        assert_allowed(&last.decision, "the third identical read");
+        assert!(
+            last.additional_context.is_none(),
+            "{:?}",
+            last.additional_context
+        );
+        assert_eq!(context_warning_rows(&state).await, 1);
+        let again = answer(&state, run_id, "Read", read_input()).await;
+        assert!(again.additional_context.is_none());
+        assert_eq!(context_warning_rows(&state).await, 1, "said once");
+    }
+
+    #[tokio::test]
+    async fn a_looping_node_run_in_live_mode_gets_the_advisory_and_the_same_decision() {
+        let state = test_state().await;
+        set_context_warning_mode(&state, "live").await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+
+        let first = answer(&state, run_id, "Read", read_input()).await;
+        answer(&state, run_id, "Read", read_input()).await;
+        let third = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_eq!(third.decision.decision, first.decision.decision);
+        assert_eq!(third.decision.reason, first.decision.reason);
+        let context = third.additional_context.expect("the advisory");
+        assert!(context.contains("contract_request"), "got {context:?}");
+        assert!(context.contains("lib.rs"), "got {context:?}");
+        assert!(first.additional_context.is_none());
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_context_warning_ignores_a_run_without_a_node_and_a_mode_that_is_off() {
+        let state = test_state().await;
+        set_context_warning_mode(&state, "live").await;
+        let plain = seed_run(&state, "shadow", Some(1_000)).await;
+        for _ in 0..4 {
+            let answer = answer(&state, plain, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+
+        sqlx::query("UPDATE devtime_action_state SET mode = 'off'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+        for _ in 0..4 {
+            let answer = answer(&state, run_id, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn two_identical_reads_of_a_node_run_say_nothing() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+        for _ in 0..2 {
+            let answer = answer(&state, run_id, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
     /// An `open` ticket of the test project guarding `core/a.rs`, routed to the run whose node owns
     /// that path. Returns the ticket id.
     async fn offer_a_ticket_to(state: &AppState, run_id: i64, node_id: &str) -> i64 {
@@ -1960,7 +2006,7 @@ mod tests {
 
     /// A command that writes a file by redirection: unrecognized by the classifier, so a
     /// `worktree` run is parked for it (`redirects_a_file`).
-    const REDIRECTING_COMMAND: &str = "cat > .nucleos-report.md <<'EOF'\nx\nEOF";
+    const REDIRECTING_COMMAND: &str = "python -c \"open('.nucleos-report.md','w').write('x')\"";
 
     async fn run_status_and_action_approvals(state: &AppState, run_id: i64) -> (String, i64) {
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
@@ -2638,6 +2684,45 @@ mod tests {
         .await;
 
         assert_allowed(&decision, "a code branch commit");
+    }
+
+    /// The node scope fence leaves the refused call in `shadow_decisions` (marker `node_scope`,
+    /// input capped to 2 KB) and answers exactly what it answered before.
+    #[tokio::test]
+    async fn a_fence_refusal_is_recorded_with_its_call() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "core", &["core/src/**"]).await;
+        sqlx::query("UPDATE work_nodes SET owned_paths = '[\"core/src/**\"]' WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let mut input = write_input(Path::new(r"C:\work\repo\shell\x.ts"));
+        input["content"] = json!("x".repeat(10_000));
+
+        let decision = decide(&state, run_id, "Write", input).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(!decision.reason.is_empty());
+        let rows: Vec<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
+            "SELECT tool_name, tool_input, decision, reason FROM shadow_decisions WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (tool, stored, verdict, reason) = &rows[0];
+        assert_eq!(tool, "Write");
+        assert_eq!(verdict, "deny");
+        assert_eq!(reason.as_deref(), Some("node_scope"));
+        let stored = stored.as_deref().unwrap();
+        assert!(stored.contains("shell"), "{stored}");
+        assert!(
+            stored.len() < 3_000,
+            "the input must be capped: {}",
+            stored.len()
+        );
     }
 
     /// F2: a warm `Read` of a node run does not read the run again. The joined read behind

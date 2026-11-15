@@ -233,7 +233,7 @@ def _track_land_wait(cfg, m, result):
     minutes = int((parse_iso(now) - parse_iso(since)).total_seconds() // 60)
     result["land_wait_minutes"] = minutes
     if minutes > int(cfg.get("lock_wait_minutes", 10)):
-        result["reasons"].append(f"land à espera há {minutes} min: passar a outro ramo")
+        result["reasons"].append(f"land waiting for {minutes} min: move on to another branch")
 
 
 def run_budget(args):

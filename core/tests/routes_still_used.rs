@@ -9,7 +9,12 @@ use std::path::{Path, PathBuf};
 
 /// Every `core/src/http.rs` and `core/src/http/**/*.rs` file, concatenated.
 fn http_sources() -> String {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Compiled into the `nucleos-daemon` binary's unit tests (see `src/main.rs`): its package is
+    // `core/crates/nucleos-daemon`, two levels below `core/`.
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("src");
     let mut files: Vec<PathBuf> = vec![src.join("http.rs")];
     let mut dirs = vec![src.join("http")];
     while let Some(dir) = dirs.pop() {

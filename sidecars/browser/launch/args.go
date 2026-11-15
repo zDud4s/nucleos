@@ -20,8 +20,8 @@ import (
 	"nucleosbrowser/browser"
 )
 
-// ErrNoProxy is the argv-level expression of spec §6.2a — "se o interceptor não estiver atado, o
-// separador não navega".
+// ErrNoProxy is the argv-level expression of spec §6.2a — "if the interceptor is not attached, the
+// tab does not navigate".
 //
 // A proxy is not an optimisation here. The spike measured that a WebSocket handshake ignores
 // Network.setBlockedURLs entirely and is invisible to Fetch interception; the proxy is the only

@@ -1,6 +1,6 @@
 // §spec pilar-de-browser
 
-// Command browser-sidecar drives a real browser on the núcleo's behalf.
+// Command nucleos-browser drives a real browser on the núcleo's behalf.
 //
 // It is the only process in NucleOS that renders somebody else's HTML and runs their JavaScript. It
 // holds no state, opens no database, and decides no trust: which profile a session runs in, and
@@ -30,7 +30,7 @@ import (
 )
 
 func main() {
-	log.SetPrefix("browser-sidecar: ")
+	log.SetPrefix("nucleos-browser: ")
 	cfg, err := config.Load()
 	if err != nil {
 		// The daemon only starts this process once the pillar is enabled, so a missing variable is
@@ -100,8 +100,8 @@ func selectDriver(cfg config.Config) (browser.Driver, func(), error) {
 		// Spec §9.5: the download happens when the pillar is ACTIVATED, which is now — the daemon
 		// only starts this process once `~/.nucleos/browser.yaml` says so. It runs in the background and
 		// this process serves immediately, answering every request with a refusal that names the
-		// revision, the path and why the last attempt failed. That is §9.5's "indisponível com a
-		// razão", and it is why this is not a fatal error the way an unknown driver is.
+		// revision, the path and why the last attempt failed. That is §9.5's "unavailable, with the
+		// reason", and it is why this is not a fatal error the way an unknown driver is.
 		deferred := newDeferredDriver(notInstalled(install, "not downloaded yet"))
 		fetching, cancel := context.WithCancel(context.Background())
 		go fetchUntilInstalled(fetching, install, deferred, build)

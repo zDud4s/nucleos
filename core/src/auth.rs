@@ -708,6 +708,8 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "team-triggers",
     "teams",
     "themes",
+    // Admin-only on a paired device (tree decision queue: the owner answering from another machine).
+    "tree-decisions",
     "voice",
     "waiting",
     "web",
@@ -865,6 +867,12 @@ use remote::REMOTE_GATEWAY_ROUTES;
 pub use remote::{DEVICE_SESSION_HEADER, RemoteDevice, remote_device_permits};
 mod grave;
 pub use grave::{GRAVE_ROUTES, is_grave};
+mod chat_door;
+pub use chat_door::ChatBrowser;
+use chat_door::{
+    CHAT_BROWSER_AGENT_ROUTE, CHAT_BROWSER_BODY_LIMIT, CHAT_BROWSER_ROUTES, chat_browser_admits,
+    chat_browser_agent_admits,
+};
 
 fn is_param(segment: &str) -> bool {
     segment.starts_with('{') && segment.ends_with('}')
@@ -1166,115 +1174,6 @@ async fn tree_run_admits(
         tree_route_id(path, "/nodes/", "/close")
     };
     node.is_some_and(|node| bound.iter().any(|(id, _, _)| id == node))
-}
-
-/// The chat turn a browser request was admitted for. `require_token` inserts it as a request
-/// extension, and `post_open` reads it to record who owns the session it opens.
-#[derive(Debug, Clone)]
-pub struct ChatBrowser {
-    pub run_id: i64,
-    pub chat_id: String,
-}
-
-/// The session routes a chat turn's run key may drive (owner decision of 2026-10-15: a chat's key
-/// drives the browser). POST only. The fixed scope tables stay pure and know nothing of this: the
-/// door is decided in `require_token` by `chat_browser_admits`, which reads the database, because
-/// whether a turn may touch a session depends on who owns that session.
-const CHAT_BROWSER_ROUTES: &[&str] = &[
-    "/browser/open",
-    "/browser/snapshot",
-    "/browser/act",
-    "/browser/look",
-    "/browser/screenshot",
-    "/browser/handoff",
-    "/browser/close",
-];
-
-/// The most a browser request body may be to be read ahead of the handler.
-const CHAT_BROWSER_BODY_LIMIT: usize = 1024 * 1024;
-
-#[derive(serde::Deserialize)]
-struct SessionRef {
-    session_id: i64,
-}
-
-/// Whether a run key belongs to a chat turn that may use this browser route. `/browser/open` is
-/// open to any chat turn; every other route needs a session its own chat (or its own run) owns.
-/// None for every other scope and for every error.
-async fn chat_browser_admits(
-    pool: &sqlx::SqlitePool,
-    scope: &Scope,
-    route: &str,
-    body: &[u8],
-) -> Option<ChatBrowser> {
-    let Scope::Run(id) = scope else {
-        return None;
-    };
-    let chat_id: String =
-        sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .flatten()
-            .filter(|chat| !chat.is_empty())?;
-    let turn = ChatBrowser {
-        run_id: *id,
-        chat_id,
-    };
-    if route == "/browser/open" {
-        return Some(turn);
-    }
-    let session: SessionRef = serde_json::from_slice(body).ok()?;
-    let row = match crate::browser::session_row(pool, session.session_id).await {
-        Ok(Some(row)) => row,
-        _ => return None,
-    };
-    match crate::browser::panel::owner_of(pool, &row).await {
-        crate::browser::panel::Owner::Chat(chat) if chat == turn.chat_id => Some(turn),
-        crate::browser::panel::Owner::Run(run) if run == *id => Some(turn),
-        _ => None,
-    }
-}
-
-/// The one assistant route a chat turn's key may reach (plan browser-agent-linked, D2): starting a
-/// linked browser agent. POST only. Like the chat-browser door, it is decided in `require_token`
-/// and the fixed scope tables know nothing of it; the handler still re-derives the sender from
-/// `RUN_ID_HEADER` and `relay::admit` still decides whether the task may travel.
-const CHAT_BROWSER_AGENT_ROUTE: &str = "/assistant/browser-agents";
-
-/// Whether this request may start a browser agent through the chat-turn door: the bearer is a
-/// conversation's key (`chat:` family, never a run's own `runs.token`), and it resolved to a run
-/// that belongs to a conversation and is running now — between turns a `chat:` key can resolve to
-/// a background task's launcher, which is not a chat turn. False for every other scope and for
-/// every error.
-///
-/// The `chat:` key is NOT out of the turn's reach: `assistant::chat_key` hands it to a rooted
-/// turn's CLI as `NUCLEOS_DAEMON_TOKEN`, so a turn with a shell can read it and call this route directly,
-/// skipping the MCP tool's classification. `post_browser_agent` therefore refuses a sender that
-/// has read untrusted text itself; this door only decides who may knock.
-async fn chat_browser_agent_admits(
-    pool: &sqlx::SqlitePool,
-    presented: &str,
-    scope: &Scope,
-) -> bool {
-    if !presented.starts_with("chat:") {
-        return false;
-    }
-    let Scope::Run(id) = scope else {
-        return false;
-    };
-    sqlx::query_scalar::<_, Option<String>>(
-        "SELECT chat_id FROM runs WHERE id = ? AND status = 'running'",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-    .is_some_and(|chat| !chat.is_empty())
 }
 
 /// A team run's key and the secret to store for it: `team:<team_run_id>.<secret>`.
@@ -6025,7 +5924,7 @@ mod tests {
     /// The hook reads those tables per decision and caches nothing, so a single `allow` row written
     /// through `POST /projects/{id}/shell-rules` binds the very next tool call of every in-flight
     /// run of that project — no restart, no second confirmation, and no moment at which a person is
-    /// shown what widened. A key that could write one is a key that can rewrite its own alçada,
+    /// shown what widened. A key that could write one is a key that can rewrite its own authority,
     /// which is a strictly larger power than anything a scoped key is sold as buying.
     ///
     /// Asserted as membership rather than through a request, like the `/settings` routes and

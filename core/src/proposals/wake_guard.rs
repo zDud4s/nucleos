@@ -35,7 +35,7 @@ const ROOTS: &[&str] = &["src", "crates/nucleos-base/src"];
 
 /// The production functions allowed to hold `INSERT INTO proposals`.
 const LISTED: &[(&str, &str)] = &[
-    ("src/proposals.rs", "create_action_approval"),
+    ("src/proposals.rs", "create_action_approval_with_context"),
     ("src/proposals.rs", "create_refused_action"),
     ("src/proposals.rs", "create_skipped_item"),
     ("src/proposals.rs", "create_contact_merge"),
@@ -47,11 +47,12 @@ const LISTED: &[(&str, &str)] = &[
     ("src/governance/exclusion.rs", "propose"),
     ("src/knowledge/propose.rs", "propose_in_with"),
     ("src/devtime/actions/deliver.rs", "deliver_proposals"),
+    ("src/context_fit/learn.rs", "file_budget_proposal"),
 ];
 
 /// Creators that must call `bump(` in their own body.
 const BUMP_IN_BODY: &[(&str, &str)] = &[
-    ("src/proposals.rs", "create_action_approval"),
+    ("src/proposals.rs", "create_action_approval_with_context"),
     ("src/proposals.rs", "create_refused_action"),
     ("src/proposals.rs", "create_skipped_item"),
     ("src/proposals.rs", "create_contact_merge"),
@@ -62,6 +63,7 @@ const BUMP_IN_BODY: &[(&str, &str)] = &[
     ("src/governance/exclusion.rs", "propose"),
     ("src/knowledge/propose.rs", "propose"),
     ("src/devtime/actions/deliver.rs", "deliver_proposals"),
+    ("src/context_fit/learn.rs", "file_budget_proposal"),
 ];
 
 /// Helpers that insert a proposal outside `cfg(test)` without being creators:

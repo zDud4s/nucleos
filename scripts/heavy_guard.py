@@ -20,8 +20,7 @@ HERE = Path(__file__).resolve().parent
 DENY_REASON = (
     "Full builds and gates belong to the orchestrator, once, at the end; "
     "run only your own tests with a filter (test_one), e.g. "
-    "`cargo test -p nucleos-core <name>`. (builds/gates completos sao do "
-    "orquestrador, uma vez no fim; corre so os teus testes com filtro: test_one)"
+    "`cargo test -p nucleos-core <name>`."
 )
 DENY_CARGO = (
     "No subagent runs cargo (owner rule, 2026-10-05): not test, build, check, "

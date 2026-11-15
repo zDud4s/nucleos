@@ -456,14 +456,52 @@ gofmt_gate() {
 }
 
 if [ "$target" = core ] || [ "$target" = all ]; then
+  # Which workspace crates clippy and the tests cover. By default all four. scripts/gate-diff.sh
+  # narrows it through NUCLEOS_GATE_CRATES (space-separated package names) to the crates a diff
+  # touched plus everything that depends on them (nucleos-base <- nucleos-core <- nucleos-app <-
+  # nucleos-daemon), so a change to an app module does not test the 160k lines of nucleos-core.
+  # A name outside the four is a caller's mistake, and the safe answer to it is the whole set.
+  gate_crates_all="nucleos-base nucleos-core nucleos-app nucleos-daemon"
+  gate_crates="$gate_crates_all"
+  if [ -n "${NUCLEOS_GATE_CRATES:-}" ]; then
+    gate_bad=""
+    for c in $NUCLEOS_GATE_CRATES; do
+      case " $gate_crates_all " in *" $c "*) ;; *) gate_bad="$gate_bad $c" ;; esac
+    done
+    if [ -n "$gate_bad" ]; then
+      echo "warning: NUCLEOS_GATE_CRATES names unknown crate(s):$gate_bad — gating all four" >&2
+    else
+      # Canonical order, duplicates dropped.
+      gate_crates=""
+      for c in $gate_crates_all; do
+        case " $NUCLEOS_GATE_CRATES " in *" $c "*) gate_crates="$gate_crates${gate_crates:+ }$c" ;; esac
+      done
+    fi
+  fi
+  gate_pkgs=()
+  for c in $gate_crates; do gate_pkgs+=(-p "$c"); done
+  # Clippy names no package for the whole set, exactly as before the narrowing: the workspace is it.
+  # One `run "core: clippy"` line either way, because test-build-slot.py counts them and the
+  # classifier test in core/src/governance/classifier.rs reads each one as a command.
+  gate_clippy_pkgs=()
+  if [ "$gate_crates" != "$gate_crates_all" ]; then
+    gate_clippy_pkgs=("${gate_pkgs[@]}")
+    echo "core: gating only $gate_crates"
+  fi
+
   run "core: fmt"    . cargo fmt --all -- --check
   # `cargo fmt` compiles nothing and takes no --target-dir, so it needs no flag.
   gate_build_args
-  run "core: clippy" . cargo clippy ${gate_args[@]+"${gate_args[@]}"} --all-targets -- -D warnings
+  run "core: clippy" . cargo clippy ${gate_args[@]+"${gate_args[@]}"} ${gate_clippy_pkgs[@]+"${gate_clippy_pkgs[@]}"} --all-targets -- -D warnings
   # Every target (lib, bin, tests/): `--lib` alone would skip the binary's http.rs tests. And every
-  # workspace crate under core/: `-p nucleos-core` alone would skip the modules moved down to
-  # core/crates/nucleos-base, the ones moved up to core/crates/nucleos-app, and the daemon binary
-  # (core/crates/nucleos-daemon).
+  # selected workspace crate under core/ (all four unless NUCLEOS_GATE_CRATES narrowed it, see
+  # above): `-p nucleos-core` alone would skip the modules moved down to core/crates/nucleos-base,
+  # the ones moved up to core/crates/nucleos-app, and the daemon binary (core/crates/nucleos-daemon).
+  # A narrowed set always keeps every crate above the changed one, so what it leaves out are crates
+  # that do not compile the change. The file-reading guards that read every crate's sources at run
+  # time (core/tests/file_size.rs, module_map.rs, no_legacy_telegram.rs, routes_still_used.rs) are
+  # compiled into nucleos-daemon's unit tests (core/src/main.rs), the one crate every narrowed set
+  # keeps, so no core diff skips them; the gap of their nucleos-core days is closed.
   #
   # cargo-nextest when it is installed: one process per test, scheduled across every core. Measured
   # 2026-10-07 on master, both under the same load: `cargo test` ran the suite in ~37 min (median
@@ -472,10 +510,10 @@ if [ "$target" = core ] || [ "$target" = all ]; then
   # Without nextest (CI, a fresh machine) the gate is what it was.
   if cargo nextest --version >/dev/null 2>&1; then
     gate_threads nextest
-    run "core: test"   . cargo nextest run ${gate_args[@]+"${gate_args[@]}"} -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --no-fail-fast ${gate_tt[@]+"${gate_tt[@]}"}
+    run "core: test"   . cargo nextest run ${gate_args[@]+"${gate_args[@]}"} ${gate_pkgs[@]+"${gate_pkgs[@]}"} --no-fail-fast ${gate_tt[@]+"${gate_tt[@]}"}
   else
     gate_threads libtest
-    run "core: test"   . cargo test ${gate_args[@]+"${gate_args[@]}"} -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon ${gate_tt[@]+"${gate_tt[@]}"}
+    run "core: test"   . cargo test ${gate_args[@]+"${gate_args[@]}"} ${gate_pkgs[@]+"${gate_pkgs[@]}"} ${gate_tt[@]+"${gate_tt[@]}"}
   fi
 fi
 

@@ -19,8 +19,14 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `core/`. This file compiles into the `nucleos-daemon` binary's unit tests (see `src/main.rs`),
+/// whose package is `core/crates/nucleos-daemon`, two levels below it.
+fn core_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
 fn sources() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = core_root();
     let mut files = Vec::new();
     collect(&root.join("src"), &mut files);
     collect(
@@ -87,7 +93,7 @@ fn no_telegram_sidecar_probe_remains() {
 /// Protects against deleting too much: the telegram binary name and the v2 manifest stay.
 #[test]
 fn the_telegram_binary_and_v2_manifest_stay() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = core_root().join("src");
     let sidecar = fs::read_to_string(root.join("sidecar.rs")).expect("sidecar.rs is readable");
     assert!(
         sidecar.contains("pub const TELEGRAM: &str = \"telegram\";"),

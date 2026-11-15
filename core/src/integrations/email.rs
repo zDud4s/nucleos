@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_ingestao_acumula_o_contacto() {
+    async fn ingestion_accumulates_the_contact() {
         let pool = test_pool().await;
         let sender = "primeiro.contacto@example.com";
         let mut inbound = message(20);
@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn um_email_duplicado_nao_conta_duas_vezes() {
+    async fn a_duplicated_email_does_not_count_twice() {
         let pool = test_pool().await;
         let sender = "redelivery@example.com";
         let mut inbound = message(21);
@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enviados_nunca_guardam_corpo() {
+    async fn sent_mail_never_stores_a_body() {
         let pool = test_pool().await;
         let secret = "rascunho confidencial que nunca deve entrar na base";
         let mut sent = message(22);
@@ -1546,7 +1546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enviados_marcam_o_trinco_sem_contar() {
+    async fn sent_mail_sets_the_latch_without_counting() {
         let pool = test_pool().await;
         let first = "primeiro.destinatario@example.com";
         let second = "segundo.destinatario@example.com";
@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn um_enviado_nao_guarda_o_que_anexaste() {
+    async fn a_sent_message_does_not_store_what_you_attached() {
         let pool = test_pool().await;
         let recipient = "destinatario@example.com";
         let mut sent = message_with_attachment(24);
@@ -1645,7 +1645,7 @@ mod tests {
     /// The message is still STORED: it is in the mailbox being read, and dropping it would lose
     /// mail. What is withheld is the claim about who corresponds with whom.
     #[tokio::test]
-    async fn uma_mensagem_de_outra_pessoa_na_pasta_de_enviados_nao_inventa_correspondentes() {
+    async fn a_message_from_another_person_in_the_sent_folder_invents_no_correspondents() {
         let pool = test_pool().await;
         let recipient = "estranho@example.com";
         let mut sent = message(30);
@@ -1703,7 +1703,7 @@ mod tests {
     /// module would still pass, because they would all be asserting on a code path that no longer
     /// runs. Both sides go through `normalize_address` for that reason.
     #[tokio::test]
-    async fn o_proprio_envio_conta_mesmo_com_nome_e_capitalizacao_diferentes() {
+    async fn the_own_send_counts_even_with_a_different_name_and_capitalisation() {
         let pool = test_pool().await;
         let recipient = "destinatario@example.com";
         let mut sent = message(31);
@@ -1748,7 +1748,7 @@ mod tests {
     // should not be able to switch that gate off silently. Recipients need the same protection,
     // especially because a hand-written demo fixture leaves casing to a human.
     #[tokio::test]
-    async fn um_cabecalho_to_com_outra_capitalizacao_ainda_conta() {
+    async fn a_to_header_with_other_capitalisation_still_counts() {
         let pool = test_pool().await;
         let first = "primeiro.destinatario@example.com";
         let second = "segundo.destinatario@example.com";
@@ -1795,7 +1795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn um_nome_com_virgula_nao_inventa_um_contacto() {
+    async fn a_name_with_a_comma_invents_no_contact() {
         let pool = test_pool().await;
         let mut sent = message(25);
         sent.headers

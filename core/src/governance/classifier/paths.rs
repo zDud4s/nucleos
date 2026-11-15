@@ -251,6 +251,8 @@ pub(super) fn classification(
         },
         action_class,
         reason,
+        culprit: None,
+        segments: Vec::new(),
     }
 }
 

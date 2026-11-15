@@ -18,6 +18,10 @@ use sqlx::SqlitePool;
 
 use crate::workflow_records::{self, RecordArgs};
 
+mod paths;
+pub(crate) use paths::check_containment;
+pub use paths::{globs_overlap, normalise_glob, path_contained, sets_overlap};
+
 /// The most characters a `View::Brief` text may hold.
 pub const BRIEF_MAX_CHARS: usize = 16_000;
 
@@ -41,7 +45,7 @@ macro_rules! select_nodes {
     ($tail:literal) => {
         concat!(
             "SELECT id, project_id, root_id, parent_id, depth, kind, title, goal, status, \
-             owned_paths, budget_tokens, context_peak, summary, handoff_path, decisions, run_id, \
+             owned_paths, pointers, budget_tokens, context_peak, summary, handoff_path, decisions, run_id, \
              session_id, chat_id, task_id, created_at, updated_at, closed_at FROM work_nodes ",
             $tail
         )
@@ -206,6 +210,7 @@ struct NodeRow {
     goal: String,
     status: String,
     owned_paths: String,
+    pointers: String,
     budget_tokens: Option<i64>,
     context_peak: Option<i64>,
     summary: Option<String>,
@@ -233,6 +238,8 @@ pub struct Node {
     pub goal: String,
     pub status: String,
     pub owned_paths: Vec<String>,
+    /// Files the parent pointed this node at to start from.
+    pub pointers: Vec<String>,
     pub budget_tokens: Option<i64>,
     pub context_peak: Option<i64>,
     pub summary: Option<String>,
@@ -251,6 +258,7 @@ impl From<NodeRow> for Node {
     fn from(row: NodeRow) -> Self {
         Node {
             owned_paths: serde_json::from_str(&row.owned_paths).unwrap_or_default(),
+            pointers: serde_json::from_str(&row.pointers).unwrap_or_default(),
             decisions: serde_json::from_str(&row.decisions).unwrap_or_default(),
             id: row.id,
             project_id: row.project_id,
@@ -286,184 +294,6 @@ pub async fn get(pool: &SqlitePool, id: &str) -> Result<Node, NodeError> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Path overlap
-// ---------------------------------------------------------------------------------------------
-
-/// The literal text of a glob before its first wildcard, with `\` read as `/` and a leading `./`
-/// dropped.
-fn literal_prefix(glob: &str) -> String {
-    let normalized = glob.replace('\\', "/");
-    let trimmed = normalized.strip_prefix("./").unwrap_or(&normalized);
-    let end = trimmed.find(['*', '?', '[', '{']).unwrap_or(trimmed.len());
-    trimmed[..end].to_owned()
-}
-
-/// **Pure.** Whether two path globs may name a common file. Deliberately conservative: it compares
-/// only the literal prefixes (the text before the first wildcard) and reports an overlap when one
-/// is a prefix of the other, so an empty prefix overlaps everything.
-pub fn globs_overlap(a: &str, b: &str) -> bool {
-    let (a, b) = (literal_prefix(a), literal_prefix(b));
-    a.starts_with(&b) || b.starts_with(&a)
-}
-
-/// **Pure.** The first pair `(from a, from b)` of globs that overlap, if any.
-pub fn sets_overlap(a: &[String], b: &[String]) -> Option<(String, String)> {
-    for left in a {
-        for right in b {
-            if globs_overlap(left, right) {
-                return Some((left.clone(), right.clone()));
-            }
-        }
-    }
-    None
-}
-
-/// **Pure.** A path glob in the one form containment compares: `\` read as `/`, empty and `.`
-/// segments dropped (so `./a`, `a//b` and `a/b/` all clean up), and refused when it contains a `..`
-/// segment, is absolute (`/x`, `C:/x`) or is left empty. Case is kept: containment is
-/// case-sensitive, which on Windows can only make it refuse more, never less.
-pub fn normalise_glob(raw: &str) -> Result<String, NodeError> {
-    let unified = raw.trim().replace('\\', "/");
-    if unified.starts_with('/') || unified.as_bytes().get(1) == Some(&b':') {
-        return Err(NodeError::Invalid(format!(
-            "owned path {raw:?} must be relative to the project root; specs and other files \
-             under the project's state_dir are not owned by tree branches; the conductor \
-             updates them"
-        )));
-    }
-    let mut kept = Vec::new();
-    for segment in unified.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                return Err(NodeError::Invalid(format!(
-                    "owned path {raw:?} may not contain a \"..\" segment"
-                )));
-            }
-            other => kept.push(other),
-        }
-    }
-    if kept.is_empty() {
-        return Err(NodeError::Invalid(format!(
-            "owned path {raw:?} names no file or directory"
-        )));
-    }
-    Ok(kept.join("/"))
-}
-
-/// Whether the text carries any glob metacharacter.
-fn has_wildcard(text: &str) -> bool {
-    text.contains(['*', '?', '[', '{'])
-}
-
-/// Whether one path segment matches a segment pattern: `*` is any run of characters, `?` exactly
-/// one. Neither crosses a `/`, because the caller has already split on it.
-fn segment_match(pattern: &[char], text: &[char]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((&'*', rest)) => (0..=text.len()).any(|skip| segment_match(rest, &text[skip..])),
-        Some((&'?', rest)) => !text.is_empty() && segment_match(rest, &text[1..]),
-        Some((literal, rest)) => text.first() == Some(literal) && segment_match(rest, &text[1..]),
-    }
-}
-
-/// Whether a segment list matches a pattern segment list; a `**` segment takes zero or more whole
-/// segments.
-fn segments_match(pattern: &[&str], text: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((head, rest)) if *head == "**" => {
-            (0..=text.len()).any(|skip| segments_match(rest, &text[skip..]))
-        }
-        Some((head, rest)) => match text.split_first() {
-            Some((first, tail)) => {
-                let pattern_chars: Vec<char> = head.chars().collect();
-                let text_chars: Vec<char> = first.chars().collect();
-                segment_match(&pattern_chars, &text_chars) && segments_match(rest, tail)
-            }
-            None => false,
-        },
-    }
-}
-
-/// Whether `child` is `dir` itself or lies under it, at a segment boundary.
-fn under_dir(child: &str, dir: &str) -> bool {
-    child == dir
-        || child
-            .strip_prefix(dir)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// **Pure.** Whether every file the `child` glob can name is also named by the `parent` glob. Both
-/// arguments must already be `normalise_glob` output. Conservative: when unsure, `false`.
-///
-/// - parent without wildcards: a file or a directory. The child is the parent itself or starts
-///   with `<parent>/` (a segment boundary, so `core/srcx` is not inside `core/src`), and may carry
-///   wildcards after that; the same rule as `<prefix>/**` below;
-/// - parent `<prefix>/**` with a wildcard-free prefix: the child is the prefix itself, or starts
-///   with `<prefix>/` (a segment boundary, so `core/srcx` is not inside `core/src/**`), and may
-///   carry wildcards after that;
-/// - any other wildcard form (`*.rs`, `a*/b`, `**`): the child must be literal and match the parent
-///   glob, where `*` and `?` stay inside a segment and `**` crosses segments. A parent with `[` or
-///   `{` contains nothing, because those forms are not understood here.
-pub fn path_contained(child: &str, parent: &str) -> bool {
-    if !has_wildcard(parent) {
-        return under_dir(child, parent);
-    }
-    if let Some(prefix) = parent.strip_suffix("/**")
-        && !has_wildcard(prefix)
-    {
-        return under_dir(child, prefix);
-    }
-    if has_wildcard(child) || parent.contains(['[', '{']) {
-        return false;
-    }
-    let pattern: Vec<&str> = parent.split('/').collect();
-    let text: Vec<&str> = child.split('/').collect();
-    segments_match(&pattern, &text)
-}
-
-/// **Pure.** The L1 rule for a child opened under `parent`: every glob the child owns must be
-/// contained in some glob the parent owns. A child with no globs (a reviewer) is always accepted.
-/// A parent with no globs imposes no limit when it is the root, which owns everything, and is
-/// otherwise only allowed children with no globs. A malformed child glob (`..`, absolute, blank) is
-/// `Invalid`; a well-formed one outside the parent is `Conflict`.
-pub(crate) fn check_containment(parent: &Node, child_paths: &[String]) -> Result<(), NodeError> {
-    let children = child_paths
-        .iter()
-        .map(|path| normalise_glob(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    if children.is_empty() {
-        return Ok(());
-    }
-    if parent.owned_paths.is_empty() {
-        if parent.kind == KIND_ROOT {
-            return Ok(());
-        }
-        return Err(NodeError::Conflict(format!(
-            "parent {:?} owns no paths, so it only takes children with no owned_paths",
-            parent.title
-        )));
-    }
-    // A parent glob that does not normalise contains nothing.
-    let owned: Vec<String> = parent
-        .owned_paths
-        .iter()
-        .filter_map(|path| normalise_glob(path).ok())
-        .collect();
-    for (raw, child) in child_paths.iter().zip(&children) {
-        if !owned.iter().any(|glob| path_contained(child, glob)) {
-            return Err(NodeError::Conflict(format!(
-                "owned path {raw:?} is not contained in any owned path of parent {:?} ({})",
-                parent.title,
-                parent.owned_paths.join(", ")
-            )));
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------------------------
 // Open
 // ---------------------------------------------------------------------------------------------
 
@@ -476,6 +306,9 @@ pub struct OpenArgs {
     pub goal: String,
     #[serde(default)]
     pub owned_paths: Vec<String>,
+    /// Files to start from, as paths; stored as given, `[]` when absent.
+    #[serde(default)]
+    pub pointers: Vec<String>,
     #[serde(default)]
     pub budget_tokens: Option<i64>,
     #[serde(default)]
@@ -544,6 +377,7 @@ pub async fn open_linked(
     let id = crate::auth::generate_uuid_v4();
     let now = chrono::Utc::now().to_rfc3339();
     let owned = serde_json::to_string(&args.owned_paths).unwrap_or_else(|_| "[]".to_owned());
+    let pointers = serde_json::to_string(&args.pointers).unwrap_or_else(|_| "[]".to_owned());
 
     let (root_id, depth, project, task_id): (String, i64, Option<String>, Option<String>) =
         match args.parent_id.as_deref() {
@@ -619,9 +453,9 @@ pub async fn open_linked(
     sqlx::query(
         "INSERT INTO work_nodes \
          (id, project_id, root_id, parent_id, depth, kind, title, goal, status, owned_paths, \
-          budget_tokens, run_id, session_id, chat_id, task_id, tree_job_id, continues_node_id, \
+          pointers, budget_tokens, run_id, session_id, chat_id, task_id, tree_job_id, continues_node_id, \
           agent_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project)
@@ -632,6 +466,7 @@ pub async fn open_linked(
     .bind(title)
     .bind(goal)
     .bind(&owned)
+    .bind(&pointers)
     .bind(args.budget_tokens)
     .bind(&args.run_id)
     .bind(&args.session_id)
@@ -662,6 +497,9 @@ pub struct UpdateArgs {
     /// Globs the node needs beyond its `owned_paths`; see [`widen`].
     #[serde(default)]
     pub widen_paths: Option<Vec<String>>,
+    /// Replaces the node's pointers (files to start from) when present.
+    #[serde(default)]
+    pub pointers: Option<Vec<String>>,
 }
 
 /// Changes a node's status, appends a decision, raises its context peak (kept as the max), and/or
@@ -710,12 +548,16 @@ pub async fn update(
     };
     sqlx::query(
         "UPDATE work_nodes SET status = ?, owned_paths = ?, decisions = ?, context_peak = ?, \
-         updated_at = ? WHERE id = ?",
+         pointers = ?, updated_at = ? WHERE id = ?",
     )
     .bind(&status)
     .bind(serde_json::to_string(&owned).unwrap_or_else(|_| "[]".to_owned()))
     .bind(serde_json::to_string(&decisions).unwrap_or_else(|_| "[]".to_owned()))
     .bind(peak)
+    .bind(
+        serde_json::to_string(args.pointers.as_ref().unwrap_or(&node.pointers))
+            .unwrap_or_else(|_| "[]".to_owned()),
+    )
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
     .execute(pool)
@@ -894,6 +736,8 @@ pub async fn close(
     {
         tracing::warn!(node = %closed.id, %error, "could not file the handoff rework record");
     }
+    // The context-fit card: fail-open, logged inside, never undoes the close.
+    crate::context_fit::store::record_close(pool, &closed).await;
     Ok(closed)
 }
 
@@ -925,10 +769,59 @@ pub fn feed_line(root_title: &str, node: &Node) -> Option<(&'static str, String)
         line.push_str(&summary);
     }
     if kind == "work_tree_parked" && !node.decisions.is_empty() {
-        line.push_str(" — precisa de: ");
+        line.push_str(NEEDS_SEPARATOR);
         line.push_str(&node.decisions.join("; "));
     }
     Some((kind, line))
+}
+
+/// The separator `feed_line` puts before the decisions a parked line asks for.
+const NEEDS_SEPARATOR: &str = " — precisa de: ";
+
+/// True when `line` (a `work_tree_parked` line `feed_line` just built for `node`) would repeat the
+/// latest parked line of the same root on the same open decision, so writing it adds only noise.
+///
+/// A line repeats when the newest parked line of this root (matched by the `"{root_title}: "`
+/// prefix, within the node's project) carries the same decisions, and the root was not unparked
+/// since: no node of the tree was opened after that line. A new node means the tree ran again, so
+/// the next park is news even when it asks the same thing. Best effort: a failed lookup answers
+/// `false`, so the line is written rather than lost.
+pub async fn repeats_latest_park(
+    pool: &SqlitePool,
+    root_title: &str,
+    node: &Node,
+    line: &str,
+) -> bool {
+    let prefix = format!("{root_title}: ");
+    let needs = |text: &str| -> String {
+        text.rsplit_once(NEEDS_SEPARATOR)
+            .map(|(_, tail)| tail.to_owned())
+            .unwrap_or_default()
+    };
+    let latest: Result<Option<(String, String)>, sqlx::Error> = sqlx::query_as(
+        "SELECT summary, created_at FROM feed \
+         WHERE kind = 'work_tree_parked' AND project_id IS ? \
+           AND substr(summary, 1, length(?)) = ? \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(node.project_id.as_deref())
+    .bind(&prefix)
+    .bind(&prefix)
+    .fetch_optional(pool)
+    .await;
+    let Ok(Some((summary, written_at))) = latest else {
+        return false;
+    };
+    if needs(&summary) != needs(line) {
+        return false;
+    }
+    let reopened: Result<i64, sqlx::Error> =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes WHERE root_id = ? AND julianday(created_at) > julianday(?)")
+            .bind(&node.root_id)
+            .bind(&written_at)
+            .fetch_one(pool)
+            .await;
+    matches!(reopened, Ok(0))
 }
 
 /// Files the `rework` row that says a node outgrew its context and handed off.
@@ -1001,6 +894,7 @@ pub struct TreeNode {
     pub status: String,
     pub summary: Option<String>,
     pub owned_paths: Vec<String>,
+    pub pointers: Vec<String>,
     pub updated_at: String,
 }
 
@@ -1070,6 +964,7 @@ pub async fn tree(pool: &SqlitePool, root_id: &str, view: View) -> Result<Tree, 
                 status: node.status.clone(),
                 summary: node.summary.clone(),
                 owned_paths: node.owned_paths.clone(),
+                pointers: node.pointers.clone(),
                 updated_at: node.updated_at.clone(),
             })
             .collect(),
@@ -1224,6 +1119,7 @@ mod tests {
             goal: "the goal".into(),
             status: status.into(),
             owned_paths: vec![],
+            pointers: vec![],
             budget_tokens: None,
             context_peak: None,
             summary,
@@ -1992,6 +1888,7 @@ mod tests {
             decision: Some(decision.to_owned()),
             context_peak: Some(peak),
             widen_paths: None,
+            pointers: None,
         };
         update(&pool, &root.id, &limits, &up(500, "first"))
             .await
@@ -2248,6 +2145,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_node_opened_with_pointers_stores_them_and_the_tree_returns_them() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let mut with = child_args(&root.id, "leaf", "With", &["core/src/a.rs"]);
+        with.pointers = vec!["core/src/a.rs".to_owned(), "core/src/b.rs".to_owned()];
+        let with = open(&pool, None, &limits, &with).await.unwrap();
+        let without = child_args(&root.id, "leaf", "Without", &["core/src/c.rs"]);
+        let without = open(&pool, None, &limits, &without).await.unwrap();
+
+        let stored = get(&pool, &with.id).await.unwrap();
+        assert_eq!(
+            stored.pointers,
+            strings(&["core/src/a.rs", "core/src/b.rs"])
+        );
+        assert!(get(&pool, &without.id).await.unwrap().pointers.is_empty());
+
+        let built = tree(&pool, &root.id, View::Brief).await.unwrap();
+        let of = |id: &str| built.nodes.iter().find(|node| node.id == id).unwrap();
+        assert_eq!(
+            of(&with.id).pointers,
+            strings(&["core/src/a.rs", "core/src/b.rs"])
+        );
+        assert_eq!(of(&without.id).pointers, Vec::<String>::new());
+        assert_eq!(of(&root.id).pointers, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn update_replaces_pointers_only_when_given() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let mut args = child_args(&root.id, "leaf", "Leaf", &["core/src/a.rs"]);
+        args.pointers = strings(&["core/src/a.rs"]);
+        let leaf = open(&pool, None, &limits, &args).await.unwrap();
+
+        let untouched = UpdateArgs {
+            decision: Some("noted".to_owned()),
+            ..UpdateArgs::default()
+        };
+        let node = update(&pool, &leaf.id, &limits, &untouched).await.unwrap();
+        assert_eq!(node.pointers, strings(&["core/src/a.rs"]));
+        let replaced = UpdateArgs {
+            pointers: Some(strings(&["docs/x.md"])),
+            ..UpdateArgs::default()
+        };
+        let node = update(&pool, &leaf.id, &limits, &replaced).await.unwrap();
+        assert_eq!(node.pointers, strings(&["docs/x.md"]));
+    }
+
+    #[tokio::test]
     async fn tree_brief_has_nodes_and_text() {
         let pool = test_pool().await;
         let limits = NodeLimits::default();
@@ -2298,6 +2246,61 @@ mod tests {
         let leaf = node(1, "blocked", Some("Waiting.".into()));
         let (_, summary) = feed_line("Ship the tree", &leaf).unwrap();
         assert_eq!(summary, "Ship the tree: blocked — Waiting.");
+    }
+
+    #[tokio::test]
+    async fn a_repeat_park_on_the_same_decision_is_skipped() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let leaf_args = child_args(&root.id, "leaf", "Leaf", &[]);
+        let leaf = open(&pool, None, &limits, &leaf_args).await.unwrap();
+
+        // Writes the line the way `announce_close` does; returns whether it wrote.
+        async fn park(pool: &SqlitePool, opened: &Opened, decision: &str) -> bool {
+            let mut blocked = get(pool, &opened.id).await.unwrap();
+            blocked.status = "blocked".into();
+            blocked.summary = Some("Needs a call.".into());
+            blocked.decisions = vec![decision.into()];
+            let (kind, line) = feed_line("Root", &blocked).unwrap();
+            if repeats_latest_park(pool, "Root", &blocked, &line).await {
+                return false;
+            }
+            crate::feed::append(pool, None, kind, &line, None, None)
+                .await
+                .unwrap();
+            true
+        }
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM feed WHERE kind = 'work_tree_parked'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        // First park writes.
+        assert!(park(&pool, &leaf, "use sqlite").await);
+        assert_eq!(count().await, 1);
+        // Same root, same decision: nothing.
+        assert!(!park(&pool, &leaf, "use sqlite").await);
+        assert_eq!(count().await, 1);
+        // A new decision writes.
+        assert!(park(&pool, &leaf, "or a file").await);
+        assert_eq!(count().await, 2);
+        // Unparked in between (a node opened after the line), then parked on the same decision.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let again = open(
+            &pool,
+            None,
+            &limits,
+            &child_args(&root.id, "leaf", "Again", &[]),
+        )
+        .await
+        .unwrap();
+        assert!(park(&pool, &again, "or a file").await);
+        assert_eq!(count().await, 3);
     }
 
     #[test]

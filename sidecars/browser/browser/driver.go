@@ -570,7 +570,7 @@ type HandoffTicket struct {
 
 // ErrFenceNotAttached is the failure that spec §6.2a exists to force:
 //
-//	"Se o interceptor não estiver atado, o separador não navega."
+//	"If the interceptor is not attached, the tab does not navigate."
 //
 // A driver returns it rather than opening an unfenced session. It is separate from every other
 // error because a fence that is absent is indistinguishable, from the outside, from a fence that is
@@ -583,7 +583,7 @@ var ErrNoSuchSession = errors.New("browser: no such session")
 // ErrNotInstalled means the pinned Chromium is not on disk yet (spec §9.5).
 //
 // It is a state and not a fault: the download happens when the pillar is activated, takes minutes,
-// and retries on its own. Spec §9.5 asks for "indisponível COM A RAZÃO, que é diferente de responder
+// and retries on its own. Spec §9.5 asks for "unavailable WITH THE REASON, which is different from answering
 // 501" — 501 would say browsing is not a thing this build does, and this says it is not a thing this
 // machine can do yet. The wrapped text names the revision and the path, because the difference
 // between "still downloading" and "the download keeps failing" is the whole of what a person can act

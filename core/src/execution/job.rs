@@ -785,7 +785,7 @@ mod tests {
     /// upgrade — writing a brief for work whose items are half done, and re-answering it forever
     /// because the node's own output is not what this reads.
     #[test]
-    fn um_job_a_meio_nao_recua_para_escrever_uma_spec() {
+    fn a_job_midway_does_not_step_back_to_write_a_spec() {
         let midway = JobView {
             specced: true,
             speccing: false,
@@ -802,7 +802,7 @@ mod tests {
     /// planning produces a queue nothing reads, and one that starts working leaves edits in a tree
     /// no gate has measured.
     #[test]
-    fn a_spec_diz_onde_escrever_e_o_que_nao_fazer() {
+    fn the_spec_says_where_to_write_and_what_not_to_do() {
         let prompt = spec_prompt("make the roster useful", "/wt/.nucleos");
 
         assert!(
@@ -830,7 +830,7 @@ mod tests {
     /// The planner is sent to the brief only when there is one to read. A sentence naming a missing
     /// file costs the node a turn to find out, which is worse than not mentioning it.
     #[test]
-    fn o_planeador_so_e_mandado_ler_a_spec_quando_ela_existe() {
+    fn the_planner_is_only_told_to_read_the_spec_when_it_exists() {
         let with = plan_prompt("t", 5, "/wt/.nucleos", None, true);
         let without = plan_prompt("t", 5, "/wt/.nucleos", None, false);
 
@@ -3241,7 +3241,7 @@ mod tests {
     /// disagreed on the word "spec" the job would spawn a spec node on every single tick — each one
     /// invisible to the read that is supposed to notice the last one.
     #[tokio::test]
-    async fn um_no_de_spec_em_voo_e_visto_como_em_voo_e_depois_como_feito() {
+    async fn an_in_flight_spec_node_is_seen_as_in_flight_and_then_as_done() {
         let pool = test_pool().await;
         let job_id = seed_job(&pool, "project-a", "running")
             .await
@@ -3839,7 +3839,7 @@ mod tests {
     /// nothing at all while reporting that it was working, which is the failure a person only
     /// discovers in the morning.
     #[test]
-    fn um_pedido_de_job_resolve_ou_recusa_com_motivo_proprio() {
+    fn a_job_request_resolves_or_refuses_with_its_own_reason() {
         use crate::governance::autopilot::Mode;
         let roster = vec![
             summary("off", Mode::Off, Some("/repos/off")),
@@ -4504,7 +4504,7 @@ mod tests {
     /// sees. `job 7 started for rule 'None'` is the shape this exists to prevent: a line that reads
     /// like a bug in the scheduler for a job the scheduler never touched.
     #[tokio::test(flavor = "current_thread")]
-    async fn um_job_sem_regra_nao_inventa_uma_no_registo_nem_no_feed() {
+    async fn a_job_with_no_rule_invents_none_in_the_record_nor_in_the_feed() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (_container, repo) = walkable_repo("nucleos-job-norule-", "git --version");
         let root = tempfile::tempdir().expect("worktree root");

@@ -7,12 +7,14 @@ use crate::search::{escape_like, fts_query};
 use crate::state::AppState;
 
 pub mod api;
+mod context_given;
 mod create;
 mod handoff;
 mod lifecycle;
 mod policy;
 mod resume;
 mod spawn;
+pub mod transient;
 pub(crate) mod verify_wake;
 
 pub use self::api::*;
@@ -1105,11 +1107,14 @@ pub mod tests {
         );
     }
 
-    /// A conflict whose worktree cannot be made at all spends its attempt too. Request 513 in the
-    /// field: its target `aut/integ` never existed, `git worktree add` failed before the claim, and
-    /// the resolver minted a failed run every minute because `resolution_run_id` stayed NULL.
+    /// A conflict whose TARGET branch does not exist fails once and is settled, with every open
+    /// twin of it, so nothing retries. Request 513 in the field: its target `aut/integ` never
+    /// existed. The per-request attempt cap (`MAX_RESOLUTION_ATTEMPTS`) bounded only that one row,
+    /// and the same merge asked again arrived as a new row with fresh attempts: 39 identical
+    /// `worktree_provision_failed` lines in a day. A ref that is positively absent cannot appear
+    /// by retrying, so the request settles as `target-gone` instead of counting an attempt.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_conflict_whose_worktree_cannot_be_made_spends_its_attempt() {
+    async fn a_conflict_whose_target_branch_is_missing_fails_once_and_settles_its_twins() {
         let _env_lock = crate::execution::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
@@ -1117,6 +1122,9 @@ pub mod tests {
         let (_container, repo) = init_contained_repo("nucleos-runs-resolve-no-target-");
         let state = test_state().await;
         let request = escalated_merge(&state.pool, &repo).await;
+        // The same merge asked again: a fresh row, which used to bring fresh attempts.
+        let twin = escalated_merge(&state.pool, &repo).await;
+        assert_ne!(request, twin, "the same merge is admitted as a new row");
 
         let refused = create_resolution_run(
             &state,
@@ -1136,9 +1144,29 @@ pub mod tests {
             matches!(refused, CreateRunError::Worktree(_)),
             "provisioning is what failed: {refused:?}"
         );
-        assert!(
-            resolution_run_id_of(&state.pool, request).await.is_some(),
-            "the attempt is spent, so the resolver does not mint the same failure every tick"
+        assert_eq!(
+            resolution_run_id_of(&state.pool, request).await,
+            None,
+            "no resolution run owns the row: its tree was never born"
+        );
+        for id in [request, twin] {
+            let (reason,): (Option<String>,) = sqlx::query_as(
+                "SELECT settled_reason FROM vcs_requests WHERE id = ? AND settled_at IS NOT NULL",
+            )
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .expect("a missing target settles the request and its twin");
+            assert_eq!(reason.as_deref(), Some("target-gone"));
+        }
+        let (failures,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM feed WHERE kind = 'worktree_provision_failed'")
+                .fetch_one(&state.pool)
+                .await
+                .expect("count the provisioning failures");
+        assert_eq!(
+            failures, 1,
+            "the missing branch fails once, not once per request"
         );
     }
 
@@ -8933,7 +8961,7 @@ tests:
     /// readable. `off` refuses with 422 before the row exists; `shadow` reaches 400 and complains
     /// about the missing field, which is the door letting it through.
     #[tokio::test]
-    async fn uma_run_nao_vigiada_e_recusada_a_um_projecto_desligado() {
+    async fn an_unwatched_run_is_refused_to_a_switched_off_project() {
         let state = test_state().await;
         project_in_mode(&state.pool, "proj", "off").await;
 
@@ -8980,7 +9008,7 @@ tests:
     /// until a project is deliberately activated. If this test ever has to change, that is the
     /// decision being revisited, and it should be revisited out loud.
     #[tokio::test]
-    async fn um_projecto_em_shadow_ainda_pode_pedir_uma_run_de_worktree() {
+    async fn a_project_in_shadow_can_still_ask_for_a_worktree_run() {
         let state = test_state().await;
         project_in_mode(&state.pool, "proj", "shadow").await;
 
@@ -9024,7 +9052,7 @@ tests:
     /// narrowing is a line of code nothing defends, and the first person to "make it consistent"
     /// takes the shell's default mode away with it.
     #[tokio::test]
-    async fn uma_run_vigiada_nao_e_travada_por_um_projecto_desligado() {
+    async fn a_watched_run_is_not_blocked_by_a_switched_off_project() {
         let state = test_state().await;
         project_in_mode(&state.pool, "proj", "off").await;
 
@@ -11452,6 +11480,55 @@ tests:
         }
     }
 
+    /// A run launched from a Claude Code session records it in `launching_session_id`, from
+    /// `LAUNCH_SESSION_HEADER`. A value that is not a plain session id tags nothing, a run that has
+    /// one keeps it, and the chat tag is untouched.
+    #[tokio::test]
+    async fn tag_launching_session_records_a_valid_header_once() {
+        let pool = search_test_pool().await;
+        let mut ids = Vec::new();
+        for prompt in ["a", "b"] {
+            ids.push(
+                sqlx::query(
+                    "INSERT INTO runs (prompt, status, mode, created_at)
+                     VALUES (?, 'completed', 'worktree', '2026-10-01T00:00:02Z')",
+                )
+                .bind(prompt)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid(),
+            );
+        }
+        let header = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                crate::daemon_client::LAUNCH_SESSION_HEADER,
+                value.parse().unwrap(),
+            );
+            headers
+        };
+        api::tag_launching_session(&pool, ids[0], &header("sess-1_A")).await;
+        api::tag_launching_session(&pool, ids[0], &header("sess-2")).await;
+        api::tag_launching_session(&pool, ids[1], &header("bad session!")).await;
+        api::tag_launching_session(&pool, ids[1], &axum::http::HeaderMap::new()).await;
+
+        let stored = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT launching_session_id FROM runs WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(stored(ids[0]).await.as_deref(), Some("sess-1_A"));
+        assert_eq!(stored(ids[1]).await, None);
+    }
+
     /// Chat turns leave the list; the run a chat LAUNCHED stays, carrying the conversation it came
     /// from — tagged by `tag_launching_chat` from the speaking turn's `RUN_ID_HEADER`. A header that
     /// names a run which is not a turn tags nothing (decision of 2026-10-11).
@@ -12135,6 +12212,8 @@ tests:
             cache_read_tokens: Some(20_000),
             num_turns: Some(3),
             context_fill: None,
+            initial_context: None,
+            tools_given: None,
             steerable: false,
             successor_run_id: None,
             chat_id: None,

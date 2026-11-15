@@ -27,10 +27,10 @@ pub(super) fn read_secret_from_stdin(prompt: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-/// Um numero, ou um travessao quando nao ha nenhum.
+/// A number, or a dash when there is none.
 ///
-/// Nada por medir escreve-se `—` e nunca `0`: zero e uma afirmacao, e sobre uma janela que ninguem
-/// mediu e falsa. E a mesma razao por que a coluna nasceu NULL.
+/// Anything unmeasured is written `—` and never `0`: zero is a claim, and about a window nobody
+/// measured it is false. It is the same reason the column was born NULL.
 pub(super) fn or_dash(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Number(number) => format!("{number}"),
@@ -38,34 +38,34 @@ pub(super) fn or_dash(value: &serde_json::Value) -> String {
     }
 }
 
-/// Desenha o relatorio que a rota devolveu.
+/// Draws the report the route returned.
 ///
-/// Devolve texto em vez de o imprimir para que o desenho tenha teste: e a unica parte deste
-/// caminho que pode estar errada sem que nada estoire, e a verificacao ponta-a-ponta exigia por o
-/// daemon a correr contra a base de dados de quem manda.
+/// Returns text instead of printing it so the drawing can be tested: it is the only part of this
+/// path that can be wrong without anything blowing up, and an end-to-end check would need the
+/// daemon running against the owner's database.
 ///
-/// Le o JSON como `Value` em vez de o desserializar para os tipos de `pressure`: o formato e um
-/// contrato de leitura e nao um tipo partilhado, e um cliente fino que exigisse os tipos passaria a
-/// quebrar de cada vez que se acrescentasse um campo.
+/// Reads the JSON as a `Value` instead of deserializing into the `pressure` types: the format is a
+/// reading contract and not a shared type, and a thin client that demanded the types would break
+/// every time a field was added.
 pub(super) fn render_pressure(report: &serde_json::Value) -> String {
     use std::fmt::Write as _;
 
     let team = report["team"].as_str().unwrap_or("?");
     if report["outcome"] == "never_ran" {
-        // A saida correcta enquanto `team_runs` estiver vazia, e a que nao se pode confundir com
-        // uma tabela de zeros.
-        return format!("equipa {team} · nunca correu");
+        // The right output while `team_runs` is empty, and the one that cannot be mistaken for
+        // a table of zeros.
+        return format!("team {team} · never ran");
     }
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "equipa {team} · job {} · {} round(s)",
+        "team {team} · job {} · {} round(s)",
         report["job"].as_str().unwrap_or("?"),
         or_dash(&report["rounds"]),
     );
     let _ = writeln!(
         out,
-        "{} itens medidos · {} sem run · {} sem passos",
+        "{} items measured · {} without run · {} without steps",
         or_dash(&report["items_measured"]),
         or_dash(&report["items_without_run"]),
         or_dash(&report["items_without_steps"]),
@@ -73,29 +73,20 @@ pub(super) fn render_pressure(report: &serde_json::Value) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "{:<5} {:<14} {:>5} {:>5} {:>9} {:>9} {:>7} {:>9} {:>8} {:>5}  veredicto",
-        "round",
-        "agente",
-        "itens",
-        "comp",
-        "pico p50",
-        "pico p90",
-        "passos",
-        "arranque",
-        "declive",
-        "R2",
+        "{:<5} {:<14} {:>5} {:>5} {:>9} {:>9} {:>7} {:>9} {:>8} {:>5}  verdict",
+        "round", "agent", "items", "comp", "peak p50", "peak p90", "steps", "start", "slope", "R2",
     );
     for rollup in report["rollups"].as_array().into_iter().flatten() {
         let fit = &rollup["fit"];
-        let (arranque, declive, r2) = if fit["kind"] == "line" {
+        let (start, slope, r2) = if fit["kind"] == "line" {
             (
                 format!("{:.0}", fit["intercept"].as_f64().unwrap_or_default()),
                 format!("{:.0}", fit["slope"].as_f64().unwrap_or_default()),
                 format!("{:.2}", fit["r2"].as_f64().unwrap_or_default()),
             )
         } else {
-            // Menos de tres pontos, ou todos com os mesmos passos. Um arranque inventado aqui seria
-            // lido com uma confianca que nao tem.
+            // Fewer than three points, or all with the same steps. An invented start here would be
+            // read with a confidence it does not have.
             ("—".to_string(), "—".to_string(), "—".to_string())
         };
         let verdicts: Vec<&str> = rollup["verdicts"]
@@ -114,8 +105,8 @@ pub(super) fn render_pressure(report: &serde_json::Value) -> String {
             or_dash(&rollup["peak_p50"]),
             or_dash(&rollup["peak_p90"]),
             or_dash(&rollup["steps_median"]),
-            arranque,
-            declive,
+            start,
+            slope,
             r2,
             if verdicts.is_empty() {
                 "—".to_string()
@@ -532,17 +523,17 @@ async fn verify() -> bool {
     false
 }
 
-// `nucleos-core --pressao --equipa NucleOS`: quanta janela custou a cada agente da equipa.
+// `nucleos-core --pressure --team NucleOS`: how much window it cost each agent of the team.
 //
-// Cliente fino pelo molde do `--land` acima, e pela mesma razao: a pool esta aberta no daemon,
-// e abrir o SQLite em paralelo a partir da CLI seria contra o desenho da casa. Aqui a CLI le o
-// token e faz um GET.
+// A thin client in the mould of `--land` above, and for the same reason: the pool is open in the
+// daemon, and opening SQLite in parallel from the CLI would go against the house design. Here the
+// CLI reads the token and makes a GET.
 //
-// Nao ha pagina na Concha de proposito. A decisao que isto informa -- mais uma layer, mais um
-// agente, repartir uma especialidade, ou so cortar o prompt -- toma-se entre jobs, e nao ha
-// nada que valha a pena olhar enquanto um corre.
+// There is no page in the Shell on purpose. The decision this informs -- one more layer, one more
+// agent, splitting a speciality, or just trimming the prompt -- is made between jobs, and there
+// is nothing worth watching while one runs.
 
-async fn pressao() {
+async fn pressure_report() {
     let args: Vec<String> = std::env::args().collect();
     let value_of = |flag: &str| -> Option<String> {
         args.iter()
@@ -551,17 +542,17 @@ async fn pressao() {
             .cloned()
     };
     let job = value_of("--job");
-    let equipa = value_of("--equipa");
-    // Sem adivinhar por omissao: uma resposta sobre a equipa errada e pior do que nenhuma.
-    // Codificado pelo mesmo escapador do `daemon_client`, e nao por um segundo: o argumento do
-    // dono chega de uma linha de comandos e um nome com `&` seria outro pedido.
-    let query = match (job, equipa) {
+    let team_name = value_of("--team");
+    // No guessing by default: an answer about the wrong team is worse than none.
+    // Encoded by the same escaper as `daemon_client`, and not by a second one: the owner's
+    // argument comes from a command line and a name with `&` would be another request.
+    let query = match (job, team_name) {
         (Some(job), _) => format!("job={}", daemon_client::urlencoding_encode(&job)),
-        (None, Some(equipa)) => {
-            format!("team={}", daemon_client::urlencoding_encode(&equipa))
+        (None, Some(team_name)) => {
+            format!("team={}", daemon_client::urlencoding_encode(&team_name))
         }
         (None, None) => {
-            eprintln!("diga de quem: --equipa <nome> ou --job <team_run_id>");
+            eprintln!("say whose: --team <name> or --job <team_run_id>");
             std::process::exit(1);
         }
     };
@@ -582,11 +573,11 @@ async fn pressao() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::NOT_FOUND {
-                eprintln!("nao ha nenhuma equipa nem job com esse nome");
+                eprintln!("there is no team or job with that name");
                 std::process::exit(1);
             }
             if !status.is_success() {
-                eprintln!("o daemon recusou: {text}");
+                eprintln!("the daemon refused: {text}");
                 std::process::exit(1);
             }
             match serde_json::from_str::<serde_json::Value>(&text) {
@@ -961,8 +952,8 @@ pub(super) async fn run_subcommand() -> bool {
     if verify().await {
         return true;
     }
-    if std::env::args().any(|a| a == "--pressao") {
-        pressao().await;
+    if std::env::args().any(|a| a == "--pressure") {
+        pressure_report().await;
         return true;
     }
     if std::env::args().any(|a| a == "--set-github-token") {

@@ -36,7 +36,7 @@ pub const LOCAL_NUM_CTX: usize = 8192;
 /// What local triage requires from a model, read by `capabilities::missing_capabilities` instead of
 /// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window: local
 /// triage checks nothing else today, and `capabilities`' own guard test
-/// (`nenhum_dos_tres_papeis_exige_hoje_mais_do_que_a_janela`) fails if this ever claims more without
+/// (`none_of_the_three_roles_requires_more_than_the_window_today`) fails if this ever claims more without
 /// that being a deliberate change.
 pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
     crate::capabilities::Requirement {
@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_correio_enviado_nao_entra_na_fila_de_triagem() {
+    async fn sent_mail_does_not_enter_the_triage_queue() {
         let state = triage_state().await;
         let now = chrono::Utc::now();
         let inbound = crate::integrations::email::IncomingMessage {
@@ -1710,7 +1710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_triagem_aplica_o_ajuste_ao_que_grava() {
+    async fn triage_applies_the_adjustment_to_what_it_records() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 2, 1).await;
         let first_contact = "first.contact@example.com";
@@ -1803,7 +1803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_registo_diz_o_que_o_modelo_disse_e_quem_decidiu() {
+    async fn the_record_says_what_the_model_said_and_who_decided() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 1, 1).await;
         let sender = "new.sender@example.com";
@@ -1841,7 +1841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sem_regra_o_registo_nao_inventa_uma() {
+    async fn with_no_rule_the_record_invents_none() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 1, 1).await;
         let sender = "established.sender@example.com";
@@ -1881,7 +1881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uma_sobreposicao_humana_fica_no_registo() {
+    async fn a_human_override_stays_in_the_record() {
         let state = triage_state().await;
         let ids = seed_pending(&state.pool, 1, 1).await;
         let sender = "Pinned Person <PINNED@example.com>";
@@ -2366,7 +2366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn o_correio_enviado_e_apagado_na_mesma_janela() {
+    async fn sent_mail_is_deleted_in_the_same_window() {
         let state = triage_state().await;
         let now = chrono::Utc::now();
         let ingested_at = now - chrono::Duration::days(ROW_RETENTION_DAYS + 1);
@@ -2410,7 +2410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn os_factos_do_contacto_sobrevivem_ao_prune_do_enviado() {
+    async fn the_contacts_facts_survive_the_sent_prune() {
         let state = triage_state().await;
         let recipient = "contacto@example.com";
         let now = chrono::Utc::now();

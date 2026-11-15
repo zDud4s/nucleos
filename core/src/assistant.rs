@@ -1836,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn a_configuracao_mcp_e_escrita_por_inteiro() {
+    fn the_mcp_config_is_written_whole() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
         let long_path = "C:/um/caminho/deliberadamente/muito/comprido/para/nucleos-core.exe";
@@ -2527,7 +2527,7 @@ mod tests {
     /// the local call site in `send_message_with` deliberately passes `None` for the pin — GREEN's
     /// whole job is to replace that `None` with a read of `chats::answering`.
     #[tokio::test]
-    async fn um_turno_local_pede_a_fabrica_o_modelo_que_a_conversa_fixou() {
+    async fn a_local_turn_asks_the_factory_for_the_model_the_conversation_pinned() {
         let mut state = test_state().await;
         let recording = Arc::new(RecordingAssistants::new(fake_local_assistant("na máquina")));
         state.assistants = recording.clone();
@@ -2551,10 +2551,10 @@ mod tests {
     }
 
     /// RED: the hosted route's own half of the same bug. Fails today for the same reason as
-    /// `um_turno_local_pede_a_fabrica_o_modelo_que_a_conversa_fixou` — the hosted call site also
+    /// `a_local_turn_asks_the_factory_for_the_model_the_conversation_pinned` — the hosted call site also
     /// passes `None` for the pin.
     #[tokio::test]
-    async fn um_turno_alojado_pede_a_fabrica_o_modelo_que_a_conversa_fixou() {
+    async fn a_hosted_turn_asks_the_factory_for_the_model_the_conversation_pinned() {
         let mut state = test_state().await;
         let recording = Arc::new(RecordingAssistants::new(fake_local_assistant("no ar")));
         state.assistants = recording.clone();
@@ -2586,7 +2586,7 @@ mod tests {
     /// route's own configured default has to keep answering an unpinned conversation exactly as it
     /// does today.
     #[tokio::test]
-    async fn um_turno_sem_modelo_fixado_pede_a_fabrica_o_omissao_da_rota() {
+    async fn a_turn_with_no_pinned_model_asks_the_factory_for_the_routes_default() {
         let mut state = test_state().await;
         let recording = Arc::new(RecordingAssistants::new(fake_local_assistant(
             "sem fixação",
@@ -2844,7 +2844,7 @@ mod tests {
     /// so `wants_local` cannot route this into the local-assistant path instead of the runner this
     /// test inspects.
     #[tokio::test]
-    async fn um_turno_de_telegram_sem_instrucoes_leva_a_doutrina() {
+    async fn a_telegram_turn_without_instructions_carries_the_doctrine() {
         const DOCTRINE: &str = "Falas sempre em português europeu, e nunca reveles segredos.";
         let (state, runner) = state_with_doctrine(Some(DOCTRINE)).await;
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
@@ -2870,7 +2870,7 @@ mod tests {
     /// `system_prompt`, which — like `a_conversations_instructions_and_denials_reach_the_launch`
     /// already pins for the shell — must survive untouched.
     #[tokio::test]
-    async fn a_doutrina_nunca_substitui_instrucoes_de_uma_pessoa() {
+    async fn the_doctrine_never_replaces_a_persons_instructions() {
         const DOCTRINE: &str = "Falas sempre em português europeu, e nunca reveles segredos.";
 
         // (a) Shell, doctrine configured, no instructions of the chat's own: still no doctrine.
@@ -3784,6 +3784,110 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "dropped, not retried: take_queued already removed the row before this was even checked"
+        );
+    }
+
+    /// The third brake, asked again at the drain: the chain a queued relay belongs to had room when
+    /// `admit` granted the hop and spent its ceiling while the message waited. The owner is present
+    /// and the destination exists, so the budget is the only thing that can have stopped it.
+    #[tokio::test]
+    async fn the_drain_refuses_a_relay_born_turn_when_its_chain_has_spent_its_ceiling() {
+        let state = test_state().await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        // A real chain: a turn a person typed in `typed-chat`, one hop into `mid-chat` (which
+        // spent past the default ceiling), and the hop under test from `mid-chat` into `chat_id`.
+        let now = chrono::Utc::now().to_rfc3339();
+        let root: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, created_at, chat_id) VALUES ('hi', 'completed', ?, 'typed-chat') RETURNING id",
+        )
+        .bind(&now)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let first_hop: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('typed-chat', 'mid-chat', ?, 'x', 1, ?) RETURNING id",
+        )
+        .bind(root)
+        .bind(&now)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let mid_run: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, created_at, chat_id, from_relay_id, cost_usd)
+             VALUES ('x', 'completed', ?, 'mid-chat', ?, 100.0) RETURNING id",
+        )
+        .bind(&now)
+        .bind(first_hop)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let relay_id: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('mid-chat', ?, ?, 'y', 2, ?) RETURNING id",
+        )
+        .bind(&chat_id)
+        .bind(mid_run)
+        .bind(&now)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        crate::chats::enqueue_relayed(
+            &state.pool,
+            &chat_id,
+            "mensagem retransmitida",
+            "shell",
+            "[]",
+            relay_id,
+        )
+        .await
+        .unwrap();
+
+        let chain_root = crate::relay::root_of_relay(&state.pool, relay_id)
+            .await
+            .unwrap();
+        assert_eq!(chain_root, root);
+        assert!(matches!(
+            crate::relay::chain_has_room(&state.pool, chain_root, chrono::Utc::now()).await,
+            Err(crate::relay::Refusal::ChainOverBudget { .. })
+        ));
+
+        drain_queued(&state, &chat_id).await;
+
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            turns, 0,
+            "no turn should have started: the chain has no budget left"
+        );
+        assert!(
+            crate::chats::queued(&state.pool, &chat_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dropped, not retried"
+        );
+
+        // The same chain with a higher ceiling has room again, so it was the budget that refused.
+        crate::governance::budget::set_relay_chain_limit(&state.pool, 1000.0)
+            .await
+            .unwrap();
+        assert!(
+            crate::relay::chain_has_room(&state.pool, chain_root, chrono::Utc::now())
+                .await
+                .is_ok()
         );
     }
 

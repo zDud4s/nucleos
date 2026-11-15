@@ -141,6 +141,13 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "Brain, 3 to answer" })).toBeDefined();
   });
 
+  it("points the Brain entry at the most urgent open request", async () => {
+    await renderWithRouter(<Sidebar badges={{ captures: 2 }} urgentCapture="capture:9" />);
+
+    const href = screen.getByRole("link", { name: "Brain, 2 to answer" }).getAttribute("href") ?? "";
+    expect(decodeURIComponent(href)).toContain("item=capture:9");
+  });
+
   it("renders no badge at all for a count the shell has no source for", async () => {
     await renderWithRouter(<Sidebar badges={{ proposals: 3 }} />);
 

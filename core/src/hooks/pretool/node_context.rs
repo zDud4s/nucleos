@@ -3,6 +3,21 @@
 
 use super::*;
 use crate::conductor::context::{Fill, allowed_for_node, handoff_path};
+
+mod loop_warning;
+
+/// Everything a node run is told on an allowed call: the warn-band hint, then the loop warning
+/// (live mode only; in shadow it only records). Fail-open: what cannot be read is not said.
+pub(super) async fn hints(
+    state: &AppState,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Vec<String> {
+    let mut parts: Vec<String> = warn_hint(state, run_id).await.into_iter().collect();
+    parts.extend(loop_warning::loop_advisory(state, run_id, tool_name, tool_input).await);
+    parts
+}
 /// The context verdict of the node a run works for, `None` for a run without a node and when the
 /// verdict cannot be read (fail open: a read error must not stop a run, and the next call asks
 /// again). The limits come from the run's own `speed.yaml`; the model-window cap is not applied
@@ -132,6 +147,46 @@ pub(super) async fn wind_down_decision(
             })
         },
     )
+}
+
+/// Whether `tool` is a Write/Edit whose target is exactly `own_report`. An exact path match: no
+/// other file under the state dir, and no other node's report, passes. Reuses `allowed_for_node`
+/// for the path comparison (it reads the `Write` spelling of the input).
+fn writes_own_report(tool: &str, input: &Value, kind: &str, own_report: Option<&Path>) -> bool {
+    matches!(tool, "Write" | "Edit") && allowed_for_node("Write", input, kind, own_report)
+}
+
+/// Lets a tree node write its own handoff report, at any context fill. The report lives in the
+/// project's state dir, outside the worktree, where the classifier refuses a write outside the cwd
+/// and the node scope fence knows nothing of it. `None` for any other tool, a run without a node,
+/// and any other path: those fall through to the rules that follow.
+pub(super) async fn own_report_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    run_id: i64,
+) -> Option<Json<Decision>> {
+    if !matches!(payload.tool_name.as_str(), "Write" | "Edit") {
+        return None;
+    }
+    let node = node_verdict(state, run_id).await?;
+    let own_report = state
+        .machine_config_root
+        .as_deref()
+        .zip(node.project_id.as_deref())
+        .and_then(|(root, project)| crate::project::state::dir(root, project))
+        .map(|dir| handoff_path(&dir, &node.root_id, &node.node_id));
+    writes_own_report(
+        &payload.tool_name,
+        &payload.tool_input,
+        &node.kind,
+        own_report.as_deref(),
+    )
+    .then(|| {
+        Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "a node may write its own handoff report".to_owned(),
+        })
+    })
 }
 
 /// Restricts a docs branch to declared writes and shell actions that alter its checkout. This is
@@ -518,6 +573,59 @@ fn docs_clean_path(path: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+/// How much of each string of a refused call's input the fence keeps in `shadow_decisions`.
+const FENCE_INPUT_CHARS: usize = 2048;
+
+/// The `reason` a fence refusal is stored under: the marker, not the sentence the run was told.
+pub(super) const NODE_SCOPE_REASON: &str = "node_scope";
+
+fn capped_for_fence(value: &Value) -> Value {
+    match value {
+        Value::String(text) => {
+            Value::String(crate::judge::trim_two_thirds(text, FENCE_INPUT_CHARS))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(capped_for_fence).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), capped_for_fence(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Records the call the node scope fence refused as a `deny` row of `shadow_decisions`, so the
+/// refusal is read back with the call that caused it. Fail-open: a write error is logged and
+/// changes nothing about the answer the hook gives.
+pub(super) async fn record_fence_refusal(
+    state: &AppState,
+    run_id: i64,
+    payload: &PreToolUsePayload,
+) {
+    let classification = crate::governance::classifier::Classification {
+        decision: Decision {
+            decision: "deny".to_owned(),
+            reason: NODE_SCOPE_REASON.to_owned(),
+        },
+        action_class: "node-scope",
+        reason: NODE_SCOPE_REASON.to_owned(),
+        culprit: None,
+        segments: Vec::new(),
+    };
+    if let Err(error) = crate::governance::shadow::record_decision(
+        &state.pool,
+        run_id,
+        &payload.tool_name,
+        &capped_for_fence(&payload.tool_input),
+        &classification,
+        state.github.policy.digest(),
+    )
+    .await
+    {
+        tracing::warn!(run_id, %error, "pretooluse-decision: failed to record the fence refusal");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +717,52 @@ mod tests {
             agent_type: None,
             subagent: false,
         }
+    }
+
+    #[test]
+    fn a_node_may_write_only_its_own_report() {
+        let state_dir = Path::new("/state/projects/p1");
+        let own = handoff_path(state_dir, "root-1", "node-a");
+        let input = |path: &Path| serde_json::json!({"file_path": path.to_string_lossy()});
+
+        for kind in ["leaf", "orchestrator"] {
+            for tool in ["Write", "Edit"] {
+                assert!(
+                    writes_own_report(tool, &input(&own), kind, Some(&own)),
+                    "{kind} {tool} must reach its own report"
+                );
+            }
+        }
+        // Another node's report, under the same root or another.
+        for other in [
+            handoff_path(state_dir, "root-1", "node-b"),
+            handoff_path(state_dir, "root-2", "node-a"),
+        ] {
+            assert!(!writes_own_report(
+                "Write",
+                &input(&other),
+                "leaf",
+                Some(&own)
+            ));
+        }
+        // A sibling file in the same directory, and a traversal back to the report.
+        let sibling = own.with_file_name("notes.md");
+        assert!(!writes_own_report(
+            "Write",
+            &input(&sibling),
+            "leaf",
+            Some(&own)
+        ));
+        let dotdot = state_dir.join("nodes/root-1/x/../node-a.md");
+        assert!(!writes_own_report(
+            "Write",
+            &input(&dotdot),
+            "leaf",
+            Some(&own)
+        ));
+        // Any other tool, and a node whose state dir is unknown.
+        assert!(!writes_own_report("Read", &input(&own), "leaf", Some(&own)));
+        assert!(!writes_own_report("Write", &input(&own), "leaf", None));
     }
 
     #[test]

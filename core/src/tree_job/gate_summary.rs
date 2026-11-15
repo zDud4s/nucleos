@@ -87,8 +87,21 @@ pub(super) fn blocked_reason_of(report_text: &str) -> String {
     format!("{cut}…")
 }
 
-/// The node's own reason for stopping, as a question suffix (`"\n\n..."`), or `""` when its report
-/// cannot be read.
+/// The question suffix (`"\n\n..."`) for a node's rendered report, or for `None` when the report
+/// cannot be read. It never ends on a bare label: a report with nothing to show says so.
+fn suffix_of(report_text: Option<&str>) -> String {
+    let reason = report_text.map(blocked_reason_of).unwrap_or_default();
+    if !reason.is_empty() {
+        return format!("\n\nThe node's own report:\n{reason}");
+    }
+    match report_text {
+        Some(_) => "\n\nThe node's own report:\nThe node gave no reason.".to_owned(),
+        None => "\n\nThe node's own report could not be read.".to_owned(),
+    }
+}
+
+/// The node's own reason for stopping, as a question suffix (`"\n\n..."`); a note that there is no
+/// reason, or no readable report, when the node gave none.
 pub(super) async fn reason_suffix(pool: &SqlitePool, node_id: &str) -> String {
     let path: Option<Option<String>> =
         sqlx::query_scalar("SELECT handoff_path FROM work_nodes WHERE id = ?")
@@ -96,18 +109,11 @@ pub(super) async fn reason_suffix(pool: &SqlitePool, node_id: &str) -> String {
             .fetch_optional(pool)
             .await
             .unwrap_or(None);
-    let Some(path) = path.flatten() else {
-        return String::new();
+    let text = match path.flatten() {
+        Some(path) => tokio::fs::read_to_string(&path).await.ok(),
+        None => None,
     };
-    let Ok(text) = tokio::fs::read_to_string(&path).await else {
-        return String::new();
-    };
-    let reason = blocked_reason_of(&text);
-    if reason.is_empty() {
-        String::new()
-    } else {
-        format!("\n\nThe node's own report:\n{reason}")
-    }
+    suffix_of(text.as_deref())
 }
 
 #[cfg(test)]
@@ -156,6 +162,26 @@ mod tests {
         assert!(reason.contains("Blocked reason: Disk is full."));
         assert!(reason.contains("Summary: Could not reach the disk."));
         assert!(reason.contains("Open items: Free space, then retry."));
+    }
+
+    #[test]
+    fn a_report_without_a_reason_says_so_instead_of_ending_on_a_label() {
+        let suffix = suffix_of(Some("# Node Handoff\n\n## Blocked reason\nnone\n"));
+        assert_eq!(
+            suffix,
+            "\n\nThe node's own report:\nThe node gave no reason."
+        );
+        let suffix = suffix_of(None);
+        assert_eq!(suffix, "\n\nThe node's own report could not be read.");
+    }
+
+    #[test]
+    fn a_report_with_a_reason_fills_the_suffix() {
+        let suffix = suffix_of(Some("## Blocked reason\nDisk is full.\n"));
+        assert_eq!(
+            suffix,
+            "\n\nThe node's own report:\nBlocked reason: Disk is full."
+        );
     }
 
     #[test]

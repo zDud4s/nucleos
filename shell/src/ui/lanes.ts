@@ -82,6 +82,7 @@ const LANE_OF: Record<string, FeedLane> = {
   job_expired: "jobs",
   job_interrupted: "jobs",
   work_tree_parked: "jobs",
+  work_tree_context_fit: "jobs",
   work_tree_finished: "jobs",
   work_tree_pending: "jobs",
   work_tree_conflict: "jobs",
@@ -91,6 +92,7 @@ const LANE_OF: Record<string, FeedLane> = {
   work_tree_relaunch_skipped: "jobs",
   work_tree_descent: "jobs",
   work_tree_auto_default: "jobs",
+  work_tree_auto_resolve: "jobs",
   work_tree_stalled: "jobs",
   spec_audit_unavailable: "machine",
 
@@ -222,6 +224,35 @@ export function feedGravityOf(kind: string): FeedGravity {
   if (tone === "paused") return "held";
   if (tone === "pending") return "asks";
   return "routine";
+}
+
+/** The fields of a feed line that say what it is about. */
+interface FeedSubjectLine {
+  kind: string;
+  subject: string | null;
+  run_id: number | null;
+}
+
+/**
+ * How many distinct things sit at each gravity, not how many lines say so.
+ *
+ * A parked work tree writes a line on every poll and an interrupted run one per restart, so
+ * counting lines made 94 parked trees read as 279. One subject with one kind is one thing; the
+ * same subject with another kind is another. The subject falls back to the run, then to the kind
+ * alone, in the same order the Feed's sequences key on.
+ */
+export function feedGravityCounts(lines: readonly FeedSubjectLine[]): Record<FeedGravity, number> {
+  const counts: Record<FeedGravity, number> = { wrong: 0, held: 0, asks: 0, routine: 0 };
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const who =
+      line.subject !== null && line.subject !== "" ? line.subject : line.run_id !== null ? `run:${line.run_id}` : "";
+    const identity = `${who}\u0000${line.kind}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    counts[feedGravityOf(line.kind)] += 1;
+  }
+  return counts;
 }
 
 /** The tone a mark is drawn in: the map's, or Switched Off Grey for a kind it cannot read. */

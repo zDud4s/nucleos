@@ -11,8 +11,11 @@
 //! It landed first, deliberately: building the launcher before the check would have meant a window
 //! in which an agent can publish a resolution nothing verified.
 
+mod gate_retry;
+
 use crate::execution::vcs;
 use crate::state::AppState;
+use gate_retry::{GateRequest, GateRunner, Refusals, Retry};
 
 /// How often the daemon looks for a conflict nobody has attempted.
 ///
@@ -43,7 +46,7 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// because of work that is about to be cancelled for being pointless.
 pub async fn run_resolution_loop(state: AppState) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
-    let mut refused = std::collections::HashSet::new();
+    let mut refused = Refusals::default();
     loop {
         interval.tick().await;
         // Steps that only read and then write one self-contained row are bounded, so a wedged one
@@ -116,7 +119,8 @@ pub(crate) const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
 /// instead of refused for good by `land_finished`. A run that finished with a failed gate, failed or
 /// gave up had its attempt, and that stays a person's. A row somebody settled (`settled_at`), one a later success already
 /// settled, or one no longer `escalated` is left alone, and `MAX_RESOLUTION_ATTEMPTS` bounds the
-/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`.
+/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`, and also
+/// by a worktree-provisioning failure there, which counts the attempt without claiming the row.
 /// Returns how many rows were released.
 async fn release_unfinished(pool: &sqlx::SqlitePool) -> u64 {
     let released = sqlx::query(
@@ -252,6 +256,11 @@ struct Candidate {
 /// dismissed row it overrides a person's "nobody needs to act". The later-success subquery below
 /// stays: it covers the tick before `settle_moot` has run, which runs after this on the same tick.
 ///
+/// **`resolution_attempts < MAX_RESOLUTION_ATTEMPTS` caps the retries of an unclaimed row.** A
+/// worktree that could not be made counts an attempt but leaves `resolution_run_id` NULL, so
+/// without the cap a permanent failure would be retried every tick for ever. For the normal path it
+/// is a no-op: `release_unfinished` only frees rows whose attempts are already under the cap.
+///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
 /// runner to prove.
@@ -262,6 +271,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           WHERE status = 'escalated'
             AND op = 'merge'
             AND resolution_run_id IS NULL
+            AND resolution_attempts < ?
             AND from_resolution = 0
             AND settled_at IS NULL
             AND NOT EXISTS (
@@ -282,6 +292,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           ORDER BY id
           LIMIT 1",
     )
+    .bind(MAX_RESOLUTION_ATTEMPTS)
     .fetch_optional(pool)
     .await
 }
@@ -975,6 +986,8 @@ struct Finished {
     completed_at: Option<String>,
     gate_status: Option<String>,
     run_status: String,
+    run_id: i64,
+    gate_output: Option<String>,
 }
 
 /// How long a completed run is left alone before its worktree is read, so a run that is about to
@@ -1002,9 +1015,20 @@ const HANDOFF_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 /// feed is not, so a still-escalated request is not re-announced each time the daemon starts. A
 /// request that is moot (its source branch is gone, or already part of its target) is not announced
 /// at all. Fails closed under the kill switch.
-async fn land_finished(
+async fn land_finished(pool: &sqlx::SqlitePool, refused: &mut Refusals) {
+    land_finished_with(pool, refused, &gate_retry::project_gate()).await;
+}
+
+/// `land_finished` with the gate re-run behind `gate_runner`, which tests replace.
+///
+/// A resolution whose run's gate `failed` gets the gate re-run once at its head (`gate_retry`): the
+/// re-run is spawned, so this tick does not wait for it, and the next one reads its outcome. Green
+/// on the retry goes on to the queue like a `passed` run; red again, or a retry that could not run,
+/// is announced with what failed.
+async fn land_finished_with(
     pool: &sqlx::SqlitePool,
-    refused: &mut std::collections::HashSet<(i64, String)>,
+    refused: &mut Refusals,
+    gate_runner: &GateRunner,
 ) {
     if crate::governance::autopilot::kill_switch_engaged(pool)
         .await
@@ -1014,7 +1038,8 @@ async fn land_finished(
     }
     let finished: Vec<Finished> = match sqlx::query_as(
         "SELECT c.id, c.op, c.args, c.project_id, w.path AS worktree_path, w.branch,
-                w.base_sha, r.completed_at, r.gate_status, r.status AS run_status
+                w.base_sha, r.completed_at, r.gate_status, r.status AS run_status,
+                r.id AS run_id, r.gate_output
            FROM vcs_requests AS c
            JOIN runs AS r ON r.id = c.resolution_run_id
            JOIN worktrees AS w
@@ -1111,16 +1136,43 @@ async fn land_finished(
         match row.gate_status.as_deref() {
             None | Some("passed") => {}
             Some(gate) => {
-                let summary = format!(
-                    "{}'s conflict resolution on {} at {} is merged but its run's gate {gate}; \
-                     it was not handed to the queue and needs a person",
-                    row.project_id,
-                    row.branch,
-                    short_head(&head)
-                );
-                refused.insert((row.id, head));
-                announce_once(pool, &summary).await;
-                continue;
+                // Only a red gate is retried: an `errored` one is infrastructure and has its own
+                // path (`release_unfinished`).
+                let retry = if gate == "failed" {
+                    let request = GateRequest {
+                        pool: pool.clone(),
+                        project_id: row.project_id.clone(),
+                        run_id: row.run_id,
+                        worktree: std::path::PathBuf::from(&row.worktree_path),
+                    };
+                    Some(
+                        refused
+                            .retry_gate((row.id, head.clone()), request, gate_runner)
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                match retry {
+                    Some(Retry::Pending) => continue,
+                    Some(Retry::Passed) => tracing::info!(
+                        vcs_request_id = row.id,
+                        "resolver: the gate of a finished resolution passed on its one retry"
+                    ),
+                    _ => {
+                        let summary = gate_retry::refusal(
+                            &row.project_id,
+                            &row.branch,
+                            short_head(&head),
+                            gate,
+                            row.gate_output.as_deref(),
+                            retry.as_ref(),
+                        );
+                        refused.insert((row.id, head));
+                        announce_once(pool, &summary).await;
+                        continue;
+                    }
+                }
             }
         }
         let repo = match crate::execution::vcs::resolve_repo(pool, &row.project_id).await {
@@ -1556,6 +1608,51 @@ mod tests {
         assert!(
             next_conflict(&pool).await.unwrap().is_none(),
             "every conflict has been attempted; a fresh agent per tick is the failure this prevents"
+        );
+    }
+
+    /// An unclaimed row whose attempts are spent is not picked up again. A worktree that cannot be
+    /// made counts an attempt but leaves `resolution_run_id` NULL, so the cap is what stops a
+    /// permanent failure from minting a run every tick; one attempt short of it still retries.
+    #[tokio::test]
+    async fn an_unclaimed_conflict_whose_attempts_are_spent_is_not_picked_up() {
+        let pool = test_pool().await;
+
+        let spent = escalated_merge_of(&pool, "feat/spent", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(spent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retryable = escalated_merge_of(&pool, "feat/retryable", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS - 1)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let picked = next_conflict(&pool)
+            .await
+            .expect("the query should run")
+            .expect("the row one attempt short of the cap is still retried");
+        assert_eq!(
+            picked.id, retryable,
+            "picked {} — spent={spent}, retryable={retryable}",
+            picked.id
+        );
+
+        // Once that one spends its last attempt too, there is nothing left to start.
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "a conflict with its attempts spent belongs to a person, not to another run"
         );
     }
 
@@ -2264,46 +2361,127 @@ mod tests {
             .unwrap();
     }
 
+    /// A gate that answers `results[n]` (`true` = green) to its n-th run, and the last one after
+    /// that, plus how many times it ran.
+    fn fake_gate(
+        results: Vec<bool>,
+    ) -> (GateRunner, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = runs.clone();
+        let runner: GateRunner = std::sync::Arc::new(move |_request| {
+            let nth = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let green = results[nth.min(results.len() - 1)];
+            Box::pin(async move {
+                if green {
+                    crate::gate::GateOutcome::Passed
+                } else {
+                    crate::gate::GateOutcome::Failed {
+                        exit_code: 101,
+                        output: "test flaky::one ... FAILED
+"
+                        .to_owned(),
+                    }
+                }
+            })
+        });
+        (runner, runs)
+    }
+
+    /// One tick, then a chance for the spawned gate retry to finish before the next.
+    async fn tick(pool: &sqlx::SqlitePool, refused: &mut Refusals, gate: &GateRunner) {
+        land_finished_with(pool, refused, gate).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+
+    async fn gate_announcements(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
+            .bind(crate::execution::land::RESOLUTION_FAILED_KIND)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
     /// `completed` says the agent stopped, not that the project's gate passed, and the queue's land
-    /// builds nothing: a resolution whose gate failed (real reds) is announced once and never
-    /// handed over, and never retried either.
+    /// builds nothing: a resolution whose gate failed twice (real red) is announced once, with the
+    /// reason, and never handed over.
     #[tokio::test]
-    async fn a_failed_resolution_gate_is_still_refused() {
-        for status in ["failed"] {
-            let pool = test_pool().await;
-            let scenario = resolution_scenario(
-                &pool,
-                "nucleos-resolver-gate-",
-                "completed",
-                Progress::Committed,
-            )
-            .await;
-            gate(&pool, status).await;
+    async fn a_resolution_whose_gate_fails_twice_is_refused_with_the_reason() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-gate-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "failed").await;
+        sqlx::query("UPDATE runs SET gate_output = 'test first::red ... FAILED' WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (runner, runs) = fake_gate(vec![false]);
 
-            let mut refused = Default::default();
-            land_finished(&pool, &mut refused).await;
-            land_finished(&pool, &mut refused).await;
-
-            assert!(
-                admitted_resolutions(&pool, &scenario).await.is_empty(),
-                "a gate that {status} keeps the resolution from the queue"
-            );
-            let linked: Option<i64> =
-                sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
-                    .bind(scenario.request)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(linked, None);
-            let summaries: Vec<String> =
-                sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
-                    .bind(crate::execution::land::RESOLUTION_FAILED_KIND)
-                    .fetch_all(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(summaries.len(), 1, "announced once, not every tick");
-            assert!(summaries[0].contains(status), "{}", summaries[0]);
+        let mut refused = Default::default();
+        for _ in 0..3 {
+            tick(&pool, &mut refused, &runner).await;
         }
+
+        assert!(
+            admitted_resolutions(&pool, &scenario).await.is_empty(),
+            "a gate that fails twice keeps the resolution from the queue"
+        );
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                .bind(scenario.request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, None);
+        let summaries = gate_announcements(&pool).await;
+        assert_eq!(summaries.len(), 1, "announced once, not every tick");
+        assert!(
+            summaries[0].contains("resolved and committed"),
+            "{}",
+            summaries[0]
+        );
+        assert!(summaries[0].contains("failed twice"), "{}", summaries[0]);
+        assert!(summaries[0].contains("first::red"), "{}", summaries[0]);
+        assert!(summaries[0].contains("flaky::one"), "{}", summaries[0]);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the gate is re-run once for a head, however many ticks look at it"
+        );
+    }
+
+    /// A red that does not repeat (a flaky test, a file elsewhere) is not a verdict on the
+    /// resolution: the retry goes green and the branch is handed to the queue like a passed one.
+    #[tokio::test]
+    async fn a_gate_that_passes_on_its_retry_hands_the_resolution_to_the_queue() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-gate-retry-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "failed").await;
+        let (runner, runs) = fake_gate(vec![true]);
+
+        let mut refused = Default::default();
+        tick(&pool, &mut refused, &runner).await;
+        assert!(
+            admitted_resolutions(&pool, &scenario).await.is_empty(),
+            "the tick that starts the retry does not wait for it"
+        );
+        tick(&pool, &mut refused, &runner).await;
+        tick(&pool, &mut refused, &runner).await;
+
+        assert_eq!(admitted_resolutions(&pool, &scenario).await.len(), 1);
+        assert!(gate_announcements(&pool).await.is_empty());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// An `errored` gate is infrastructure (a pool timeout, an unreadable config), not a verdict on
@@ -2447,14 +2625,19 @@ mod tests {
         )
         .await;
         gate(&pool, "failed").await;
+        // The retry is forgotten on a restart, so it runs again; the announcement is not repeated.
+        let (always_red, runs) = fake_gate(vec![false]);
 
-        let mut before_restart = Default::default();
-        land_finished(&pool, &mut before_restart).await;
-        let mut after_restart = Default::default();
-        land_finished(&pool, &mut after_restart).await;
+        let mut before_restart = Refusals::default();
+        tick(&pool, &mut before_restart, &always_red).await;
+        tick(&pool, &mut before_restart, &always_red).await;
+        let mut after_restart = Refusals::default();
+        tick(&pool, &mut after_restart, &always_red).await;
+        tick(&pool, &mut after_restart, &always_red).await;
 
         let summaries = resolution_failed_summaries(&pool).await;
         assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2922,5 +3105,145 @@ mod tests {
         // beside it, never put away, is still the one launched.
         let next = next_conflict(&pool).await.unwrap().map(|c| c.id);
         assert_eq!(next, Some(open));
+    }
+
+    async fn attempts_of(pool: &sqlx::SqlitePool, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT resolution_attempts FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the attempts")
+    }
+
+    async fn resolution_run_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT resolution_run_id FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read the resolution run")
+    }
+
+    /// A real `AppState` for `launch_once`, with worktrees provisioned under a root of the test's
+    /// own. Field order matters on drop: the env override and the lock go last.
+    struct LaunchFixture {
+        state: AppState,
+        _worktrees: tempfile::TempDir,
+        _env: crate::execution::runs::tests::WorktreeRootEnv,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// The env lock first, then the rules gate (taken inside `test_state_with_runner`): the order
+    /// `worktree::test_env_lock` insists on.
+    // The guard is held across the awaits on purpose: it is returned in the fixture so the env
+    // stays locked for the whole test, and these tests run on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn launch_fixture(prefix: &str) -> LaunchFixture {
+        let env_lock = crate::execution::worktree::test_env_lock();
+        let worktrees = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
+        let env = crate::execution::runs::tests::WorktreeRootEnv::set(worktrees.path());
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            None,
+            crate::state::DEFAULT_RUN_TIMEOUT,
+        )
+        .await;
+        LaunchFixture {
+            state,
+            _worktrees: worktrees,
+            _env: env,
+            _env_lock: env_lock,
+        }
+    }
+
+    /// `create_resolution_run` refuses before its claim when the worktree cannot be made, and the
+    /// target branch is NOT the cause: a target that is positively absent settles the request
+    /// instead of counting (`settle_missing_target`). So the failure here is transient by
+    /// construction — `aut/integ` exists, but the worktree root sits beneath a regular file, so
+    /// `create_dir_all` fails on every platform. `settle_moot` is deliberately not run: this is
+    /// about the launcher, which must count a failed hand-off as spent so that
+    /// `MAX_RESOLUTION_ATTEMPTS` bounds it, rather than retrying the same row every tick for ever.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_that_fails_before_the_claim_still_spends_an_attempt() {
+        let fixture = launch_fixture("nucleos-resolver-spend-wt-").await;
+        let pool = &fixture.state.pool;
+        let (_container, repo) = moot_repo("nucleos-resolver-spend-");
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        assert!(git_at(&repo, &["branch", "aut/integ"]));
+        let unlaunchable = escalated_merge_into(pool, "feat/x", "aut/integ", false).await;
+        rooted_at(pool, unlaunchable, &repo).await;
+
+        // A file where the worktree root's parent should be. Declared after the fixture so it drops
+        // first and restores the fixture's own root.
+        let blocker = fixture._worktrees.path().join("not-a-directory");
+        std::fs::write(&blocker, "x").expect("write the blocker file");
+        let _blocked_root =
+            crate::execution::runs::tests::WorktreeRootEnv::set(&blocker.join("root"));
+
+        let started = launch_once(&fixture.state).await;
+        assert_eq!(
+            started, None,
+            "a merge whose worktree cannot be made starts no agent"
+        );
+        assert_eq!(
+            attempts_of(pool, unlaunchable).await,
+            1,
+            "a hand-off that failed is an attempt spent, not an attempt kept"
+        );
+
+        for _ in 1..MAX_RESOLUTION_ATTEMPTS {
+            let _ = launch_once(&fixture.state).await;
+        }
+        assert_eq!(
+            attempts_of(pool, unlaunchable).await,
+            MAX_RESOLUTION_ATTEMPTS
+        );
+        assert_eq!(
+            next_conflict(pool).await.unwrap().map(|c| c.id),
+            None,
+            "a conflict whose attempts are spent is no longer a candidate"
+        );
+    }
+
+    /// The head-of-line block itself: `next_conflict` takes the oldest row, so an oldest row that
+    /// can never be launched must stop being the oldest candidate, or every escalation behind it
+    /// waits for ever.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_unlaunchable_conflict_does_not_starve_the_ones_behind_it() {
+        let fixture = launch_fixture("nucleos-resolver-starve-wt-").await;
+        let pool = &fixture.state.pool;
+        let (_container, repo) = moot_repo("nucleos-resolver-starve-");
+        // The younger row is a real conflict: `feat/y` and `master` change the same line.
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/y"]));
+        commit_file(&repo, "theirs\n", "theirs");
+        assert!(git_at(&repo, &["checkout", "-q", "master"]));
+        commit_file(&repo, "ours\n", "ours");
+
+        let older = escalated_merge_into(pool, "feat/x", "aut/integ", false).await;
+        let younger = escalated_merge_into(pool, "feat/y", "master", false).await;
+        rooted_at(pool, older, &repo).await;
+        rooted_at(pool, younger, &repo).await;
+        assert!(
+            older < younger,
+            "the unlaunchable row has to be first in line"
+        );
+
+        // The missing target settles the older row on the first tick (`settle_missing_target`), so
+        // it stops being the oldest candidate at once; the loop bound is kept generous anyway.
+        for _ in 0..=MAX_RESOLUTION_ATTEMPTS {
+            let _ = launch_once(&fixture.state).await;
+            if resolution_run_of(pool, younger).await.is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            resolution_run_of(pool, younger).await.is_some(),
+            "the conflict behind an unlaunchable one is handed to an agent"
+        );
+        assert_eq!(attempts_of(pool, younger).await, 1);
     }
 }
