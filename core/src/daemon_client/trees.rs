@@ -27,15 +27,21 @@ impl DaemonClient {
     }
 
     /// `POST /tree-decisions/{id}/answer`: body is `{answer}`. The answer goes through the shell's
-    /// path (`answer_and_relaunch`) with the origin `conductor`.
-    pub async fn decision_answer(&self, id: &str, answer: &str) -> Result<Value, String> {
+    /// path (`answer_and_relaunch`) with the origin `conductor`; with `drop` the parked branch is
+    /// dropped instead and nothing is relaunched (`{answer, drop: true}`).
+    pub async fn decision_answer(
+        &self,
+        id: &str,
+        answer: &str,
+        drop: bool,
+    ) -> Result<Value, String> {
         let path = format!(
             "/tree-decisions/{}/answer",
             super::nodes::encode_segment(id)
         );
         let response = self
             .request(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({ "answer": answer }))
+            .json(&serde_json::json!({ "answer": answer, "drop": drop }))
             .send()
             .await
             .map_err(|e| e.to_string())?;
