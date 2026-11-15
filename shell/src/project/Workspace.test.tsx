@@ -283,6 +283,7 @@ describe("the project workspace", () => {
       "Workflow",
       "Commands",
       "Autopilot rules",
+      "Automations",
       "Test map",
     ]);
   });
@@ -393,6 +394,7 @@ describe("the project workspace", () => {
       "Workflow",
       "Commands",
       "Autopilot rules",
+      "Automations",
       "Test map",
     ]);
   });
