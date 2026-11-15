@@ -111,6 +111,27 @@ pub async fn last_push(
     .await
 }
 
+/// The distinct branches that have at least one rule push with outcome `pushed`.
+pub async fn push_branches(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT branch FROM automation_firings
+         WHERE project_id = ? AND action = 'push' AND outcome = 'pushed'
+         ORDER BY branch",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// One free-text feed line (kind [`FEED_KIND`]). Best effort: a failed write is only logged.
+pub async fn note(pool: &SqlitePool, project_id: &str, text: &str) {
+    if let Err(error) =
+        crate::feed::append(pool, Some(project_id), FEED_KIND, text, None, None).await
+    {
+        tracing::warn!(%error, project_id, "could not write an automation feed note");
+    }
+}
+
 /// One feed line for a firing. Best effort: a failed write is only logged.
 pub async fn announce(pool: &SqlitePool, firing: &Firing) {
     let short = firing.sha.get(..7).unwrap_or(&firing.sha);
@@ -121,11 +142,7 @@ pub async fn announce(pool: &SqlitePool, firing: &Firing) {
     if !firing.detail.is_empty() {
         text.push_str(&format!(" ({})", firing.detail));
     }
-    if let Err(error) =
-        crate::feed::append(pool, Some(&firing.project_id), FEED_KIND, &text, None, None).await
-    {
-        tracing::warn!(%error, rule = %firing.rule, "could not announce an automation firing");
-    }
+    note(pool, &firing.project_id, &text).await;
 }
 
 #[cfg(test)]
@@ -219,16 +236,26 @@ mod tests {
     #[tokio::test]
     async fn last_push_is_the_newest_pushed_firing_of_the_branch_whatever_the_rule() {
         let pool = crate::testdb::fresh_pool().await;
-        record(&pool, &push("p", "a", "k1", "master", "s1")).await.unwrap();
+        record(&pool, &push("p", "a", "k1", "master", "s1"))
+            .await
+            .unwrap();
         settle(&pool, "p", "a", "s1", PUSHED, "").await.unwrap();
-        record(&pool, &push("p", "b", "k2", "master", "s2")).await.unwrap();
+        record(&pool, &push("p", "b", "k2", "master", "s2"))
+            .await
+            .unwrap();
         settle(&pool, "p", "b", "s2", PUSHED, "").await.unwrap();
         // Ignored: not pushed, another branch, another project, not a push.
-        record(&pool, &push("p", "a", "k3", "master", "s3")).await.unwrap();
+        record(&pool, &push("p", "a", "k3", "master", "s3"))
+            .await
+            .unwrap();
         settle(&pool, "p", "a", "s3", REJECTED, "").await.unwrap();
-        record(&pool, &push("p", "a", "k4", "release", "s4")).await.unwrap();
+        record(&pool, &push("p", "a", "k4", "release", "s4"))
+            .await
+            .unwrap();
         settle(&pool, "p", "a", "s4", PUSHED, "").await.unwrap();
-        record(&pool, &push("q", "a", "k5", "master", "s5")).await.unwrap();
+        record(&pool, &push("q", "a", "k5", "master", "s5"))
+            .await
+            .unwrap();
         settle(&pool, "q", "a", "s5", PUSHED, "").await.unwrap();
         let mut incident = push("p", "c", "k6", "master", "s6");
         incident.action = "open_incident";
@@ -242,5 +269,73 @@ mod tests {
         assert_eq!(last.sha, "s2");
         assert_eq!(last.rule, "b");
         assert!(last_push(&pool, "p", "nowhere").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn push_branches_lists_each_branch_with_a_pushed_push_once() {
+        let pool = crate::testdb::fresh_pool().await;
+        record(&pool, &push("p", "a", "k1", "master", "s1"))
+            .await
+            .unwrap();
+        settle(&pool, "p", "a", "s1", PUSHED, "").await.unwrap();
+        record(&pool, &push("p", "a", "k2", "master", "s2"))
+            .await
+            .unwrap();
+        settle(&pool, "p", "a", "s2", PUSHED, "").await.unwrap();
+        record(&pool, &push("p", "a", "k3", "release", "s3"))
+            .await
+            .unwrap();
+        settle(&pool, "p", "a", "s3", PUSHED, "").await.unwrap();
+        // Never pushed: only queued, only rejected.
+        record(&pool, &push("p", "a", "k4", "queued-only", "s4"))
+            .await
+            .unwrap();
+        record(&pool, &push("p", "a", "k5", "rejected-only", "s5"))
+            .await
+            .unwrap();
+        settle(&pool, "p", "a", "s5", REJECTED, "").await.unwrap();
+        // Another project.
+        record(&pool, &push("q", "a", "k6", "other", "s6"))
+            .await
+            .unwrap();
+        settle(&pool, "q", "a", "s6", PUSHED, "").await.unwrap();
+
+        assert_eq!(
+            push_branches(&pool, "p").await.unwrap(),
+            vec!["master".to_string(), "release".to_string()]
+        );
+        assert!(push_branches(&pool, "nobody").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn last_push_never_returns_a_rejected_or_queued_firing() {
+        let pool = crate::testdb::fresh_pool().await;
+        record(&pool, &push("p", "a", "k1", "master", "s1"))
+            .await
+            .unwrap();
+        record(&pool, &push("p", "a", "k2", "master", "s2"))
+            .await
+            .unwrap();
+        settle(&pool, "p", "a", "s2", REJECTED, "").await.unwrap();
+        assert!(last_push(&pool, "p", "master").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn note_appends_one_feed_line_of_kind_automation_firing() {
+        let pool = crate::testdb::fresh_pool().await;
+        note(&pool, "p", "ci watch: nothing to report").await;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, summary FROM feed WHERE project_id = ?")
+                .bind("p")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                FEED_KIND.to_string(),
+                "ci watch: nothing to report".to_string()
+            )]
+        );
     }
 }

@@ -8,7 +8,7 @@
 pub mod dispatch;
 pub mod firings;
 
-pub use dispatch::{automation_enabled, dispatch, Event};
+pub use dispatch::{Event, automation_enabled, dispatch};
 
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +119,17 @@ pub enum Action {
     Push { remote: String },
     /// Open the branch's `ci-red` incident; `auto_fix` lets the incident launcher start a fix.
     OpenIncident { auto_fix: bool },
+}
+
+/// The enabled rules of the project's snapshot; the error is the reader's (an unreadable document).
+pub fn enabled_rules(
+    project_id: &str,
+) -> Result<Vec<AutomationRule>, crate::project::rules::DocumentUnreadable> {
+    Ok(crate::project::rules::automations(project_id)?
+        .rules
+        .into_iter()
+        .filter(|rule| rule.enabled)
+        .collect())
 }
 
 impl Automations {
@@ -255,6 +266,25 @@ mod tests {
     }
 
     #[test]
+    fn enabled_rules_returns_only_the_enabled_ones() {
+        let yaml = "rules:\n  - name: on-rule\n    enabled: true\n    on: {event: published_green}\n    do: {action: push, remote: origin}\n  - name: off-rule\n    enabled: false\n    on: {event: ci_finished, workflow: gates}\n    do: {action: open_incident, auto_fix: false}\n";
+        crate::project::rules::testing::publish_automations("enabled-rules-ok", yaml);
+        let rules = enabled_rules("enabled-rules-ok").expect("a readable document");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "on-rule");
+    }
+
+    #[test]
+    fn enabled_rules_of_an_unreadable_document_is_an_error() {
+        crate::project::rules::testing::publish_unreadable(
+            "enabled-rules-bad",
+            "automations",
+            "broken on purpose",
+        );
+        assert!(enabled_rules("enabled-rules-bad").is_err());
+    }
+
+    #[test]
     fn the_default_document_has_the_two_preset_rules_switched_off_and_is_valid() {
         let default = Automations::default();
         assert_eq!(default.rules.len(), 2);
@@ -315,9 +345,12 @@ mod tests {
 
     #[test]
     fn two_rules_with_the_same_name_are_refused() {
-        let error = doc(vec![push("same", Some("a"), true), push("same", Some("b"), true)])
-            .validate()
-            .unwrap_err();
+        let error = doc(vec![
+            push("same", Some("a"), true),
+            push("same", Some("b"), true),
+        ])
+        .validate()
+        .unwrap_err();
         assert!(error.contains("same"), "{error}");
         assert!(error.contains("twice"), "{error}");
     }
@@ -325,17 +358,27 @@ mod tests {
     #[test]
     fn two_push_rules_for_the_same_branch_are_refused() {
         assert!(
-            doc(vec![push("one", Some("master"), true), push("two", Some("master"), true)])
-                .validate()
-                .is_err()
+            doc(vec![
+                push("one", Some("master"), true),
+                push("two", Some("master"), true)
+            ])
+            .validate()
+            .is_err()
         );
         assert!(
-            doc(vec![push("one", None, true), push("two", Some("master"), true)])
-                .validate()
-                .is_err()
+            doc(vec![
+                push("one", None, true),
+                push("two", Some("master"), true)
+            ])
+            .validate()
+            .is_err()
         );
         assert_eq!(
-            doc(vec![push("one", Some("a"), true), push("two", Some("b"), true)]).validate(),
+            doc(vec![
+                push("one", Some("a"), true),
+                push("two", Some("b"), true)
+            ])
+            .validate(),
             Ok(())
         );
     }
@@ -354,7 +397,12 @@ mod tests {
         ci_push.on = Trigger::CiFinished {
             workflow: "gates".to_string(),
         };
-        assert!(doc(vec![ci_push]).validate().unwrap_err().contains("ci-push"));
+        assert!(
+            doc(vec![ci_push])
+                .validate()
+                .unwrap_err()
+                .contains("ci-push")
+        );
 
         let mut green_incident = push("green-incident", None, true);
         green_incident.action = Action::OpenIncident { auto_fix: false };
@@ -388,7 +436,14 @@ mod tests {
     #[test]
     fn a_rule_name_with_a_space_or_over_64_chars_is_refused() {
         assert!(doc(vec![push("has space", None, true)]).validate().is_err());
-        assert!(doc(vec![push(&"x".repeat(65), None, true)]).validate().is_err());
-        assert_eq!(doc(vec![push(&"x".repeat(64), None, true)]).validate(), Ok(()));
+        assert!(
+            doc(vec![push(&"x".repeat(65), None, true)])
+                .validate()
+                .is_err()
+        );
+        assert_eq!(
+            doc(vec![push(&"x".repeat(64), None, true)]).validate(),
+            Ok(())
+        );
     }
 }
