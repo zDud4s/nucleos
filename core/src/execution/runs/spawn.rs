@@ -682,7 +682,10 @@ pub(super) fn spawn_run(
                 max_budget_usd: None,
                 agents: Vec::new(),
                 append_system_prompt: None,
-                denied_tools: Vec::new(),
+                denied_tools: job_mcp
+                    .as_ref()
+                    .map(|mcp| mcp.denied_tools.clone())
+                    .unwrap_or_default(),
                 session_name: None,
                 context_window: None,
                 // A job node sees exactly the tools its loadout lists (the box's fixed list when it
