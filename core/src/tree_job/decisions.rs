@@ -1147,7 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn park_or_ask_on_a_dropped_branch_answers_none() {
-        for state in ["dropped", "merged"] {
+        for state in ["dropped", "merged", "done"] {
             let pool = crate::testdb::fresh_pool().await;
             seed_one_branch(&pool, state).await;
             let before = job(&pool).await;
