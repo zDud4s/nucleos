@@ -47,7 +47,11 @@ struct ListQuery {
 
 #[derive(Debug, Deserialize)]
 struct AnswerBody {
+    #[serde(default)]
     answer: String,
+    /// Drop the parked branch instead of resuming it (the answer is then optional).
+    #[serde(default)]
+    drop: bool,
 }
 
 /// The branch a decision belongs to: the one parked on it, else the one its node runs behind.
@@ -129,10 +133,25 @@ async fn post_tree_decision_answer(
 ) -> Result<Json<Value>, Refusal> {
     let Json(body) = body.map_err(|e| refuse(StatusCode::BAD_REQUEST, e.body_text()))?;
     let answer = body.answer.trim();
-    if answer.is_empty() {
+    if answer.is_empty() && !body.drop {
         return Err(refuse(StatusCode::BAD_REQUEST, "the answer is empty"));
     }
-    match crate::tree_job::open::answer_and_relaunch(&state, &id, answer, ORIGIN_CONDUCTOR).await {
+    let result = if body.drop {
+        let text = if answer.is_empty() {
+            "drop the branch"
+        } else {
+            answer
+        };
+        decisions::answer_dropping(&state.pool, &id, text, ORIGIN_CONDUCTOR)
+            .await
+            .map(|decision| crate::tree_job::open::Answered {
+                decision,
+                relaunched: None,
+            })
+    } else {
+        crate::tree_job::open::answer_and_relaunch(&state, &id, answer, ORIGIN_CONDUCTOR).await
+    };
+    match result {
         Ok(answered) => Ok(Json(json!({
             "id": answered.decision.id,
             "question": answered.decision.question,
@@ -147,6 +166,7 @@ async fn post_tree_decision_answer(
             StatusCode::CONFLICT,
             format!("decision {id} is already answered"),
         )),
+        Err(DecisionError::Invalid(message)) => Err(refuse(StatusCode::BAD_REQUEST, message)),
         Err(e) => Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}"))),
     }
 }
@@ -216,6 +236,7 @@ mod tests {
             Path(id.to_owned()),
             Ok(Json(AnswerBody {
                 answer: text.to_owned(),
+                drop: false,
             })),
         )
         .await

@@ -568,6 +568,86 @@ pub async fn answer_widening(
     Ok((decision, widened))
 }
 
+/// Answers `decision_id` by dropping the branch parked on it: the `dropped` transition is applied,
+/// the decision is closed as answered with `text`, and nothing is relaunched. A decision no branch
+/// is parked on is refused with nothing written (`Invalid`).
+pub async fn answer_dropping(
+    pool: &SqlitePool,
+    decision_id: &str,
+    text: &str,
+    origin: &str,
+) -> Result<Decision, DecisionError> {
+    let found: Option<Decision> = sqlx::query_as(select_decisions!("WHERE id = ?"))
+        .bind(decision_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(mut decision) = found else {
+        return Err(DecisionError::NotFound(decision_id.to_owned()));
+    };
+    if decision.status != STATUS_OPEN {
+        return Err(DecisionError::AlreadyDecided(decision_id.to_owned()));
+    }
+    let invalid = || {
+        DecisionError::Invalid(
+            "no branch is parked on this decision, so there is nothing to drop".to_owned(),
+        )
+    };
+    let (Some(tree_id), Some(node_id)) = (decision.tree_id.clone(), decision.node_id.clone())
+    else {
+        return Err(invalid());
+    };
+    let lock = super::http::job_lock(&tree_id);
+    let _guard = lock.lock().await;
+    let Some(mut job) = store::load(pool, &tree_id).await? else {
+        return Err(invalid());
+    };
+    let Some(branch) = branch_of_node(&mut job.manifest, &node_id) else {
+        return Err(invalid());
+    };
+    let parked_here = branch.state == PARKED
+        && branch
+            .park
+            .as_ref()
+            .and_then(|record| record.get("decision_id"))
+            .and_then(Value::as_str)
+            == Some(decision_id);
+    if !parked_here {
+        return Err(invalid());
+    }
+    apply_transition(branch, "dropped")?;
+    let manifest = serde_json::to_string(&job.manifest).map_err(StoreError::from)?;
+    let at = now();
+
+    let mut tx = pool.begin().await?;
+    let claimed = sqlx::query(
+        "UPDATE decisions SET answer = ?, origin = ?, at = ?, answered_at = ?, status = ?
+         WHERE id = ? AND status = ?",
+    )
+    .bind(text)
+    .bind(origin)
+    .bind(&at)
+    .bind(&at)
+    .bind(STATUS_ANSWERED)
+    .bind(decision_id)
+    .bind(STATUS_OPEN)
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Err(DecisionError::AlreadyDecided(decision_id.to_owned()));
+    }
+    write_manifest(&mut tx, &tree_id, &manifest, &at).await?;
+    tx.commit().await?;
+    // An earlier park of the same node may still be open: a dropped branch leaves none.
+    super::obsolete::close_node_decisions_logged(pool, &tree_id, &node_id, "branch dropped").await;
+    crate::conductor::sweep::wake();
+
+    decision.answer = Some(text.to_owned());
+    decision.origin = Some(origin.to_owned());
+    decision.at = at;
+    decision.status = STATUS_ANSWERED.to_owned();
+    Ok(decision)
+}
+
 /// Closes an `open` decision as `obsolete`, recording why. Returns whether a row changed: only an
 /// open row ever does, so a repeat call, an answered row or an unknown id is `false`. Never deletes
 /// and never touches an answer.
@@ -1043,6 +1123,69 @@ mod tests {
         let other = park(&pool, TREE, OTHER_NODE, "pick C or D").await.unwrap();
         assert_ne!(other.id, parked.id);
         assert_eq!(decision_rows(&pool).await, 2);
+    }
+
+    // ----- answer_dropping -----
+
+    #[tokio::test]
+    async fn answer_dropping_drops_the_parked_branch_and_closes_every_park_of_its_node() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_two_branches(&pool, "building", "fixing").await;
+        let earlier = park(&pool, TREE, NODE, "first question").await.unwrap();
+        // A second park of the same node left the first open (the park record names the latest).
+        let parked = sqlx::query(
+            "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+             VALUES ('d-latest', ?, ?, 'second question', NULL, 'agent', ?, 'open')",
+        )
+        .bind(TREE)
+        .bind(NODE)
+        .bind(T1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(parked.rows_affected(), 1);
+        let mut job = job(&pool).await;
+        job.manifest.branches.get_mut(BRANCH).unwrap().park =
+            Some(serde_json::json!({"prev_state": "building", "decision_id": "d-latest"}));
+        store::update(&pool, &job).await.unwrap();
+
+        let answered = answer_dropping(&pool, "d-latest", "drop it", ORIGIN_CONDUCTOR)
+            .await
+            .unwrap();
+
+        assert_eq!(answered.status, STATUS_ANSWERED);
+        assert_eq!(answered.answer.as_deref(), Some("drop it"));
+        assert_eq!(branch_of(&pool, BRANCH).await.state, "dropped");
+        assert_eq!(branch_of(&pool, OTHER_BRANCH).await.state, "fixing");
+        assert_eq!(stored(&pool, "d-latest").await.status, STATUS_ANSWERED);
+        assert_eq!(stored(&pool, &earlier.id).await.status, STATUS_OBSOLETE);
+    }
+
+    #[tokio::test]
+    async fn answer_dropping_refuses_a_decision_no_branch_is_parked_on() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+        // The branch left the park by other means: its decision cannot drop anything.
+        let mut job = job(&pool).await;
+        let branch = job.manifest.branches.get_mut(BRANCH).unwrap();
+        branch.state = "building".to_owned();
+        branch.park = None;
+        store::update(&pool, &job).await.unwrap();
+
+        let refused = answer_dropping(&pool, &parked.id, "drop", ORIGIN_CONDUCTOR).await;
+
+        assert!(
+            matches!(refused, Err(DecisionError::Invalid(_))),
+            "{refused:?}"
+        );
+        assert_eq!(stored(&pool, &parked.id).await.status, STATUS_OPEN);
+        assert_eq!(branch_of(&pool, BRANCH).await.state, "building");
+        let again = answer_dropping(&pool, "d-nope", "drop", ORIGIN_CONDUCTOR).await;
+        assert!(
+            matches!(again, Err(DecisionError::NotFound(_))),
+            "{again:?}"
+        );
     }
 
     #[tokio::test]

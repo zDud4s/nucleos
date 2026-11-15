@@ -74,6 +74,7 @@ export {
   type Stage,
   type StageKey,
 } from "./RunPipeline";
+export { chainLegs, partOfText, reasonLabel, type RunChain } from "./runChain";
 /**
  * A container and its item in one module — the third recorded exception to one
  * primitive per file. See the header of `Rows.tsx`: a row exists only inside

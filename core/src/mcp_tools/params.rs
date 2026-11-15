@@ -94,7 +94,11 @@ pub(super) struct DecisionAnswerParams {
     /// The decision to answer (`d-…`, as `decision_list` or `tree_status` shows it).
     pub(super) id: String,
     /// The answer: it is handed to the parked branch's node when it resumes.
+    #[serde(default)]
     pub(super) answer: String,
+    /// Drop the branch parked on the decision instead of resuming it (the answer is then optional).
+    #[serde(default)]
+    pub(super) drop: bool,
 }
 
 /// The query of `GET /tree-decisions`.

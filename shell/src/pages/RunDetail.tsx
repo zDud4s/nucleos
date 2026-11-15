@@ -31,6 +31,7 @@ import {
   Quiet,
   RefusalNote,
   RunPipeline,
+  partOfText,
   Section,
   usePaletteGroup,
 } from "../ui";
@@ -184,7 +185,14 @@ function KnownRun({ id }: { id: number }) {
       {/* The shape first, then the figures. Which stage a run is standing at is what somebody
           opens the page to see, and it was previously assembled by reading a badge here, a
           second badge beside it and an exit code four blocks down. */}
-      <RunPipeline run={detail} alive={alive} />
+      <PartOfLine partOf={detail.part_of} />
+      <RunPipeline
+        run={detail}
+        alive={alive}
+        onOpenRun={(runId) =>
+          void navigate({ to: "/runs/$runId", params: { runId: String(runId) } })
+        }
+      />
 
       <Outcome run={detail} />
 
@@ -198,6 +206,15 @@ function KnownRun({ id }: { id: number }) {
       {detail.steerable && <SteeringBox id={id} running={detail.status === "running"} />}
     </>
   );
+}
+
+/**
+ * What this run's chain belongs to, as plain text: a tree node or a job. Not a link, because the
+ * shell has no route for a tree or a job to send it to.
+ */
+function PartOfLine({ partOf }: { partOf: Run["part_of"] }) {
+  const text = partOfText(partOf);
+  return text === null ? null : <Quiet compact says={text} />;
 }
 
 /* --------------------------------------------------------------- outcome -- */
