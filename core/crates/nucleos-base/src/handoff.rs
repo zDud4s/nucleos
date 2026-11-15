@@ -15,6 +15,33 @@ pub fn should_hand_off(fill: i64, context_limit: i64, already_handed_off: bool) 
     fill.saturating_mul(denominator) >= context_limit.saturating_mul(numerator)
 }
 
+/// Why a run has a successor; stored in `runs.successor_reason` beside `successor_run_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessorReason {
+    ContextFull,
+    ApprovalApproved,
+    ApprovalDeclined,
+}
+
+impl SuccessorReason {
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::ContextFull => "context_full",
+            Self::ApprovalApproved => "approval_approved",
+            Self::ApprovalDeclined => "approval_declined",
+        }
+    }
+
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "context_full" => Some(Self::ContextFull),
+            "approval_approved" => Some(Self::ApprovalApproved),
+            "approval_declined" => Some(Self::ApprovalDeclined),
+            _ => None,
+        }
+    }
+}
+
 pub async fn record_handoff(
     pool: &sqlx::SqlitePool,
     run_id: i64,
@@ -23,8 +50,9 @@ pub async fn record_handoff(
 ) -> sqlx::Result<()> {
     let mut transaction = pool.begin().await?;
 
-    sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+    sqlx::query("UPDATE runs SET successor_run_id = ?, successor_reason = ? WHERE id = ?")
         .bind(successor_run_id)
+        .bind(SuccessorReason::ContextFull.as_wire())
         .bind(run_id)
         .execute(&mut *transaction)
         .await?;
@@ -125,5 +153,26 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(linked_successor, Some(successor_run_id));
+
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT successor_reason FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("context_full"));
+    }
+
+    #[test]
+    fn successor_reason_wire_values_round_trip() {
+        use crate::handoff::SuccessorReason;
+        for r in [
+            SuccessorReason::ContextFull,
+            SuccessorReason::ApprovalApproved,
+            SuccessorReason::ApprovalDeclined,
+        ] {
+            assert_eq!(SuccessorReason::from_wire(r.as_wire()), Some(r));
+        }
+        assert_eq!(SuccessorReason::from_wire("something_new"), None);
     }
 }

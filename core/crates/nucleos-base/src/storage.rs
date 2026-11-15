@@ -823,6 +823,53 @@ mod tests {
         assert_eq!(next, 4);
     }
 
+    /// Migration `0312` adds `runs.successor_reason` and backfills it from recorded facts only.
+    #[tokio::test]
+    async fn migration_0312_backfills_the_successor_reason_from_recorded_facts() {
+        let pool = crate::testdb::pool_migrated_through(311).await;
+        for (id, successor, pending) in [
+            (1_i64, Some(2_i64), None),
+            (2, None, None),
+            (3, Some(4), None),
+            (4, None, Some(9_i64)),
+            (5, Some(6), None),
+            (6, None, None),
+            (7, None, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, mode, created_at, successor_run_id, \
+                 pending_resume_proposal_id) \
+                 VALUES (?, 'p', 'completed', 'real', '2026-10-01T00:00:00Z', ?, ?)",
+            )
+            .bind(id)
+            .bind(successor)
+            .bind(pending)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at) \
+             VALUES (1, 0, 'context_handoff', '{}', '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        crate::testdb::apply_migrations_after(&pool, 311).await;
+
+        let reasons: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, successor_reason FROM runs ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let reason = |id: i64| reasons.iter().find(|(i, _)| *i == id).unwrap().1.as_deref();
+        assert_eq!(reason(1), Some("context_full"));
+        assert_eq!(reason(3), Some("approval_approved"));
+        assert_eq!(reason(5), None);
+        assert_eq!(reason(7), None);
+    }
+
     /// Every stored value of `table`, quoted and joined, keyed by `id` — a byte-level snapshot of
     /// the named columns.
     async fn rows_of(pool: &SqlitePool, table: &str, columns: &[&str]) -> Vec<(i64, String)> {
