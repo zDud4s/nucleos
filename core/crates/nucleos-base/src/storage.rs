@@ -827,26 +827,34 @@ mod tests {
     #[tokio::test]
     async fn migration_0312_backfills_the_successor_reason_from_recorded_facts() {
         let pool = crate::testdb::pool_migrated_through(311).await;
-        for (id, successor, pending) in [
-            (1_i64, Some(2_i64), None),
-            (2, None, None),
-            (3, Some(4), None),
-            (4, None, Some(9_i64)),
-            (5, Some(6), None),
-            (6, None, None),
-            (7, None, None),
+        for (id, pending) in [
+            (1_i64, None),
+            (2, None),
+            (3, None),
+            (4, Some(9_i64)),
+            (5, None),
+            (6, None),
+            (7, None),
         ] {
             sqlx::query(
                 "INSERT INTO runs (id, prompt, status, mode, created_at, successor_run_id, \
                  pending_resume_proposal_id) \
-                 VALUES (?, 'p', 'completed', 'real', '2026-10-01T00:00:00Z', ?, ?)",
+                 VALUES (?, 'p', 'completed', 'real', '2026-10-01T00:00:00Z', NULL, ?)",
             )
             .bind(id)
-            .bind(successor)
             .bind(pending)
             .execute(&pool)
             .await
             .unwrap();
+        }
+        // `successor_run_id` is a self-reference: link it once every run exists.
+        for (id, successor) in [(1_i64, 2_i64), (3, 4), (5, 6)] {
+            sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+                .bind(successor)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         sqlx::query(
             "INSERT INTO run_events (run_id, seq, kind, payload, created_at) \
