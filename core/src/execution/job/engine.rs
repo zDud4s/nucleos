@@ -369,9 +369,7 @@ async fn review_from_runs(
         None if passed_this_round == 0 => Some(NodeState::Skipped),
         None => None,
         Some((status, _, _)) if node_in_flight(&status) => Some(NodeState::Running),
-        Some((_, Some(stdout), 1))
-            if crate::execution::runner::failed_on_a_transient_api_error(&stdout) =>
-        {
+        Some((_, Some(stdout), 1)) if failed_on_a_retryable_error(&stdout) => {
             Some(NodeState::RetryOwed)
         }
         // A review that failed is still a review that happened.
@@ -787,6 +785,14 @@ pub(super) async fn before_review(
     view: &JobView,
     artifacts: &str,
 ) -> Result<bool, Pass> {
+    // A review owed again because it died on an account's usage limit: that account is marked
+    // exhausted and another one takes the retry (cold), or, when none is left, the job parks
+    // until the earliest reset instead of retrying blind.
+    if view.review == ReviewState::Retry
+        && let Some(detail) = review_retry_parked_on_limit(&state.pool, job, Utc::now()).await
+    {
+        return Err(park(state, job, WAIT_ACCOUNT_LIMIT, &detail).await);
+    }
     match council_before_review(state, job, artifacts).await {
         BeforeReview::Go { council_file } => {
             // Here, where the node actually starts, and once: a review parked behind a council comes

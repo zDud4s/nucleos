@@ -92,7 +92,10 @@ async fn a_limit_with_another_account_available_runs_the_item_again_now() {
     let job = load_job(&pool, job_id).await.unwrap();
     reconcile_nodes_at(&state, &job, Utc::now()).await.unwrap();
 
-    assert_eq!(item_row(&pool, job_id).await, ("pending".to_owned(), 0, None));
+    assert_eq!(
+        item_row(&pool, job_id).await,
+        ("pending".to_owned(), 0, None)
+    );
     // The account that hit its limit is out of the pool; the other one is not.
     let view = PoolState::global().view();
     let exhausted: Vec<_> = view
@@ -158,7 +161,10 @@ async fn the_parked_job_resumes_after_the_reset_plus_the_margin() {
     // Parked until the EARLIEST reset (b), plus the margin.
     assert!(matches!(
         account_limit_brake(&job, now),
-        Some(Brake::Park { reason: WAIT_ACCOUNT_LIMIT, .. })
+        Some(Brake::Park {
+            reason: WAIT_ACCOUNT_LIMIT,
+            ..
+        })
     ));
     assert!(
         matches!(
@@ -171,6 +177,52 @@ async fn the_parked_job_resumes_after_the_reset_plus_the_margin() {
         account_limit_brake(&job, early + RESUME_MARGIN + chrono::Duration::seconds(5)).is_none(),
         "past the earliest reset and the margin the job goes"
     );
+}
+
+/// A review (a sequential node) that died on the account limit with a second account free is owed a
+/// retry, and the account it died on is out of the pool; with the only account it parks instead.
+async fn job_whose_review_hit_the_limit(pool: &sqlx::SqlitePool, account: &str) -> JobRow {
+    let job_id = seed_job(pool, "project-a", "running").await.unwrap();
+    let run_id = seed_node(pool, job_id, "review", "failed").await;
+    sqlx::query("UPDATE runs SET stdout = ?, runner = 'claude', account_id = ? WHERE id = ?")
+        .bind(USAGE_LIMIT)
+        .bind(account)
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    load_job(pool, job_id).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_review_that_hit_the_limit_is_owed_a_retry_on_another_account() {
+    let _pool_owner = own_pool_with(&["claude:a", "claude:b"]).await;
+    let pool = test_pool().await;
+    let job = job_whose_review_hit_the_limit(&pool, "claude:a").await;
+
+    assert!(failed_on_a_retryable_error(USAGE_LIMIT));
+    assert_eq!(
+        review_retry_parked_on_limit(&pool, &job, Utc::now()).await,
+        None
+    );
+    let view = PoolState::global().view();
+    assert!(
+        view.candidates
+            .iter()
+            .any(|c| c.account.id.0 == "claude:a" && !c.exhausted.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn a_review_that_hit_the_limit_on_the_only_account_parks_with_the_resume_time() {
+    let _pool_owner = own_pool_with(&["claude:a"]).await;
+    let pool = test_pool().await;
+    let job = job_whose_review_hit_the_limit(&pool, "claude:a").await;
+
+    let detail = review_retry_parked_on_limit(&pool, &job, Utc::now())
+        .await
+        .expect("every account is out");
+    assert!(detail.contains("every account is out"), "{detail}");
 }
 
 /// An empty pool (no accounts set up) is today's launch: nothing to park on.

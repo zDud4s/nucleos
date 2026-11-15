@@ -36,6 +36,52 @@ fn engine_or_active(runner: Option<String>) -> String {
     })
 }
 
+/// Whether a failed node's stream says the account hit a usage limit (on the active engine). Such a
+/// node judged nothing, like one that never reached the API, so a sequential node owes a retry,
+/// on another account or after the reset.
+pub(super) fn failed_on_account_limit(stdout: &str) -> bool {
+    crate::accounts::adapters::adapter_for(&engine_or_active(None))
+        .is_some_and(|adapter| adapter.classify_failure(stdout, "").is_some())
+}
+
+/// A sequential node (the review) is owed a retry after failing: a transient API error, or an
+/// account's usage limit.
+pub(super) fn failed_on_a_retryable_error(stdout: &str) -> bool {
+    crate::execution::runner::failed_on_a_transient_api_error(stdout)
+        || failed_on_account_limit(stdout)
+}
+
+/// A review owed a retry whose last run died on an account limit: mark the account exhausted and
+/// re-pick. `Some(detail)` means every account is out, so the caller parks the job until then;
+/// `None` means go now (another account is free, or the failure was no limit).
+pub(super) async fn review_retry_parked_on_limit(
+    pool: &SqlitePool,
+    job: &JobRow,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let run_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM runs WHERE job_id = ? AND stage = 'review' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(job.id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    match note_limit_of_run(pool, job, run_id?, now).await {
+        Ok(LimitOutcome::AllExhausted { resets_at }) => Some(match resets_at {
+            Some(at) => format!(
+                "its review hit an account usage limit and every account is out; the job resumes \
+                 at {}",
+                (at + RESUME_MARGIN).to_rfc3339()
+            ),
+            None => "its review hit an account usage limit and every account is out, with no \
+                     known reset"
+                .to_owned(),
+        }),
+        _ => None,
+    }
+}
+
 /// Reads a failed run's output for an account limit and, when there is one, marks that account
 /// exhausted (memory, store and the once-per-window feed row) and re-picks.
 pub(super) async fn note_limit_of_run(
