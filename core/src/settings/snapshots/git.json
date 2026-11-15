@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "`~/.nucleos/git.yaml`: how the merge queue treats the history a tree leaf leaves behind.",
+  "properties": {
+    "squash_checkpoints": {
+      "default": true,
+      "description": "Squash checkpoints: on by default. When a tree leaf is merged, its `nucleos: checkpoint` and\n`nucleos: autoformat` commits collapse into one commit and real commits stay as they are.\nOff keeps every checkpoint in the history.",
+      "type": "boolean"
+    }
+  },
+  "title": "GitConfig",
+  "type": "object"
+}

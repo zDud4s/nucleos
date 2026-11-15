@@ -134,7 +134,22 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 {
                     return outcome;
                 }
-                match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
+                // `git.squash_checkpoints`: a leaf merged into its tree branch is merged as a rebuilt
+                // chain with its checkpoint and autoformat runs collapsed. The leaf branch itself is
+                // untouched, so rollback points stay valid. Fails open to the plain merge.
+                let squashed = if squash_applies(source.as_str(), target.as_str()) {
+                    squashed_tip(project_root, source.as_str(), target.as_str(), deadline).await
+                } else {
+                    None
+                };
+                match compute_merge_of(
+                    project_root,
+                    source.as_str(),
+                    squashed.as_deref().unwrap_or(source.as_str()),
+                    target.as_str(),
+                    deadline,
+                )
+                .await
                 {
                     Ok(mut computed) => {
                         // Integration steps (plan 2026-11-09): only a merge INTO the integration

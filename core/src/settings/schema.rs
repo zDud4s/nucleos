@@ -140,6 +140,7 @@ mod tests {
         the_schema_of_verify_is_stable => "verify",
         the_schema_of_keep_awake_is_stable => "keep_awake",
         the_schema_of_background_is_stable => "background",
+        the_schema_of_git_is_stable => "git",
         the_schema_of_machine_is_stable => "machine",
         the_schema_of_devtime_is_stable => "devtime",
         the_schema_of_autopilot_is_stable => "autopilot",
