@@ -181,7 +181,9 @@ pub(super) fn excerpt(output: &str) -> String {
     if !failing.is_empty() {
         return clip(&failing.join("; "));
     }
-    lines().next_back().map_or_else(|| "no output".to_owned(), clip)
+    lines()
+        .next_back()
+        .map_or_else(|| "no output".to_owned(), clip)
 }
 
 /// The announcement for a resolution whose gate was not green. `first_output` is the output the
