@@ -1041,6 +1041,17 @@ async fn post_transition(
         )
         .await;
     }
+    if transition == "dropped" {
+        // A dropped branch leaves no open decision: the park record names only the last one, and
+        // the branch may not even have been parked.
+        super::obsolete::close_node_decisions_logged(
+            &state.pool,
+            &id,
+            &node,
+            &format!("branch {name} dropped"),
+        )
+        .await;
+    }
     let applied = node_run::apply(&state.pool, &node, &transition, &key, &transition)
         .await
         .map_err(run_refusal)?;
@@ -3575,6 +3586,34 @@ mod tests {
         let (status, body) = move_branch(&app, JOB, NODE, "building", KEY).await;
         assert_eq!(status, StatusCode::OK, "{body:?}");
         assert_eq!(branch_state(&state.pool, JOB, BRANCH).await, "building");
+    }
+
+    /// A dropped branch leaves no open decision: the park record names only the last one, so an
+    /// earlier park of the same node used to stay open in `open_decisions`.
+    #[tokio::test]
+    async fn transition_to_dropped_closes_every_open_park_decision_of_the_node() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_one_branch(&state.pool, "queued").await;
+        seed_decision(&state.pool, "d-first", NODE, "First park?", "open").await;
+        seed_decision(&state.pool, "d-last", NODE, "Second park?", "open").await;
+        park_on(&state.pool, "d-last").await;
+
+        let (status, body) = move_branch(&app, JOB, NODE, "dropped", KEY).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(branch_state(&state.pool, JOB, BRANCH).await, "dropped");
+
+        let open: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM decisions WHERE tree_id = ? AND node_id = ? AND status = 'open'",
+        )
+        .bind(JOB)
+        .bind(NODE)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert!(open.is_empty(), "open decisions left: {open:?}");
+        let (_, tree) = get(&app, &format!("/trees/{JOB}")).await;
+        assert_eq!(tree["open_decisions"], json!([]));
     }
 
     /// `done` is no member of `BRANCH_STATES`, yet the engine knows it for the docs layer alone.
