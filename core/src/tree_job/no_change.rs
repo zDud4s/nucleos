@@ -233,7 +233,7 @@ async fn park_no_change(
         parks.push((
             node,
             format!(
-                "Branch {name} produced no change ({reason}), so nothing was merged. Answer to have its node try again, or drop the branch."
+                "Branch {name} produced no change ({reason}), so nothing was merged. Answer to have its node try again, or answer with drop: true to drop the branch."
             ),
         ));
     }
