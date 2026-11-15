@@ -6408,6 +6408,33 @@ mod tests {
     /// A project's rules and pins live in `~/.nucleos/projects/<id>/`, and an agent may not write
     /// them there. Home-spelled, absolute, and in the shell. The old `.ai/` copies are nobody's
     /// state any more — nothing reads or migrates them — so writing one is an ordinary write.
+    /// The project's automations are the owner's alone (spec 2026-11-15, decision 8): a run writing
+    /// `automations.yaml` in the state directory is the owner's file by name, like the rules beside it.
+    #[test]
+    fn a_run_cannot_write_automations_yaml_in_the_project_state_dir() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        let absolute = r"C:\Users\someone\.nucleos\projects\alpha\automations.yaml";
+        for tool in ["Edit", "Write"] {
+            assert_classification(
+                classify(tool, &json!({ "file_path": "~/.nucleos/projects/alpha/automations.yaml" }), cwd),
+                "pending_approval",
+                "self-governing-file",
+            );
+            assert_eq!(
+                classify(tool, &json!({ "file_path": absolute }), cwd)
+                    .decision
+                    .decision,
+                "deny",
+                "{tool}"
+            );
+            assert_classification(
+                classify(tool, &json!({ "file_path": absolute }), None),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
+    }
+
     #[test]
     fn writing_a_projects_state_in_its_new_home_asks_for_approval() {
         let cwd = Some(Path::new(r"C:\work\repo"));
