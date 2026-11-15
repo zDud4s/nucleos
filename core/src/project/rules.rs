@@ -6,6 +6,7 @@
 //! document no longer fits its type. The contract callers rely on is unchanged: nothing stored is the default,
 //! unreadable is an `Err`, and each caller keeps the safe side it already had for that `Err`.
 
+use crate::automations::Automations;
 use crate::config::AutopilotRules;
 use crate::settings::{Document, Scope, Snapshot};
 use crate::workflows::Pins;
@@ -34,6 +35,11 @@ pub fn autopilot(project_id: &str) -> Result<AutopilotRules, DocumentUnreadable>
 }
 
 pub fn pins(project_id: &str) -> Result<Pins, DocumentUnreadable> {
+    read_from(&crate::settings::global().snapshot(), project_id)
+}
+
+/// The project's automations. Absent is [`Automations::default`] (the presets, switched off).
+pub fn automations(project_id: &str) -> Result<Automations, DocumentUnreadable> {
     read_from(&crate::settings::global().snapshot(), project_id)
 }
 
@@ -425,6 +431,14 @@ pub mod testing {
     pub fn publish_pins(project_id: &str, yaml: &str) {
         let pins = crate::workflows::parse_pins(yaml).expect("a fixture's pins parse");
         edit(|snapshot| snapshot.with_document(&Scope::project(project_id), pins));
+    }
+
+    /// Stores `yaml` as the project's `automations` document, validated exactly like the settings route does.
+    pub fn publish_automations(project_id: &str, yaml: &str) {
+        let automations: crate::automations::Automations =
+            serde_yaml::from_str(yaml).expect("a fixture's automations parse");
+        automations.validate().expect("a fixture's automations are valid");
+        edit(|snapshot| snapshot.with_document(&Scope::project(project_id), automations));
     }
 
     /// Makes the document absent (the old "file does not exist").

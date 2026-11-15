@@ -104,6 +104,7 @@ mod tests {
         round_trip::<DevtimeConfig>();
         round_trip::<AutopilotRules>();
         round_trip::<Pins>();
+        round_trip::<crate::automations::Automations>();
     }
 
     #[test]

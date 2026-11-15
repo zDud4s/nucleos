@@ -1,0 +1,206 @@
+{
+  "$defs": {
+    "Action": {
+      "description": "The actions a rule can take.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Fast-forward `remote`'s branch to the green sha, through the git queue.",
+          "properties": {
+            "action": {
+              "const": "push",
+              "type": "string"
+            },
+            "remote": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "remote"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Open the branch's `ci-red` incident; `auto_fix` lets the incident launcher start a fix.",
+          "properties": {
+            "action": {
+              "const": "open_incident",
+              "type": "string"
+            },
+            "auto_fix": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "action",
+            "auto_fix"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AutomationRule": {
+      "additionalProperties": false,
+      "description": "One rule: a name, a switch, the event it answers, optional conditions, and the one action it takes.",
+      "properties": {
+        "do": {
+          "$ref": "#/$defs/Action"
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "on": {
+          "$ref": "#/$defs/Trigger"
+        },
+        "when": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Conditions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "on",
+        "do"
+      ],
+      "type": "object"
+    },
+    "CiConclusion": {
+      "enum": [
+        "success",
+        "failure",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "Conditions": {
+      "additionalProperties": false,
+      "description": "Conditions over the event; every condition given must hold.",
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conclusion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CiConclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pushed_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PushedBy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PushedBy": {
+      "enum": [
+        "automation"
+      ],
+      "type": "string"
+    },
+    "Trigger": {
+      "description": "The events a rule can answer.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The published branch reached a green sha: `promoted` with a release branch, `local_green` without one.",
+          "properties": {
+            "event": {
+              "const": "published_green",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A GitHub Actions workflow run finished.",
+          "properties": {
+            "event": {
+              "const": "ci_finished",
+              "type": "string"
+            },
+            "workflow": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "workflow"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The project's automations. A missing document reads as [`Automations::default`]: the spec's two preset rules,\nboth switched off.",
+  "properties": {
+    "rules": {
+      "default": [
+        {
+          "do": {
+            "action": "push",
+            "remote": "origin"
+          },
+          "enabled": false,
+          "name": "push-when-green",
+          "on": {
+            "event": "published_green"
+          }
+        },
+        {
+          "do": {
+            "action": "open_incident",
+            "auto_fix": true
+          },
+          "enabled": false,
+          "name": "fix-red-ci",
+          "on": {
+            "event": "ci_finished",
+            "workflow": "gates"
+          },
+          "when": {
+            "conclusion": "failure",
+            "pushed_by": "automation"
+          }
+        }
+      ],
+      "items": {
+        "$ref": "#/$defs/AutomationRule"
+      },
+      "type": "array"
+    }
+  },
+  "title": "Automations",
+  "type": "object"
+}
