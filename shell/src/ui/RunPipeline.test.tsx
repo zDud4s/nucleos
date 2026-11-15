@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, within } from "@testing-library/react";
 
 import { RunPipeline } from "./RunPipeline";
 import type { ChainLeg, ChainRun } from "./runChain";
@@ -266,5 +266,47 @@ describe("RunPipeline chain", () => {
     const container = drawn(chain([leg(1), leg(2)], 2, { lineage_truncated: true }));
 
     expect(container.textContent).toContain("chain truncated");
+  });
+
+  it("the chain svg is a group, so its legs stay reachable as links", () => {
+    const container = drawn(chain(many(3), 2), vi.fn());
+    const group = within(container).getByRole("group", { name: /^Chain of runs/ });
+
+    expect(group.tagName.toLowerCase()).toBe("svg");
+    expect(within(group).getAllByRole("link").map((l) => l.getAttribute("aria-label"))).toEqual([
+      "Open run 1",
+      "Open run 3",
+    ]);
+    expect(container.querySelector('svg[role="img"]')).toBeNull();
+  });
+
+  it("Space activates a leg link", () => {
+    const onOpenRun = vi.fn();
+    const container = drawn(chain(many(3), 2), onOpenRun);
+
+    fireEvent.keyDown(legFor(container, 3), { key: " " });
+    expect(onOpenRun).toHaveBeenCalledWith(3);
+  });
+
+  it("Enter and Space on the gap expand it", () => {
+    for (const key of ["Enter", " "]) {
+      const { container, unmount } = render(<RunPipeline run={chain(many(12), 6)} alive={false} />);
+      fireEvent.keyDown(container.querySelector(".ui-runpipe-gap")!, { key });
+      expect(container.querySelectorAll(".ui-runpipe-leg")).toHaveLength(12);
+      unmount();
+    }
+  });
+
+  it("the flow mark leads only into a leg that is alive", () => {
+    const still = drawn(chain([leg(1), leg(2)], 2));
+    expect(still.querySelectorAll(".ui-runpipe-flow")).toHaveLength(0);
+
+    const legs = [leg(1, { status: "superseded" }), leg(2, { status: "running", exit_code: null })];
+    const going = drawn(chain(legs, 2, {}, { status: "running", exit_code: null }), undefined, true);
+    const marks = going.querySelectorAll(".ui-runpipe-flow");
+    expect(marks).toHaveLength(3);
+    expect(marks[0].parentElement!.getAttribute("class")).toContain(
+      `ui-runpipe-${readState("run", "running")!.tone}`,
+    );
   });
 });

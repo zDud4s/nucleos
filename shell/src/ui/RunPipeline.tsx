@@ -140,7 +140,7 @@ export function RunPipeline({ run, alive, onOpenRun }: RunPipelineProps) {
     )
     .join(", ")}, gate ${chain.gate.title}, result ${chain.result.title}${chain.truncated ? ", chain truncated" : ""}`;
 
-  /** What is drawn at position `i` of the row, with the facts an edge into it needs. */
+  /** Whether the edge into position `i` of the row is drawn as reached: legs always are, GATE and RESULT as they say. */
   const reachedAt = (i: number): boolean =>
     i < nItems ? true : ends[i - nItems].reached;
 
@@ -150,7 +150,7 @@ export function RunPipeline({ run, alive, onOpenRun }: RunPipelineProps) {
         className="ui-runpipe"
         style={{ width: viewW }}
         viewBox={`0 0 ${viewW} ${VIEW_H}`}
-        role="img"
+        role="group"
         aria-label={label}
       >
         {cells.slice(0, -1).map((cell, i) => {
@@ -237,7 +237,6 @@ function LegBox({
   const cx = x + width / 2;
   const at = tall ? LINES.tall : LINES.short;
   const open = !item.current && onOpenRun !== undefined ? () => onOpenRun(item.id) : null;
-  const subs = item.sub === "" ? [] : item.sub.split(" / ");
   return (
     <g
       className={`ui-runpipe-stage ui-runpipe-leg ui-runpipe-${tone(item)}${item.current ? " ui-runpipe-current" : ""}`}
@@ -259,7 +258,7 @@ function LegBox({
       <text className="ui-runpipe-title" x={cx} y={y + at.title} textAnchor="middle">
         {fit(item.title, width)}
       </text>
-      {subs.map((line, n) => (
+      {item.subs.map((line, n) => (
         <text key={n} className="ui-runpipe-sub" x={cx} y={y + at.sub + n * SUB_STEP} textAnchor="middle">
           {line}
         </text>

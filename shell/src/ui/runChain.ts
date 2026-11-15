@@ -35,7 +35,8 @@ export type ChainItem =
       kind: "leg";
       id: number;
       title: string;
-      sub: string;
+      /** Detail lines under the title: the reason the leg ended, then its turn count. */
+      subs: string[];
       tone: BadgeTone | null;
       current: boolean;
       alive: boolean;
@@ -113,17 +114,15 @@ export function chainLegs(run: ChainRun, expanded = false): RunChain {
     }
     flush();
     const state = readState("run", l.status);
-    const sub = [
+    const subs = [
       reasonLabel(l.ended_because),
       l.num_turns === null ? "no turns recorded" : `${l.num_turns} turns`,
-    ]
-      .filter((p): p is string => p !== null)
-      .join(" / ");
+    ].filter((p): p is string => p !== null);
     items.push({
       kind: "leg",
       id: l.id,
       title: state?.label ?? l.status,
-      sub,
+      subs,
       tone: state?.tone ?? null,
       current,
       // Mirrors `runIsAlive` in `data/runs.ts`, which `ui/` must not import.

@@ -53,8 +53,8 @@ describe("chainLegs", () => {
     const chain = chainLegs(run(legs, 2));
     expect(ids(chain)).toEqual([1, 2, 3]);
     const items = chain.items as Extract<(typeof chain.items)[number], { kind: "leg" }>[];
-    expect(items[0].sub).toContain("context full");
-    expect(items[1].sub).toContain("approved");
+    expect(items[0].subs).toContain("context full");
+    expect(items[1].subs).toContain("approved");
     expect(items.map((i) => i.current)).toEqual([false, true, false]);
     expect(items[0].tone).toBe(readState("run", "superseded")?.tone);
     expect(items[0].tone).toBe("off");
@@ -65,7 +65,7 @@ describe("chainLegs", () => {
     const first = chain.items[0];
     if (first.kind !== "leg") throw new Error("leg expected");
     expect(first.title).toBe("superseded");
-    expect(first.sub).not.toMatch(/context full|approved|declined/);
+    expect(first.subs).toEqual(["no turns recorded"]);
   });
 
   it("takes gate and result from the last leg", () => {
