@@ -1,6 +1,7 @@
 //! Which model answers: the catalog, OpenAI-compatible and local agents, and route and seat advice.
 
 pub mod agent_decide;
+pub mod agent_report;
 pub mod agent_route;
 pub mod agent_spawns;
 pub mod local_agent;
