@@ -127,11 +127,17 @@ async fn a_limit_on_the_only_account_parks_the_job_until_the_reset() {
         ("pending", 0, None),
         "no counted, backed-off retry against the exhausted account"
     );
+    // The reset in the stream is "5:50am", the next one on the wall clock: depending on the hour the
+    // tests run it can fall beyond the job's lifetime (a stop). Born in the future, the job's
+    // lifetime always covers it, so the verdict does not depend on the time of day.
+    let mut job = job;
+    job.created_at = (Utc::now() + chrono::Duration::days(2)).to_rfc3339();
     match brakes(&state, &job, Utc::now()).await {
         Brake::Park { reason, detail } => {
             assert_eq!(reason, WAIT_ACCOUNT_LIMIT);
             assert!(detail.contains("resumes at"), "{detail}");
         }
+        Brake::Stop { detail } => panic!("expected the job to be parked, got a stop: {detail}"),
         _ => panic!("expected the job to be parked"),
     }
 }
