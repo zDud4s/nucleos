@@ -173,7 +173,14 @@ mod tests {
     async fn a_failed_or_errored_check_keeps_clippy() {
         for status in ["failed", "errored", "queued", "running", "superseded"] {
             let pool = crate::testdb::fresh_pool().await;
-            finished(&pool, &Spec { status, ..CHECK_PASSED }).await;
+            finished(
+                &pool,
+                &Spec {
+                    status,
+                    ..CHECK_PASSED
+                },
+            )
+            .await;
             let unit = queued_test(&pool, "job", "fp1").await;
             assert!(env(&pool, unit).await.is_empty(), "{status}");
         }
@@ -182,11 +189,26 @@ mod tests {
     #[tokio::test]
     async fn a_check_at_another_tree_group_or_worktree_keeps_clippy() {
         let others = [
-            Spec { fingerprint: Some("fp0"), ..CHECK_PASSED },
-            Spec { fingerprint: None, ..CHECK_PASSED },
-            Spec { group: "shell", ..CHECK_PASSED },
-            Spec { worktree: "/elsewhere", ..CHECK_PASSED },
-            Spec { kind: "test", ..CHECK_PASSED },
+            Spec {
+                fingerprint: Some("fp0"),
+                ..CHECK_PASSED
+            },
+            Spec {
+                fingerprint: None,
+                ..CHECK_PASSED
+            },
+            Spec {
+                group: "shell",
+                ..CHECK_PASSED
+            },
+            Spec {
+                worktree: "/elsewhere",
+                ..CHECK_PASSED
+            },
+            Spec {
+                kind: "test",
+                ..CHECK_PASSED
+            },
         ];
         for other in &others {
             let pool = crate::testdb::fresh_pool().await;
