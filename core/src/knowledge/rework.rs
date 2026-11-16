@@ -6,6 +6,7 @@
 //! per cause, reinforcing it when the cause recurs in another task.
 
 use chrono::{DateTime, Utc};
+use sha2::Digest;
 use sqlx::SqlitePool;
 
 /// The `distill_cause` every row written here carries.
@@ -36,37 +37,298 @@ pub enum Captured {
     Skipped,
 }
 
+/// A payload string, cleaned of ANSI and trimmed; `None` when absent, not text or empty.
+fn clean_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let text = value?.as_str()?;
+    let cleaned = super::signature::strip_ansi(text).trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The first `TITLE_CLIP` characters of `text`, trimmed, with no ellipsis.
+fn clip_title(text: &str) -> String {
+    text.chars().take(TITLE_CLIP).collect::<String>().trim().to_owned()
+}
+
 /// **Pure.** The candidate a rework record carries, `None` when it carries none.
-pub fn rework_candidate(_record: &crate::workflow_records::Record) -> Option<Candidate> {
-    None
+pub fn rework_candidate(record: &crate::workflow_records::Record) -> Option<Candidate> {
+    if record.kind != "rework" {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(&record.payload).ok()?;
+    let object = payload.as_object()?;
+    let root_cause = clean_text(object.get("root_cause"))?;
+    let fix = clean_text(object.get("fix"))?;
+    let caught_by = record
+        .caught_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let decomposition =
+        object.get("kind").and_then(serde_json::Value::as_str) == Some("decomposition");
+    if decomposition && caught_by == Some("budget") {
+        return None;
+    }
+
+    let title = clean_text(object.get("lesson"))
+        .map(|lesson| clip_title(&lesson))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| clip_title(&root_cause));
+    let mut body = format!("Cause: {root_cause}\nFix: {fix}");
+    if let Some(catcher) = caught_by {
+        body.push_str("\nCaught by: ");
+        body.push_str(catcher);
+        if let Some(phase) = record
+            .phase
+            .as_deref()
+            .map(str::trim)
+            .filter(|phase| !phase.is_empty())
+        {
+            body.push_str(&format!(" ({phase})"));
+        }
+    }
+    Some(Candidate {
+        title,
+        body,
+        cause_key: cause_key(&root_cause),
+    })
 }
 
 /// **Pure.** The identity of a cause: the hex digest of its normalised text.
-pub fn cause_key(_root_cause: &str) -> String {
-    String::new()
+pub fn cause_key(root_cause: &str) -> String {
+    let normalised = super::signature::normalise_line(&root_cause.to_lowercase());
+    let text = normalised.split_whitespace().collect::<Vec<_>>().join(" ");
+    super::signature::hex16(&sha2::Sha256::digest(text.as_bytes()))
+}
+
+/// A live row of a cause: id, layer, status, evidence.
+type LiveRow = (i64, String, String, Option<String>);
+
+async fn live_row_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project: &str,
+    key: &str,
+) -> sqlx::Result<Option<LiveRow>> {
+    sqlx::query_as(
+        "SELECT id, layer, status, evidence FROM knowledge
+          WHERE scope_kind = 'project' AND scope_id = ? AND cause_key = ?
+            AND status IN ('active', 'proposed')
+          ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project)
+    .bind(key)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// The newest retired row of a cause that still blocks a new lesson, if any.
+async fn tombstoned_cause_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project: &str,
+    key: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Option<i64>> {
+    let cutoff = (now - chrono::Duration::days(super::TRIAL_COOLOFF_DAYS)).to_rfc3339();
+    sqlx::query_scalar(
+        "SELECT id FROM knowledge
+          WHERE scope_kind = 'project' AND scope_id = ? AND cause_key = ?
+            AND (status IN ('reverted', 'rejected', 'superseded')
+                 OR (status = 'expired' AND ended_at > ?))
+          ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project)
+    .bind(key)
+    .bind(cutoff)
+    .fetch_optional(&mut **tx)
+    .await
 }
 
 /// Turn the rework record `record_id` into knowledge, or reinforce what it repeats.
-pub async fn capture_rework(_pool: &SqlitePool, _record_id: i64) -> sqlx::Result<Captured> {
-    Ok(Captured::Skipped)
+pub async fn capture_rework(pool: &SqlitePool, record_id: i64) -> sqlx::Result<Captured> {
+    let record: Option<crate::workflow_records::Record> = sqlx::query_as(
+        "SELECT id, project_id, worktree, kind, task_id, phase, caught_by, created_at, payload
+           FROM workflow_records WHERE id = ?",
+    )
+    .bind(record_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(record) = record else {
+        return Ok(Captured::Skipped);
+    };
+    let Some(candidate) = rework_candidate(&record) else {
+        return Ok(Captured::Skipped);
+    };
+    if record.project_id.is_empty() || record.project_id == "unknown" {
+        return Ok(Captured::Skipped);
+    }
+
+    let now = Utc::now();
+    let evidence = serde_json::json!([{"t": "record", "id": record.id}]).to_string();
+    let mut tx = pool.begin().await?;
+    let outcome = capture_in(&mut tx, &record, &candidate, &evidence, now).await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+async fn capture_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &crate::workflow_records::Record,
+    candidate: &Candidate,
+    evidence: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Captured> {
+    let project = record.project_id.as_str();
+    if let Some(dead) = tombstoned_cause_in(tx, project, &candidate.cause_key, now).await? {
+        super::note_tombstone_skip_in(tx, dead).await?;
+        return Ok(Captured::Skipped);
+    }
+    if let Some(live) = live_row_in(tx, project, &candidate.cause_key).await? {
+        return reinforce_in(tx, record, live, evidence).await;
+    }
+    if let Some(id) = insert_row_in(tx, project, candidate, evidence, now).await? {
+        return Ok(Captured::Written(id));
+    }
+    // Lost the race to a live row of the same cause: reinforce it instead.
+    match live_row_in(tx, project, &candidate.cause_key).await? {
+        Some(live) => reinforce_in(tx, record, live, evidence).await,
+        None => Ok(Captured::Skipped),
+    }
+}
+
+/// Merge a repeat into the live row; another task's repeat also counts and may promote it.
+async fn reinforce_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &crate::workflow_records::Record,
+    live: LiveRow,
+    evidence: &str,
+) -> sqlx::Result<Captured> {
+    let (id, layer, status, stored) = live;
+    let seen = stored.clone().unwrap_or_else(|| "[]".to_owned());
+    // Idempotent: a record already in the evidence has been counted.
+    let already: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM json_each(?)
+          WHERE json_extract(value, '$.t') = 'record' AND json_extract(value, '$.id') = ?",
+    )
+    .bind(&seen)
+    .bind(record.id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if already > 0 {
+        return Ok(Captured::Skipped);
+    }
+    let same_task: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_records
+          WHERE project_id = ? AND task_id = ?
+            AND id IN (SELECT json_extract(value, '$.id') FROM json_each(?)
+                        WHERE json_extract(value, '$.t') = 'record')",
+    )
+    .bind(&record.project_id)
+    .bind(&record.task_id)
+    .bind(&seen)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    super::propose::reconfirm_row_in(tx, id, &layer, &status, stored, evidence).await?;
+    if same_task > 0 {
+        return Ok(Captured::Reinforced(id));
+    }
+    sqlx::query("UPDATE knowledge SET observations = COALESCE(observations, 0) + 1 WHERE id = ?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COALESCE(observations, 0) FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if observations >= 2 && super::promote_layer_in(tx, id, super::Layer::Procedural).await? {
+        return Ok(Captured::Promoted(id));
+    }
+    Ok(Captured::Reinforced(id))
 }
 
 /// Capture every rework record newer than the watermark, at most 200 per call. Returns how many
 /// records produced or reinforced a row.
-pub async fn sweep_rework(_pool: &SqlitePool, _now: DateTime<Utc>) -> sqlx::Result<usize> {
-    Ok(0)
+pub async fn sweep_rework(pool: &SqlitePool, _now: DateTime<Utc>) -> sqlx::Result<usize> {
+    let mark: i64 = sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = ?")
+        .bind(REWORK_WATERMARK)
+        .fetch_optional(pool)
+        .await?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM workflow_records WHERE kind = 'rework' AND id > ? ORDER BY id LIMIT 200",
+    )
+    .bind(mark)
+    .fetch_all(pool)
+    .await?;
+
+    let mut upto = mark;
+    let mut captured = 0;
+    for id in ids {
+        match capture_rework(pool, id).await {
+            Ok(Captured::Skipped) => {}
+            Ok(_) => captured += 1,
+            Err(error) => {
+                tracing::warn!(%error, record = id, "could not capture a rework record");
+                break;
+            }
+        }
+        upto = id;
+    }
+    if upto > mark {
+        sqlx::query("INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)")
+            .bind(REWORK_WATERMARK)
+            .bind(upto.to_string())
+            .execute(pool)
+            .await?;
+    }
+    Ok(captured)
 }
 
 /// Insert the row for a new cause; `None` when a live row of that cause already exists.
-#[allow(dead_code)]
 async fn insert_row_in(
-    _tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    _project: &str,
-    _candidate: &Candidate,
-    _evidence: &str,
-    _now: DateTime<Utc>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project: &str,
+    candidate: &Candidate,
+    evidence: &str,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<Option<i64>> {
-    Ok(None)
+    let at = now.to_rfc3339();
+    let fingerprint = super::title_fingerprint(&candidate.title);
+    let result = sqlx::query(
+        "INSERT INTO knowledge
+           (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, evidence,
+            distill_cause, cause_key, observations, status, trial, trial_started_at,
+            created_at, activated_at, last_confirmed_at)
+         VALUES ('episodic', 'project', ?, 'distiller', 'memory', ?, ?, ?, ?, 'rework', ?, 1,
+                 'active', 1, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(project)
+    .bind(&candidate.title)
+    .bind(&candidate.body)
+    .bind(fingerprint)
+    .bind(evidence)
+    .bind(&candidate.cause_key)
+    .bind(&at)
+    .bind(&at)
+    .bind(&at)
+    .bind(&at)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let id = result.last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'active', 'created', ?)",
+    )
+    .bind(id)
+    .bind(&at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(Some(id))
 }
 
 #[cfg(test)]

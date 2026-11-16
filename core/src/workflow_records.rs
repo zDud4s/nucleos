@@ -204,10 +204,14 @@ pub async fn insert(pool: &SqlitePool, record: &NewRecord) -> sqlx::Result<i64> 
 }
 
 /// Stores one validated record, then turns a `rework` into knowledge without failing the insert.
-///
-/// RED stub: it only inserts; the capture arrives with the implementation.
 pub async fn insert_and_capture(pool: &SqlitePool, record: &NewRecord) -> sqlx::Result<i64> {
-    insert(pool, record).await
+    let id = insert(pool, record).await?;
+    if record.kind == KIND_REWORK
+        && let Err(error) = crate::knowledge::capture_rework(pool, id).await
+    {
+        tracing::warn!(%error, "could not turn a rework record into knowledge");
+    }
+    Ok(id)
 }
 
 /// Every record of one task in one project, oldest first.
@@ -266,7 +270,7 @@ pub async fn record(
         .map_err(|error| (error.status(), error.message().to_owned()))?;
     row.project_id = project_id;
     row.worktree = Some(root.to_string_lossy().into_owned());
-    let id = insert(pool, &row).await.map_err(|error| {
+    let id = insert_and_capture(pool, &row).await.map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not store the record: {error}"),

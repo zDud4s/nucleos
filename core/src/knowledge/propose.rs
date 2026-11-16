@@ -422,9 +422,9 @@ pub fn title_fingerprint(title: &str) -> Option<String> {
 
 /// Record an episode a job taught: believed from the start, on trial.
 ///
-/// Active, episodic and the distiller's, expiring unless somebody reconfirms it. `observations`
-/// and `generator` stay NULL - they are the consolidator's measurement and a distilled row has
-/// none. Nothing is committed here.
+/// Active, episodic and the distiller's, expiring unless somebody reconfirms it.
+/// `observations` starts at 1 (its first sighting) and `generator` stays NULL. Nothing is
+/// committed here.
 pub async fn record_distilled(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     declaration: &Declaration<'_>,
@@ -438,8 +438,8 @@ pub async fn record_distilled(
         "INSERT INTO knowledge
            (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, evidence,
             points_at, distill_cause, expires_after_runs, last_confirmed_at, status,
-            created_at, activated_at)
-         VALUES ('episodic', ?, ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            created_at, activated_at, observations)
+         VALUES ('episodic', ?, ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 1)",
     )
     .bind(scope_kind)
     .bind(scope_id.as_deref())
@@ -488,8 +488,9 @@ pub async fn record_distilled_trial(
     let id = sqlx::query(
         "INSERT INTO knowledge
            (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, evidence,
-            points_at, distill_cause, status, trial, trial_started_at, created_at, activated_at)
-         VALUES (?, ?, ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?)",
+            points_at, distill_cause, status, trial, trial_started_at, created_at, activated_at,
+            observations)
+         VALUES (?, ?, ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, 1)",
     )
     .bind(layer.as_str())
     .bind(scope_kind)
@@ -652,11 +653,36 @@ pub async fn arm_trial_in(
 /// `false` (and no event) when the row is not an active trial row or is already in that layer.
 /// Nothing is committed here.
 pub async fn promote_layer_in(
-    _tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    _id: i64,
-    _to: Layer,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    to: Layer,
 ) -> sqlx::Result<bool> {
-    Ok(false)
+    let from: Option<String> = sqlx::query_scalar(
+        "SELECT layer FROM knowledge WHERE id = ? AND status = 'active' AND trial = 1",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(from) = from else {
+        return Ok(false);
+    };
+    let moved = sqlx::query(
+        "UPDATE knowledge SET layer = ?, trial_started_at = ?
+          WHERE id = ? AND status = 'active' AND trial = 1 AND layer <> ?",
+    )
+    .bind(to.as_str())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .bind(to.as_str())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if moved {
+        let note = format!("layer {from}->{}", to.as_str());
+        same_status_event_in(tx, id, note).await?;
+    }
+    Ok(moved)
 }
 
 /// Merge evidence into a live row, renew it when it is an active episode, and log the event.

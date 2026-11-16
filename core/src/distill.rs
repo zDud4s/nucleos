@@ -1072,6 +1072,9 @@ pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn
     if let Err(error) = tree::sweep_trees(pool, Utc::now()).await {
         tracing::warn!(%error, "distillation: could not sweep the finished trees");
     }
+    if let Err(error) = crate::knowledge::sweep_rework(pool, Utc::now()).await {
+        tracing::warn!(%error, "distillation: could not sweep the rework records");
+    }
     if let Err(error) = crate::knowledge::sweep_observations(pool, Utc::now()).await {
         tracing::warn!(%error, "distillation: could not sweep the observations");
     }
