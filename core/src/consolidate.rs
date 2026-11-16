@@ -1,4 +1,8 @@
-//! Periodic measurements distilled from durable gate and refusal histories.
+//! Periodic measurements distilled from durable gate histories.
+//!
+//! The consolidator never creates a lesson from a count. It reinforces a row that already has a
+//! cause, merges exact duplicates into the oldest one, expires what nobody reconfirms and promotes
+//! measurements repeated across projects.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -10,9 +14,8 @@ use sqlx::{FromRow, SqliteConnection, SqlitePool};
 pub const CONSOLIDATION_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const MIN_OBSERVATIONS: i64 = 2;
 const PROMOTION_PROJECTS: usize = 3;
-const EPISODIC_VALIDITY_RUNS: i64 = 50;
-const CLEARED_WINDOW_RUNS: usize = 5;
 const EVIDENCE_LIMIT: usize = 20;
+const CLEANUP_FLAG: &str = "consolidator.cleanup_v1";
 
 /// The first retention tick consolidates immediately; later ticks wait for the pass interval.
 pub fn due(last: Option<Instant>, now: Instant) -> bool {
@@ -37,27 +40,6 @@ struct GateRun {
     gate_output: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-struct WindowRun {
-    id: i64,
-    fingerprint: Option<String>,
-}
-
-#[derive(Debug, FromRow)]
-struct RefusalGroup {
-    tool_name: String,
-    observations: i64,
-    first_at: String,
-    last_at: String,
-}
-
-#[derive(Debug, FromRow)]
-struct RefusedGate {
-    id: i64,
-    fingerprint: String,
-    title: String,
-}
-
 #[derive(Debug, FromRow)]
 struct DuplicateKey {
     scope_kind: String,
@@ -68,11 +50,7 @@ struct DuplicateKey {
 #[derive(Debug, FromRow)]
 struct DuplicateMember {
     id: i64,
-    generator: Option<String>,
     observations: i64,
-    kind: String,
-    title: String,
-    body: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -91,24 +69,14 @@ struct Evidence {
     id: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Outcome {
-    Created,
-    Remeasured,
-    Pending,
-    Refused,
-    Elsewhere,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PassReport {
-    pub created: usize,
+    /// Rows with a cause reinforced in place.
     pub remeasured: usize,
-    pub pending: usize,
-    pub refused: usize,
-    pub elsewhere: usize,
+    /// Always 0: no path writes a successor row any more.
     pub successors: usize,
     pub expired: usize,
+    /// Always 0: a contradicted row is left as it is.
     pub superseded: usize,
     pub merged: usize,
     pub skipped_busy: usize,
@@ -130,9 +98,6 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
              SELECT DISTINCT project_id FROM runs
               WHERE project_id IS NOT NULL AND gate_status IS NOT NULL
              UNION
-             SELECT DISTINCT project_id FROM proposals
-              WHERE kind = 'refused-action' AND project_id IS NOT NULL
-             UNION
              SELECT DISTINCT scope_id AS project_id FROM knowledge
               WHERE scope_kind = 'project' AND scope_id IS NOT NULL
                 AND (source = 'consolidator' OR source = 'distiller')
@@ -147,20 +112,7 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
             continue;
         }
         let window = gate_window(pool, &project).await?;
-        for measurement in gate_measurements(&window) {
-            record(
-                &mut report,
-                write_measurement(pool, &project, &measurement, now).await?,
-            );
-        }
-        for measurement in refusal_measurements(pool, &project).await? {
-            record(
-                &mut report,
-                write_measurement(pool, &project, &measurement, now).await?,
-            );
-        }
-        report.successors += write_reversals(pool, &project, &window, now).await?;
-        report.superseded += supersede_contradicted(pool, &project, &window, now).await?;
+        report.remeasured += reinforce_gate_signatures(pool, &project, &window, now).await?;
         report.expired += expire_unconfirmed(pool, &project, now).await?;
     }
     promote_to_machine(pool, now).await?;
@@ -178,89 +130,24 @@ impl crate::execution::runs::Consolidation for Consolidator {
             return;
         }
         *last = Some(Instant::now());
+        match archive_countless_rows(pool, now).await {
+            Ok(0) => {}
+            Ok(archived) => {
+                tracing::info!(archived, "consolidate: archived count rows without a cause");
+            }
+            Err(error) => tracing::warn!(%error, "consolidate: cleanup failed"),
+        }
         match run_pass(pool, now).await {
             Ok(report) if report.is_quiet() => {}
             Ok(report) => tracing::info!(
-                created = report.created,
                 remeasured = report.remeasured,
-                pending = report.pending,
-                refused = report.refused,
-                successors = report.successors,
+                merged = report.merged,
+                expired = report.expired,
                 skipped_busy = report.skipped_busy,
                 "consolidate: pass finished"
             ),
             Err(error) => tracing::warn!(%error, "consolidate: pass failed"),
         }
-    }
-}
-
-async fn write_measurement(
-    pool: &SqlitePool,
-    project: &str,
-    measurement: &Measurement,
-    now: DateTime<Utc>,
-) -> sqlx::Result<Outcome> {
-    let mut transaction = pool.begin().await?;
-    let lives_at_machine_scope: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM knowledge
-          WHERE scope_kind = 'machine' AND scope_id IS NULL AND fingerprint = ?
-            AND source = 'consolidator' AND layer = 'episodic' AND status = 'active')",
-    )
-    .bind(&measurement.fingerprint)
-    .fetch_one(&mut *transaction)
-    .await?;
-    if lives_at_machine_scope != 0 {
-        transaction.commit().await?;
-        return Ok(Outcome::Elsewhere);
-    }
-    if let Some(id) =
-        active_measurement(&mut transaction, project, &measurement.fingerprint).await?
-    {
-        let now = now.to_rfc3339();
-        sqlx::query(
-            "UPDATE knowledge
-                SET observations = ?, title = ?, body = ?, evidence = ?, last_confirmed_at = ?
-              WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
-                AND status = 'active' AND supersedes IS NULL",
-        )
-        .bind(measurement.observations)
-        .bind(&measurement.title)
-        .bind(&measurement.body)
-        .bind(&measurement.evidence)
-        .bind(now)
-        .bind(id)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        return Ok(Outcome::Remeasured);
-    }
-    if let Some(outcome) =
-        blocked_outcome(&mut transaction, project, &measurement.fingerprint).await?
-    {
-        transaction.commit().await?;
-        return Ok(outcome);
-    }
-    insert_measurement(
-        &mut transaction,
-        ("project", Some(project)),
-        measurement,
-        now,
-        None,
-        Some(EPISODIC_VALIDITY_RUNS),
-        "measured by the consolidator",
-    )
-    .await?;
-    transaction.commit().await?;
-    Ok(Outcome::Created)
-}
-
-fn record(report: &mut PassReport, outcome: Outcome) {
-    match outcome {
-        Outcome::Created => report.created += 1,
-        Outcome::Remeasured => report.remeasured += 1,
-        Outcome::Pending => report.pending += 1,
-        Outcome::Refused => report.refused += 1,
-        Outcome::Elsewhere => report.elsewhere += 1,
     }
 }
 
@@ -292,8 +179,10 @@ async fn gate_window(pool: &SqlitePool, project: &str) -> sqlx::Result<Vec<GateR
     .await
 }
 
-fn gate_measurements(window: &[GateRun]) -> Vec<Measurement> {
-    let mut groups: BTreeMap<String, (String, Vec<i64>)> = BTreeMap::new();
+/// Failed gate runs of the window grouped by raw failure signature, keeping the signatures that
+/// repeat: fingerprint to run ids, newest first.
+fn repeated_signatures(window: &[GateRun]) -> BTreeMap<String, Vec<i64>> {
+    let mut groups: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     for run in window {
         if !matches!(run.gate_status.as_str(), "failed" | "errored") {
             continue;
@@ -305,135 +194,70 @@ fn gate_measurements(window: &[GateRun]) -> Vec<Measurement> {
         else {
             continue;
         };
-        let key = format!("gate:{}", signature.fingerprint);
-        let group = groups
-            .entry(key)
-            .or_insert((signature.headline, Vec::new()));
-        group.1.push(run.id);
+        groups
+            .entry(signature.fingerprint)
+            .or_default()
+            .push(run.id);
     }
+    groups.retain(|_, ids| ids.len() as i64 >= MIN_OBSERVATIONS);
     groups
-        .into_iter()
-        .filter(|(_, (_, ids))| ids.len() as i64 >= MIN_OBSERVATIONS)
-        .map(|(fingerprint, (headline, ids))| {
-            gate_measurement(window.len(), fingerprint, headline, ids)
-        })
-        .collect()
 }
 
-fn gate_measurement(
-    total: usize,
-    fingerprint: String,
-    headline: String,
-    ids: Vec<i64>,
-) -> Measurement {
-    let observations = ids.len() as i64;
-    let evidence = ids
-        .into_iter()
-        .take(EVIDENCE_LIMIT)
-        .map(|id| Evidence { t: "run", id })
-        .collect::<Vec<_>>();
-    Measurement {
-        generator: Some("gate".to_owned()),
-        fingerprint,
-        observations,
-        kind: "memory".to_owned(),
-        title: format!("Gate keeps failing: {}", clipped(&headline, 80)),
-        body: format!(
-            "The gate failed with this signature in {observations} of the last {total} gated runs in this project: {headline}"
-        ),
-        evidence: serde_json::to_string(&evidence).expect("evidence is serializable"),
-    }
-}
-
-async fn refusal_measurements(pool: &SqlitePool, project: &str) -> sqlx::Result<Vec<Measurement>> {
-    let groups: Vec<RefusalGroup> = sqlx::query_as(
-        "SELECT tool_name, COUNT(*) AS observations, MIN(created_at) AS first_at,
-                MAX(created_at) AS last_at
-           FROM proposals
-          WHERE kind = 'refused-action' AND project_id = ?
-            AND tool_name IS NOT NULL AND tool_name <> ''
-          GROUP BY tool_name HAVING COUNT(*) >= 2 ORDER BY tool_name",
-    )
-    .bind(project)
-    .fetch_all(pool)
-    .await?;
-    let mut measurements = Vec::with_capacity(groups.len());
-    for group in groups {
-        measurements.push(refusal_measurement(pool, project, group).await?);
-    }
-    Ok(measurements)
-}
-
-async fn refusal_measurement(
+/// A repeated gate signature raises a row somebody already explained (its `cause_key` is the raw
+/// fingerprint) and never creates one: observations go up, the runs become evidence, the row is
+/// reconfirmed.
+async fn reinforce_gate_signatures(
     pool: &SqlitePool,
     project: &str,
-    group: RefusalGroup,
-) -> sqlx::Result<Measurement> {
-    let ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM proposals
-          WHERE kind = 'refused-action' AND project_id = ? AND tool_name = ?
-          ORDER BY id DESC LIMIT ?",
-    )
-    .bind(project)
-    .bind(&group.tool_name)
-    .bind(EVIDENCE_LIMIT as i64)
-    .fetch_all(pool)
-    .await?;
-    let evidence = ids
-        .into_iter()
-        .map(|id| Evidence { t: "proposal", id })
-        .collect::<Vec<_>>();
-    Ok(Measurement {
-        generator: Some("refused-action".to_owned()),
-        fingerprint: format!("refused-action:{}", group.tool_name.trim().to_lowercase()),
-        observations: group.observations,
-        kind: "memory".to_owned(),
-        title: format!("Refused here: {}", group.tool_name),
-        body: format!(
-            "Asking for {} in this project was refused {} times between {} and {}.",
-            group.tool_name, group.observations, group.first_at, group.last_at
-        ),
-        evidence: serde_json::to_string(&evidence).expect("evidence is serializable"),
-    })
-}
-
-async fn active_measurement(
-    connection: &mut SqliteConnection,
-    project: &str,
-    fingerprint: &str,
-) -> sqlx::Result<Option<i64>> {
-    sqlx::query_scalar(
-        "SELECT id FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?
-            AND source = 'consolidator' AND layer = 'episodic' AND status = 'active'
-            AND supersedes IS NULL ORDER BY id DESC LIMIT 1",
-    )
-    .bind(project)
-    .bind(fingerprint)
-    .fetch_optional(connection)
-    .await
-}
-
-async fn blocked_outcome(
-    connection: &mut SqliteConnection,
-    project: &str,
-    fingerprint: &str,
-) -> sqlx::Result<Option<Outcome>> {
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?
-            AND status IN ('proposed', 'rejected', 'reverted')
-          ORDER BY CASE status WHEN 'proposed' THEN 0 ELSE 1 END, id DESC LIMIT 1",
-    )
-    .bind(project)
-    .bind(fingerprint)
-    .fetch_optional(connection)
-    .await?;
-    Ok(match status.as_deref() {
-        Some("proposed") => Some(Outcome::Pending),
-        Some("rejected" | "reverted") => Some(Outcome::Refused),
-        _ => None,
-    })
+    window: &[GateRun],
+    now: DateTime<Utc>,
+) -> sqlx::Result<usize> {
+    let now = now.to_rfc3339();
+    let mut reinforced = 0;
+    for (fingerprint, run_ids) in repeated_signatures(window) {
+        let mut transaction = pool.begin().await?;
+        let rows: Vec<(i64, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT id, observations, evidence FROM knowledge
+              WHERE scope_kind = 'project' AND scope_id = ? AND cause_key = ?
+                AND source IN ('consolidator', 'distiller')
+                AND status IN ('active', 'proposed')
+              ORDER BY id",
+        )
+        .bind(project)
+        .bind(&fingerprint)
+        .fetch_all(&mut *transaction)
+        .await?;
+        for (id, observations, evidence) in rows {
+            let mut items: Vec<serde_json::Value> = evidence
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or_default();
+            for run_id in &run_ids {
+                let item = serde_json::json!({"t": "run", "id": run_id});
+                if items.len() < EVIDENCE_LIMIT && !items.contains(&item) {
+                    items.push(item);
+                }
+            }
+            let observed = observations.unwrap_or(0).max(run_ids.len() as i64);
+            let updated = sqlx::query(
+                "UPDATE knowledge
+                    SET observations = ?, evidence = ?, last_confirmed_at = ?
+                  WHERE id = ? AND cause_key = ?
+                    AND source IN ('consolidator', 'distiller')
+                    AND status IN ('active', 'proposed')",
+            )
+            .bind(observed)
+            .bind(serde_json::to_string(&items).expect("evidence is serializable"))
+            .bind(&now)
+            .bind(id)
+            .bind(&fingerprint)
+            .execute(&mut *transaction)
+            .await?;
+            reinforced += updated.rows_affected() as usize;
+        }
+        transaction.commit().await?;
+    }
+    Ok(reinforced)
 }
 
 async fn insert_measurement(
@@ -441,7 +265,6 @@ async fn insert_measurement(
     scope: (&str, Option<&str>),
     measurement: &Measurement,
     now: DateTime<Utc>,
-    supersedes: Option<i64>,
     expires_after_runs: Option<i64>,
     event_note: &str,
 ) -> sqlx::Result<i64> {
@@ -451,7 +274,7 @@ async fn insert_measurement(
              observations, fingerprint, expires_after_runs, last_confirmed_at, kind, title, body,
              status, proposal_id, supersedes, origin_run_id, created_at, activated_at, ended_at)
          VALUES ('episodic', ?, ?, 'consolidator', ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 'active', NULL, ?, NULL, ?, ?, NULL)",
+                 'active', NULL, NULL, NULL, ?, ?, NULL)",
     )
     .bind(scope.0)
     .bind(scope.1)
@@ -464,7 +287,6 @@ async fn insert_measurement(
     .bind(&measurement.kind)
     .bind(&measurement.title)
     .bind(&measurement.body)
-    .bind(supersedes)
     .bind(&now)
     .bind(&now)
     .execute(&mut *connection)
@@ -482,169 +304,158 @@ async fn insert_measurement(
     Ok(id)
 }
 
-fn as_window(window: &[GateRun]) -> Vec<WindowRun> {
-    window
-        .iter()
-        .map(|run| WindowRun {
-            id: run.id,
-            fingerprint: run
-                .gate_output
-                .as_deref()
-                .filter(|_| matches!(run.gate_status.as_str(), "failed" | "errored"))
-                .and_then(crate::knowledge::failure_signature)
-                .map(|signature| format!("gate:{}", signature.fingerprint)),
-        })
-        .collect()
-}
 
-fn reversed(window: &[WindowRun], fingerprint: &str) -> bool {
-    window.len() >= CLEARED_WINDOW_RUNS
-        && window
-            .iter()
-            .take(CLEARED_WINDOW_RUNS)
-            .all(|run| run.fingerprint.as_deref() != Some(fingerprint))
-}
-
-async fn write_reversals(
-    pool: &SqlitePool,
-    project: &str,
-    window: &[GateRun],
-    now: DateTime<Utc>,
-) -> sqlx::Result<usize> {
-    let refused: Vec<RefusedGate> = sqlx::query_as(
-        "SELECT id, fingerprint, title FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint IS NOT NULL
-            AND status IN ('rejected', 'reverted') AND source = 'consolidator'
-            AND layer = 'episodic' AND generator = 'gate' AND supersedes IS NULL
-          ORDER BY id DESC",
+/// Exact duplicates collapse into the oldest row: it absorbs the observations and the others are
+/// archived, so the surviving id never changes and no successor is inserted.
+async fn merge_duplicates(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<usize> {
+    let keys: Vec<DuplicateKey> = sqlx::query_as(
+        "SELECT scope_kind, scope_id, fingerprint FROM knowledge
+          WHERE source = 'consolidator' AND layer = 'episodic' AND status = 'active'
+            AND fingerprint IS NOT NULL
+          GROUP BY scope_kind, scope_id, fingerprint HAVING COUNT(*) > 1
+          ORDER BY scope_kind, scope_id, fingerprint",
     )
-    .bind(project)
     .fetch_all(pool)
     .await?;
-    let window = as_window(window);
-    let mut written = 0;
-    for row in refused {
-        if reversed(&window, &row.fingerprint)
-            && write_reversal(pool, project, &row, &window, now, false).await?
+    let mut merged = 0;
+    for key in keys {
+        if key.scope_kind == "project"
+            && let Some(project) = key.scope_id.as_deref()
+            && project_is_busy(pool, project).await?
         {
-            written += 1;
+            continue;
         }
-    }
-    Ok(written)
-}
-
-async fn write_reversal(
-    pool: &SqlitePool,
-    project: &str,
-    refused: &RefusedGate,
-    window: &[WindowRun],
-    now: DateTime<Utc>,
-    supersede_old: bool,
-) -> sqlx::Result<bool> {
-    let mut transaction = pool.begin().await?;
-    let exists: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?
-            AND supersedes IS NOT NULL AND status IN ('proposed', 'active'))",
-    )
-    .bind(project)
-    .bind(&refused.fingerprint)
-    .fetch_one(&mut *transaction)
-    .await?;
-    if exists != 0 {
-        transaction.commit().await?;
-        return Ok(false);
-    }
-    let measurement = reversal_measurement(refused, window);
-    insert_measurement(
-        &mut transaction,
-        ("project", Some(project)),
-        &measurement,
-        now,
-        Some(refused.id),
-        Some(EPISODIC_VALIDITY_RUNS),
-        "measured by the consolidator",
-    )
-    .await?;
-    if supersede_old {
-        let now = now.to_rfc3339();
-        let updated = sqlx::query(
-            "UPDATE knowledge SET status = 'superseded', ended_at = ?
-              WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
-                AND generator = 'gate' AND status = 'active' AND supersedes IS NULL",
+        let mut transaction = pool.begin().await?;
+        let members: Vec<DuplicateMember> = sqlx::query_as(
+            "SELECT id, COALESCE(observations, 0) AS observations
+               FROM knowledge
+              WHERE scope_kind = ? AND scope_id IS ? AND fingerprint = ?
+                AND source = 'consolidator' AND layer = 'episodic' AND status = 'active'
+              ORDER BY id",
         )
-        .bind(&now)
-        .bind(refused.id)
+        .bind(&key.scope_kind)
+        .bind(&key.scope_id)
+        .bind(&key.fingerprint)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let Some((oldest, rest)) = members.split_first() else {
+            transaction.commit().await?;
+            continue;
+        };
+        if rest.is_empty() {
+            transaction.commit().await?;
+            continue;
+        }
+        let evidence = rest
+            .iter()
+            .map(|member| Evidence {
+                t: "knowledge",
+                id: member.id,
+            })
+            .collect::<Vec<_>>();
+        let observations: i64 = members.iter().map(|member| member.observations).sum();
+        let now_text = now.to_rfc3339();
+        let updated = sqlx::query(
+            "UPDATE knowledge SET observations = ?, evidence = ?, last_confirmed_at = ?
+              WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
+                AND status = 'active'",
+        )
+        .bind(observations)
+        .bind(serde_json::to_string(&evidence).expect("evidence is serializable"))
+        .bind(&now_text)
+        .bind(oldest.id)
         .execute(&mut *transaction)
         .await?;
-        if updated.rows_affected() != 1 {
-            transaction.rollback().await?;
-            return Ok(false);
+        if updated.rows_affected() == 0 {
+            transaction.commit().await?;
+            continue;
+        }
+        for member in rest {
+            let updated = sqlx::query(
+                "UPDATE knowledge SET status = 'archived', ended_at = ?
+                  WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
+                    AND status = 'active'",
+            )
+            .bind(&now_text)
+            .bind(member.id)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+                 VALUES (?, 'active', 'archived', ?, ?)",
+            )
+            .bind(member.id)
+            .bind(format!("merged into {}", oldest.id))
+            .bind(&now_text)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        merged += 1;
+    }
+    Ok(merged)
+}
+
+/// One-shot cleanup of the count rows the consolidator used to write (gate and refused-action
+/// generators, episodic layer): they are archived, one event each, nothing is deleted. The
+/// `schema_meta` flag makes a second call a no-op, so a row written later is never swept.
+pub(super) async fn archive_countless_rows(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> sqlx::Result<usize> {
+    let mut transaction = pool.begin().await?;
+    let done: Option<String> = sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+        .bind(CLEANUP_FLAG)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    if done.is_some() {
+        transaction.commit().await?;
+        return Ok(0);
+    }
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM knowledge
+          WHERE source = 'consolidator' AND generator IN ('gate', 'refused-action')
+            AND layer = 'episodic' AND status IN ('active', 'proposed')
+          ORDER BY id",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let now_text = now.to_rfc3339();
+    let mut archived = 0;
+    for (id, from_status) in rows {
+        let updated = sqlx::query(
+            "UPDATE knowledge SET status = 'archived', ended_at = ?
+              WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
+                AND status IN ('active', 'proposed')",
+        )
+        .bind(&now_text)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() == 0 {
+            continue;
         }
         sqlx::query(
             "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
-             VALUES (?, 'active', 'superseded', 'the measurement now says the opposite', ?)",
+             VALUES (?, ?, 'archived', 'cleanup: consolidator count without cause', ?)",
         )
-        .bind(refused.id)
-        .bind(now)
+        .bind(id)
+        .bind(from_status)
+        .bind(&now_text)
         .execute(&mut *transaction)
         .await?;
+        archived += 1;
     }
+    sqlx::query("INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)")
+        .bind(CLEANUP_FLAG)
+        .bind(&now_text)
+        .execute(&mut *transaction)
+        .await?;
     transaction.commit().await?;
-    Ok(true)
-}
-
-fn reversal_measurement(refused: &RefusedGate, window: &[WindowRun]) -> Measurement {
-    let headline = refused
-        .title
-        .strip_prefix("Gate keeps failing: ")
-        .unwrap_or(&refused.title);
-    let evidence = window
-        .iter()
-        .take(CLEARED_WINDOW_RUNS)
-        .map(|run| Evidence {
-            t: "run",
-            id: run.id,
-        })
-        .collect::<Vec<_>>();
-    Measurement {
-        generator: Some("gate".to_owned()),
-        fingerprint: refused.fingerprint.clone(),
-        observations: 0,
-        kind: "memory".to_owned(),
-        title: format!("Gate failure no longer recurs: {}", clipped(headline, 80)),
-        body: format!(
-            "The gate has not failed with this signature in the last {CLEARED_WINDOW_RUNS} gated runs in this project."
-        ),
-        evidence: serde_json::to_string(&evidence).expect("evidence is serializable"),
-    }
-}
-
-async fn supersede_contradicted(
-    pool: &SqlitePool,
-    project: &str,
-    window: &[GateRun],
-    now: DateTime<Utc>,
-) -> sqlx::Result<usize> {
-    let active: Vec<RefusedGate> = sqlx::query_as(
-        "SELECT id, fingerprint, title FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint IS NOT NULL
-            AND source = 'consolidator' AND layer = 'episodic' AND status = 'active'
-            AND generator = 'gate' AND supersedes IS NULL ORDER BY id DESC",
-    )
-    .bind(project)
-    .fetch_all(pool)
-    .await?;
-    let window = as_window(window);
-    let mut superseded = 0;
-    for row in active {
-        if reversed(&window, &row.fingerprint)
-            && write_reversal(pool, project, &row, &window, now, true).await?
-        {
-            superseded += 1;
-        }
-    }
-    Ok(superseded)
+    Ok(archived)
 }
 
 async fn expire_unconfirmed(
@@ -695,99 +506,6 @@ async fn expire_unconfirmed(
     }
     transaction.commit().await?;
     Ok(expired)
-}
-
-async fn merge_duplicates(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<usize> {
-    let keys: Vec<DuplicateKey> = sqlx::query_as(
-        "SELECT scope_kind, scope_id, fingerprint FROM knowledge
-          WHERE source = 'consolidator' AND layer = 'episodic' AND status = 'active'
-            AND fingerprint IS NOT NULL
-          GROUP BY scope_kind, scope_id, fingerprint HAVING COUNT(*) > 1
-          ORDER BY scope_kind, scope_id, fingerprint",
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut merged = 0;
-    for key in keys {
-        if key.scope_kind == "project"
-            && let Some(project) = key.scope_id.as_deref()
-            && project_is_busy(pool, project).await?
-        {
-            continue;
-        }
-        let mut transaction = pool.begin().await?;
-        let members: Vec<DuplicateMember> = sqlx::query_as(
-            "SELECT id, generator, COALESCE(observations, 0) AS observations,
-                    kind, title, body
-               FROM knowledge
-              WHERE scope_kind = ? AND scope_id IS ? AND fingerprint = ?
-                AND source = 'consolidator' AND layer = 'episodic' AND status = 'active'
-              ORDER BY id",
-        )
-        .bind(&key.scope_kind)
-        .bind(&key.scope_id)
-        .bind(&key.fingerprint)
-        .fetch_all(&mut *transaction)
-        .await?;
-        if members.len() < 2 {
-            transaction.commit().await?;
-            continue;
-        }
-        let newest = members.last().expect("duplicate group has a newest member");
-        let evidence = members
-            .iter()
-            .map(|member| Evidence {
-                t: "knowledge",
-                id: member.id,
-            })
-            .collect::<Vec<_>>();
-        let measurement = Measurement {
-            generator: newest.generator.clone(),
-            fingerprint: key.fingerprint,
-            observations: members.iter().map(|member| member.observations).sum(),
-            kind: newest.kind.clone(),
-            title: newest.title.clone(),
-            body: newest.body.clone(),
-            evidence: serde_json::to_string(&evidence).expect("evidence is serializable"),
-        };
-        let successor = insert_measurement(
-            &mut transaction,
-            (&key.scope_kind, key.scope_id.as_deref()),
-            &measurement,
-            now,
-            None,
-            Some(EPISODIC_VALIDITY_RUNS),
-            "measured by the consolidator",
-        )
-        .await?;
-        let now_text = now.to_rfc3339();
-        for member in members {
-            let updated = sqlx::query(
-                "UPDATE knowledge SET status = 'archived', ended_at = ?
-                  WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
-                    AND status = 'active'",
-            )
-            .bind(&now_text)
-            .bind(member.id)
-            .execute(&mut *transaction)
-            .await?;
-            if updated.rows_affected() == 0 {
-                continue;
-            }
-            sqlx::query(
-                "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
-                 VALUES (?, 'active', 'archived', ?, ?)",
-            )
-            .bind(member.id)
-            .bind(format!("merged into {successor}"))
-            .bind(&now_text)
-            .execute(&mut *transaction)
-            .await?;
-        }
-        transaction.commit().await?;
-        merged += 1;
-    }
-    Ok(merged)
 }
 
 /// Promote measurements repeated across independent projects into the inherited machine scope.
@@ -876,7 +594,6 @@ pub async fn promote_to_machine(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::
             &measurement,
             now,
             None,
-            None,
             &format!("promoted from {project_count} projects"),
         )
         .await?;
@@ -908,10 +625,6 @@ pub async fn promote_to_machine(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::
         promoted += 1;
     }
     Ok(promoted)
-}
-
-fn clipped(value: &str, width: usize) -> String {
-    value.chars().take(width).collect()
 }
 
 #[cfg(test)]
@@ -1083,9 +796,10 @@ mod tests {
 
     /// `(name, declared type, notnull, default)` of every column of `table`.
     async fn columns(pool: &SqlitePool, table: &str) -> Vec<(String, String, i64, Option<String>)> {
-        sqlx::query(&format!(
-            "SELECT name, type, \"notnull\" AS not_null, dflt_value FROM pragma_table_info('{table}')"
-        ))
+        sqlx::query(
+            "SELECT name, type, \"notnull\" AS not_null, dflt_value FROM pragma_table_info(?)",
+        )
+        .bind(table)
         .fetch_all(pool)
         .await
         .unwrap()

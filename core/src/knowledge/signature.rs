@@ -70,8 +70,48 @@ pub fn failure_signature(output: &str) -> Option<FailureSignature> {
     })
 }
 
+/// Drops ANSI escape sequences: CSI (`ESC [ ... <final byte>`, colour and cursor codes) and OSC
+/// (`ESC ] ... BEL` or `ESC ] ... ESC \`). A lone ESC is dropped; the text is otherwise untouched.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 pub(super) fn normalise_line(line: &str) -> String {
-    let line = replace_worktree_paths(line);
+    let line = strip_ansi(line);
+    let line = replace_worktree_paths(&line);
     let line = replace_numbered_ids(&line);
     let line = replace_line_columns(&line);
     let line = replace_durations(&line);
