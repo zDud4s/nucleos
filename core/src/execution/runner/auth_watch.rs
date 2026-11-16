@@ -363,7 +363,11 @@ mod tests {
             .await
             .unwrap();
         let mark = stored.iter().find(|m| m.account_id == id).expect("stored");
-        assert_eq!(mark.resets_at, Some(reset));
+        // Storage keeps whole seconds.
+        assert_eq!(
+            mark.resets_at.map(|t| t.timestamp()),
+            Some(reset.timestamp())
+        );
     }
 
     #[test]
