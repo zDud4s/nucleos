@@ -347,6 +347,19 @@ pub async fn enqueue(pool: &SqlitePool, request: &Request, now_ms: i64) -> sqlx:
     Ok(Submitted { id, joined: false })
 }
 
+/// When a `verify` request's oldest unit was queued: the queue position a follow-up request can
+/// inherit. Cache-hit rows carry no enqueue time, so a fully cached request yields `None`.
+pub async fn ticket_queued_since(pool: &SqlitePool, request_id: i64) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT MIN(enqueued_ms) FROM verify_runs \
+         WHERE origin = ? AND origin_id = ? AND enqueued_ms IS NOT NULL",
+    )
+    .bind(ORIGIN_VERIFY)
+    .bind(request_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Records the workflow task on the unit rows one `verify` request created: the rows it queued and
 /// the cache hits it recorded, all of which carry the request as their `origin_id`.
 ///
@@ -1119,6 +1132,20 @@ mod tests {
         r.argv = vec![argv.to_owned()];
         let unit = enqueue(pool, &r, 100).await.unwrap().id;
         (ticket, unit)
+    }
+
+    #[tokio::test]
+    async fn a_ticket_queued_since_is_its_oldest_unit_enqueue_time() {
+        let pool = test_pool().await;
+        for (origin_id, at) in [(7, 150), (7, 100), (8, 50)] {
+            let mut r = request(None, 1);
+            r.origin = ORIGIN_VERIFY.to_owned();
+            r.origin_id = Some(origin_id);
+            enqueue(&pool, &r, at).await.unwrap();
+        }
+        assert_eq!(ticket_queued_since(&pool, 7).await.unwrap(), Some(100));
+        assert_eq!(ticket_queued_since(&pool, 8).await.unwrap(), Some(50));
+        assert_eq!(ticket_queued_since(&pool, 99).await.unwrap(), None);
     }
 
     #[tokio::test]

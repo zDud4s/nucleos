@@ -510,6 +510,16 @@ async fn submit_with(
     })?;
 
     let worktree = root.to_string_lossy().into_owned();
+    if !plan.unclaimed.is_empty() {
+        tracing::warn!(
+            base = base.as_deref().unwrap_or(""),
+            worktree = %worktree,
+            caller = %caller.label(),
+            count = plan.unclaimed.len(),
+            paths = ?plan.unclaimed.iter().take(20).collect::<Vec<_>>(),
+            "verify: unclaimed paths make every group run"
+        );
+    }
     let scope = args.scope.as_str();
     let kind = args.kind.as_str();
     let priority = terms.priority(caller);
@@ -646,23 +656,29 @@ async fn submit_with(
             }
         }
 
+        let since = terms
+            .queued_since_ms
+            .filter(|_| matches!(caller, Caller::Job(_)));
         let submitted = executor
-            .submit(verify_runs::Request {
-                project_id: Some(project_id.clone()),
-                worktree: worktree.clone(),
-                scope: scope.to_owned(),
-                origin: ORIGIN_VERIFY.to_owned(),
-                origin_id: Some(id),
-                requested_by: caller.requested_by(scope),
-                group_name: unit.group.clone(),
-                kind: Some(kind.to_owned()),
-                argv: unit.argv.clone(),
-                fingerprint: unit.fingerprint.clone(),
-                priority,
-                // Zero lets the executor derive both from the argv and its own config.
-                weight: 0,
-                timeout_ms: terms.unit_timeout_ms(caller),
-            })
+            .submit_since(
+                verify_runs::Request {
+                    project_id: Some(project_id.clone()),
+                    worktree: worktree.clone(),
+                    scope: scope.to_owned(),
+                    origin: ORIGIN_VERIFY.to_owned(),
+                    origin_id: Some(id),
+                    requested_by: caller.requested_by(scope),
+                    group_name: unit.group.clone(),
+                    kind: Some(kind.to_owned()),
+                    argv: unit.argv.clone(),
+                    fingerprint: unit.fingerprint.clone(),
+                    priority,
+                    // Zero lets the executor derive both from the argv and its own config.
+                    weight: 0,
+                    timeout_ms: terms.unit_timeout_ms(caller),
+                },
+                since,
+            )
             .await;
         let submitted = match submitted {
             Ok(submitted) => submitted,
@@ -1426,6 +1442,7 @@ tests:
             fix: false,
             unit_timeout_secs: 3600,
             recheck: None,
+            queued_since_ms: None,
         };
         assert_eq!(scoped.unit_timeout_ms(job), 3_600_000);
     }

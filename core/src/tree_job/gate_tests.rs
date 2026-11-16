@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::driver::{GateVerdict, NotMeasured};
 use super::gate::{
     GateIo, Stored, failed_tests_of, gate_at_head, gate_compiled_then_tested,
-    gate_rechecked_then_tested,
+    gate_rechecked_then_tested, inherit_since,
 };
 use crate::verify::plan::{Progress, Ticket, UnitReport};
 
@@ -438,4 +438,16 @@ async fn a_new_head_gets_its_own_unit() {
     assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
     assert!(gate_at_head(&fake, "h2", WAIT).await.is_err());
     assert_eq!(fake.submits(), 2);
+}
+
+#[test]
+fn the_test_step_inherits_only_the_check_ticket_of_the_same_head() {
+    let stored = Stored {
+        ticket: 3,
+        head: "abc".to_owned(),
+    };
+    assert_eq!(inherit_since(Some(&stored), "abc", Some(5)), Some(5));
+    assert_eq!(inherit_since(Some(&stored), "def", Some(5)), None);
+    assert_eq!(inherit_since(Some(&stored), "abc", None), None);
+    assert_eq!(inherit_since(None, "abc", Some(5)), None);
 }

@@ -44,6 +44,9 @@ pub struct GateTerms {
     /// A `test` request that runs only these `(group, test ids)` instead of the diff's scope: the
     /// first step of a fix's re-gate (`plan::plan_recheck`).
     pub recheck: Option<Vec<(String, Vec<String>)>>,
+    /// Queue the request as of this time (ms) instead of now: a follow-up request inherits the
+    /// position its predecessor already waited for. Honoured only for a job caller.
+    pub queued_since_ms: Option<i64>,
 }
 
 impl GateTerms {

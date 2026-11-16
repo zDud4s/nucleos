@@ -231,6 +231,18 @@ struct VerifyIo<'a> {
     job_id: &'a str,
     branch: &'a str,
     worktree: &'a str,
+    /// The HEAD this gate measures.
+    head: &'a str,
+}
+
+/// The queue time the test step inherits from the build check: the check's oldest unit, only when
+/// the check measured the same `head`.
+pub(super) fn inherit_since(
+    stored: Option<&Stored>,
+    head: &str,
+    oldest: Option<i64>,
+) -> Option<i64> {
+    stored.filter(|stored| stored.head == head).and(oldest)
 }
 
 impl VerifyIo<'_> {
@@ -245,7 +257,28 @@ impl VerifyIo<'_> {
         let Some(held) = job.manifest.branches.get(self.branch) else {
             return GateTerms::default();
         };
+        let queued_since_ms = if self.kind == Kind::Test && !self.recheck {
+            let check = held.extra.get(CHECK_KEY).and_then(|value| {
+                Some(Stored {
+                    ticket: value.get("ticket")?.as_i64()?,
+                    head: value.get("head")?.as_str()?.to_owned(),
+                })
+            });
+            let oldest = match &check {
+                Some(check) => crate::verify::runs::ticket_queued_since(self.pool, check.ticket)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, job = self.job_id, branch = self.branch, "gate: cannot read the check ticket's queue time");
+                        None
+                    }),
+                None => None,
+            };
+            inherit_since(check.as_ref(), self.head, oldest)
+        } else {
+            None
+        };
         GateTerms {
+            queued_since_ms,
             fix: held.state == "fixing",
             unit_timeout_secs: branch_ceiling_secs(
                 &held.extra,
@@ -433,6 +466,7 @@ pub(super) async fn gate_branch(
         job_id,
         branch,
         worktree,
+        head: &head,
     };
     if recorded_failures(pool, job_id, branch, true)
         .await
