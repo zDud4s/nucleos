@@ -862,13 +862,7 @@ pub async fn ingest_cycle(
 
     // The scan root is `<config dir>/projects`; its parent stands for the default account's dir.
     // A failed read leaves the account column NULL, never blocks the ingest.
-    let accounts = crate::accounts::store::list(pool)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "devtime: could not read the accounts");
-            Vec::new()
-        });
-    let default_dir = path_key(projects_dir.parent().unwrap_or(projects_dir));
+    let (accounts, default_dir) = account::load(pool, projects_dir).await;
 
     let dir = projects_dir.to_path_buf();
     let found = tokio::task::spawn_blocking(move || walk(&dir))
@@ -938,8 +932,7 @@ pub async fn ingest_cycle(
                 worktree,
                 ..
             }) if kind == "project" || kind == "worktree" || kind == "tree_node" => {
-                let account_id =
-                    crate::devtime::account::resolve_account(&key, &default_dir, &accounts);
+                let account_id = account::resolve_account(&key, &default_dir, &accounts);
                 match ingest_file(
                     pool,
                     file,

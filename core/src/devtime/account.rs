@@ -3,6 +3,7 @@
 //! Pure: no I/O, no database. Only directory paths are compared, never credentials.
 
 use crate::accounts::Account;
+use sqlx::SqlitePool;
 use std::path::{Component, Path};
 
 /// Path components, lower-cased on Windows (case-insensitive) and with `\` and `/` treated alike.
@@ -23,6 +24,19 @@ fn parts(path: &str) -> Vec<String> {
 
 fn is_under(path: &[String], dir: &[String]) -> bool {
     !dir.is_empty() && path.len() > dir.len() && path[..dir.len()] == dir[..]
+}
+
+/// The accounts plus the default config dir (the parent of the scanned `projects` root). A failed
+/// read yields no accounts, so the column stays NULL and the ingest is never blocked.
+pub async fn load(pool: &SqlitePool, projects_dir: &Path) -> (Vec<Account>, String) {
+    let accounts = crate::accounts::store::list(pool)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "devtime: could not read the accounts");
+            Vec::new()
+        });
+    let default_dir = projects_dir.parent().unwrap_or(projects_dir);
+    (accounts, super::path_key(default_dir))
 }
 
 /// The id of the Claude account whose config dir holds `transcript`, or `None` when no account's

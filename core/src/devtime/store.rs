@@ -1127,6 +1127,7 @@ mod tests {
                     "unknown_records",
                     "parser_version",
                     "updated_at",
+                    "account_id",
                 ],
             ),
             (
