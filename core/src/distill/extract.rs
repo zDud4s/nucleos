@@ -301,7 +301,12 @@ pub fn standing_for(cause: Cause) -> String {
         | Cause::GateRecovered
         | Cause::ReviewBlocking
         | Cause::RunExhausted
-        | Cause::OwnerAnswered => "",
+        | Cause::OwnerAnswered
+        | Cause::TreeLanded
+        | Cause::TreeFailed
+        | Cause::TreeParked
+        | Cause::BranchRecovered
+        | Cause::BranchLanded => "",
     };
     format!("{STANDING_HEAD}{tail}")
 }

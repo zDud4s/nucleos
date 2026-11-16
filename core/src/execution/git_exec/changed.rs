@@ -104,6 +104,23 @@ pub async fn worktree_of_branch(
         .map_err(|outcome| format!("could not list the worktrees: {outcome:?}"))
 }
 
+/// What a commit brought in against its first parent: the `git diff --stat` text and the subjects
+/// of the commits in `sha^1..sha`.
+pub struct CommitSummary {
+    pub stat: String,
+    pub subjects: Vec<String>,
+}
+
+/// The diff stat and commit subjects of `sha` against its first parent; an error when either git
+/// read fails.
+pub async fn commit_summary(
+    _project_root: &std::path::Path,
+    _sha: &str,
+    _deadline: std::time::Instant,
+) -> Result<CommitSummary, String> {
+    Err("todo".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +186,52 @@ mod tests {
             .await
             .is_err(),
             "an unknown sha is an error, never an empty list"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_summary_lists_stat_and_subjects_of_a_merge() {
+        let (_container, repo) = forked();
+        git(&repo, &["merge", "--no-ff", "-q", "-m", "merge feat", "feat"]);
+        let merge = git(&repo, &["rev-parse", "HEAD"]);
+
+        let summary = commit_summary(&repo, &merge, deadline()).await.unwrap();
+
+        assert!(summary.stat.contains("a.txt"), "stat: {}", summary.stat);
+        assert!(
+            !summary.stat.contains("m.txt"),
+            "m.txt was master's before the merge: {}",
+            summary.stat
+        );
+        assert!(
+            summary.subjects.contains(&"merge feat".to_owned()),
+            "subjects: {:?}",
+            summary.subjects
+        );
+        assert!(
+            summary.subjects.contains(&"a".to_owned()),
+            "subjects: {:?}",
+            summary.subjects
+        );
+        assert!(
+            !summary.subjects.contains(&"m".to_owned()),
+            "subjects: {:?}",
+            summary.subjects
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_summary_of_an_unknown_sha_is_an_error() {
+        let (_container, repo) = forked();
+        let error = commit_summary(
+            &repo,
+            "0000000000000000000000000000000000000000",
+            deadline(),
+        )
+        .await;
+        assert!(
+            matches!(&error, Err(message) if message != "todo"),
+            "an unknown sha is an error from git, never an empty summary"
         );
     }
 

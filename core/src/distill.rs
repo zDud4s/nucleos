@@ -11,6 +11,14 @@ pub mod origin;
 pub mod sources;
 mod week;
 
+mod known;
+mod tree;
+mod tree_dossier;
+mod tree_gather;
+mod tree_worker;
+pub use tree::*;
+pub use tree_dossier::*;
+
 mod extract;
 mod generalise;
 pub use extract::*;
@@ -32,9 +40,19 @@ pub enum Cause {
     /// A batch of exchanges of one chat; the row names its chat in `chat_id`.
     ChatExchanges,
     OwnerAnswered,
+    /// A tree that finished and landed (or ended with nothing to blame).
+    TreeLanded,
+    /// A tree that ended abandoned or with a failed landing.
+    TreeFailed,
+    /// A tree decision the owner answered.
+    TreeParked,
+    /// A tree branch whose gate went red and then green.
+    BranchRecovered,
+    /// A merge into a protected branch that is neither a job's nor a tree's own.
+    BranchLanded,
 }
 
-pub const CAUSES: [Cause; 8] = [
+pub const CAUSES: [Cause; 13] = [
     Cause::JobLanded,
     Cause::JobFailed,
     Cause::GateRecovered,
@@ -43,6 +61,11 @@ pub const CAUSES: [Cause; 8] = [
     Cause::CalendarWeek,
     Cause::ChatExchanges,
     Cause::OwnerAnswered,
+    Cause::TreeLanded,
+    Cause::TreeFailed,
+    Cause::TreeParked,
+    Cause::BranchRecovered,
+    Cause::BranchLanded,
 ];
 
 impl Cause {
@@ -56,6 +79,12 @@ impl Cause {
             Cause::CalendarWeek => "calendar_week",
             Cause::ChatExchanges => "chat_exchanges",
             Cause::OwnerAnswered => "owner_answered",
+            // RED stub: the wire names arrive with the GREEN packet.
+            Cause::TreeLanded
+            | Cause::TreeFailed
+            | Cause::TreeParked
+            | Cause::BranchRecovered
+            | Cause::BranchLanded => "",
         }
     }
 
@@ -255,6 +284,10 @@ pub struct QueueRow {
     pub run_id: Option<i64>,
     pub chat_id: Option<String>,
     pub attempts: i64,
+    pub tree_id: Option<String>,
+    pub node_id: Option<String>,
+    pub request_id: Option<i64>,
+    pub decision_id: Option<String>,
 }
 
 /// Put every row a dead daemon left `running` back in line. Returns the rows changed.
@@ -279,7 +312,8 @@ pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<O
               WHERE id = (SELECT q.id FROM distill_queue q
                            WHERE q.status = ? AND (q.not_before IS NULL OR q.not_before <= ?)
                            ORDER BY q.id LIMIT 1)
-             RETURNING id, cause, project_id, job_id, item_id, run_id, chat_id, attempts",
+             RETURNING id, cause, project_id, job_id, item_id, run_id, chat_id, attempts,
+                       tree_id, node_id, request_id, decision_id",
         )
         .bind(STATUS_RUNNING)
         .bind(STATUS_PENDING)
@@ -1475,8 +1509,8 @@ mod tests {
 
         let spellings: std::collections::HashSet<&str> =
             CAUSES.iter().map(|c| c.as_str()).collect();
-        assert_eq!(CAUSES.len(), 8);
-        assert_eq!(spellings.len(), 8, "two causes share a spelling");
+        assert_eq!(CAUSES.len(), 13);
+        assert_eq!(spellings.len(), 13, "two causes share a spelling");
         for expected in [
             "job_landed",
             "job_failed",
@@ -1486,6 +1520,11 @@ mod tests {
             "calendar_week",
             "chat_exchanges",
             "owner_answered",
+            "tree_landed",
+            "tree_failed",
+            "tree_parked",
+            "branch_recovered",
+            "branch_landed",
         ] {
             assert!(spellings.contains(expected), "{expected} is not a cause");
         }
