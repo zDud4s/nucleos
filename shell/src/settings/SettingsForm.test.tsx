@@ -494,3 +494,39 @@ describe("takesEffectPhrase", () => {
     expect(takesEffectPhrase("at the next tick")).toBe("at the next tick");
   });
 });
+
+describe("SettingsForm: the git document", () => {
+  // The schema is `core/src/settings/snapshots/git.json`, as the núcleo serves it.
+  const GIT_SCHEMA: SchemaNode = {
+    type: "object",
+    description: "`~/.nucleos/git.yaml`: how the merge queue treats the history a tree leaf leaves behind.",
+    properties: {
+      squash_checkpoints: {
+        type: "boolean",
+        default: true,
+        description:
+          "Squash checkpoints: on by default. When a tree leaf is merged, its `nucleos: checkpoint` and\n`nucleos: autoformat` commits collapse into one commit and real commits stay as they are.\nOff keeps every checkpoint in the history.",
+      },
+    },
+  };
+
+  it("draws squash_checkpoints as a toggle that is on by default, and writes false when it is turned off", async () => {
+    const double = settingsDouble([{ scope: "machine", name: "git", schema: GIT_SCHEMA, body: {}, version: 0 }]);
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => double.handle(path, init));
+    renderWithQuery(<SettingsForm scope="machine" name="git" takesEffect="from the next merge" />);
+
+    const box = (await screen.findByLabelText("Squash checkpoints")) as HTMLInputElement;
+    expect(box.type).toBe("checkbox");
+    expect(box.checked).toBe(true);
+    expect(screen.getByText(/commits collapse into one commit/)).toBeTruthy();
+    expect(screen.getByText("Takes effect from the next merge.")).toBeTruthy();
+
+    fireEvent.click(box);
+    clickSave();
+
+    await waitFor(() => {
+      expect(double.writes.length).toBe(1);
+    });
+    expect(double.writes[0].body).toEqual({ squash_checkpoints: false });
+  });
+});

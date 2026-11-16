@@ -13,8 +13,8 @@ use crate::automations::Automations;
 use crate::channels::registry::ChannelConfig;
 use crate::config::{
     AutopilotRules, BackgroundConfig, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig,
-    EmailConfig, GithubConfig, KeepAwakeConfig, MachineConfig, ModelsConfig, VerifyConfig,
-    VoiceConfig, WebConfig, validate_devtime, validate_rules,
+    EmailConfig, GitConfig, GithubConfig, KeepAwakeConfig, MachineConfig, ModelsConfig,
+    VerifyConfig, VoiceConfig, WebConfig, validate_devtime, validate_rules,
 };
 use crate::engines::agy::AgyDoc;
 use crate::machine_config as files;
@@ -175,6 +175,7 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         ),
         of::<KeepAwakeConfig>(files::KEEP_AWAKE_FILE, "when the daemon restarts"),
         of::<BackgroundConfig>(files::BACKGROUND_FILE, "when the daemon restarts"),
+        of::<GitConfig>(files::GIT_FILE, "from the next merge"),
         of::<DevtimeConfig>(
             files::DEVTIME_FILE,
             "when the daemon restarts — except that on a save or a reset the actions.* settings apply from the next ingest cycle, and the pending actions decided under other actions.* thresholds are voided at once (those the owner marked stay)",
@@ -322,6 +323,11 @@ impl Document for BackgroundConfig {
     }
 }
 
+impl Document for GitConfig {
+    const NAME: &'static str = "git";
+    const KIND: Kind = Kind::Machine;
+}
+
 impl Document for DevtimeConfig {
     const NAME: &'static str = "devtime";
     const KIND: Kind = Kind::Machine;
@@ -382,7 +388,7 @@ mod tests {
         assert_eq!(names.len(), 19 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            16 + channels
+            17 + channels
         );
         let project: Vec<_> = docs
             .iter()
