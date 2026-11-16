@@ -61,7 +61,12 @@ pub fn tampered_scripts<'a>(
             };
             match std::fs::read(project_root.join(&word)) {
                 Ok(configured) if configured == used.as_bytes() => {}
-                Ok(_) if matches_trunk(project_root, worktree, &word, used.as_bytes()) => {}
+                Ok(_) if nucleos_base::gate_trunk::script_matches_trunk(
+                    project_root,
+                    worktree,
+                    &word,
+                    used.as_bytes(),
+                ) => {}
                 Ok(_) => {
                     return Some(format!(
                         "gate script `{word}` differs from the project root's"
@@ -76,45 +81,6 @@ pub fn tampered_scripts<'a>(
         }
     }
     None
-}
-
-/// Whether `used` is the script as the trunk has it, or had it where this branch forked.
-///
-/// The project root's working copy alone is the wrong yardstick: it is whatever the main checkout is
-/// parked on, so a branch that merely lags behind a changed script (or runs ahead of the checkout)
-/// would be refused though it never touched the file. A branch that edited the script matches none
-/// of the trunk's tip, the fork point and the root's copy. Any git failure answers `false`, which
-/// keeps the strict refusal.
-fn matches_trunk(project_root: &Path, worktree: &Path, word: &str, used: &[u8]) -> bool {
-    let spec = |rev: &str| format!("{rev}:{}", word.replace('\\', "/"));
-    for trunk in ["master", "main"] {
-        if git_stdout(project_root, &["show", &spec(trunk)]).is_some_and(|tip| tip == used) {
-            return true;
-        }
-        let Some(base) = git_stdout(worktree, &["merge-base", "HEAD", trunk]) else {
-            continue;
-        };
-        let base = String::from_utf8_lossy(&base).trim().to_owned();
-        if !base.is_empty()
-            && git_stdout(worktree, &["show", &spec(&base)]).is_some_and(|forked| forked == used)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Stdout of a local, read-only `git -C dir args`; `None` when it fails to start or exits non-zero.
-fn git_stdout(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    output.status.success().then_some(output.stdout)
 }
 
 /// Copies `from` over `to` (both inside `root`) as a crossing read followed by a crossing write.
