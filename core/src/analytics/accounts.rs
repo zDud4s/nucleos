@@ -186,7 +186,9 @@ mod tests {
     #[tokio::test]
     async fn empty_history_gives_empty_groups() {
         let pool = crate::testdb::fresh_pool().await;
-        let block = accounts_block(&pool, Scope::Global, window()).await.unwrap();
+        let block = accounts_block(&pool, Scope::Global, window())
+            .await
+            .unwrap();
         assert_eq!(block, AccountsBlock::default());
     }
 
@@ -207,7 +209,9 @@ mod tests {
         assert_eq!((totals[0].input, totals[0].output), (300, 30));
         assert_eq!(totals[2].cost_usd, Some(4.0));
 
-        let scoped = run_totals(&pool, Scope::Project("p"), window()).await.unwrap();
+        let scoped = run_totals(&pool, Scope::Project("p"), window())
+            .await
+            .unwrap();
         assert_eq!(scoped[0].items, 2);
         assert_eq!(scoped[0].cost_usd, Some(1.5));
     }
@@ -216,7 +220,12 @@ mod tests {
     async fn runs_outside_the_window_are_left_out() {
         let pool = crate::testdb::fresh_pool().await;
         insert(&pool, done("p", "2026-09-01T10:00:00Z")).await;
-        assert!(run_totals(&pool, Scope::Global, window()).await.unwrap().is_empty());
+        assert!(
+            run_totals(&pool, Scope::Global, window())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -236,10 +245,15 @@ mod tests {
         message(&pool, "s4", "m5", day, 1).await;
         message(&pool, "s1", "m6", "2026-09-01T10:00:00.000Z", 99).await;
 
-        let totals = devtime_totals(&pool, Scope::Global, window()).await.unwrap();
+        let totals = devtime_totals(&pool, Scope::Global, window())
+            .await
+            .unwrap();
         let keys: Vec<_> = totals.iter().map(|t| t.account_id.as_deref()).collect();
         assert_eq!(keys, [Some("a"), Some("b"), None]);
-        assert_eq!((totals[0].items, totals[0].output, totals[0].input), (2, 30, 10));
+        assert_eq!(
+            (totals[0].items, totals[0].output, totals[0].input),
+            (2, 30, 10)
+        );
         assert_eq!(totals[1].output, 7);
         assert_eq!((totals[2].items, totals[2].output), (2, 4));
         assert!(totals.iter().all(|t| t.cost_usd.is_none()));
