@@ -244,6 +244,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_trial_lesson_covers_nothing() {
+        let pool = crate::testdb::fresh_pool().await;
+        let (a, _) = propose(
+            &pool,
+            Some("alpha"),
+            "Use PATH",
+            "job_failed",
+            r#"[{"t":"job","id":1}]"#,
+        )
+        .await;
+        let (b, _) = propose(
+            &pool,
+            Some("bravo"),
+            "Use PATH too",
+            "job_failed",
+            r#"[{"t":"job","id":2}]"#,
+        )
+        .await;
+        let evidence = format!(r#"[{{"t":"knowledge","id":{a}}},{{"t":"knowledge","id":{b}}}]"#);
+        let (lesson, lp) = propose(
+            &pool,
+            None,
+            "Put Git usr/bin first",
+            "generalised",
+            &evidence,
+        )
+        .await;
+        approve(&pool, lp).await.unwrap();
+        // The lesson is active but still on trial: the owner has not kept it yet.
+        sqlx::query("UPDATE knowledge SET trial = 1, trial_started_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(lesson)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(col(&pool, "knowledge", lesson).await, "active");
+
+        assert_eq!(tidy_covered(&pool).await.unwrap(), 0);
+        for id in [a, b] {
+            assert_eq!(col(&pool, "knowledge", id).await, "proposed");
+        }
+    }
+
+    #[tokio::test]
     async fn reverting_the_lesson_restores_the_candidates_and_their_approval_works() {
         let pool = crate::testdb::fresh_pool().await;
         let (a, b, lesson, pa) = covered_pair(&pool).await;

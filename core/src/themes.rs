@@ -1179,6 +1179,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn theme_candidates_leave_trial_rows_out() {
+        let pool = crate::testdb::fresh_pool().await;
+        let permanent = knowledge_row(&pool, "kept", "distiller", "active", [1.0, 0.0, 0.0]).await;
+        let on_trial = knowledge_row(&pool, "trial", "distiller", "active", [1.0, 0.1, 0.0]).await;
+        sqlx::query("UPDATE knowledge SET trial = 1, trial_started_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(on_trial)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let keys: Vec<(MemberKind, i64)> = candidates(&pool, "m")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        assert!(keys.contains(&(MemberKind::Knowledge, permanent)));
+        assert!(
+            !keys.contains(&(MemberKind::Knowledge, on_trial)),
+            "a lesson on trial is not themes material"
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_theme_does_not_come_back() {
         let pool = crate::testdb::fresh_pool().await;
         for i in 0..3 {

@@ -508,6 +508,16 @@ async fn expire_unconfirmed(
     Ok(expired)
 }
 
+/// Withdraws trial lessons that did not earn their place. Stub until the green packet.
+#[allow(dead_code)]
+async fn expire_trials(
+    _pool: &SqlitePool,
+    _project: &str,
+    _now: DateTime<Utc>,
+) -> sqlx::Result<usize> {
+    Ok(0)
+}
+
 /// Promote measurements repeated across independent projects into the inherited machine scope.
 pub async fn promote_to_machine(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
     let fingerprints: Vec<String> = sqlx::query_scalar(
@@ -639,8 +649,8 @@ mod tests {
     use sqlx::{Row, SqlitePool};
 
     use super::{
-        CONSOLIDATION_INTERVAL, archive_countless_rows, due, merge_duplicates, promote_to_machine,
-        run_pass,
+        CONSOLIDATION_INTERVAL, archive_countless_rows, due, expire_trials, expire_unconfirmed,
+        merge_duplicates, promote_to_machine, run_pass,
     };
     use crate::knowledge::{Known, Scope, approved, failure_signature, for_scope};
 
@@ -2449,6 +2459,294 @@ mod tests {
             .expect("the machine lesson should be inherited by another project");
         assert_eq!(promoted.scope_kind, "machine");
         assert!(approved(promoted));
+    }
+
+    /// A distilled project row; `started` makes it a lesson on trial (`trial = 1`), `None` makes it
+    /// a permanent one. `stats` is `(shown_count, outcome_count, green_count)`.
+    async fn seed_trial(
+        pool: &SqlitePool,
+        project: &str,
+        layer: &str,
+        started: Option<DateTime<Utc>>,
+        stats: (i64, i64, i64),
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, trial,
+                trial_started_at, shown_count, outcome_count, green_count,
+                created_at, activated_at)
+             VALUES (?, 'project', ?, 'distiller', 'memory', 'trial title', 'trial body',
+                     'active', ?, ?, ?, ?, ?,
+                     '2026-09-01T00:00:00+00:00', '2026-09-01T00:00:00+00:00')",
+        )
+        .bind(layer)
+        .bind(project)
+        .bind(i64::from(started.is_some()))
+        .bind(started.map(|at| at.to_rfc3339()))
+        .bind(stats.0)
+        .bind(stats.1)
+        .bind(stats.2)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// Three permanent rows that carry a 7/10 success rate.
+    async fn seed_baseline(pool: &SqlitePool, project: &str) {
+        for _ in 0..3 {
+            seed_trial(pool, project, "semantic", None, (10, 10, 7)).await;
+        }
+    }
+
+    async fn status_of(pool: &SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn event_notes(pool: &SqlitePool, id: i64) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(note, '') FROM knowledge_events WHERE knowledge_id = ? ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_runs_after(pool: &SqlitePool, project: &str, count: usize, at: DateTime<Utc>) {
+        for _ in 0..count {
+            seed_run_at(pool, project, None, None, at).await;
+        }
+    }
+
+    /// Criterion 1 of E3: enough outcomes, and clearly worse than the permanent rows.
+    #[tokio::test]
+    async fn a_trial_lesson_that_does_not_help_expires_with_the_criterion_note() {
+        let pool = test_pool().await;
+        let now = at(12);
+        seed_baseline(&pool, PROJECT).await;
+        let subject = seed_trial(
+            &pool,
+            PROJECT,
+            "semantic",
+            Some(now - chrono::Duration::days(1)),
+            (8, 8, 2),
+        )
+        .await;
+
+        assert_eq!(expire_trials(&pool, PROJECT, now).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, subject).await, "expired");
+        let ended: Option<String> =
+            sqlx::query_scalar("SELECT ended_at FROM knowledge WHERE id = ?")
+                .bind(subject)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ended.is_some(), "an expired row records when it ended");
+        let notes = event_notes(&pool, subject).await;
+        assert_eq!(notes.len(), 1, "one event for the expiry: {notes:?}");
+        assert!(notes[0].starts_with("trial:"), "{notes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_trial_lesson_with_three_outcomes_is_left_alone() {
+        let pool = test_pool().await;
+        let now = at(12);
+        seed_baseline(&pool, PROJECT).await;
+        let subject = seed_trial(
+            &pool,
+            PROJECT,
+            "semantic",
+            Some(now - chrono::Duration::days(1)),
+            (3, 3, 0),
+        )
+        .await;
+
+        assert_eq!(expire_trials(&pool, PROJECT, now).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, subject).await, "active");
+    }
+
+    /// Trial rows are not a yardstick: with permanent rows alone the baseline is 0.7, so a 4/8
+    /// subject (0.5) is clearly worse. Dragged down by the 0/10 trial rows it would pass.
+    #[tokio::test]
+    async fn the_trial_baseline_counts_only_permanent_rows() {
+        let pool = test_pool().await;
+        let now = at(12);
+        let started = Some(now - chrono::Duration::days(1));
+        seed_baseline(&pool, PROJECT).await;
+        for _ in 0..3 {
+            seed_trial(&pool, PROJECT, "semantic", started, (10, 10, 0)).await;
+        }
+        let subject = seed_trial(&pool, PROJECT, "semantic", started, (8, 8, 4)).await;
+
+        expire_trials(&pool, PROJECT, now).await.unwrap();
+
+        assert_eq!(status_of(&pool, subject).await, "expired");
+    }
+
+    #[tokio::test]
+    async fn a_trial_lesson_is_not_judged_on_outcomes_without_three_baseline_rows() {
+        let pool = test_pool().await;
+        let now = at(12);
+        for _ in 0..2 {
+            seed_trial(&pool, PROJECT, "semantic", None, (10, 10, 7)).await;
+        }
+        // Below three outcomes: not a baseline row either.
+        seed_trial(&pool, PROJECT, "semantic", None, (2, 2, 2)).await;
+        let subject = seed_trial(
+            &pool,
+            PROJECT,
+            "semantic",
+            Some(now - chrono::Duration::days(1)),
+            (8, 8, 0),
+        )
+        .await;
+
+        assert_eq!(expire_trials(&pool, PROJECT, now).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, subject).await, "active");
+    }
+
+    /// Criterion 2 of E3: a hundred project runs and the lesson was never shown.
+    #[tokio::test]
+    async fn an_unshown_trial_lesson_expires_after_100_project_runs() {
+        let pool = test_pool().await;
+        let now = at(12);
+        let started = Some(now - chrono::Duration::days(5));
+        let after = now - chrono::Duration::days(1);
+        let unshown = seed_trial(&pool, "idle", "semantic", started, (0, 0, 0)).await;
+        let shown = seed_trial(&pool, "idle", "semantic", started, (1, 0, 0)).await;
+        let short = seed_trial(&pool, "short", "semantic", started, (0, 0, 0)).await;
+        seed_runs_after(&pool, "idle", 100, after).await;
+        seed_runs_after(&pool, "short", 99, after).await;
+
+        assert_eq!(expire_trials(&pool, "idle", now).await.unwrap(), 1);
+        assert_eq!(expire_trials(&pool, "short", now).await.unwrap(), 0);
+
+        assert_eq!(status_of(&pool, unshown).await, "expired");
+        assert_eq!(status_of(&pool, shown).await, "active");
+        assert_eq!(status_of(&pool, short).await, "active");
+        let notes = event_notes(&pool, unshown).await;
+        assert!(notes.iter().any(|n| n.starts_with("trial:")), "{notes:?}");
+    }
+
+    /// Criterion 3 of E3: sixty days on trial is the ceiling.
+    #[tokio::test]
+    async fn a_trial_lesson_older_than_60_days_expires_with_the_max_age_note() {
+        let pool = test_pool().await;
+        let now = at(12);
+        let old = seed_trial(
+            &pool,
+            PROJECT,
+            "procedural",
+            Some(now - chrono::Duration::days(61)),
+            (1, 0, 0),
+        )
+        .await;
+        let young = seed_trial(
+            &pool,
+            PROJECT,
+            "procedural",
+            Some(now - chrono::Duration::days(59)),
+            (1, 0, 0),
+        )
+        .await;
+
+        assert_eq!(expire_trials(&pool, PROJECT, now).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, old).await, "expired");
+        assert_eq!(status_of(&pool, young).await, "active");
+        let notes = event_notes(&pool, old).await;
+        assert!(
+            notes.iter().any(|n| n.starts_with("trial: max age")),
+            "{notes:?}"
+        );
+    }
+
+    /// E1: the run-count expiry of an episode is for permanent episodes; a trial row has its own.
+    #[tokio::test]
+    async fn expire_unconfirmed_ignores_trial_rows_after_50_runs() {
+        let pool = test_pool().await;
+        let now = at(12);
+        let confirmed = now - chrono::Duration::days(5);
+        let on_trial = seed_trial(&pool, PROJECT, "episodic", Some(confirmed), (1, 0, 0)).await;
+        let permanent = seed_trial(&pool, PROJECT, "episodic", None, (1, 0, 0)).await;
+        for id in [on_trial, permanent] {
+            sqlx::query(
+                "UPDATE knowledge SET expires_after_runs = 50, last_confirmed_at = ? WHERE id = ?",
+            )
+            .bind(confirmed.to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        seed_runs_after(&pool, PROJECT, 50, now - chrono::Duration::days(1)).await;
+
+        assert_eq!(expire_unconfirmed(&pool, PROJECT, now).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, on_trial).await, "active");
+        assert_eq!(status_of(&pool, permanent).await, "expired");
+    }
+
+    #[tokio::test]
+    async fn a_pass_reaches_a_project_whose_only_live_rows_are_trial_semantic_rows() {
+        let pool = test_pool().await;
+        let now = at(12);
+        // No run with a gate result and no episodic row: only the trial row names the project.
+        let old = seed_trial(
+            &pool,
+            "trial-only",
+            "semantic",
+            Some(now - chrono::Duration::days(61)),
+            (1, 0, 0),
+        )
+        .await;
+
+        let report = run_pass(&pool, now).await.unwrap();
+
+        assert_eq!(report.expired, 1);
+        assert_eq!(status_of(&pool, old).await, "expired");
+    }
+
+    #[tokio::test]
+    async fn promote_to_machine_skips_trial_rows() {
+        let pool = test_pool().await;
+        let fingerprint = "gate:trial-skipped";
+        let mut ids = Vec::new();
+        for project in ["alpha", "beta", "gamma"] {
+            ids.push(
+                seed_knowledge(
+                    &pool,
+                    "episodic",
+                    "project",
+                    project,
+                    "consolidator",
+                    Some("gate"),
+                    fingerprint,
+                    "active",
+                    Some(2),
+                )
+                .await,
+            );
+        }
+        sqlx::query("UPDATE knowledge SET trial = 1, trial_started_at = ? WHERE id = ?")
+            .bind(at(1).to_rfc3339())
+            .bind(ids[2])
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            promote_to_machine(&pool, at(2)).await.unwrap(),
+            0,
+            "two permanent projects are not enough to promote"
+        );
+        assert_eq!(status_of(&pool, ids[0]).await, "active");
     }
 
     /// The six-hour clock runs once at startup and never early after a completed pass.

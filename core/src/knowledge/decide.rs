@@ -412,3 +412,13 @@ pub async fn revert(pool: &SqlitePool, knowledge_id: i64, note: &str) -> sqlx::R
     }
     Ok(true)
 }
+
+/// The owner keeps a lesson on trial: it becomes permanent. Stub until the green packet.
+pub async fn confirm_trial(_pool: &SqlitePool, _knowledge_id: i64) -> sqlx::Result<bool> {
+    Ok(false)
+}
+
+/// The owner withdraws a lesson on trial. Stub until the green packet.
+pub async fn retire_trial(_pool: &SqlitePool, _knowledge_id: i64) -> sqlx::Result<bool> {
+    Ok(false)
+}

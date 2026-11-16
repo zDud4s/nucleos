@@ -3982,4 +3982,164 @@ mod tests {
             );
         }
     }
+
+    /// Lessons on trial (spec §2 D1, E1, E4, E5): active and admissible, kept or withdrawn by the
+    /// owner.
+    mod trial {
+        use sqlx::SqlitePool;
+
+        use crate::knowledge::{approved, confirm_trial, retire_trial};
+
+        async fn pool() -> SqlitePool {
+            crate::testdb::fresh_pool().await
+        }
+
+        /// A distiller row; `on_trial` sets `trial = 1` with a start, expiry stays NULL unless set.
+        async fn seed(pool: &SqlitePool, status: &str, layer: &str, on_trial: bool) -> i64 {
+            sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, trial,
+                    trial_started_at, expires_after_runs, created_at, activated_at)
+                 VALUES (?, 'project', 'p', 'distiller', 'prompt', 'a lesson', 'its body', ?, ?,
+                         ?, 50, '2026-09-01T00:00:00+00:00', '2026-09-01T00:00:00+00:00')",
+            )
+            .bind(layer)
+            .bind(status)
+            .bind(i64::from(on_trial))
+            .bind(on_trial.then_some("2026-09-01T00:00:00+00:00"))
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+        }
+
+        /// `(status, trial, trial_started_at, expires_after_runs)`.
+        async fn state(pool: &SqlitePool, id: i64) -> (String, i64, Option<String>, Option<i64>) {
+            sqlx::query_as(
+                "SELECT status, trial, trial_started_at, expires_after_runs
+                   FROM knowledge WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn events(pool: &SqlitePool, id: i64) -> Vec<(String, String, Option<String>)> {
+            sqlx::query_as(
+                "SELECT from_status, to_status, note FROM knowledge_events
+                  WHERE knowledge_id = ? ORDER BY id",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn an_active_trial_row_is_approved_and_selectable() {
+            let pool = pool().await;
+            let id = seed(&pool, "active", "procedural", true).await;
+
+            let row = crate::knowledge::history::fetch(&pool, id)
+                .await
+                .unwrap()
+                .expect("the row exists");
+
+            assert_eq!(row.status, "active");
+            assert_eq!(row.source, "distiller");
+            assert_eq!(row.layer, "procedural");
+            assert!(approved(&row), "a lesson on trial is admissible");
+        }
+
+        #[tokio::test]
+        async fn confirm_trial_makes_the_row_permanent_and_is_idempotent() {
+            let pool = pool().await;
+            let id = seed(&pool, "active", "semantic", true).await;
+
+            assert!(confirm_trial(&pool, id).await.unwrap());
+
+            assert_eq!(state(&pool, id).await, ("active".to_owned(), 0, None, None));
+            let first = events(&pool, id).await;
+            assert_eq!(
+                first,
+                vec![(
+                    "active".to_owned(),
+                    "active".to_owned(),
+                    Some("approved by the owner".to_owned())
+                )]
+            );
+
+            assert!(
+                !confirm_trial(&pool, id).await.unwrap(),
+                "a second confirmation has nothing to do"
+            );
+            assert_eq!(events(&pool, id).await, first, "no new event");
+
+            // A permanent row is out of the trial sweep for good.
+            let sweep = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM knowledge WHERE status = 'active' AND trial = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(sweep, 0);
+        }
+
+        #[tokio::test]
+        async fn confirm_trial_refuses_a_permanent_or_proposed_row() {
+            let pool = pool().await;
+            let permanent = seed(&pool, "active", "semantic", false).await;
+            let proposed = seed(&pool, "proposed", "semantic", false).await;
+            let permanent_before = state(&pool, permanent).await;
+            let proposed_before = state(&pool, proposed).await;
+
+            assert!(!confirm_trial(&pool, permanent).await.unwrap());
+            assert!(!confirm_trial(&pool, proposed).await.unwrap());
+
+            assert_eq!(state(&pool, permanent).await, permanent_before);
+            assert_eq!(state(&pool, proposed).await, proposed_before);
+            assert!(events(&pool, permanent).await.is_empty());
+            assert!(events(&pool, proposed).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn retire_trial_reverts_with_the_rejected_during_trial_note() {
+            let pool = pool().await;
+            let id = seed(&pool, "active", "procedural", true).await;
+
+            assert!(retire_trial(&pool, id).await.unwrap());
+
+            assert_eq!(state(&pool, id).await.0, "reverted");
+            let ended: Option<String> =
+                sqlx::query_scalar("SELECT ended_at FROM knowledge WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(ended.is_some());
+            assert_eq!(
+                events(&pool, id).await,
+                vec![(
+                    "active".to_owned(),
+                    "reverted".to_owned(),
+                    Some("rejected during trial".to_owned())
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn retire_trial_refuses_a_row_that_is_not_on_trial() {
+            let pool = pool().await;
+            let permanent = seed(&pool, "active", "semantic", false).await;
+            let proposed = seed(&pool, "proposed", "semantic", false).await;
+
+            assert!(!retire_trial(&pool, permanent).await.unwrap());
+            assert!(!retire_trial(&pool, proposed).await.unwrap());
+
+            assert_eq!(state(&pool, permanent).await.0, "active");
+            assert_eq!(state(&pool, proposed).await.0, "proposed");
+            assert!(events(&pool, permanent).await.is_empty());
+        }
+    }
 }

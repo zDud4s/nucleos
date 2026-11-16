@@ -416,6 +416,8 @@ pub fn parse_items(answer: &str) -> Result<Vec<Item>, ParseError> {
 pub enum Door {
     Record,
     Propose,
+    /// Recorded active on trial: reaches prompts at once and is withdrawn unless it earns its place.
+    Trial,
 }
 
 /// The model picks only the layer; kind and door follow from it.
