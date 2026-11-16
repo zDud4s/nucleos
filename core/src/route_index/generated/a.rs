@@ -130,6 +130,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "create_agent",
     },
     RouteEntry {
+        method: "GET",
+        path: "/agents/route-report",
+        purpose: "Get agent report.",
+        body: Body::None,
+        handler: "get_agent_report",
+    },
+    RouteEntry {
         method: "DELETE",
         path: "/agents/{id}",
         purpose: "Delete agent.",

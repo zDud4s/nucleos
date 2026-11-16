@@ -334,6 +334,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "POST",
+        path: "/hooks/agent-model",
+        purpose: "Asks which model an agent spawn gets (PreToolUse on Agent), records the spawn, and answers with the alias to write or null.",
+        body: Body::Shapeless("AgentModelRequest"),
+        handler: "agent_model",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/hooks/agent-outcome",
+        purpose: "Records how a subagent ended (SubagentStop), so the next request for the same work can climb the ladder.",
+        body: Body::Shapeless("AgentOutcomeRequest"),
+        handler: "agent_outcome",
+    },
+    RouteEntry {
+        method: "POST",
         path: "/hooks/ask-wait",
         purpose: "The blocking half of the same conversation.",
         body: Body::Shapeless("AskWaitRequest"),

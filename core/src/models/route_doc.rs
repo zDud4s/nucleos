@@ -20,7 +20,7 @@ pub struct RouterDoc {
     pub timeout_ms: u64,
     pub runners: Vec<String>,
     pub models: BTreeMap<String, Vec<String>>,
-    /// Surface name (`runs`, `team`, `council`, `recruit`) to mode.
+    /// Surface name (`runs`, `team`, `council`, `recruit`, `agents`) to mode.
     pub surfaces: BTreeMap<String, String>,
 }
 
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn a_router_off_this_machine_is_refused() {
         let doc = RouterDoc {
-            url: "http://example.com:18733".to_owned(),
+            url: "http://example.com:8080".to_owned(),
             ..RouterDoc::default()
         };
         let why = doc.to_config().unwrap_err();
@@ -184,6 +184,33 @@ mod tests {
                 .unwrap_err()
                 .contains("for surface runs")
         );
+    }
+
+    #[test]
+    fn the_agents_surface_is_accepted() {
+        let doc = RouterDoc {
+            surfaces: BTreeMap::from([("agents".to_owned(), "shadow".to_owned())]),
+            ..RouterDoc::default()
+        };
+        let config = doc.to_config().expect("agents is a known surface");
+        assert_eq!(config.mode_for(Surface::Agents), Mode::Shadow);
+    }
+
+    #[test]
+    fn an_absent_agents_surface_inherits_the_global_mode() {
+        let doc = RouterDoc {
+            mode: "apply".into(),
+            ..RouterDoc::default()
+        };
+        assert_eq!(
+            doc.to_config().unwrap().mode_for(Surface::Agents),
+            Mode::Apply
+        );
+    }
+
+    #[test]
+    fn the_default_url_is_the_one_the_router_listens_on() {
+        assert_eq!(RouterDoc::default().url, "http://127.0.0.1:8080");
     }
 
     #[test]
