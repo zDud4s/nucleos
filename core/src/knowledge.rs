@@ -32,6 +32,7 @@ mod decide;
 mod history;
 mod observe;
 mod propose;
+mod rework;
 mod select;
 mod signature;
 mod store;
@@ -41,6 +42,7 @@ pub use self::decide::*;
 pub use self::history::*;
 pub use self::observe::*;
 pub use self::propose::*;
+pub use self::rework::*;
 pub use self::select::*;
 pub use self::signature::*;
 pub use self::store::*;
@@ -1482,7 +1484,7 @@ mod tests {
         assert_eq!(row.points_at.as_deref(), Some("core/src/main.rs"));
         assert!(row.last_confirmed_at.is_some());
         assert!(row.activated_at.is_some());
-        assert_eq!(row.observations, None);
+        assert_eq!(row.observations, Some(1));
         assert_eq!(row.generator, None);
         assert_eq!(row.proposal_id, None);
         assert_eq!(row.origin_run_id, None);
@@ -1759,6 +1761,27 @@ mod tests {
         assert_eq!(
             tagged_evidence(&serde_json::json!([{"t": "job", "id": 7}])).as_deref(),
             Some(r#"[{"t":"job","id":7}]"#)
+        );
+    }
+
+    /// A workflow record and a verify run are things a finding can point at, and the vocabulary
+    /// still refuses a tag nobody declared.
+    #[test]
+    fn record_and_verify_run_are_evidence() {
+        assert!(EVIDENCE_TAGS.contains(&"record"));
+        assert!(EVIDENCE_TAGS.contains(&"verify_run"));
+        assert!(known_element(&serde_json::json!({"t": "record", "id": 7})));
+        assert!(known_element(
+            &serde_json::json!({"t": "verify_run", "id": 7})
+        ));
+        assert!(!known_element(&serde_json::json!({"t": "nope", "id": 7})));
+        assert_eq!(
+            tagged_evidence(&serde_json::json!([
+                {"t": "record", "id": 7},
+                {"t": "nope", "id": 7}
+            ]))
+            .as_deref(),
+            Some(r#"[{"t":"record","id":7}]"#)
         );
     }
 

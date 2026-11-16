@@ -3686,4 +3686,57 @@ mod tests {
             .unwrap();
         assert_eq!(left, 0, "the sweep needs no embedder");
     }
+
+    /// W4 sweep: a rework stored with the plain `insert` (no hook, as when the daemon was down)
+    /// is turned into one knowledge row by the next tick, without asking the model, and a second
+    /// tick changes nothing.
+    #[tokio::test]
+    async fn tick_captures_unprocessed_rework_records() {
+        let pool = test_pool().await;
+        // No calendar row, so nothing in the tick has a reason to ask the runner.
+        super::sources::set(&pool, super::sources::CALENDAR_KEY, false)
+            .await
+            .unwrap();
+        crate::workflow_records::insert(
+            &pool,
+            &crate::workflow_records::NewRecord {
+                project_id: "alpha".to_owned(),
+                worktree: None,
+                kind: "rework".to_owned(),
+                task_id: "t-1".to_owned(),
+                phase: Some("execute".to_owned()),
+                caught_by: Some("gate".to_owned()),
+                payload: serde_json::json!({
+                    "root_cause": "the gate ran on a stale build",
+                    "fix": "rebuild before the gate",
+                })
+                .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let runner = fake_answering("[]");
+        super::tick(&pool, Extractor::Cli(&runner), None).await;
+        let rows: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, observations, layer FROM knowledge WHERE distill_cause = 'rework'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one rework record, one knowledge row");
+        assert!(
+            runner.last_prompt.lock().unwrap().is_none(),
+            "the rework path asks no model"
+        );
+
+        super::tick(&pool, Extractor::Cli(&runner), None).await;
+        let again: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, observations, layer FROM knowledge WHERE distill_cause = 'rework'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(again, rows, "a second tick neither duplicates nor recounts");
+    }
 }

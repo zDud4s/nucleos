@@ -203,6 +203,13 @@ pub async fn insert(pool: &SqlitePool, record: &NewRecord) -> sqlx::Result<i64> 
     Ok(id)
 }
 
+/// Stores one validated record, then turns a `rework` into knowledge without failing the insert.
+///
+/// RED stub: it only inserts; the capture arrives with the implementation.
+pub async fn insert_and_capture(pool: &SqlitePool, record: &NewRecord) -> sqlx::Result<i64> {
+    insert(pool, record).await
+}
+
 /// Every record of one task in one project, oldest first.
 pub async fn for_task(
     pool: &SqlitePool,
@@ -321,6 +328,84 @@ mod tests {
             Some("/w/alpha"),
         )
         .unwrap()
+    }
+
+    /// A rework carrying the controller convention (`root_cause` and `fix`).
+    fn rework_with_cause(task_id: &str, root_cause: &str, fix: &str) -> NewRecord {
+        let mut payload = Map::new();
+        payload.insert("root_cause".to_owned(), Value::from(root_cause));
+        payload.insert("fix".to_owned(), Value::from(fix));
+        validate(
+            &RecordArgs {
+                phase: Some("execute".to_owned()),
+                caught_by: Some("gate".to_owned()),
+                payload,
+                ..args(KIND_REWORK, task_id)
+            },
+            "alpha",
+            Some("/w/alpha"),
+        )
+        .unwrap()
+    }
+
+    async fn knowledge_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn record_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM workflow_records")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// W4 hook: the ledger insert of a rework with cause and fix yields one knowledge row; a
+    /// `metric`, a budget `decomposition` rework and a fix-less rework yield none.
+    #[tokio::test]
+    async fn inserting_a_rework_through_the_ledger_captures_knowledge() {
+        let pool = crate::testdb::fresh_pool().await;
+        assert_eq!(knowledge_rows(&pool).await, 0);
+
+        // Not rework: stored, never knowledge.
+        let mut metric = rework_with_cause("t-1", "the gate ran on a stale build", "rebuild first");
+        metric.kind = KIND_METRIC.to_owned();
+        insert_and_capture(&pool, &metric).await.unwrap();
+        // A budget decomposition: stored, never knowledge.
+        let mut decomposition = rework_with_cause("t-1", "the packet was too big", "split it");
+        decomposition.caught_by = Some("budget".to_owned());
+        decomposition.payload = serde_json::json!({
+            "root_cause": "the packet was too big",
+            "fix": "split it",
+            "kind": "decomposition",
+        })
+        .to_string();
+        insert_and_capture(&pool, &decomposition).await.unwrap();
+        // A rework without a fix: stored, never knowledge.
+        let mut fixless = rework_with_cause("t-1", "a cause with no fix", "x");
+        fixless.payload = serde_json::json!({"root_cause": "a cause with no fix"}).to_string();
+        insert_and_capture(&pool, &fixless).await.unwrap();
+        assert_eq!(record_rows(&pool).await, 3, "the records exist either way");
+        assert_eq!(knowledge_rows(&pool).await, 0);
+
+        // Positive control: the same shape with cause and fix becomes one row.
+        let good = rework_with_cause("t-2", "the migration ran twice", "make it idempotent");
+        let id = insert_and_capture(&pool, &good).await.unwrap();
+        assert_eq!(record_rows(&pool).await, 4);
+        assert_eq!(knowledge_rows(&pool).await, 1);
+        let (layer, trial, evidence): (String, i64, String) = sqlx::query_as(
+            "SELECT layer, trial, evidence FROM knowledge WHERE distill_cause = 'rework'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((layer.as_str(), trial), ("episodic", 1));
+        assert!(
+            evidence.contains(&format!("\"id\":{id}")),
+            "the row cites its record: {evidence}"
+        );
     }
 
     #[test]

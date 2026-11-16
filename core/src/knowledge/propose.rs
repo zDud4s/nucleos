@@ -647,6 +647,18 @@ pub async fn arm_trial_in(
     Ok(())
 }
 
+/// Move an active trial row to another layer and restart its trial clock, with an event.
+///
+/// `false` (and no event) when the row is not an active trial row or is already in that layer.
+/// Nothing is committed here.
+pub async fn promote_layer_in(
+    _tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    _id: i64,
+    _to: Layer,
+) -> sqlx::Result<bool> {
+    Ok(false)
+}
+
 /// Merge evidence into a live row, renew it when it is an active episode, and log the event.
 pub(super) async fn reconfirm_row_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -803,5 +815,141 @@ mod provenance_tests {
                 "proposed".into()
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod rework_core_tests {
+    use super::*;
+
+    const LONG_AGO: &str = "2026-01-01T00:00:00+00:00";
+
+    fn declaration(title: &str) -> Declaration<'_> {
+        Declaration {
+            project_id: Some("alpha"),
+            origin_run_id: None,
+            kind: Kind::Memory,
+            title,
+            body: "A body.",
+            reasoning: "test",
+            supersedes: None,
+        }
+    }
+
+    async fn trial_row(pool: &sqlx::SqlitePool, title: &str) -> i64 {
+        let mut tx = pool.begin().await.unwrap();
+        let id = record_distilled_trial(
+            &mut tx,
+            &declaration(title),
+            &Provenance {
+                layer: Some(Layer::Episodic),
+                distill_cause: Some("rework"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        id
+    }
+
+    async fn events_of(pool: &sqlx::SqlitePool, id: i64) -> Vec<Option<String>> {
+        sqlx::query_scalar("SELECT note FROM knowledge_events WHERE knowledge_id = ? ORDER BY id")
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn promote(pool: &sqlx::SqlitePool, id: i64) -> bool {
+        let mut tx = pool.begin().await.unwrap();
+        let moved = promote_layer_in(&mut tx, id, Layer::Procedural)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        moved
+    }
+
+    /// W4: an active trial row moves layer and its trial clock restarts; everything else is a
+    /// no-op that writes no event.
+    #[tokio::test]
+    async fn promote_layer_in_moves_an_active_trial_row_and_restarts_the_trial_clock() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = trial_row(&pool, "A promotable lesson").await;
+        sqlx::query("UPDATE knowledge SET trial_started_at = ? WHERE id = ?")
+            .bind(LONG_AGO)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(promote(&pool, id).await, "an active trial row moves");
+        let (layer, status, trial, started): (String, String, i64, Option<String>) =
+            sqlx::query_as(
+                "SELECT layer, status, trial, trial_started_at FROM knowledge WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(layer, "procedural");
+        assert_eq!(status, "active");
+        assert_eq!(trial, 1, "the row stays on trial");
+        assert!(
+            started.as_deref().is_some_and(|at| at > LONG_AGO),
+            "the trial clock restarts: {started:?}"
+        );
+        let notes = events_of(&pool, id).await;
+        assert_eq!(notes.len(), 2, "created plus the layer event: {notes:?}");
+        assert!(
+            notes[1]
+                .as_deref()
+                .is_some_and(|note| note.contains("episodic->procedural")),
+            "the event names both layers: {notes:?}"
+        );
+
+        assert!(!promote(&pool, id).await, "a second call is a no-op");
+        assert_eq!(events_of(&pool, id).await.len(), 2);
+
+        // A row that is not on trial never moves.
+        let mut tx = pool.begin().await.unwrap();
+        let permanent = record_distilled(
+            &mut tx,
+            &declaration("A permanent lesson"),
+            &Provenance::default(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(!promote(&pool, permanent).await);
+        assert_eq!(events_of(&pool, permanent).await.len(), 1);
+
+        // Nor does a proposed one, even on trial.
+        let proposed = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, trial, created_at)
+             VALUES ('episodic', 'project', 'alpha', 'distiller', 'memory', 'Waiting', 'b',
+                     'proposed', 1, '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        assert!(!promote(&pool, proposed).await);
+        assert!(events_of(&pool, proposed).await.is_empty());
+    }
+
+    /// W3: a distilled trial row counts its first sighting.
+    #[tokio::test]
+    async fn record_distilled_trial_starts_observations_at_one() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = trial_row(&pool, "Counted from one").await;
+        let observations: Option<i64> =
+            sqlx::query_scalar("SELECT observations FROM knowledge WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(observations, Some(1));
     }
 }
