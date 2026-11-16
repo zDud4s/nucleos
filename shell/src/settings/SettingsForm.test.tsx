@@ -102,6 +102,32 @@ describe("SettingsForm", () => {
     expect(double.writes[0].body).toEqual({ future_key: 7 });
   });
 
+  it("does not draw a field listed in hide, and still writes its value back unchanged", async () => {
+    const double = world({
+      schema: {
+        type: "object",
+        properties: {
+          host: { type: "string" },
+          gate_targets: { type: "object", additionalProperties: { type: "string", enum: ["local", "ci"] } },
+        },
+      },
+      body: { host: "a.example", gate_targets: { build: "ci" } },
+    });
+    renderWithQuery(<SettingsForm scope="machine" name="email" hide={["/gate_targets"]} />);
+
+    fireEvent.change(await hostBox(), { target: { value: "b.example" } });
+    expect(screen.queryByText("Gate targets")).toBeNull();
+    expect(screen.queryByLabelText("Gate targets")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Add/ })).toBeNull();
+    expect(screen.queryByText(/Gate targets \(JSON\)/)).toBeNull();
+    clickSave();
+
+    await waitFor(() => {
+      expect(double.writes.length).toBe(1);
+    });
+    expect(double.writes[0].body).toEqual({ host: "b.example", gate_targets: { build: "ci" } });
+  });
+
   it("says when a document was never written, because defaults are not an empty document", async () => {
     world({ version: 0, body: { host: "default.example" } });
     open();

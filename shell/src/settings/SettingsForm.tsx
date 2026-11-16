@@ -21,6 +21,8 @@ export interface SettingsFormProps {
   takesEffect?: string;
   /** Whether there is an unsaved draft, for a page that shows several documents. */
   onDirty?: (dirty: boolean) => void;
+  /** JSON pointers (`"/gate_targets"`) of fields another editor owns; not drawn, but kept in the body. */
+  hide?: readonly string[];
 }
 
 type Mode = "form" | "raw";
@@ -107,7 +109,7 @@ function noticeWords(notice: Notice | null, phrase: string | null): string | nul
  * document its draft started from, and the newer version waits until the save that would have clobbered
  * it answers 409.
  */
-export function SettingsForm({ scope, name, takesEffect, onDirty }: SettingsFormProps) {
+export function SettingsForm({ scope, name, takesEffect, onDirty, hide }: SettingsFormProps) {
   const doc = useSettingDoc(scope, name);
   const write = useWriteSetting(scope, name);
   const rollback = useRollbackSetting(scope, name);
@@ -159,6 +161,7 @@ export function SettingsForm({ scope, name, takesEffect, onDirty }: SettingsForm
         onMode={setMode}
         notice={notice}
         takesEffect={takesEffect}
+        hide={hide}
         saving={write.isPending}
         busy={write.isPending || rollback.isPending || doc.isFetching}
         onEdit={() => setNotice(null)}
@@ -210,6 +213,7 @@ interface EditorProps {
   onMode: (mode: Mode) => void;
   notice: Notice | null;
   takesEffect?: string;
+  hide?: readonly string[];
   saving: boolean;
   busy: boolean;
   onEdit: () => void;
@@ -223,6 +227,7 @@ function Editor({
   onMode,
   notice,
   takesEffect,
+  hide,
   saving,
   busy,
   onEdit,
@@ -307,6 +312,7 @@ function Editor({
           label="Settings"
           errors={errors}
           bare
+          hide={hide}
         />
       ) : (
         <Field label="Raw JSON">

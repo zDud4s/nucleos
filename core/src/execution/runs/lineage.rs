@@ -186,12 +186,14 @@ pub(super) async fn part_of(
     .bind(run_id)
     .fetch_optional(pool)
     .await?;
-    Ok(job.map(|(job_id, job_title, item_id, item_ordinal)| PartOf::Job {
-        job_id,
-        job_title,
-        item_id,
-        item_ordinal,
-    }))
+    Ok(
+        job.map(|(job_id, job_title, item_id, item_ordinal)| PartOf::Job {
+            job_id,
+            job_title,
+            item_id,
+            item_ordinal,
+        }),
+    )
 }
 
 #[cfg(test)]
