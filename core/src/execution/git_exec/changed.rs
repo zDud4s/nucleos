@@ -118,6 +118,10 @@ pub async fn commit_summary(
     sha: &str,
     deadline: std::time::Instant,
 ) -> Result<CommitSummary, String> {
+    // `sha` goes before `--`, so anything but a hex object name could pass for an option.
+    if !(7..=64).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("not a commit sha: {sha:?}"));
+    }
     let parent = format!("{sha}^1");
     let stat = git_read(
         project_root,
@@ -256,6 +260,27 @@ mod tests {
             "subjects: {:?}",
             summary.subjects
         );
+    }
+
+    #[tokio::test]
+    async fn commit_summary_rejects_a_sha_that_is_not_hex() {
+        let (_container, repo) = forked();
+        let too_long = "a".repeat(65);
+        for bad in [
+            "--output=x",
+            "HEAD",
+            "abc123",
+            "zzzzzzzz",
+            "",
+            too_long.as_str(),
+        ] {
+            let error = commit_summary(&repo, bad, deadline()).await;
+            assert!(
+                matches!(&error, Err(message) if message.starts_with("not a commit sha")),
+                "{bad:?} must be refused before git runs: {:?}",
+                error.as_ref().err()
+            );
+        }
     }
 
     #[tokio::test]

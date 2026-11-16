@@ -1,7 +1,18 @@
 //! The dossier of a finished tree (spec 2026-11-16-memoria-agentes-captura, F3): the blocks the
 //! gatherer reads, cut by priority and clipped per block, with every text scrubbed.
 
-use super::{DOSSIER_CEILING, Dossier, clip_head, scrub};
+use super::{DOSSIER_CEILING, clip_head, scrub};
+
+/// The text handed to the model and the ids whose text survived the cut: `runs` are agent runs
+/// (`runs` table), `verify_runs` are failed verifications (`verify_runs` table).
+pub struct TreeDossier {
+    pub text: String,
+    pub runs: Vec<i64>,
+    pub verify_runs: Vec<i64>,
+}
+
+/// One block of the dossier: its text, the `runs` ids and the `verify_runs` ids it quotes.
+type DossierBlock = (String, Vec<i64>, Vec<i64>);
 
 /// The tree dossier is cut at the same ceiling as the job dossier.
 pub const TREE_DOSSIER_CEILING: usize = DOSSIER_CEILING;
@@ -74,7 +85,17 @@ fn clipped(text: &str, cap: usize) -> String {
 }
 
 /// A block of `heading` over its `parts` (blank ones dropped); `None` when nothing is left.
-fn block(heading: &str, parts: Vec<String>, runs: Vec<i64>) -> Option<(String, Vec<i64>)> {
+fn block(heading: &str, parts: Vec<String>, runs: Vec<i64>) -> Option<DossierBlock> {
+    block_ids(heading, parts, runs, Vec::new())
+}
+
+/// [`block`] that also names the `verify_runs` ids it quotes.
+fn block_ids(
+    heading: &str,
+    parts: Vec<String>,
+    runs: Vec<i64>,
+    verify_runs: Vec<i64>,
+) -> Option<DossierBlock> {
     let parts: Vec<String> = parts.into_iter().filter(|p| present(p)).collect();
     if parts.is_empty() {
         return None;
@@ -90,14 +111,15 @@ fn block(heading: &str, parts: Vec<String>, runs: Vec<i64>) -> Option<(String, V
             )
         ),
         runs,
+        verify_runs,
     ))
 }
 
 /// Build the dossier of a tree: blocks in priority order, the last one going first when over
 /// `ceiling`.
-pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
-    let mut all: Vec<(String, Vec<i64>)> = Vec::new();
-    let mut push = |b: Option<(String, Vec<i64>)>| all.extend(b);
+pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> TreeDossier {
+    let mut all: Vec<DossierBlock> = Vec::new();
+    let mut push = |b: Option<DossierBlock>| all.extend(b);
 
     push(block(
         "Node reports",
@@ -128,7 +150,7 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
         Vec::new(),
     ));
     let failures: Vec<&(i64, String)> = blocks.red_failures.iter().take(MAX_FAILURES).collect();
-    push(block(
+    push(block_ids(
         "Failed verifications",
         failures
             .iter()
@@ -140,6 +162,7 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
                 )
             })
             .collect(),
+        Vec::new(),
         failures.iter().map(|(id, _)| *id).collect(),
     ));
     push(block(
@@ -225,7 +248,7 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
     let join = |n: usize| -> String {
         all[..n]
             .iter()
-            .map(|(t, _)| t.as_str())
+            .map(|(t, _, _)| t.as_str())
             .collect::<Vec<_>>()
             .join(
                 "
@@ -252,11 +275,21 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
     }
     let mut runs: Vec<i64> = all[..kept]
         .iter()
-        .flat_map(|(_, ids)| ids.iter().copied())
+        .flat_map(|(_, ids, _)| ids.iter().copied())
         .collect();
     runs.sort_unstable();
     runs.dedup();
-    Dossier { text, runs }
+    let mut verify_runs: Vec<i64> = all[..kept]
+        .iter()
+        .flat_map(|(_, _, ids)| ids.iter().copied())
+        .collect();
+    verify_runs.sort_unstable();
+    verify_runs.dedup();
+    TreeDossier {
+        text,
+        runs,
+        verify_runs,
+    }
 }
 
 /// Words that mark a line as the one that says what went wrong (the markers of
@@ -442,11 +475,13 @@ mod tests {
             "the lower blocks go first"
         );
         assert!(!out.text.contains("COMMIT-MARKER"));
+        // A failed verification is a `verify_runs` id, not a `runs` one.
         assert!(
-            out.runs.contains(&41),
-            "runs of the kept blocks: {:?}",
-            out.runs
+            out.verify_runs.contains(&41),
+            "verify runs of the kept blocks: {:?}",
+            out.verify_runs
         );
+        assert!(out.runs.is_empty(), "{:?}", out.runs);
     }
 
     #[test]

@@ -250,6 +250,65 @@ async fn reinforce_in(
     Ok(Captured::Reinforced(id))
 }
 
+/// Failed captures of one record after which the sweep skips it.
+const STUCK_LIMIT: i64 = 3;
+
+/// Count one more failed capture of record `id`; the counter restarts when the stuck record
+/// changes. Returns the failures of `id` so far.
+async fn note_failure(pool: &SqlitePool, id: i64) -> sqlx::Result<i64> {
+    let stuck: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'rework.stuck_id'")
+            .fetch_optional(pool)
+            .await?;
+    let attempts: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'rework.stuck_attempts'")
+            .fetch_optional(pool)
+            .await?;
+    let same = stuck.and_then(|value| value.parse::<i64>().ok()) == Some(id);
+    let next = if same {
+        attempts
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+    sqlx::query("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('rework.stuck_id', ?)")
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('rework.stuck_attempts', ?)",
+    )
+    .bind(next.to_string())
+    .execute(pool)
+    .await?;
+    Ok(next)
+}
+
+/// Forget the failure counter when it belongs to record `id` (or to an older record the
+/// watermark has passed).
+async fn clear_stuck(pool: &SqlitePool, id: i64) {
+    let stuck: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'rework.stuck_id'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let stuck = stuck.and_then(|value| value.parse::<i64>().ok());
+    if stuck.is_none_or(|stuck| stuck > id) {
+        return;
+    }
+    let cleared = sqlx::query(
+        "DELETE FROM schema_meta WHERE key IN ('rework.stuck_id', 'rework.stuck_attempts')",
+    )
+    .execute(pool)
+    .await;
+    if let Err(error) = cleared {
+        tracing::warn!(%error, "could not clear the rework failure counter");
+    }
+}
+
 /// Capture every rework record newer than the watermark, at most 200 per call. Returns how many
 /// records produced or reinforced a row.
 pub async fn sweep_rework(pool: &SqlitePool, _now: DateTime<Utc>) -> sqlx::Result<usize> {
@@ -271,10 +330,20 @@ pub async fn sweep_rework(pool: &SqlitePool, _now: DateTime<Utc>) -> sqlx::Resul
     for id in ids {
         match capture_rework(pool, id).await {
             Ok(Captured::Skipped) => {}
-            Ok(_) => captured += 1,
+            Ok(_) => {
+                captured += 1;
+                clear_stuck(pool, id).await;
+            }
             Err(error) => {
                 tracing::warn!(%error, record = id, "could not capture a rework record");
-                break;
+                // The first failures break the sweep, so a transient SQLITE_BUSY retries; a
+                // record that keeps failing is skipped instead of blocking every later one.
+                let attempts = note_failure(pool, id).await.unwrap_or(1);
+                if attempts < STUCK_LIMIT {
+                    break;
+                }
+                tracing::warn!(record = id, attempts, "skipping a rework record that fails");
+                clear_stuck(pool, id).await;
             }
         }
         upto = id;
@@ -896,5 +965,51 @@ mod tests {
         assert_eq!(counts(cause_key("cause x")).await, Some(3));
         assert_eq!(live_rows(&pool).await, 2);
         assert_eq!(watermark().await, later.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_record_that_keeps_failing_is_skipped_after_three_sweeps() {
+        let pool = pool().await;
+        // Every insert of a knowledge row titled "poison..." fails, whatever the record says.
+        sqlx::query(
+            "CREATE TRIGGER poison_rework BEFORE INSERT ON knowledge
+             WHEN NEW.title LIKE 'poison%'
+             BEGIN SELECT RAISE(ABORT, 'poison'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let poison = seed_rework(&pool, PROJECT, "t1", "poison cause", "a fix", &[]).await;
+        let good = seed_rework(&pool, PROJECT, "t2", "a good cause", "a fix", &[]).await;
+        let watermark = || async {
+            sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = ?")
+                .bind(REWORK_WATERMARK)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+        };
+
+        // The first two failures break the sweep: the watermark stays and nothing later is read.
+        for _ in 0..2 {
+            assert_eq!(sweep_rework(&pool, Utc::now()).await.unwrap(), 0);
+            assert_eq!(watermark().await, None);
+            assert_eq!(knowledge_rows(&pool).await, 0);
+        }
+
+        // The third failure skips the record and the sweep goes on to the next one.
+        assert_eq!(sweep_rework(&pool, Utc::now()).await.unwrap(), 1);
+        assert_eq!(watermark().await, Some(good.to_string()));
+        assert_eq!(knowledge_rows(&pool).await, 1);
+        let counters: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schema_meta WHERE key IN ('rework.stuck_id', 'rework.stuck_attempts')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            counters, 0,
+            "the counter is cleared once the record is skipped"
+        );
+        assert!(poison < good);
     }
 }

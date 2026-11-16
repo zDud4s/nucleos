@@ -683,7 +683,7 @@ async fn tombstoned_in(
         && let Some((vector, model)) = embedded
     {
         let dead = crate::embed::nearest_in_scope(
-            &mut **tx,
+            tx,
             "project",
             Some(project_id),
             &["reverted", "rejected", "superseded"],
@@ -697,7 +697,7 @@ async fn tombstoned_in(
         {
             hit = Some(id);
         } else if let Some((id, similarity)) = crate::embed::nearest_in_scope(
-            &mut **tx,
+            tx,
             "project",
             Some(project_id),
             &["expired"],

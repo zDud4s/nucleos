@@ -1205,16 +1205,17 @@ mod tests {
             .unwrap();
     }
 
-    /// The distillation queue as `(cause, tree_id, node_id, request_id, decision_id)`.
-    async fn queued(
-        pool: &SqlitePool,
-    ) -> Vec<(
+    /// `(cause, tree_id, node_id, request_id, decision_id)` of a `distill_queue` row.
+    type QueuedRow = (
         String,
         Option<String>,
         Option<String>,
         Option<i64>,
         Option<String>,
-    )> {
+    );
+
+    /// The distillation queue.
+    async fn queued(pool: &SqlitePool) -> Vec<QueuedRow> {
         sqlx::query_as(
             "SELECT cause, tree_id, node_id, request_id, decision_id FROM distill_queue ORDER BY id",
         )

@@ -150,6 +150,7 @@ async fn write(
     cause: Cause,
     gathered: &Gathered,
     runs: &[i64],
+    verify_runs: &[i64],
     items: &[Item],
     vectors: &[Option<Vec<f32>>],
     model: Option<&str>,
@@ -159,6 +160,11 @@ async fn write(
     evidence_list.extend(
         runs.iter()
             .map(|r| serde_json::json!({"t": "run", "id": r})),
+    );
+    evidence_list.extend(
+        verify_runs
+            .iter()
+            .map(|r| serde_json::json!({"t": "verify_run", "id": r})),
     );
     let evidence = serde_json::Value::Array(evidence_list).to_string();
     let reasoning = format!("distilled from {} ({})", gathered.label, cause.as_str());
@@ -272,6 +278,7 @@ pub(super) async fn process(
         cause,
         &gathered,
         &built.runs,
+        &built.verify_runs,
         &items,
         &vectors,
         model,
@@ -496,6 +503,58 @@ mod tests {
                 .iter()
                 .any(|e| e["t"] == "tree" && e["id"] == "job-1"),
             "the tree is evidence: {evidence:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tree_lesson_cites_a_failed_verification_as_verify_run() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc::now();
+        let extra = [("finish", json!({ "status": "abandoned" }))];
+        seed_tree(&pool, "job-1", &extra, now).await;
+        seed_work_node(&pool, "node-api", "job-1", "failed").await;
+        let mut job = store::load(&pool, "job-1").await.unwrap().unwrap();
+        let mut branch = crate::tree_job::model::Branch::new("api", &[], "leaf", None);
+        branch.worktree = Some("C:/wt/api".to_owned());
+        job.manifest.branches.insert("api".to_owned(), branch);
+        store::update(&pool, &job).await.unwrap();
+        let stamp = now.to_rfc3339();
+        let verify_id = sqlx::query(
+            "INSERT INTO verify_runs (project_id, worktree, scope, origin, requested_by, argv,
+                                      status, duration_ms, started_at, finished_at, output_tail)
+             VALUES ('alpha', 'C:/wt/api', 'full', 'job', 'gate', '[]', 'failed', 10, ?, ?,
+                     'error: gate failed on api')",
+        )
+        .bind(&stamp)
+        .bind(&stamp)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        seed_tree_row(&pool, "tree_failed", "job-1", None, &stamp).await;
+        let runner = answering(
+            r#"[{"layer":"procedural","title":"Fix the api gate","body":"Cause X; do Y","files":[]}]"#,
+        );
+
+        claim_and_process(&pool, &runner, now).await;
+
+        let evidence: String =
+            sqlx::query_scalar("SELECT evidence FROM knowledge WHERE title = 'Fix the api gate'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let evidence: Vec<Value> = serde_json::from_str(&evidence).unwrap();
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e["t"] == "verify_run" && e["id"] == verify_id),
+            "the failed verification is cited as verify_run: {evidence:?}"
+        );
+        assert!(
+            !evidence
+                .iter()
+                .any(|e| e["t"] == "run" && e["id"] == verify_id),
+            "and not as a run: {evidence:?}"
         );
     }
 

@@ -21,6 +21,15 @@ const MAX_SHAS: usize = 8;
 /// Deadline of each git read.
 const GIT_DEADLINE: Duration = Duration::from_secs(10);
 
+/// `(id, status, summary, handoff_path, run_id)` of a `work_nodes` row.
+type NodeRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// The blocks of a tree. `focus_node` restricts the node reports and the failures to that node.
 #[allow(dead_code)]
 pub(super) async fn gather_blocks(
@@ -32,13 +41,7 @@ pub(super) async fn gather_blocks(
     let mut blocks = TreeBlocks::default();
 
     // Node reports: counts run over every node, the report list over the focused ones, capped.
-    let nodes: Vec<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let nodes: Vec<NodeRow> = sqlx::query_as(
         "SELECT id, status, summary, handoff_path, run_id FROM work_nodes
              WHERE tree_job_id = ? ORDER BY created_at, id",
     )
