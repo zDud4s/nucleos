@@ -33,6 +33,10 @@ const KEY: &str = "gate_ticket";
 /// The key of `Branch.extra` that holds the ticket of the branch's build check, same shape.
 const CHECK_KEY: &str = "gate_check_ticket";
 
+/// The key of `Branch.extra` that holds the HEAD whose test step already inherited the check's queue
+/// time; a later gate of that HEAD queues as new.
+const INHERITED_KEY: &str = "gate_inherited_head";
+
 /// The key of `Branch.extra` that holds the ticket of a fix's recheck of the failed tests.
 const RECHECK_KEY: &str = "gate_recheck_ticket";
 
@@ -245,16 +249,44 @@ struct VerifyIo<'a> {
 }
 
 /// The queue time the test step inherits from the build check: the check's oldest unit, only when
-/// the check measured the same `head`.
+/// the check measured the same `head` and that head has not inherited it already (`inherited`).
 pub(super) fn inherit_since(
     stored: Option<&Stored>,
+    inherited: Option<&str>,
     head: &str,
     oldest: Option<i64>,
 ) -> Option<i64> {
+    if inherited == Some(head) {
+        return None;
+    }
     stored.filter(|stored| stored.head == head).and(oldest)
 }
 
 impl VerifyIo<'_> {
+    /// Record that this head's test step inherited the check's queue time, so a later gate of the
+    /// same head queues as new.
+    async fn mark_inherited(&self) {
+        let lock = job_lock(self.job_id);
+        let _guard = lock.lock().await;
+        let result = match store::load(self.pool, self.job_id).await {
+            Ok(Some(mut job)) => match job.manifest.branches.get_mut(self.branch) {
+                Some(held) => {
+                    held.extra
+                        .insert(INHERITED_KEY.to_owned(), json!(self.head));
+                    store::update(self.pool, &job)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                None => return,
+            },
+            Ok(None) => return,
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, job = self.job_id, branch = self.branch, "gate: cannot record the inherited head");
+        }
+    }
+
     /// The queue terms of this branch's next ticket (spec A7): a branch in `fixing` re-gates a fix,
     /// which the queue serves before a new branch's gate; one whose last gate hit the unit time
     /// ceiling is measured again with a ceiling sized to its scope. A branch that cannot be read
@@ -282,7 +314,12 @@ impl VerifyIo<'_> {
                     }),
                 None => None,
             };
-            inherit_since(check.as_ref(), self.head, oldest)
+            let inherited = held.extra.get(INHERITED_KEY).and_then(|v| v.as_str());
+            let since = inherit_since(check.as_ref(), inherited, self.head, oldest);
+            if since.is_some() {
+                self.mark_inherited().await;
+            }
+            since
         } else {
             None
         };
