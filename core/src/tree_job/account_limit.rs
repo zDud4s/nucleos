@@ -147,7 +147,8 @@ async fn announce_wait(
         account.as_str(),
         resume.format("%Y-%m-%d %H:%M UTC")
     );
-    let subject = format!("node:{node_id}");
+    // The feed has no node subject; the dead run is the story this row belongs to.
+    let subject = nucleos_base::feed::Subject::Run(run);
     if let Err(error) =
         crate::feed::append(db, None, WAIT_KIND, &summary, Some(run), Some(&subject)).await
     {
