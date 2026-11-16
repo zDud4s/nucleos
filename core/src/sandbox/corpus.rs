@@ -175,7 +175,14 @@ fn gate_script_comparison_refuses_a_reparse_point() {
 
 fn git_in(dir: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -196,7 +203,17 @@ fn trunk_and_branch() -> (tempfile::TempDir, tempfile::TempDir) {
     git_in(project.path(), &["add", "."]);
     git_in(project.path(), &["commit", "-q", "-m", "old"]);
     let tree = parent.path().join("wt");
-    git_in(project.path(), &["worktree", "add", "-q", "-b", "feat", tree.to_str().unwrap()]);
+    git_in(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            tree.to_str().unwrap(),
+        ],
+    );
     (project, parent)
 }
 
@@ -211,7 +228,10 @@ fn gate_script_of_a_lagging_branch_is_trusted() {
     commit_script(project.path(), "new");
     // The root has the new script, the branch the one it forked with.
     let tree = parent.path().join("wt");
-    assert_eq!(tampered_scripts(project.path(), &tree, ["sh tools/run.sh"]), None);
+    assert_eq!(
+        tampered_scripts(project.path(), &tree, ["sh tools/run.sh"]),
+        None
+    );
 }
 
 #[test]
@@ -237,7 +257,10 @@ fn gate_script_of_a_branch_ahead_of_the_root_checkout_is_trusted() {
     // The branch takes the trunk's tip, while the root's working copy is parked elsewhere.
     git_in(&tree, &["merge", "-q", "--ff-only", "master"]);
     std::fs::write(project.path().join("tools/run.sh"), "parked").unwrap();
-    assert_eq!(tampered_scripts(project.path(), &tree, ["sh tools/run.sh"]), None);
+    assert_eq!(
+        tampered_scripts(project.path(), &tree, ["sh tools/run.sh"]),
+        None
+    );
 }
 
 #[test]

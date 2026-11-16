@@ -9,13 +9,8 @@ use std::path::Path;
 /// would be refused though it never touched the file. A branch that edited the script matches none
 /// of the trunk's tip, the fork point and the root's copy. Any git failure answers `false`, which
 /// keeps the strict refusal.
-pub fn script_matches_trunk(
-    project_root: &Path,
-    worktree: &Path,
-    rel: &str,
-    bytes: &[u8],
-) -> bool {
-    let spec = |rev: &str| format!("{rev}:{}", rel.replace('\', "/"));
+pub fn script_matches_trunk(project_root: &Path, worktree: &Path, rel: &str, bytes: &[u8]) -> bool {
+    let spec = |rev: &str| format!("{rev}:{}", rel.replace('\\', "/"));
     for trunk in ["master", "main"] {
         if git_stdout(project_root, &["show", &spec(trunk)]).is_some_and(|tip| tip == bytes) {
             return true;
@@ -59,7 +54,8 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-            .args(["-c", "commit.gpgsign=false"])
+            // Without this a Windows autocrlf checkout writes `v1\r\n` beside the `v1\n` blob.
+            .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
             .args(args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -108,7 +104,12 @@ mod tests {
         git(root.path(), &["checkout", "-b", "other"]);
         std::fs::write(root.path().join("scripts/g.sh"), "other\n").unwrap();
         std::fs::write(wt.join("scripts/g.sh"), "v2\n").unwrap();
-        assert!(script_matches_trunk(root.path(), &wt, "scripts/g.sh", b"v2\n"));
+        assert!(script_matches_trunk(
+            root.path(),
+            &wt,
+            "scripts/g.sh",
+            b"v2\n"
+        ));
         assert_eq!(tampered_command_scripts(root.path(), &wt, [CMD]), None);
     }
 
@@ -128,6 +129,11 @@ mod tests {
     #[test]
     fn a_git_failure_is_not_trusted() {
         let root = tempfile::tempdir().unwrap();
-        assert!(!script_matches_trunk(root.path(), root.path(), "x.sh", b"x"));
+        assert!(!script_matches_trunk(
+            root.path(),
+            root.path(),
+            "x.sh",
+            b"x"
+        ));
     }
 }
