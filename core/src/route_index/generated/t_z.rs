@@ -83,7 +83,7 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     RouteEntry {
         method: "GET",
         path: "/team-pressure",
-        purpose: "`/team-pressure` e nao `/teams/pressure`: os irmaos que colhem sobre todas as equipas chamam-se `/team-runs`, `/team-files`, `/team-actions`, e sob `/teams/` o segmento estatico ficaria a sombrear o `/teams/{id}` para uma equipa que se chamasse `pressure`.",
+        purpose: "`/team-pressure` and not `/teams/pressure`: the siblings that collect across all teams are called `/team-runs`, `/team-files`, `/team-actions`, and under `/teams/` the static segment would shadow `/teams/{id}` for a team that happened to be named `pressure`.",
         body: Body::None,
         handler: "get_team_pressure",
     },
@@ -275,6 +275,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "Synthesise theme.",
         body: Body::None,
         handler: "synthesise_theme",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/tree-decisions",
+        purpose: "Get tree decisions.",
+        body: Body::None,
+        handler: "get_tree_decisions",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/tree-decisions/{id}/answer",
+        purpose: "Post tree decision answer.",
+        body: Body::Shapeless("AnswerBody"),
+        handler: "post_tree_decision_answer",
     },
     RouteEntry {
         method: "POST",

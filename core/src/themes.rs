@@ -162,11 +162,13 @@ async fn candidates(pool: &SqlitePool, model: &str) -> sqlx::Result<Vec<Candidat
             vector,
         })
         .collect();
+    // `k.trial = 0`: only the permanent is clustered (spec §7.2).
     let rows: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
         "SELECT e.knowledge_id, e.dim, e.vector
            FROM knowledge_embeddings e JOIN knowledge k ON k.id = e.knowledge_id
           WHERE e.model = ? AND k.status IN ('active', 'proposed', 'observed')
             AND k.source IN ('distiller', 'owner')
+            AND k.trial = 0
           ORDER BY e.knowledge_id",
     )
     .bind(model)

@@ -391,6 +391,17 @@ mod reopen_tests {
 /// trial, spec `destilador` section 3.
 pub const DISTILLED_TRIAL_RUNS: i64 = 50;
 
+/// A trial lesson needs at least this many measured outcomes before it is judged on its record.
+pub const TRIAL_MIN_OUTCOMES: i64 = 8;
+/// How far below the permanent rows' green rate a trial lesson may sit before it is withdrawn.
+pub const TRIAL_MARGIN: f64 = 0.15;
+/// Project runs a never-shown trial lesson may wait before it is withdrawn.
+pub const TRIAL_IDLE_RUNS: i64 = 100;
+/// The longest a lesson stays on trial, in days.
+pub const TRIAL_MAX_DAYS: i64 = 60;
+/// Days an expired lesson keeps blocking its own fingerprint from coming back.
+pub const TRIAL_COOLOFF_DAYS: i64 = 30;
+
 /// The note of an event that renews a row without changing its status.
 pub const NOTE_RECONFIRMED: &str = "reconfirmed";
 
@@ -457,6 +468,68 @@ pub async fn record_distilled(
     .await?;
 
     Ok(id)
+}
+
+/// Record a semantic or procedural lesson the distiller drew: active from the start, on trial.
+///
+/// Like `record_distilled`, but the layer comes from the provenance (semantic when absent), there
+/// is no run clock (`expires_after_runs` stays NULL; the trial sweep owns its expiry) and the row
+/// carries `trial = 1` with `trial_started_at` set. Nothing is committed here.
+pub async fn record_distilled_trial(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    declaration: &Declaration<'_>,
+    provenance: &Provenance<'_>,
+) -> sqlx::Result<i64> {
+    let scope = Scope::of_project(declaration.project_id);
+    let (scope_kind, scope_id) = scope.columns();
+    let layer = provenance.layer.unwrap_or(Layer::Semantic);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let id = sqlx::query(
+        "INSERT INTO knowledge
+           (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, evidence,
+            points_at, distill_cause, status, trial, trial_started_at, created_at, activated_at)
+         VALUES (?, ?, ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?)",
+    )
+    .bind(layer.as_str())
+    .bind(scope_kind)
+    .bind(scope_id.as_deref())
+    .bind(declaration.kind.as_str())
+    .bind(declaration.title)
+    .bind(declaration.body)
+    .bind(provenance.fingerprint)
+    .bind(provenance.evidence)
+    .bind(provenance.points_at)
+    .bind(provenance.distill_cause)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?
+    .last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'active', 'created', ?)",
+    )
+    .bind(id)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(id)
+}
+
+/// The note of an event that says a lesson was not inserted because a retired one blocks it.
+pub const NOTE_TOMBSTONE_SKIP: &str = "skipped: tombstone";
+
+/// Say, in a same-status event on the retired row `knowledge_id`, that a new lesson was skipped
+/// because of it.
+pub async fn note_tombstone_skip_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    knowledge_id: i64,
+) -> sqlx::Result<()> {
+    same_status_event_in(tx, knowledge_id, NOTE_TOMBSTONE_SKIP.to_owned()).await
 }
 
 /// A learning seen again: merge the new evidence into the project's newest live row with the same

@@ -19,6 +19,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "POST",
+        path: "/backlog/finish/cancel",
+        purpose: "Post finish cancel.",
+        body: Body::Shapeless("CancelRequest"),
+        handler: "post_finish_cancel",
+    },
+    RouteEntry {
+        method: "POST",
         path: "/backup",
         purpose: "Post backup.",
         body: Body::None,

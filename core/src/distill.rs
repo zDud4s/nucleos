@@ -575,7 +575,7 @@ async fn write_items(
     let mut kept = 0usize;
     for (index, item) in items.iter().enumerate() {
         let vector = vectors.get(index).and_then(|v| v.as_deref());
-        match write_one_item(&mut tx, &subject, item, vector).await? {
+        match write_one_item_at(&mut tx, &subject, item, vector, now).await? {
             Written::Skipped => {}
             Written::Recorded => kept += 1,
             Written::Proposed => {
@@ -620,6 +620,90 @@ async fn write_one_item(
     item: &Item,
     vector: Option<&[f32]>,
 ) -> sqlx::Result<Written> {
+    write_one_item_at(tx, subject, item, vector, Utc::now()).await
+}
+
+/// Whether a retired lesson blocks a new one: a `reverted`, `rejected` or `superseded` row with
+/// the same fingerprint or a neighbour by embedding (>= `SIM_SAME`), or an `expired` one that
+/// ended less than `TRIAL_COOLOFF_DAYS` before `now`. On a hit a `skipped: tombstone` event lands
+/// on the matched row. Matching on the F2 `cause_key` waits for the rework writer; no distiller
+/// row carries one yet.
+async fn tombstoned_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: &str,
+    fingerprint: &str,
+    embedded: Option<(&[f32], &str)>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let cutoff = (now - chrono::Duration::days(crate::knowledge::TRIAL_COOLOFF_DAYS)).to_rfc3339();
+    let by_fingerprint: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM knowledge
+          WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?
+            AND (status IN ('reverted', 'rejected', 'superseded')
+                 OR (status = 'expired' AND ended_at > ?))
+          ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(fingerprint)
+    .bind(&cutoff)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let mut hit = by_fingerprint;
+    if hit.is_none()
+        && let Some((vector, model)) = embedded
+    {
+        let dead = crate::embed::nearest_in_scope(
+            &mut **tx,
+            "project",
+            Some(project_id),
+            &["reverted", "rejected", "superseded"],
+            model,
+            vector,
+            &[],
+        )
+        .await?;
+        if let Some((id, similarity)) = dead
+            && similarity >= SIM_SAME
+        {
+            hit = Some(id);
+        } else if let Some((id, similarity)) = crate::embed::nearest_in_scope(
+            &mut **tx,
+            "project",
+            Some(project_id),
+            &["expired"],
+            model,
+            vector,
+            &[],
+        )
+        .await?
+            && similarity >= SIM_SAME
+        {
+            // Only the nearest expired row is checked, so an older neighbour hides a newer one.
+            let recent: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM knowledge WHERE id = ? AND ended_at > ?",
+            )
+            .bind(id)
+            .bind(&cutoff)
+            .fetch_optional(&mut **tx)
+            .await?;
+            hit = recent;
+        }
+    }
+    let Some(id) = hit else {
+        return Ok(false);
+    };
+    crate::knowledge::note_tombstone_skip_in(tx, id).await?;
+    Ok(true)
+}
+
+/// `write_one_item` with the clock the tombstone cool-off reads supplied by the caller.
+async fn write_one_item_at(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject: &Subject<'_>,
+    item: &Item,
+    vector: Option<&[f32]>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Written> {
     let Some(fingerprint) = crate::knowledge::title_fingerprint(&item.title) else {
         return Ok(Written::Skipped);
     };
@@ -645,6 +729,9 @@ async fn write_one_item(
             Dedup::Near(id) => near = Some(id),
             Dedup::New => {}
         }
+    }
+    if tombstoned_in(tx, subject.project_id, &fingerprint, embedded, now).await? {
+        return Ok(Written::Skipped);
     }
     let points_at = if item.files.is_empty() {
         None
@@ -680,7 +767,9 @@ async fn write_one_item(
     };
     let new_id = match how {
         Door::Record => crate::knowledge::record_distilled(tx, &declaration, &provenance).await?,
-        Door::Trial => unimplemented!("green-1"),
+        Door::Trial => {
+            crate::knowledge::record_distilled_trial(tx, &declaration, &provenance).await?
+        }
         Door::Propose => {
             crate::knowledge::propose_in_with(tx, declaration, &provenance)
                 .await
@@ -3297,7 +3386,8 @@ mod tests {
 
     async fn project_candidates(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND status = 'proposed'
+            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project'
+               AND (status = 'proposed' OR (status = 'active' AND trial = 1))
                AND distill_cause = 'chat_exchanges'",
         )
         .fetch_one(pool)
@@ -3306,27 +3396,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_single_project_batch_writes_proposed_candidates_and_observed_observations() {
+    async fn a_single_project_batch_writes_trial_candidates_and_observed_observations() {
         let pool = test_pool().await;
         let chat = fixtures::chat_with(&pool).await;
         let last = four_turns(&pool, &chat, Some("alpha")).await;
         chat_row(&pool, "alpha", &chat, last).await;
         distil(&pool, SEMANTIC_THREE, None).await;
 
-        type CandRow = (String, String, Option<String>, Option<String>, String);
+        type CandRow = (String, String, Option<String>, Option<String>, String, i64);
         let cands: Vec<CandRow> = sqlx::query_as(
-            "SELECT scope_kind, status, scope_id, about, evidence FROM knowledge
+            "SELECT scope_kind, status, scope_id, about, evidence, trial FROM knowledge
               WHERE distill_cause = 'chat_exchanges' AND scope_kind = 'project'",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
         assert_eq!(cands.len(), 2);
-        for (kind, status, scope_id, about, evidence) in cands {
+        for (kind, status, scope_id, about, evidence, trial) in cands {
             assert_eq!(
                 (kind.as_str(), status.as_str(), scope_id.as_deref(), about),
-                ("project", "proposed", Some("alpha"), None)
+                ("project", "active", Some("alpha"), None)
             );
+            assert_eq!(trial, 1, "an unquoted distilled lesson enters on trial");
             assert!(evidence.contains(r#""t":"chat""#) && evidence.contains(r#""t":"run""#));
         }
         let key = fixtures::chat_key(&pool, &chat).await;
@@ -3341,11 +3432,14 @@ mod tests {
             vec![("observed".into(), format!("alpha:chat:{key}"), None)]
         );
         let active: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE status = 'active'")
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE status = 'active' AND trial = 0")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(active, 0, "a conversation never writes active knowledge");
+        assert_eq!(
+            active, 0,
+            "a conversation never writes permanent (non-trial) active knowledge"
+        );
         let evidence: String =
             sqlx::query_scalar("SELECT evidence FROM knowledge WHERE scope_kind = 'observation'")
                 .fetch_one(&pool)

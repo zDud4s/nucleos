@@ -432,6 +432,9 @@ pub(super) fn select_pass<'a>(
 /// `source = 'distiller'` too, and it is approved. A proposed one never gets here. The other named
 /// exception is not approval: `admitted` separately requires a same-job working row with
 /// well-tagged evidence.
+///
+/// `active` includes `trial = 1`: a distilled lesson on trial is admitted to prompts at once, so
+/// "approved" here means admissible, not permanent. Only the owner's confirm clears `trial`.
 pub fn approved(row: &Known) -> bool {
     match row.status.as_str() {
         "active" if row.source == "consolidator" => {

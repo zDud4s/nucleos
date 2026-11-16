@@ -413,12 +413,78 @@ pub async fn revert(pool: &SqlitePool, knowledge_id: i64, note: &str) -> sqlx::R
     Ok(true)
 }
 
-/// The owner keeps a lesson on trial: it becomes permanent. Stub until the green packet.
-pub async fn confirm_trial(_pool: &SqlitePool, _knowledge_id: i64) -> sqlx::Result<bool> {
-    Ok(false)
+/// The owner keeps a lesson on trial: it becomes permanent. `false` when the row is not an active
+/// trial row (already permanent, still proposed, ended or missing), so a second call is a no-op.
+pub async fn confirm_trial(pool: &SqlitePool, knowledge_id: i64) -> sqlx::Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "UPDATE knowledge SET trial = 0, trial_started_at = NULL, expires_after_runs = NULL
+          WHERE id = ? AND status = 'active' AND trial = 1",
+    )
+    .bind(knowledge_id)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         VALUES (?, 'active', 'active', 'approved by the owner', ?)",
+    )
+    .bind(knowledge_id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
-/// The owner withdraws a lesson on trial. Stub until the green packet.
-pub async fn retire_trial(_pool: &SqlitePool, _knowledge_id: i64) -> sqlx::Result<bool> {
-    Ok(false)
+/// The owner withdraws a lesson on trial. `false` when the row is not an active trial row.
+pub async fn retire_trial(pool: &SqlitePool, knowledge_id: i64) -> sqlx::Result<bool> {
+    let on_trial: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM knowledge WHERE id = ? AND status = 'active' AND trial = 1",
+    )
+    .bind(knowledge_id)
+    .fetch_optional(pool)
+    .await?;
+    if on_trial.is_none() {
+        return Ok(false);
+    }
+    revert(pool, knowledge_id, "rejected during trial").await
+}
+
+/// The trial sweep withdraws a lesson that did not earn its place: `active` to `expired` with the
+/// criterion as the note. `false` when the row is no longer an active trial row.
+pub async fn expire_trial(
+    pool: &SqlitePool,
+    knowledge_id: i64,
+    now: &str,
+    note: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "UPDATE knowledge SET status = 'expired', ended_at = ?
+          WHERE id = ? AND status = 'active' AND trial = 1",
+    )
+    .bind(now)
+    .bind(knowledge_id)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         VALUES (?, 'active', 'expired', ?, ?)",
+    )
+    .bind(knowledge_id)
+    .bind(note)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }

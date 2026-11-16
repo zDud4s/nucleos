@@ -23,8 +23,9 @@ fn knowledge_ids(evidence: Option<&str>) -> Vec<i64> {
 /// proposals (`expired`, not `rejected`: the owner said nothing) and note `covers:[ids]` on the lesson. Returns rows covered.
 pub async fn tidy_covered(pool: &SqlitePool) -> sqlx::Result<u64> {
     let lessons: Vec<(i64, Option<String>)> = sqlx::query_as(
+        // Only the permanent covers: a lesson still on trial covers nothing (spec §7.2).
         "SELECT id, evidence FROM knowledge
-          WHERE distill_cause = 'generalised' AND status = 'active' ORDER BY id",
+          WHERE distill_cause = 'generalised' AND status = 'active' AND trial = 0 ORDER BY id",
     )
     .fetch_all(pool)
     .await?;

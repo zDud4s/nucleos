@@ -182,7 +182,7 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         method: "POST",
         path: "/runs/{id}/message",
         purpose: "Post run message.",
-        body: Body::Shapeless("RunMessageRequest"),
+        body: Body::None,
         handler: "post_run_message",
     },
     RouteEntry {
@@ -202,7 +202,7 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     RouteEntry {
         method: "GET",
         path: "/sandbox/status",
-        purpose: "How the OS sandbox stands, with the banner the shell shows.",
+        purpose: "Get sandbox status.",
         body: Body::None,
         handler: "get_sandbox_status",
     },

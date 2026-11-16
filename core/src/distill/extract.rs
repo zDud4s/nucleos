@@ -411,7 +411,8 @@ pub fn parse_items(answer: &str) -> Result<Vec<Item>, ParseError> {
         .collect())
 }
 
-/// How a learning enters the store: recorded as it is, or proposed for a person to approve.
+/// How a learning enters the store: recorded as it is, recorded on trial, or proposed for a person
+/// to approve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Door {
     Record,
@@ -424,9 +425,9 @@ pub enum Door {
 pub fn door(layer: Layer) -> (Kind, Door) {
     match layer {
         Layer::Episodic => (Kind::Memory, Door::Record),
-        Layer::Semantic => (Kind::Memory, Door::Propose),
-        Layer::Procedural => (Kind::Prompt, Door::Propose),
-        // The parser never lets `working` through; if one arrives it is proposed like a rule.
+        Layer::Semantic => (Kind::Memory, Door::Trial),
+        Layer::Procedural => (Kind::Prompt, Door::Trial),
+        // The parser never lets `working` through; if one arrives it is proposed.
         Layer::Working => (Kind::Memory, Door::Propose),
     }
 }

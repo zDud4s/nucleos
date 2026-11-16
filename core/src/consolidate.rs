@@ -100,8 +100,9 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
              UNION
              SELECT DISTINCT scope_id AS project_id FROM knowledge
               WHERE scope_kind = 'project' AND scope_id IS NOT NULL
-                AND (source = 'consolidator' OR source = 'distiller')
-                AND layer = 'episodic' AND status = 'active'
+                AND status = 'active'
+                AND ((source IN ('consolidator', 'distiller') AND layer = 'episodic')
+                     OR trial = 1)
          ) ORDER BY project_id",
     )
     .fetch_all(pool)
@@ -114,6 +115,7 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
         let window = gate_window(pool, &project).await?;
         report.remeasured += reinforce_gate_signatures(pool, &project, &window, now).await?;
         report.expired += expire_unconfirmed(pool, &project, now).await?;
+        report.expired += expire_trials(pool, &project, now).await?;
     }
     promote_to_machine(pool, now).await?;
     Ok(report)
@@ -468,7 +470,8 @@ async fn expire_unconfirmed(
         "SELECT id FROM knowledge
           WHERE scope_kind = 'project' AND scope_id = ?
             AND (source = 'consolidator' OR source = 'distiller')
-            AND layer = 'episodic' AND status = 'active' AND expires_after_runs IS NOT NULL
+            AND layer = 'episodic' AND status = 'active' AND trial = 0
+            AND expires_after_runs IS NOT NULL
             AND last_confirmed_at IS NOT NULL
             AND (SELECT COUNT(*) FROM runs
                   WHERE project_id = ? AND created_at > knowledge.last_confirmed_at)
@@ -485,7 +488,7 @@ async fn expire_unconfirmed(
         let updated = sqlx::query(
             "UPDATE knowledge SET status = 'expired', ended_at = ?
               WHERE id = ? AND (source = 'consolidator' OR source = 'distiller')
-                AND layer = 'episodic' AND status = 'active'",
+                AND layer = 'episodic' AND status = 'active' AND trial = 0",
         )
         .bind(&now)
         .bind(id)
@@ -508,14 +511,73 @@ async fn expire_unconfirmed(
     Ok(expired)
 }
 
-/// Withdraws trial lessons that did not earn their place. Stub until the green packet.
-#[allow(dead_code)]
+/// Withdraws trial lessons that did not earn their place (spec E3): clearly worse than the
+/// project's permanent rows, never shown in a hundred runs, or past the sixty-day ceiling. The
+/// status change itself lives in the knowledge module, which owns every write to a non-measurement.
 async fn expire_trials(
-    _pool: &SqlitePool,
-    _project: &str,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    project: &str,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<usize> {
-    Ok(0)
+    use crate::knowledge::{
+        TRIAL_IDLE_RUNS, TRIAL_MARGIN, TRIAL_MAX_DAYS, TRIAL_MIN_OUTCOMES, expire_trial,
+    };
+
+    // Only permanent rows are a yardstick, and only with at least three outcomes each.
+    let (rate, rows): (Option<f64>, i64) = sqlx::query_as(
+        "SELECT SUM(green_count) * 1.0 / SUM(outcome_count), COUNT(*) FROM knowledge
+          WHERE scope_kind = 'project' AND scope_id = ? AND status = 'active'
+            AND trial = 0 AND outcome_count >= 3",
+    )
+    .bind(project)
+    .fetch_one(pool)
+    .await?;
+    let baseline = rate.filter(|rate| rows >= 3 && *rate > 0.0);
+
+    let trials: Vec<(i64, i64, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, shown_count, outcome_count, green_count, trial_started_at FROM knowledge
+          WHERE scope_kind = 'project' AND scope_id = ? AND status = 'active' AND trial = 1
+          ORDER BY id",
+    )
+    .bind(project)
+    .fetch_all(pool)
+    .await?;
+    let now_text = now.to_rfc3339();
+    let mut expired = 0;
+    for (id, shown, outcomes, green, started) in trials {
+        let started_at = started
+            .as_deref()
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+            .map(|at| at.with_timezone(&Utc));
+        let note = if baseline.is_some_and(|baseline| {
+            outcomes >= TRIAL_MIN_OUTCOMES && (green as f64 / outcomes as f64) < baseline - TRIAL_MARGIN
+        }) {
+            Some("trial: not helping, clearly worse than the permanent rows")
+        } else if shown == 0 && started.is_some() && {
+            let runs: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM runs WHERE project_id = ? AND created_at > ?",
+            )
+            .bind(project)
+            .bind(started.as_deref())
+            .fetch_one(pool)
+            .await?;
+            runs >= TRIAL_IDLE_RUNS
+        } {
+            Some("trial: never shown in 100 project runs")
+        } else if started_at
+            .is_some_and(|started| now - started >= chrono::Duration::days(TRIAL_MAX_DAYS))
+        {
+            Some("trial: max age reached")
+        } else {
+            None
+        };
+        if let Some(note) = note
+            && expire_trial(pool, id, &now_text, note).await?
+        {
+            expired += 1;
+        }
+    }
+    Ok(expired)
 }
 
 /// Promote measurements repeated across independent projects into the inherited machine scope.
@@ -523,7 +585,8 @@ pub async fn promote_to_machine(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::
     let fingerprints: Vec<String> = sqlx::query_scalar(
         "SELECT fingerprint FROM knowledge
           WHERE source = 'consolidator' AND layer = 'episodic'
-            AND scope_kind = 'project' AND status = 'active' AND fingerprint IS NOT NULL
+            AND scope_kind = 'project' AND status = 'active' AND trial = 0
+            AND fingerprint IS NOT NULL
           GROUP BY fingerprint HAVING COUNT(DISTINCT scope_id) >= ?
           ORDER BY fingerprint",
     )
@@ -550,8 +613,8 @@ pub async fn promote_to_machine(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::
                     title, body
                FROM knowledge
               WHERE source = 'consolidator' AND layer = 'episodic'
-                AND scope_kind = 'project' AND status = 'active' AND fingerprint = ?
-                AND scope_id IS NOT NULL
+                AND scope_kind = 'project' AND status = 'active' AND trial = 0
+                AND fingerprint = ? AND scope_id IS NOT NULL
               ORDER BY id",
         )
         .bind(&fingerprint)
