@@ -267,7 +267,15 @@ pub(super) async fn process(
     let vectors = embed_items(embedder, &items).await;
     let model = embedder.map(|e| e.model());
     match write(
-        pool, row, cause, &gathered, &built.runs, &items, &vectors, model, now,
+        pool,
+        row,
+        cause,
+        &gathered,
+        &built.runs,
+        &items,
+        &vectors,
+        model,
+        now,
     )
     .await
     {
@@ -421,7 +429,11 @@ mod tests {
 
         claim_and_process(&pool, &runner, now).await;
 
-        assert_eq!(prompt_of(&runner), None, "a clean run never reaches the model");
+        assert_eq!(
+            prompt_of(&runner),
+            None,
+            "a clean run never reaches the model"
+        );
         let (status, _, _, error) = queue_state(&pool, row).await;
         assert_eq!(status, "done");
         assert_eq!(error.as_deref(), Some("nothing: clean run"));
@@ -514,7 +526,11 @@ mod tests {
 
         claim_and_process(&pool, &runner, now).await;
 
-        assert_eq!(prompt_of(&runner), None, "a deferred row does not call the model");
+        assert_eq!(
+            prompt_of(&runner),
+            None,
+            "a deferred row does not call the model"
+        );
         let (status, attempts, not_before, error) = queue_state(&pool, row).await;
         assert_eq!(status, "pending", "error: {error:?}");
         assert_eq!(attempts, 0, "a deferral is not an attempt");
@@ -530,7 +546,10 @@ mod tests {
 
         // The next UTC day the cap is fresh and the row is processed.
         claim_and_process(&pool, &runner, midnight).await;
-        assert!(prompt_of(&runner).is_some(), "the next day it reaches the model");
+        assert!(
+            prompt_of(&runner).is_some(),
+            "the next day it reaches the model"
+        );
         let (status, _, _, error) = queue_state(&pool, row).await;
         assert_eq!(status, "done", "error: {error:?}");
     }
@@ -550,7 +569,11 @@ mod tests {
 
         claim_and_process(&pool, &runner, now).await;
 
-        assert_eq!(prompt_of(&runner), None, "a stale row does not call the model");
+        assert_eq!(
+            prompt_of(&runner),
+            None,
+            "a stale row does not call the model"
+        );
         let (status, _, _, error) = queue_state(&pool, row).await;
         assert_eq!(status, "done");
         assert_eq!(error.as_deref(), Some("nothing: stale"));
@@ -624,12 +647,11 @@ mod tests {
 
         tick(&pool, Extractor::Cli(&runner), None).await;
 
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT cause, status FROM distill_queue WHERE tree_id = 'job-1'",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT cause, status FROM distill_queue WHERE tree_id = 'job-1'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             rows,
             vec![("tree_landed".to_owned(), "done".to_owned())],

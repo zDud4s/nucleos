@@ -1208,7 +1208,13 @@ mod tests {
     /// The distillation queue as `(cause, tree_id, node_id, request_id, decision_id)`.
     async fn queued(
         pool: &SqlitePool,
-    ) -> Vec<(String, Option<String>, Option<String>, Option<i64>, Option<String>)> {
+    ) -> Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> {
         sqlx::query_as(
             "SELECT cause, tree_id, node_id, request_id, decision_id FROM distill_queue ORDER BY id",
         )
@@ -1223,7 +1229,10 @@ mod tests {
         seed_one_branch(&pool, "building").await;
         give_the_tree_a_project(&pool).await;
         let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
-        assert!(queued(&pool).await.is_empty(), "parking alone queues nothing");
+        assert!(
+            queued(&pool).await.is_empty(),
+            "parking alone queues nothing"
+        );
 
         answer(&pool, &parked.id, ANSWER, CHANNEL).await.unwrap();
 

@@ -81,7 +81,9 @@ fn break_dossier_markers(text: &str) -> String {
 /// Every raw text leaves redacted (`judge::redact_for_judge`: it goes to a cloud model by default)
 /// and with the dossier's markers broken.
 pub(crate) fn scrub(text: &str) -> String {
-    break_dossier_markers(&crate::judge::redact_for_judge(&crate::knowledge::strip_ansi(text)))
+    break_dossier_markers(&crate::judge::redact_for_judge(
+        &crate::knowledge::strip_ansi(text),
+    ))
 }
 
 /// `inputs` with every text field scrubbed, so `blocks` formats only treated text.
@@ -292,9 +294,7 @@ pub fn standing_for(cause: Cause) -> String {
         Cause::ChatExchanges => {
             " This dossier is a conversation between the owner and an assistant. Write down the preferences, decisions and corrections the owner stated that would still matter in a later session, never a summary of the conversation."
         }
-        Cause::TreeLanded => {
-            " The tree landed: ask what let it land and what nearly blocked it."
-        }
+        Cause::TreeLanded => " The tree landed: ask what let it land and what nearly blocked it.",
         Cause::TreeFailed => {
             " The tree failed: ask for the root cause and what the next agent must avoid."
         }

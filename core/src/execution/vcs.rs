@@ -3795,7 +3795,12 @@ mod tests {
                 .unwrap();
         assert_eq!(
             rows,
-            vec![("branch_landed".to_string(), "alpha".to_string(), None, Some(id))]
+            vec![(
+                "branch_landed".to_string(),
+                "alpha".to_string(),
+                None,
+                Some(id)
+            )]
         );
     }
 

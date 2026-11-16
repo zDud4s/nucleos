@@ -46,7 +46,11 @@ fn clean_text(value: Option<&serde_json::Value>) -> Option<String> {
 
 /// The first `TITLE_CLIP` characters of `text`, trimmed, with no ellipsis.
 fn clip_title(text: &str) -> String {
-    text.chars().take(TITLE_CLIP).collect::<String>().trim().to_owned()
+    text.chars()
+        .take(TITLE_CLIP)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 /// **Pure.** The candidate a rework record carries, `None` when it carries none.
@@ -609,7 +613,15 @@ mod tests {
     #[tokio::test]
     async fn a_rework_with_cause_and_fix_writes_one_episodic_trial_row_without_a_model() {
         let pool = pool().await;
-        let record = seed_rework(&pool, PROJECT, "t1", "the linker held the exe", "retry", &[]).await;
+        let record = seed_rework(
+            &pool,
+            PROJECT,
+            "t1",
+            "the linker held the exe",
+            "retry",
+            &[],
+        )
+        .await;
 
         let Captured::Written(id) = capture_rework(&pool, record).await.unwrap() else {
             panic!("a rework with a cause and a fix is written");
@@ -625,7 +637,10 @@ mod tests {
         assert!(started.is_some(), "the trial clock is running");
         assert_eq!(expires, None, "the trial sweep owns its expiry");
         assert_eq!(observations, Some(1));
-        assert_eq!(key.as_deref(), Some(cause_key("the linker held the exe").as_str()));
+        assert_eq!(
+            key.as_deref(),
+            Some(cause_key("the linker held the exe").as_str())
+        );
         let evidence: Value = serde_json::from_str(&evidence.unwrap()).unwrap();
         assert_eq!(evidence, json!([{"t": "record", "id": record}]));
         assert_eq!(notes_of(&pool, id).await, vec!["created".to_owned()]);
@@ -641,17 +656,35 @@ mod tests {
     async fn a_second_rework_of_the_same_cause_from_another_task_reinforces_and_promotes_to_procedural()
      {
         let pool = pool().await;
-        let first = seed_rework(&pool, PROJECT, "t1", "The gate failed in run-3", "retry", &[]).await;
+        let first = seed_rework(
+            &pool,
+            PROJECT,
+            "t1",
+            "The gate failed in run-3",
+            "retry",
+            &[],
+        )
+        .await;
         let Captured::Written(id) = capture_rework(&pool, first).await.unwrap() else {
             panic!("the first sighting is written");
         };
-        sqlx::query("UPDATE knowledge SET trial_started_at = '2026-01-01T00:00:00+00:00' WHERE id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE knowledge SET trial_started_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let second = seed_rework(&pool, PROJECT, "t2", "the gate FAILED in run-8", "retry", &[]).await;
+        let second = seed_rework(
+            &pool,
+            PROJECT,
+            "t2",
+            "the gate FAILED in run-8",
+            "retry",
+            &[],
+        )
+        .await;
         assert_eq!(
             capture_rework(&pool, second).await.unwrap(),
             Captured::Promoted(id)
@@ -664,7 +697,9 @@ mod tests {
         assert_eq!(status, "active");
         assert_eq!(trial, 1, "still on trial");
         assert!(
-            started.as_deref().is_some_and(|at| at > "2026-01-01T00:00:00+00:00"),
+            started
+                .as_deref()
+                .is_some_and(|at| at > "2026-01-01T00:00:00+00:00"),
             "the trial clock restarted: {started:?}"
         );
         let evidence: Value = serde_json::from_str(&evidence.unwrap()).unwrap();
@@ -675,7 +710,9 @@ mod tests {
         let notes = notes_of(&pool, id).await;
         assert!(notes.iter().any(|note| note == "reconfirmed"), "{notes:?}");
         assert!(
-            notes.iter().any(|note| note.contains("episodic->procedural")),
+            notes
+                .iter()
+                .any(|note| note.contains("episodic->procedural")),
             "{notes:?}"
         );
         assert_eq!(live_rows(&pool).await, 1, "one live row per cause");
@@ -745,7 +782,10 @@ mod tests {
             capture_rework(&pool, decomposition).await.unwrap(),
             Captured::Skipped
         );
-        assert_eq!(capture_rework(&pool, fixless).await.unwrap(), Captured::Skipped);
+        assert_eq!(
+            capture_rework(&pool, fixless).await.unwrap(),
+            Captured::Skipped
+        );
         assert_eq!(knowledge_rows(&pool).await, 0);
 
         // Positive control: a complete rework in the same database is written.
@@ -766,8 +806,14 @@ mod tests {
 
         let blocked_a = seed_rework(&pool, PROJECT, "t1", "cause a", "a fix", &[]).await;
         let blocked_b = seed_rework(&pool, PROJECT, "t2", "cause b", "a fix", &[]).await;
-        assert_eq!(capture_rework(&pool, blocked_a).await.unwrap(), Captured::Skipped);
-        assert_eq!(capture_rework(&pool, blocked_b).await.unwrap(), Captured::Skipped);
+        assert_eq!(
+            capture_rework(&pool, blocked_a).await.unwrap(),
+            Captured::Skipped
+        );
+        assert_eq!(
+            capture_rework(&pool, blocked_b).await.unwrap(),
+            Captured::Skipped
+        );
         assert_eq!(knowledge_rows(&pool).await, 2, "only the two planted rows");
         for dead in [reverted, expired] {
             let notes = notes_of(&pool, dead).await;

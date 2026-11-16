@@ -709,13 +709,12 @@ async fn tombstoned_in(
             && similarity >= SIM_SAME
         {
             // Only the nearest expired row is checked, so an older neighbour hides a newer one.
-            let recent: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM knowledge WHERE id = ? AND ended_at > ?",
-            )
-            .bind(id)
-            .bind(&cutoff)
-            .fetch_optional(&mut **tx)
-            .await?;
+            let recent: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM knowledge WHERE id = ? AND ended_at > ?")
+                    .bind(id)
+                    .bind(&cutoff)
+                    .fetch_optional(&mut **tx)
+                    .await?;
             hit = recent;
         }
     }
@@ -2385,7 +2384,11 @@ mod tests {
         )
         .await;
         distil(&pool, SCRIPTS_RULE, None).await;
-        assert_eq!(learnings(&pool).await, 1, "expired 10 days ago still blocks");
+        assert_eq!(
+            learnings(&pool).await,
+            1,
+            "expired 10 days ago still blocks"
+        );
 
         let pool = test_pool().await;
         seeded_cause(&pool, "job_failed").await;
@@ -3477,11 +3480,12 @@ mod tests {
             obs,
             vec![("observed".into(), format!("alpha:chat:{key}"), None)]
         );
-        let active: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE status = 'active' AND trial = 0")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge WHERE status = 'active' AND trial = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             active, 0,
             "a conversation never writes permanent (non-trial) active knowledge"

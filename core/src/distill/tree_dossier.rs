@@ -79,10 +79,18 @@ fn block(heading: &str, parts: Vec<String>, runs: Vec<i64>) -> Option<(String, V
     if parts.is_empty() {
         return None;
     }
-    Some((format!("## {heading}
-{}", parts.join("
+    Some((
+        format!(
+            "## {heading}
+{}",
+            parts.join(
+                "
 
-")), runs))
+"
+            )
+        ),
+        runs,
+    ))
 }
 
 /// Build the dossier of a tree: blocks in priority order, the last one going first when over
@@ -124,8 +132,13 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
         "Failed verifications",
         failures
             .iter()
-            .map(|(id, t)| format!("Run #{id}:
-{}", clipped(t, FAILURE_CHARS)))
+            .map(|(id, t)| {
+                format!(
+                    "Run #{id}:
+{}",
+                    clipped(t, FAILURE_CHARS)
+                )
+            })
             .collect(),
         failures.iter().map(|(id, _)| *id).collect(),
     ));
@@ -143,8 +156,13 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
         "Agent final message",
         finals
             .iter()
-            .map(|(id, t)| format!("Run #{id}:
-{}", clipped(t, FINAL_CHARS)))
+            .map(|(id, t)| {
+                format!(
+                    "Run #{id}:
+{}",
+                    clipped(t, FINAL_CHARS)
+                )
+            })
             .collect(),
         finals.iter().map(|(id, _)| *id).collect(),
     ));
@@ -164,8 +182,13 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
             .iter()
             .map(|c| {
                 let lines: Vec<&str> = c.lines().take(COMMIT_LINES).collect();
-                clipped(&lines.join("
-"), COMMITS_CHARS)
+                clipped(
+                    &lines.join(
+                        "
+",
+                    ),
+                    COMMITS_CHARS,
+                )
             })
             .collect(),
         Vec::new(),
@@ -181,8 +204,10 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
         if items.is_empty() {
             Vec::new()
         } else {
-            vec![items.join("
-")]
+            vec![items.join(
+                "
+",
+            )]
         }
     };
     push(block(
@@ -202,9 +227,11 @@ pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
             .iter()
             .map(|(t, _)| t.as_str())
             .collect::<Vec<_>>()
-            .join("
+            .join(
+                "
 
-")
+",
+            )
     };
     let mut kept = total;
     while kept > 1 && join(kept).chars().count() > ceiling {
@@ -250,8 +277,10 @@ const ERROR_MARKERS: [&str; 9] = [
 pub fn signal_window(output: &str, lines: usize) -> String {
     let all: Vec<&str> = output.lines().collect();
     if lines == 0 || all.len() <= lines {
-        return all.join("
-");
+        return all.join(
+            "
+",
+        );
     }
     let first_error = all.iter().position(|line| {
         let lower = line.to_lowercase();
@@ -261,8 +290,10 @@ pub fn signal_window(output: &str, lines: usize) -> String {
         Some(i) => i.saturating_sub(lines / 2).min(all.len() - lines),
         None => all.len() - lines,
     };
-    all[start..start + lines].join("
-")
+    all[start..start + lines].join(
+        "
+",
+    )
 }
 
 /// The summary, decisions, open items and blocked reason of a node report, clipped to `NODE_CHARS`.
@@ -278,9 +309,14 @@ pub fn node_report_block(report: &crate::tree_job::report::Report, status: &str)
         .filter(|d| present(d))
         .collect();
     if !decisions.is_empty() {
-        parts.push(format!("Decisions:
-- {}", decisions.join("
-- ")));
+        parts.push(format!(
+            "Decisions:
+- {}",
+            decisions.join(
+                "
+- "
+            )
+        ));
     }
     if present(&report.open_items) {
         parts.push(format!("Open items: {}", report.open_items.trim()));
@@ -288,8 +324,13 @@ pub fn node_report_block(report: &crate::tree_job::report::Report, status: &str)
     if present(&report.blocked_reason) {
         parts.push(format!("Blocked: {}", report.blocked_reason.trim()));
     }
-    clip_head(&parts.join("
-"), NODE_CHARS)
+    clip_head(
+        &parts.join(
+            "
+",
+        ),
+        NODE_CHARS,
+    )
 }
 
 #[cfg(test)]
@@ -324,7 +365,9 @@ mod tests {
                 .collect(),
             bad_nodes: 1,
             open_item_nodes: 1,
-            decisions: (0..6).map(|i| filler(&format!("DECISION-{i}"), 100)).collect(),
+            decisions: (0..6)
+                .map(|i| filler(&format!("DECISION-{i}"), 100))
+                .collect(),
             red_failures: (0..4)
                 .map(|i| (11 + i, filler(&format!("FAILURE-{i}"), 200)))
                 .collect(),
@@ -336,12 +379,7 @@ mod tests {
         }
     }
 
-    fn report(
-        summary: &str,
-        decisions: &[&str],
-        open_items: &str,
-        blocked_reason: &str,
-    ) -> Report {
+    fn report(summary: &str, decisions: &[&str], open_items: &str, blocked_reason: &str) -> Report {
         Report {
             node_id: "n-api".to_owned(),
             root_id: "job-1-root".to_owned(),
@@ -404,7 +442,11 @@ mod tests {
             "the lower blocks go first"
         );
         assert!(!out.text.contains("COMMIT-MARKER"));
-        assert!(out.runs.contains(&41), "runs of the kept blocks: {:?}", out.runs);
+        assert!(
+            out.runs.contains(&41),
+            "runs of the kept blocks: {:?}",
+            out.runs
+        );
     }
 
     #[test]
@@ -507,13 +549,19 @@ mod tests {
         assert_eq!(out.lines().count(), SIGNAL_LINES, "{out}");
         assert!(out.contains("error[E0599]: no method named foo"));
         assert!(out.contains("line 16") && out.contains("line 24"), "{out}");
-        assert!(!out.contains("line 01") && !out.contains("line 40"), "{out}");
+        assert!(
+            !out.contains("line 01") && !out.contains("line 40"),
+            "{out}"
+        );
 
         // No error line: the tail.
         let quiet: Vec<String> = (1..=40).map(|i| format!("line {i:02}")).collect();
         let tail = signal_window(&quiet.join("\n"), SIGNAL_LINES);
         assert_eq!(tail.lines().count(), SIGNAL_LINES, "{tail}");
-        assert!(tail.contains("line 40") && tail.contains("line 29"), "{tail}");
+        assert!(
+            tail.contains("line 40") && tail.contains("line 29"),
+            "{tail}"
+        );
         assert!(!tail.contains("line 28"), "{tail}");
     }
 
@@ -540,16 +588,24 @@ mod tests {
         let long = report(&filler("SUMMARY", 600), &[], "", "");
         let clipped = node_report_block(&long, "done");
         assert!(clipped.contains("SUMMARY"));
-        assert!(clipped.chars().count() <= NODE_CHARS, "{}", clipped.chars().count());
+        assert!(
+            clipped.chars().count() <= NODE_CHARS,
+            "{}",
+            clipped.chars().count()
+        );
     }
 
     // ----- scrub and the standing instruction (P2, P4) -----
 
     #[test]
     fn scrub_strips_ansi_sequences() {
-        let out = super::super::scrub("\u{1b}[31mred words\u{1b}[0m and \u{1b}[1;32mgreen\u{1b}[0m");
+        let out =
+            super::super::scrub("\u{1b}[31mred words\u{1b}[0m and \u{1b}[1;32mgreen\u{1b}[0m");
         assert!(!out.contains('\u{1b}'), "{out:?}");
-        assert!(out.contains("red words") && out.contains("green"), "{out:?}");
+        assert!(
+            out.contains("red words") && out.contains("green"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -574,11 +630,20 @@ mod tests {
     #[test]
     fn standing_tails_name_the_new_causes() {
         for (cause, phrase) in [
-            (Cause::TreeLanded, "what let it land and what nearly blocked it"),
-            (Cause::TreeFailed, "the root cause and what the next agent must avoid"),
+            (
+                Cause::TreeLanded,
+                "what let it land and what nearly blocked it",
+            ),
+            (
+                Cause::TreeFailed,
+                "the root cause and what the next agent must avoid",
+            ),
             (Cause::TreeParked, "what the owner's answer teaches"),
             (Cause::BranchRecovered, "what failed and what fixed it"),
-            (Cause::BranchLanded, "what the commit messages and the diff teach"),
+            (
+                Cause::BranchLanded,
+                "what the commit messages and the diff teach",
+            ),
         ] {
             let text = super::super::standing_for(cause);
             assert!(text.contains(phrase), "{cause:?}: {text}");
@@ -592,7 +657,10 @@ mod tests {
             assert!(!text.contains("THIS project"), "{cause:?}");
             assert!(text.contains("another project"), "{cause:?}");
             assert!(text.contains("Never quote the owner context"), "{cause:?}");
-            assert!(!text.contains("made it land"), "{cause:?}: only a job landing says so");
+            assert!(
+                !text.contains("made it land"),
+                "{cause:?}: only a job landing says so"
+            );
         }
     }
 }

@@ -82,11 +82,56 @@ mod tests {
     async fn titles_exclude_consolidator_rows() {
         let pool = crate::testdb::fresh_pool().await;
         let now = Utc::now();
-        seed(&pool, "alpha", "Active title", "distiller", "active", now, None).await;
-        seed(&pool, "alpha", "Proposed title", "run", "proposed", now, None).await;
-        seed(&pool, "alpha", "Consolidated title", "consolidator", "active", now, None).await;
-        seed(&pool, "alpha", "Rejected title", "distiller", "rejected", now, Some(now)).await;
-        seed(&pool, "beta", "Other project title", "distiller", "active", now, None).await;
+        seed(
+            &pool,
+            "alpha",
+            "Active title",
+            "distiller",
+            "active",
+            now,
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            "alpha",
+            "Proposed title",
+            "run",
+            "proposed",
+            now,
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            "alpha",
+            "Consolidated title",
+            "consolidator",
+            "active",
+            now,
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            "alpha",
+            "Rejected title",
+            "distiller",
+            "rejected",
+            now,
+            Some(now),
+        )
+        .await;
+        seed(
+            &pool,
+            "beta",
+            "Other project title",
+            "distiller",
+            "active",
+            now,
+            None,
+        )
+        .await;
 
         let got = titles(&pool, "alpha").await.unwrap();
         assert!(got.contains(&"Active title".to_owned()), "{got:?}");
@@ -101,25 +146,94 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let now = Utc::now();
         let long_ago = now - Duration::days(400);
-        seed(&pool, "alpha", "Reverted old", "distiller", "reverted", long_ago, Some(now - Duration::days(120))).await;
-        seed(&pool, "alpha", "Reverted recent", "distiller", "reverted", long_ago, Some(now - Duration::days(10))).await;
+        seed(
+            &pool,
+            "alpha",
+            "Reverted old",
+            "distiller",
+            "reverted",
+            long_ago,
+            Some(now - Duration::days(120)),
+        )
+        .await;
+        seed(
+            &pool,
+            "alpha",
+            "Reverted recent",
+            "distiller",
+            "reverted",
+            long_ago,
+            Some(now - Duration::days(10)),
+        )
+        .await;
         // No `ended_at`: the creation date stands in for it.
-        seed(&pool, "alpha", "Rejected recent", "distiller", "rejected", now - Duration::days(5), None).await;
-        seed(&pool, "alpha", "Expired recent", "distiller", "expired", long_ago, Some(now - Duration::days(1))).await;
-        seed(&pool, "alpha", "Still active", "distiller", "active", now, None).await;
-        seed(&pool, "beta", "Other project reverted", "distiller", "reverted", now, Some(now)).await;
+        seed(
+            &pool,
+            "alpha",
+            "Rejected recent",
+            "distiller",
+            "rejected",
+            now - Duration::days(5),
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            "alpha",
+            "Expired recent",
+            "distiller",
+            "expired",
+            long_ago,
+            Some(now - Duration::days(1)),
+        )
+        .await;
+        seed(
+            &pool,
+            "alpha",
+            "Still active",
+            "distiller",
+            "active",
+            now,
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            "beta",
+            "Other project reverted",
+            "distiller",
+            "reverted",
+            now,
+            Some(now),
+        )
+        .await;
 
         let got = refused(&pool, "alpha", now).await.unwrap();
         for wanted in ["Reverted recent", "Rejected recent", "Expired recent"] {
-            assert!(got.contains(&wanted.to_owned()), "{wanted:?} missing from {got:?}");
+            assert!(
+                got.contains(&wanted.to_owned()),
+                "{wanted:?} missing from {got:?}"
+            );
         }
         for unwanted in ["Reverted old", "Still active", "Other project reverted"] {
-            assert!(!got.contains(&unwanted.to_owned()), "{unwanted:?} in {got:?}");
+            assert!(
+                !got.contains(&unwanted.to_owned()),
+                "{unwanted:?} in {got:?}"
+            );
         }
 
         // More than the cap: the newest rows win.
         for i in 0..25 {
-            seed(&pool, "alpha", &format!("Bulk {i}"), "distiller", "reverted", long_ago, Some(now - Duration::days(2))).await;
+            seed(
+                &pool,
+                "alpha",
+                &format!("Bulk {i}"),
+                "distiller",
+                "reverted",
+                long_ago,
+                Some(now - Duration::days(2)),
+            )
+            .await;
         }
         let capped = refused(&pool, "alpha", now).await.unwrap();
         assert_eq!(capped.len(), MAX_REFUSED, "{capped:?}");

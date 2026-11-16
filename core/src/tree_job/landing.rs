@@ -771,10 +771,9 @@ pub async fn settle_merge(
             persist(pool, job).await?;
             // A branch that failed a verification and then passed one is a lesson; fail open.
             if let (Some(node_id), Some(worktree)) = (recovered_node, recovered_worktree)
-                && let Err(error) = crate::distill::enqueue_branch_recovered_in(
-                    pool, &job.id, &node_id, &worktree,
-                )
-                .await
+                && let Err(error) =
+                    crate::distill::enqueue_branch_recovered_in(pool, &job.id, &node_id, &worktree)
+                        .await
             {
                 tracing::warn!(tree_id = %job.id, %error, "distill: could not queue a recovered branch");
             }
@@ -2038,7 +2037,13 @@ mod tests {
     /// The distillation queue as `(cause, tree_id, node_id, request_id, decision_id)`.
     async fn queued_for_distillation(
         pool: &SqlitePool,
-    ) -> Vec<(String, Option<String>, Option<String>, Option<i64>, Option<String>)> {
+    ) -> Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> {
         sqlx::query_as(
             "SELECT cause, tree_id, node_id, request_id, decision_id FROM distill_queue ORDER BY id",
         )

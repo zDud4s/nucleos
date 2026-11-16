@@ -30,9 +30,10 @@ pub(super) fn next_day_start(now: DateTime<Utc>) -> DateTime<Utc> {
 
 /// Whether the manifest holds a non-empty value under `key`.
 fn has_extra(job: &TreeJob, key: &str) -> bool {
-    job.manifest.extra.get(key).is_some_and(|value| {
-        !value.is_null() && value.as_str().is_none_or(|text| !text.is_empty())
-    })
+    job.manifest
+        .extra
+        .get(key)
+        .is_some_and(|value| !value.is_null() && value.as_str().is_none_or(|text| !text.is_empty()))
 }
 
 /// Trees (and branches) of one project the distiller reads per UTC day.
@@ -134,7 +135,11 @@ pub async fn enqueue_tree_end_in(pool: &SqlitePool, tree_id: &str) -> sqlx::Resu
     let Some(job) = store::load(pool, tree_id).await.map_err(store_error)? else {
         return Ok(false);
     };
-    let Some(project) = job.project_id.as_deref().filter(|project| !project.is_empty()) else {
+    let Some(project) = job
+        .project_id
+        .as_deref()
+        .filter(|project| !project.is_empty())
+    else {
         return Ok(false);
     };
     if job.state != "finished" {
@@ -313,10 +318,7 @@ pub async fn sweep_trees(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<
 
 /// Model calls made since the start of the UTC day of `now`: rows closed `done` without an error
 /// note. A row closed `nothing: ...`, `gone`, `ingest` or `disabled` never asked the model.
-pub(super) async fn model_calls_today(
-    pool: &SqlitePool,
-    now: DateTime<Utc>,
-) -> sqlx::Result<i64> {
+pub(super) async fn model_calls_today(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<i64> {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM distill_queue
           WHERE status = 'done' AND error IS NULL AND finished_at >= ?",
@@ -553,7 +555,11 @@ mod tests {
                 .unwrap();
             }
         }
-        assert_eq!(rows(&pool).await.len(), 5, "the second round must be ignored");
+        assert_eq!(
+            rows(&pool).await.len(),
+            5,
+            "the second round must be ignored"
+        );
 
         // The claim carries the new columns back.
         let claimed = claim_next(&pool, Utc::now())
@@ -568,7 +574,13 @@ mod tests {
 
     #[test]
     fn classify_end_landed_with_land_sha_is_tree_landed() {
-        let job = tree_job("job-1", Some("alpha"), "finished", &landed_extra(), Utc::now());
+        let job = tree_job(
+            "job-1",
+            Some("alpha"),
+            "finished",
+            &landed_extra(),
+            Utc::now(),
+        );
         let cause = classify_end(&job, 0);
         assert_eq!(cause, Cause::TreeLanded);
         assert_eq!(cause.as_str(), "tree_landed");
@@ -665,10 +677,33 @@ mod tests {
     #[tokio::test]
     async fn a_tree_without_project_queues_nothing() {
         let pool = crate::testdb::fresh_pool().await;
-        seed_tree_at(&pool, "no-project", None, "finished", &landed_extra(), Utc::now()).await;
-        seed_tree_at(&pool, "blank", Some(""), "finished", &landed_extra(), Utc::now()).await;
-        seed_tree_at(&pool, "with-project", Some("alpha"), "finished", &landed_extra(), Utc::now())
-            .await;
+        seed_tree_at(
+            &pool,
+            "no-project",
+            None,
+            "finished",
+            &landed_extra(),
+            Utc::now(),
+        )
+        .await;
+        seed_tree_at(
+            &pool,
+            "blank",
+            Some(""),
+            "finished",
+            &landed_extra(),
+            Utc::now(),
+        )
+        .await;
+        seed_tree_at(
+            &pool,
+            "with-project",
+            Some("alpha"),
+            "finished",
+            &landed_extra(),
+            Utc::now(),
+        )
+        .await;
 
         assert!(!enqueue_tree_end_in(&pool, "no-project").await.unwrap());
         assert!(!enqueue_tree_end_in(&pool, "blank").await.unwrap());
@@ -892,17 +927,40 @@ mod tests {
         let now = Utc::now();
         let recent = now - Duration::days(2);
         let old = now - Duration::days(30);
-        let finish = |at: DateTime<Utc>, status: &str| {
-            json!({ "status": status, "at": at.to_rfc3339() })
-        };
+        let finish =
+            |at: DateTime<Utc>, status: &str| json!({ "status": status, "at": at.to_rfc3339() });
 
         let mut landed = landed_extra();
         landed.push(("finish", finish(recent, "landed")));
-        seed_tree_at(&pool, "a-landed", Some("alpha"), "finished", &landed, recent).await;
+        seed_tree_at(
+            &pool,
+            "a-landed",
+            Some("alpha"),
+            "finished",
+            &landed,
+            recent,
+        )
+        .await;
         let abandoned = [("finish", finish(recent, "abandoned"))];
-        seed_tree_at(&pool, "b-abandoned", Some("alpha"), "finished", &abandoned, recent).await;
+        seed_tree_at(
+            &pool,
+            "b-abandoned",
+            Some("alpha"),
+            "finished",
+            &abandoned,
+            recent,
+        )
+        .await;
         // Already has a row: the sweep leaves it alone.
-        seed_tree_at(&pool, "c-queued", Some("alpha"), "finished", &landed, recent).await;
+        seed_tree_at(
+            &pool,
+            "c-queued",
+            Some("alpha"),
+            "finished",
+            &landed,
+            recent,
+        )
+        .await;
         sqlx::query(
             "INSERT OR IGNORE INTO distill_queue (cause, project_id, tree_id, status, attempts, created_at)
              VALUES ('tree_landed', 'alpha', 'c-queued', 'done', 0, ?)",
@@ -947,7 +1005,11 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(sweep_trees(&pool, now).await.unwrap(), 0, "the sweep is idempotent");
+        assert_eq!(
+            sweep_trees(&pool, now).await.unwrap(),
+            0,
+            "the sweep is idempotent"
+        );
     }
 
     // ----- 17: the daily model-call cap -----

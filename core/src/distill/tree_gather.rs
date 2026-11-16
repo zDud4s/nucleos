@@ -32,21 +32,28 @@ pub(super) async fn gather_blocks(
     let mut blocks = TreeBlocks::default();
 
     // Node reports: counts run over every node, the report list over the focused ones, capped.
-    let nodes: Vec<(String, String, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT id, status, summary, handoff_path, run_id FROM work_nodes
+    let nodes: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, status, summary, handoff_path, run_id FROM work_nodes
              WHERE tree_job_id = ? ORDER BY created_at, id",
-        )
-        .bind(&job.id)
-        .fetch_all(pool)
-        .await?;
+    )
+    .bind(&job.id)
+    .fetch_all(pool)
+    .await?;
     for (id, status, summary, handoff_path, run_id) in &nodes {
         let report = handoff_path
             .as_deref()
             .filter(|path| !path.is_empty())
             .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|text| crate::tree_job::report::parse_report(&text));
-        let has_open_items = report.as_ref().is_some_and(|r| !r.open_items.trim().is_empty());
+        let has_open_items = report
+            .as_ref()
+            .is_some_and(|r| !r.open_items.trim().is_empty());
         if matches!(status.as_str(), "failed" | "blocked") {
             blocks.bad_nodes += 1;
         }
@@ -67,9 +74,7 @@ pub(super) async fn gather_blocks(
             });
         }
         // The last message of the node's run.
-        if in_focus
-            && let Some(run) = run_id.as_deref().and_then(|raw| raw.parse::<i64>().ok())
-        {
+        if in_focus && let Some(run) = run_id.as_deref().and_then(|raw| raw.parse::<i64>().ok()) {
             let stdout: Option<Option<String>> =
                 sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
                     .bind(run)
@@ -80,7 +85,9 @@ pub(super) async fn gather_blocks(
                 .and_then(|out| crate::execution::runner::extract_reply(&out))
                 .filter(|reply| !reply.trim().is_empty())
             {
-                blocks.agent_final.push((run, clip_head(&reply, ENTRY_CHARS)));
+                blocks
+                    .agent_final
+                    .push((run, clip_head(&reply, ENTRY_CHARS)));
             }
         }
     }
@@ -221,7 +228,14 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn report(node: &str, status: &str, summary: &str, decisions: &[&str], open: &str, blocked: &str) -> Report {
+    fn report(
+        node: &str,
+        status: &str,
+        summary: &str,
+        decisions: &[&str],
+        open: &str,
+        blocked: &str,
+    ) -> Report {
         Report {
             node_id: node.to_owned(),
             root_id: format!("{TREE}-root"),
@@ -334,7 +348,14 @@ mod tests {
         let ui_md = dir.path().join("n-ui.md");
         std::fs::write(
             &ui_md,
-            render_handoff(&report("n-ui", "blocked", "Started the panel", &[], "", "Waiting for the API key")),
+            render_handoff(&report(
+                "n-ui",
+                "blocked",
+                "Started the panel",
+                &[],
+                "",
+                "Waiting for the API key",
+            )),
         )
         .unwrap();
 
@@ -361,7 +382,13 @@ mod tests {
         .await
         .unwrap();
 
-        insert_verify(pool, "C:/wt/api", "failed", "\u{1b}[31merror: gate failed on api\u{1b}[0m\nmore output").await;
+        insert_verify(
+            pool,
+            "C:/wt/api",
+            "failed",
+            "\u{1b}[31merror: gate failed on api\u{1b}[0m\nmore output",
+        )
+        .await;
         insert_verify(pool, "C:/wt/ui", "failed", "error: ui lint failed").await;
         insert_verify(pool, "C:/wt/api", "passed", "all green").await;
 
@@ -400,12 +427,20 @@ mod tests {
         let blocks = gather_blocks(&pool, &fx.job, None, now()).await.unwrap();
 
         assert_eq!(blocks.node_reports.len(), 2, "{:?}", blocks.node_reports);
-        let api = blocks.node_reports.iter().find(|n| n.node_id == "n-api").expect("n-api report");
+        let api = blocks
+            .node_reports
+            .iter()
+            .find(|n| n.node_id == "n-api")
+            .expect("n-api report");
         assert_eq!(api.status, "done");
         assert!(api.text.contains("Added the cache layer"), "{}", api.text);
         assert!(api.text.contains("Use LRU eviction"), "{}", api.text);
         assert!(api.has_open_items);
-        let ui = blocks.node_reports.iter().find(|n| n.node_id == "n-ui").expect("n-ui report");
+        let ui = blocks
+            .node_reports
+            .iter()
+            .find(|n| n.node_id == "n-ui")
+            .expect("n-ui report");
         assert_eq!(ui.status, "blocked");
         assert!(ui.text.contains("Waiting for the API key"), "{}", ui.text);
         assert!(!ui.has_open_items);
@@ -418,9 +453,24 @@ mod tests {
 
         // Failed verifications only, of the branches' worktrees; the passed one is not a failure.
         assert_eq!(blocks.red_failures.len(), 2, "{:?}", blocks.red_failures);
-        assert!(blocks.red_failures.iter().any(|(_, t)| t.contains("gate failed on api")));
-        assert!(blocks.red_failures.iter().any(|(_, t)| t.contains("ui lint failed")));
-        assert!(!blocks.red_failures.iter().any(|(_, t)| t.contains("all green")));
+        assert!(
+            blocks
+                .red_failures
+                .iter()
+                .any(|(_, t)| t.contains("gate failed on api"))
+        );
+        assert!(
+            blocks
+                .red_failures
+                .iter()
+                .any(|(_, t)| t.contains("ui lint failed"))
+        );
+        assert!(
+            !blocks
+                .red_failures
+                .iter()
+                .any(|(_, t)| t.contains("all green"))
+        );
 
         assert_eq!(blocks.agent_final.len(), 1, "{:?}", blocks.agent_final);
         assert!(blocks.agent_final[0].1.contains("Shipped the cache layer"));
@@ -441,7 +491,12 @@ mod tests {
             .find(|(_, t)| t.contains("gate failed on api"))
             .expect("the api failure");
         assert!(!api.1.contains('\u{1b}'), "{:?}", api.1);
-        assert!(blocks.red_failures.iter().all(|(_, t)| !t.contains('\u{1b}')));
+        assert!(
+            blocks
+                .red_failures
+                .iter()
+                .all(|(_, t)| !t.contains('\u{1b}'))
+        );
     }
 
     #[tokio::test]
@@ -462,14 +517,21 @@ mod tests {
     async fn gather_blocks_focus_node_limits_the_reports() {
         let pool = crate::testdb::fresh_pool().await;
         let fx = fixture(&pool).await;
-        let blocks = gather_blocks(&pool, &fx.job, Some("n-api"), now()).await.unwrap();
+        let blocks = gather_blocks(&pool, &fx.job, Some("n-api"), now())
+            .await
+            .unwrap();
 
         assert_eq!(blocks.node_reports.len(), 1, "{:?}", blocks.node_reports);
         assert_eq!(blocks.node_reports[0].node_id, "n-api");
         // Only the failures of that node's branch worktree.
         assert_eq!(blocks.red_failures.len(), 1, "{:?}", blocks.red_failures);
         assert!(blocks.red_failures[0].1.contains("gate failed on api"));
-        assert!(!blocks.red_failures.iter().any(|(_, t)| t.contains("ui lint failed")));
+        assert!(
+            !blocks
+                .red_failures
+                .iter()
+                .any(|(_, t)| t.contains("ui lint failed"))
+        );
         // The counts stay over the whole tree.
         assert_eq!(blocks.bad_nodes, 1);
         assert_eq!(blocks.open_item_nodes, 1);

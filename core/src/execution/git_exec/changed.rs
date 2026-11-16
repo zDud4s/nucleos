@@ -132,7 +132,12 @@ pub async fn commit_summary(
         ));
     }
     let range = format!("{parent}..{sha}");
-    let log = git_read(project_root, &["log", "--format=%s", &range, "--"], deadline).await?;
+    let log = git_read(
+        project_root,
+        &["log", "--format=%s", &range, "--"],
+        deadline,
+    )
+    .await?;
     if !log.succeeded() {
         return Err(format!(
             "could not list the commits of {sha}: {}",
@@ -222,7 +227,10 @@ mod tests {
     #[tokio::test]
     async fn commit_summary_lists_stat_and_subjects_of_a_merge() {
         let (_container, repo) = forked();
-        git(&repo, &["merge", "--no-ff", "-q", "-m", "merge feat", "feat"]);
+        git(
+            &repo,
+            &["merge", "--no-ff", "-q", "-m", "merge feat", "feat"],
+        );
         let merge = git(&repo, &["rev-parse", "HEAD"]);
 
         let summary = commit_summary(&repo, &merge, deadline()).await.unwrap();
