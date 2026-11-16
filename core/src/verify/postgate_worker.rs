@@ -1332,7 +1332,7 @@ mod tests {
                  {WAIT_CAP:?} in all; last seen: {}",
                 patience.last()
             );
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 

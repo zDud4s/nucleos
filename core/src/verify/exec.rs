@@ -535,6 +535,7 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     }
     let mut env = executor.warm_env(&claimed).await;
     env.extend(executor.gate_env(&claimed).await);
+    env.extend(crate::verify::skip_clippy::env(&executor.pool, claimed.id).await);
     let argv = final_argv(&executor.config.broker_prefix, &claimed.argv);
     let timeout_ms = if claimed.timeout_ms > 0 {
         u64::try_from(claimed.timeout_ms).unwrap_or(u64::MAX)
