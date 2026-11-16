@@ -649,6 +649,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "hooks: conductor" . "$py" scripts/test-conductor-hook.py
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
+    run "gates: warm seed" . "$py" scripts/test-gate-seed.py
     run "gates: build slot" . "$py" scripts/test-build-slot.py
     run "daemon: from copy" . "$py" scripts/test-run-daemon.py
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
