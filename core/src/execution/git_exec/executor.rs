@@ -142,15 +142,25 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 } else {
                     None
                 };
-                match compute_merge_of(
-                    project_root,
-                    source.as_str(),
-                    squashed.as_deref().unwrap_or(source.as_str()),
-                    target.as_str(),
-                    deadline,
-                )
-                .await
-                {
+                // The declared `land` flow names `compute_merge` here, so the plain merge keeps
+                // calling it; only a squashed tip goes through `compute_merge_of`.
+                let merged = match squashed.as_deref() {
+                    Some(tip) => {
+                        compute_merge_of(
+                            project_root,
+                            source.as_str(),
+                            tip,
+                            target.as_str(),
+                            deadline,
+                        )
+                        .await
+                    }
+                    None => {
+                        compute_merge(project_root, source.as_str(), target.as_str(), deadline)
+                            .await
+                    }
+                };
+                match merged {
                     Ok(mut computed) => {
                         // Integration steps (plan 2026-11-09): only a merge INTO the integration
                         // branch runs them, and only when it moved the target. A project with no
