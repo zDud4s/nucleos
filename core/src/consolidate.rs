@@ -925,10 +925,11 @@ mod tests {
 
     use sqlx::{Row, SqlitePool};
 
-    use super::{CONSOLIDATION_INTERVAL, due, merge_duplicates, promote_to_machine, run_pass};
-    use crate::knowledge::{
-        Declaration, Kind, Known, Scope, approved, failure_signature, for_scope, propose,
+    use super::{
+        CONSOLIDATION_INTERVAL, archive_countless_rows, due, merge_duplicates, promote_to_machine,
+        run_pass,
     };
+    use crate::knowledge::{Known, Scope, approved, failure_signature, for_scope};
 
     const PROJECT: &str = "nucleos";
     const FAILURE: &str = "error: build failed because the linker refused output.exe";
@@ -1059,6 +1060,707 @@ mod tests {
         format!("gate:{}", failure_signature(output).unwrap().fingerprint)
     }
 
+    /// The raw signature fingerprint: slice 1 matches `cause_key` against it (plan assumption).
+    fn raw_fingerprint(output: &str) -> String {
+        failure_signature(output).unwrap().fingerprint
+    }
+
+    async fn set_cause_key(pool: &SqlitePool, id: i64, cause_key: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE knowledge SET cause_key = ? WHERE id = ?")
+            .bind(cause_key)
+            .bind(id)
+            .execute(pool)
+            .await
+            .map(|_| ())
+    }
+
+    async fn knowledge_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(name, declared type, notnull, default)` of every column of `table`.
+    async fn columns(pool: &SqlitePool, table: &str) -> Vec<(String, String, i64, Option<String>)> {
+        sqlx::query(&format!(
+            "SELECT name, type, \"notnull\" AS not_null, dflt_value FROM pragma_table_info('{table}')"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("name"),
+                row.get::<String, _>("type"),
+                row.get::<i64, _>("not_null"),
+                row.get::<Option<String>, _>("dflt_value"),
+            )
+        })
+        .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn queue_row(
+        pool: &SqlitePool,
+        job_id: Option<i64>,
+        item_id: Option<i64>,
+        run_id: Option<i64>,
+        tree_id: Option<&str>,
+        node_id: Option<&str>,
+        request_id: Option<i64>,
+        decision_id: Option<&str>,
+    ) -> u64 {
+        sqlx::query(
+            "INSERT OR IGNORE INTO distill_queue
+               (cause, project_id, job_id, item_id, run_id, tree_id, node_id, request_id,
+                decision_id, status, attempts, created_at)
+             VALUES ('run_exhausted', 'nucleos', ?, ?, ?, ?, ?, ?, ?, 'pending', 0,
+                     '2026-09-30T00:00:00+00:00')",
+        )
+        .bind(job_id)
+        .bind(item_id)
+        .bind(run_id)
+        .bind(tree_id)
+        .bind(node_id)
+        .bind(request_id)
+        .bind(decision_id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .rows_affected()
+    }
+
+    /// Slice 1 lays every capture column of the spec, inert: nobody writes them yet.
+    #[tokio::test]
+    async fn migration_0316_adds_the_capture_columns_with_inert_defaults() {
+        let pool = test_pool().await;
+        let existing = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            PROJECT,
+            "consolidator",
+            Some("gate"),
+            "gate:before-the-columns",
+            "active",
+            Some(2),
+        )
+        .await;
+
+        let knowledge = columns(&pool, "knowledge").await;
+        let find = |table: &[(String, String, i64, Option<String>)], name: &str| {
+            table
+                .iter()
+                .find(|column| column.0 == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("column {name} is missing"))
+        };
+        let cause_key = find(&knowledge, "cause_key");
+        assert_eq!(cause_key.1, "TEXT");
+        assert_eq!(cause_key.2, 0);
+        assert_eq!(cause_key.3, None);
+        let trial = find(&knowledge, "trial");
+        assert_eq!(trial.1, "INTEGER");
+        assert_eq!(trial.2, 1);
+        assert_eq!(trial.3.as_deref(), Some("0"));
+        let trial_started_at = find(&knowledge, "trial_started_at");
+        assert_eq!(trial_started_at.1, "TEXT");
+        assert_eq!(trial_started_at.2, 0);
+
+        let queue = columns(&pool, "distill_queue").await;
+        for (name, kind) in [
+            ("tree_id", "TEXT"),
+            ("node_id", "TEXT"),
+            ("request_id", "INTEGER"),
+            ("decision_id", "TEXT"),
+        ] {
+            let column = find(&queue, name);
+            assert_eq!(column.1, kind, "{name}");
+            assert_eq!(column.2, 0, "{name} must be nullable");
+            assert_eq!(column.3, None, "{name}");
+        }
+
+        let row = sqlx::query(
+            "SELECT trial, cause_key, trial_started_at FROM knowledge WHERE id = ?",
+        )
+        .bind(existing)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("trial"), 0);
+        assert!(row.get::<Option<String>, _>("cause_key").is_none());
+        assert!(row.get::<Option<String>, _>("trial_started_at").is_none());
+    }
+
+    /// The unique key of the queue tells subjects apart by every id, and still ignores a repeat.
+    #[tokio::test]
+    async fn distill_queue_once_tells_apart_trees_nodes_requests_and_decisions() {
+        let pool = test_pool().await;
+
+        assert_eq!(queue_row(&pool, None, None, None, None, None, None, None).await, 1);
+        assert_eq!(
+            queue_row(&pool, None, None, None, Some("tree-1"), None, None, None).await,
+            1
+        );
+        assert_eq!(
+            queue_row(&pool, None, None, None, Some("tree-2"), None, None, None).await,
+            1
+        );
+        assert_eq!(
+            queue_row(&pool, None, None, None, None, Some("node-1"), None, None).await,
+            1
+        );
+        assert_eq!(
+            queue_row(&pool, None, None, None, None, None, Some(7), None).await,
+            1
+        );
+        assert_eq!(
+            queue_row(&pool, None, None, None, None, None, None, Some("decision-1")).await,
+            1
+        );
+        // An exact repeat of any of them is ignored.
+        assert_eq!(queue_row(&pool, None, None, None, None, None, None, None).await, 0);
+        assert_eq!(
+            queue_row(&pool, None, None, None, Some("tree-1"), None, None, None).await,
+            0
+        );
+        assert_eq!(
+            queue_row(&pool, None, None, None, None, None, Some(7), None).await,
+            0
+        );
+        assert_eq!(
+            queue_row(&pool, None, None, None, None, None, None, Some("decision-1")).await,
+            0
+        );
+
+        // The old shape (job / item / run) dedups exactly as before.
+        assert_eq!(
+            queue_row(&pool, Some(1), Some(2), Some(3), None, None, None, None).await,
+            1
+        );
+        assert_eq!(
+            queue_row(&pool, Some(1), Some(2), Some(3), None, None, None, None).await,
+            0
+        );
+        assert_eq!(
+            queue_row(&pool, Some(1), None, Some(3), None, None, None, None).await,
+            1
+        );
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 8);
+    }
+
+    /// Only a live row (active or proposed) holds its cause key; the machine scope dedups too.
+    #[tokio::test]
+    async fn a_live_cause_key_is_unique_per_scope_and_dead_rows_do_not_count() {
+        let pool = test_pool().await;
+        let seed = |scope_id: &'static str, status: &'static str, fingerprint: &'static str| {
+            let pool = pool.clone();
+            async move {
+                seed_knowledge(
+                    &pool,
+                    "semantic",
+                    "project",
+                    scope_id,
+                    "distiller",
+                    None,
+                    fingerprint,
+                    status,
+                    None,
+                )
+                .await
+            }
+        };
+        let live = seed(PROJECT, "active", "title:live").await;
+        set_cause_key(&pool, live, "cause-1").await.unwrap();
+
+        // NULL cause keys never collide.
+        seed(PROJECT, "active", "title:null-a").await;
+        seed(PROJECT, "active", "title:null-b").await;
+
+        // Dead twins with the same key do not count.
+        for status in ["archived", "expired", "reverted"] {
+            let twin = seed(PROJECT, status, "title:twin").await;
+            set_cause_key(&pool, twin, "cause-1").await.unwrap();
+        }
+        // The same key in another scope is another cause.
+        let other = seed("other-project", "active", "title:other").await;
+        set_cause_key(&pool, other, "cause-1").await.unwrap();
+
+        // A second live row with the same scope and key is refused, active or proposed.
+        let second = seed(PROJECT, "active", "title:second").await;
+        assert!(set_cause_key(&pool, second, "cause-1").await.is_err());
+        let proposed = seed(PROJECT, "proposed", "title:proposed").await;
+        assert!(set_cause_key(&pool, proposed, "cause-1").await.is_err());
+
+        // A dead twin cannot be brought back to life next to a live row.
+        let dead: i64 = sqlx::query_scalar(
+            "SELECT id FROM knowledge WHERE cause_key = 'cause-1' AND status = 'archived'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query("UPDATE knowledge SET status = 'active' WHERE id = ?")
+                .bind(dead)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+
+        // Machine scope has scope_id NULL: the pair must dedupe all the same.
+        let machine_a = seed_machine_knowledge(&pool, "gate:machine-a", "active").await;
+        let machine_b = seed_machine_knowledge(&pool, "gate:machine-b", "active").await;
+        set_cause_key(&pool, machine_a, "machine-cause").await.unwrap();
+        assert!(set_cause_key(&pool, machine_b, "machine-cause").await.is_err());
+    }
+
+    /// A gate signature nobody explained is not a lesson: the consolidator no longer writes it.
+    #[tokio::test]
+    async fn a_repeated_gate_signature_without_a_row_that_has_a_cause_writes_nothing() {
+        let pool = test_pool().await;
+        for _ in 0..3 {
+            seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        }
+        // A row with the same fingerprint but no cause_key does not count as having a cause.
+        let bare = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            &gate_fingerprint(FAILURE),
+            "active",
+            Some(1),
+        )
+        .await;
+        let before = known(&pool, bare).await;
+
+        let report = run_pass(&pool, at(1)).await.unwrap();
+
+        assert_eq!(report.remeasured, 0);
+        assert_eq!(knowledge_count(&pool).await, 1);
+        assert_eq!(known(&pool, bare).await, before);
+    }
+
+    /// F2: a row with a cause is reinforced in place; the id never changes and nothing is inserted.
+    #[tokio::test]
+    async fn a_repeated_gate_signature_with_a_cause_key_row_raises_observations_and_keeps_the_id() {
+        let pool = test_pool().await;
+        let cause = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:explained failure",
+            "active",
+            Some(1),
+        )
+        .await;
+        set_cause_key(&pool, cause, &raw_fingerprint(FAILURE))
+            .await
+            .unwrap();
+        // An owner row that was refused keeps its cause key but is dead: never reinforced.
+        let other = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "owner",
+            None,
+            "title:owner row",
+            "rejected",
+            Some(1),
+        )
+        .await;
+        set_cause_key(&pool, other, &raw_fingerprint(FAILURE))
+            .await
+            .unwrap();
+        let owner_before = known(&pool, other).await;
+        let first_run = seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+
+        let first = run_pass(&pool, at(1)).await.unwrap();
+        assert_eq!(first.remeasured, 1);
+        let row = known(&pool, cause).await;
+        assert_eq!(row["observations"], 2);
+        assert_eq!(row["last_confirmed_at"], at(1).to_rfc3339());
+        assert_eq!(row["status"], "active");
+        let evidence: Vec<Value> =
+            serde_json::from_str(row["evidence"].as_str().expect("evidence is written")).unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.iter().all(|item| item["t"] == "run"));
+        assert!(evidence.contains(&serde_json::json!({"t": "run", "id": first_run})));
+
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        let second = run_pass(&pool, at(2)).await.unwrap();
+        assert_eq!(second.remeasured, 1);
+        let row = known(&pool, cause).await;
+        assert_eq!(row["observations"], 3);
+        assert_eq!(row["last_confirmed_at"], at(2).to_rfc3339());
+        let evidence: Vec<Value> =
+            serde_json::from_str(row["evidence"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence.len(), 3, "an evidence item is never added twice");
+
+        assert_eq!(knowledge_count(&pool).await, 2);
+        assert_eq!(known(&pool, other).await, owner_before);
+    }
+
+    /// F3: a merge pass keeps the oldest id, so two passes never churn a new successor id.
+    #[tokio::test]
+    async fn two_merge_passes_over_duplicates_keep_the_oldest_id_and_create_no_new_row() {
+        let pool = test_pool().await;
+        let mut ids = Vec::new();
+        for observations in [2, 3, 4] {
+            ids.push(
+                seed_knowledge(
+                    &pool,
+                    "episodic",
+                    "project",
+                    PROJECT,
+                    "consolidator",
+                    Some("gate"),
+                    "gate:duplicate-twice",
+                    "active",
+                    Some(observations),
+                )
+                .await,
+            );
+        }
+        let before = knowledge_count(&pool).await;
+
+        assert_eq!(merge_duplicates(&pool, at(1)).await.unwrap(), 1);
+        assert_eq!(merge_duplicates(&pool, at(2)).await.unwrap(), 0);
+
+        assert_eq!(knowledge_count(&pool).await, before);
+        let oldest = known(&pool, ids[0]).await;
+        assert_eq!(oldest["status"], "active");
+        assert_eq!(oldest["observations"], 9);
+        assert_eq!(oldest["last_confirmed_at"], at(1).to_rfc3339());
+        for id in &ids[1..] {
+            assert_eq!(known(&pool, *id).await["status"], "archived");
+        }
+    }
+
+    /// F4: a refused action is no longer turned into a count row.
+    #[tokio::test]
+    async fn refused_action_proposals_write_no_knowledge() {
+        let pool = test_pool().await;
+        for _ in 0..19 {
+            seed_refusal(&pool, PROJECT, "Bash").await;
+        }
+        seed_refusal(&pool, PROJECT, "Edit").await;
+
+        let report = run_pass(&pool, at(1)).await.unwrap();
+
+        assert_eq!(knowledge_count(&pool).await, 0);
+        assert!(report.is_quiet(), "{report:?}");
+    }
+
+    /// F5: the one-shot cleanup archives the countless rows and nothing else.
+    #[tokio::test]
+    async fn the_cleanup_archives_consolidator_rows_and_leaves_the_distiller_rows_alone() {
+        let pool = test_pool().await;
+        let mut count_rows = Vec::new();
+        for (generator, fingerprint, status) in [
+            ("gate", "gate:aaaa", "active"),
+            ("gate", "gate:bbbb", "proposed"),
+            ("refused-action", "refused-action:bash", "active"),
+        ] {
+            count_rows.push((
+                seed_knowledge(
+                    &pool,
+                    "episodic",
+                    "project",
+                    PROJECT,
+                    "consolidator",
+                    Some(generator),
+                    fingerprint,
+                    status,
+                    Some(7),
+                )
+                .await,
+                status,
+            ));
+        }
+        let machine = seed_machine_knowledge(&pool, "gate:machine", "active").await;
+        let mut distiller = Vec::new();
+        for index in 0..4 {
+            let id = seed_knowledge(
+                &pool,
+                "semantic",
+                "project",
+                PROJECT,
+                "distiller",
+                None,
+                &format!("title:distilled {index}"),
+                "active",
+                None,
+            )
+            .await;
+            sqlx::query("UPDATE knowledge SET shown_count = ? WHERE id = ?")
+                .bind(10 + index)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            distiller.push(id);
+        }
+        let reverted = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            PROJECT,
+            "consolidator",
+            Some("gate"),
+            "gate:owner-reverted",
+            "reverted",
+            Some(5),
+        )
+        .await;
+        let distiller_before = {
+            let mut rows = Vec::new();
+            for id in &distiller {
+                rows.push(known(&pool, *id).await);
+            }
+            rows
+        };
+        let reverted_before = known(&pool, reverted).await;
+
+        let archived = archive_countless_rows(&pool, at(1)).await.unwrap();
+
+        assert_eq!(archived, 4);
+        let active_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge
+             WHERE source = 'consolidator' AND generator IN ('gate', 'refused-action')
+               AND status IN ('active', 'proposed')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_left, 0);
+        for (id, from_status) in count_rows
+            .into_iter()
+            .chain(std::iter::once((machine, "active")))
+        {
+            let row = known(&pool, id).await;
+            assert_eq!(row["status"], "archived");
+            assert_eq!(row["ended_at"], at(1).to_rfc3339());
+            let event = sqlx::query(
+                "SELECT from_status, to_status, note FROM knowledge_events
+                 WHERE knowledge_id = ? ORDER BY id DESC LIMIT 1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(event.get::<String, _>("from_status"), from_status);
+            assert_eq!(event.get::<String, _>("to_status"), "archived");
+            assert_eq!(
+                event.get::<String, _>("note"),
+                "cleanup: consolidator count without cause"
+            );
+        }
+        for (id, before) in distiller.iter().zip(distiller_before) {
+            assert_eq!(known(&pool, *id).await, before);
+        }
+        assert_eq!(known(&pool, reverted).await, reverted_before);
+        let distiller_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_events WHERE knowledge_id IN (?, ?, ?, ?)",
+        )
+        .bind(distiller[0])
+        .bind(distiller[1])
+        .bind(distiller[2])
+        .bind(distiller[3])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(distiller_events, 0);
+    }
+
+    /// F5 is idempotent through its schema_meta flag, and archiving deletes nothing.
+    #[tokio::test]
+    async fn the_cleanup_twice_writes_no_second_event_and_run_knowledge_still_resolves() {
+        let pool = test_pool().await;
+        let row = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            PROJECT,
+            "consolidator",
+            Some("gate"),
+            "gate:cleaned-once",
+            "active",
+            Some(6),
+        )
+        .await;
+        let run = seed_run(&pool, PROJECT, "completed", Some("passed"), None).await;
+        sqlx::query(
+            "INSERT INTO run_knowledge
+               (run_id, knowledge_id, shown, s_fts, s_scope, s_structure, s_recency, s_use, at)
+             VALUES (?, ?, 1, 0.5, 0.5, 0.5, 0.5, 0.5, '2026-09-30T00:00:00+00:00')",
+        )
+        .bind(run)
+        .bind(row)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(archive_countless_rows(&pool, at(1)).await.unwrap(), 1);
+        let flag: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM schema_meta WHERE key = 'consolidator.cleanup_v1'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(flag.is_some());
+        let events_after_first: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE knowledge_id = ?")
+                .bind(row)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // A row that appears after the first cleanup is not swept again: the flag is the gate.
+        let later = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            PROJECT,
+            "consolidator",
+            Some("gate"),
+            "gate:written-later",
+            "active",
+            Some(6),
+        )
+        .await;
+        assert_eq!(archive_countless_rows(&pool, at(2)).await.unwrap(), 0);
+
+        let events_after_second: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE knowledge_id = ?")
+                .bind(row)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(events_after_first, 1);
+        assert_eq!(events_after_second, events_after_first);
+        assert_eq!(known(&pool, row).await["ended_at"], at(1).to_rfc3339());
+        assert_eq!(known(&pool, later).await["status"], "active");
+
+        // Nothing was deleted: the briefing trace of the archived row still joins its knowledge.
+        let joined: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_knowledge rk
+               JOIN knowledge k ON k.id = rk.knowledge_id
+              WHERE rk.run_id = ? AND k.status = 'archived'",
+        )
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(joined, 1);
+    }
+
+    /// F6: failures painted in colour write no escape byte anywhere in the knowledge table.
+    #[tokio::test]
+    async fn a_pass_over_ansi_coloured_gate_failures_writes_no_escape_bytes() {
+        let pool = test_pool().await;
+        let coloured =
+            "\x1b[1m\x1b[31merror\x1b[0m: build failed because the \x1b[33mlinker\x1b[0m refused output.exe";
+        let plain = "error: build failed because the linker refused output.exe";
+        // A row with a cause is reinforced from coloured output.
+        let cause = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:coloured failure",
+            "active",
+            Some(1),
+        )
+        .await;
+        set_cause_key(&pool, cause, &raw_fingerprint(plain))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            seed_run(&pool, PROJECT, "completed", Some("failed"), Some(coloured)).await;
+        }
+
+        run_pass(&pool, at(1)).await.unwrap();
+
+        assert_eq!(known(&pool, cause).await["observations"], 3);
+        assert_eq!(
+            gate_fingerprint(coloured),
+            gate_fingerprint(plain),
+            "the signature ignores the colour"
+        );
+        let escaped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge
+             WHERE instr(title, char(27)) > 0 OR instr(body, char(27)) > 0
+                OR instr(COALESCE(fingerprint, ''), char(27)) > 0
+                OR instr(COALESCE(evidence, ''), char(27)) > 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(escaped, 0);
+        assert_eq!(knowledge_count(&pool).await, 1);
+    }
+
+    /// Owner decision on open point 4: reversing a gate row the owner refused writes no count-only
+    /// successor either.
+    #[tokio::test]
+    async fn an_owner_reversal_of_a_gate_row_writes_no_count_only_successor() {
+        let pool = test_pool().await;
+        let fingerprint = gate_fingerprint(FAILURE);
+        let mut refused = Vec::new();
+        for (project, status) in [("alpha", "rejected"), ("bravo", "reverted")] {
+            refused.push(
+                seed_knowledge(
+                    &pool,
+                    "episodic",
+                    "project",
+                    project,
+                    "consolidator",
+                    Some("gate"),
+                    &fingerprint,
+                    status,
+                    Some(2),
+                )
+                .await,
+            );
+            for _ in 0..5 {
+                seed_run(&pool, project, "completed", Some("passed"), None).await;
+            }
+        }
+        let before = knowledge_count(&pool).await;
+
+        let report = run_pass(&pool, at(1)).await.unwrap();
+        run_pass(&pool, at(2)).await.unwrap();
+
+        assert_eq!(report.successors, 0);
+        assert_eq!(knowledge_count(&pool).await, before);
+        for id in refused {
+            let successors: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE supersedes = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(successors, 0);
+        }
+    }
+
     /// A measured exception may bypass approval only while every production write is fenced to it.
     #[tokio::test]
     async fn the_consolidator_has_no_way_to_create_anything_but_a_measurement() {
@@ -1068,26 +1770,10 @@ mod tests {
         seed_refusal(&pool, PROJECT, "Bash").await;
         seed_refusal(&pool, PROJECT, "Bash").await;
 
-        let report = run_pass(&pool, at(1)).await.unwrap();
-        assert_eq!(report.created, 2);
-        let rows = sqlx::query(
-            "SELECT layer, source, status, observations, generator
-             FROM knowledge WHERE source = 'consolidator' ORDER BY id",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 2);
-        for row in rows {
-            assert_eq!(row.get::<String, _>("layer"), "episodic");
-            assert_eq!(row.get::<String, _>("source"), "consolidator");
-            assert_eq!(row.get::<String, _>("status"), "active");
-            assert!(row.get::<Option<i64>, _>("observations").is_some());
-            assert!(matches!(
-                row.get::<String, _>("generator").as_str(),
-                "gate" | "refused-action"
-            ));
-        }
+        // The consolidator is a reinforcer now: a pass over repeated failures and refusals
+        // creates no row of its own.
+        run_pass(&pool, at(1)).await.unwrap();
+        assert_eq!(knowledge_count(&pool).await, 0);
 
         let built_in = Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1112,6 +1798,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!updates.is_empty());
         for update in updates {
+            let flat = update.split_whitespace().collect::<String>();
+            if update.contains("cause_key = ?") {
+                // The one reinforcement statement: it may only raise a row that has a cause and
+                // is the consolidator's or the distiller's, never an owner's.
+                assert!(
+                    flat.contains("sourceIN('consolidator','distiller')"),
+                    "{update}"
+                );
+                assert!(!flat.contains("source='owner'"), "{update}");
+                assert!(flat.contains("statusIN('active','proposed')"), "{update}");
+                continue;
+            }
             if update.contains("source = 'distiller'") {
                 // The distiller's rows may be touched here only to expire them -- never to
                 // renew, merge or rewrite what the distiller wrote.
@@ -1261,115 +1959,6 @@ mod tests {
         assert_eq!(known(&pool, project_row).await, before_project);
     }
 
-    /// Idempotence means a later count re-measures the original row instead of duplicating it.
-    #[tokio::test]
-    async fn two_passes_over_the_same_measurement_leave_one_row_with_the_newer_count() {
-        let pool = test_pool().await;
-        let fingerprint = gate_fingerprint(FAILURE);
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
-        run_pass(&pool, at(1)).await.unwrap();
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
-
-        let second = run_pass(&pool, at(2)).await.unwrap();
-
-        assert_eq!(second.remeasured, 1);
-        let rows = sqlx::query(
-            "SELECT observations, last_confirmed_at FROM knowledge
-             WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?",
-        )
-        .bind(PROJECT)
-        .bind(fingerprint)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<i64, _>("observations"), 3);
-        assert_eq!(
-            rows[0].get::<String, _>("last_confirmed_at"),
-            at(2).to_rfc3339()
-        );
-    }
-
-    /// A proposal already waiting for a person is the one door for that fingerprint.
-    #[tokio::test]
-    async fn a_pending_proposal_is_never_proposed_again() {
-        let pool = test_pool().await;
-        let fingerprint = gate_fingerprint(FAILURE);
-        seed_knowledge(
-            &pool,
-            "semantic",
-            "project",
-            PROJECT,
-            "run",
-            None,
-            &fingerprint,
-            "proposed",
-            None,
-        )
-        .await;
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
-
-        let report = run_pass(&pool, at(1)).await.unwrap();
-
-        assert_eq!(report.pending, 1);
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?",
-        )
-        .bind(PROJECT)
-        .bind(fingerprint)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    /// The public proposal door writes the same fence the consolidator reads.
-    #[tokio::test]
-    async fn a_proposal_written_by_propose_is_never_proposed_again() {
-        let pool = test_pool().await;
-        let fingerprint = gate_fingerprint(FAILURE);
-        let (knowledge_id, _) = propose(
-            &pool,
-            Declaration {
-                project_id: Some(PROJECT),
-                origin_run_id: None,
-                kind: Kind::Memory,
-                title: "linker",
-                body: FAILURE,
-                reasoning: "seen twice",
-                supersedes: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT fingerprint FROM knowledge WHERE id = ?")
-                .bind(knowledge_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stored.as_deref(), Some(fingerprint.as_str()));
-
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
-
-        let report = run_pass(&pool, at(1)).await.unwrap();
-
-        assert_eq!(report.pending, 1);
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?",
-        )
-        .bind(PROJECT)
-        .bind(fingerprint)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 1);
-    }
-
     /// Rejected and reverted are both explicit refusals, so neither may silently return.
     #[tokio::test]
     async fn neither_a_rejection_nor_a_withdrawal_comes_back() {
@@ -1396,17 +1985,13 @@ mod tests {
 
         let report = run_pass(&pool, at(1)).await.unwrap();
 
-        assert_eq!(report.refused, 2);
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(report.remeasured, 0);
+        assert_eq!(knowledge_count(&pool).await, 2);
     }
 
-    /// A cleared gate signature may have one measured successor, but never be resurrected in place.
+    /// A cleared gate signature writes no successor and is never resurrected in place.
     #[tokio::test]
-    async fn a_measurement_that_reverses_writes_one_successor_and_never_two() {
+    async fn a_measurement_that_reverses_writes_no_successor() {
         let pool = test_pool().await;
         let fingerprint = gate_fingerprint(FAILURE);
         let refused = seed_knowledge(
@@ -1425,33 +2010,19 @@ mod tests {
             seed_run(&pool, PROJECT, "completed", Some("passed"), None).await;
         }
 
+        let before = knowledge_count(&pool).await;
         let first = run_pass(&pool, at(1)).await.unwrap();
-        assert_eq!(first.successors, 1);
-        let successor = sqlx::query(
-            "SELECT id, fingerprint, observations, body FROM knowledge WHERE supersedes = ?",
-        )
-        .bind(refused)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let successor_id = successor.get::<i64, _>("id");
-        assert_eq!(successor.get::<String, _>("fingerprint"), fingerprint);
-        assert_eq!(successor.get::<i64, _>("observations"), 0);
-        let unchanged_body = successor.get::<String, _>("body");
-
+        assert_eq!(first.successors, 0);
         run_pass(&pool, at(2)).await.unwrap();
         run_pass(&pool, at(3)).await.unwrap();
-        let rows = sqlx::query(
-            "SELECT id, observations, body FROM knowledge WHERE supersedes = ? ORDER BY id",
-        )
-        .bind(refused)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<i64, _>("id"), successor_id);
-        assert_eq!(rows[0].get::<i64, _>("observations"), 0);
-        assert_eq!(rows[0].get::<String, _>("body"), unchanged_body);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE supersedes = ?")
+            .bind(refused)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(knowledge_count(&pool).await, before);
+        assert_eq!(known(&pool, refused).await["status"], "rejected");
 
         let short_project = "only-four";
         let short_refused = seed_knowledge(
@@ -1485,6 +2056,21 @@ mod tests {
         let pool = test_pool().await;
         let legacy = r#"error: failed to remove file `C:\Projects\nucleos-worktrees\nucleos\run-900372\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#;
         let nested = r#"error: failed to remove file `C:\Projects\nucleos\.nucleos\worktrees\run-900446\core\target\debug\nucleos-core.exe`: Acesso negado. (os error 5)"#;
+        let cause = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:remove file denied",
+            "active",
+            Some(1),
+        )
+        .await;
+        set_cause_key(&pool, cause, &raw_fingerprint(legacy))
+            .await
+            .unwrap();
         for output in [legacy, nested, legacy, nested] {
             seed_run(&pool, PROJECT, "completed", Some("failed"), Some(output)).await;
         }
@@ -1495,58 +2081,38 @@ mod tests {
 
         run_pass(&pool, at(1)).await.unwrap();
 
-        let row = sqlx::query(
-            "SELECT observations, body, evidence FROM knowledge WHERE generator = 'gate'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        assert_eq!(knowledge_count(&pool).await, 1);
+        let row = sqlx::query("SELECT observations, evidence FROM knowledge WHERE id = ?")
+            .bind(cause)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(row.get::<i64, _>("observations"), 4);
-        assert!(row.get::<String, _>("body").contains("4 of the last 8"));
         let evidence: Value = serde_json::from_str(&row.get::<String, _>("evidence")).unwrap();
         let evidence = evidence.as_array().unwrap();
         assert_eq!(evidence.len(), 4);
         assert!(evidence.iter().all(|item| item["t"] == "run"));
     }
 
-    /// Repeated refusals teach one lesson per tool; a singleton and an unscoped refusal teach none.
-    #[tokio::test]
-    async fn the_refused_action_generator_writes_one_lesson_per_tool() {
-        let pool = test_pool().await;
-        for _ in 0..19 {
-            seed_refusal(&pool, PROJECT, "Bash").await;
-        }
-        seed_refusal(&pool, PROJECT, "Edit").await;
-        sqlx::query(
-            "INSERT INTO proposals
-               (kind, status, project_id, tool_name, reasoning, created_at)
-             VALUES ('refused-action', 'pending', NULL, 'Bash', 'unscoped refusal',
-                     '2026-09-30T00:00:00+00:00')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        run_pass(&pool, at(1)).await.unwrap();
-
-        let rows = sqlx::query(
-            "SELECT observations, fingerprint FROM knowledge WHERE generator = 'refused-action'",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<i64, _>("observations"), 19);
-        assert_eq!(
-            rows[0].get::<String, _>("fingerprint"),
-            "refused-action:bash"
-        );
-    }
-
     /// A project in flight is not stable history, so the whole project waits for a later pass.
     #[tokio::test]
     async fn a_project_with_a_running_job_is_left_alone() {
         let pool = test_pool().await;
+        let cause = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:linker refused",
+            "active",
+            Some(1),
+        )
+        .await;
+        set_cause_key(&pool, cause, &raw_fingerprint(FAILURE))
+            .await
+            .unwrap();
         seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
         seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
         let job = sqlx::query(
@@ -1563,11 +2129,7 @@ mod tests {
 
         let busy = run_pass(&pool, at(1)).await.unwrap();
         assert_eq!(busy.skipped_busy, 1);
-        let empty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(empty, 0);
+        assert_eq!(known(&pool, cause).await["observations"], 1);
 
         sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = ?")
             .bind(job)
@@ -1575,7 +2137,8 @@ mod tests {
             .await
             .unwrap();
         let settled = run_pass(&pool, at(2)).await.unwrap();
-        assert_eq!(settled.created, 1);
+        assert_eq!(settled.remeasured, 1);
+        assert_eq!(known(&pool, cause).await["observations"], 2);
     }
 
     /// An episodic measurement expires only after its full run window passes without confirmation.
@@ -1656,6 +2219,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // Only a row that has a cause is reinforced (and so reconfirmed) by the gate now.
+        set_cause_key(&pool, id, &raw_fingerprint(FAILURE))
+            .await
+            .unwrap();
         for hour in 2..=4 {
             seed_run_at(&pool, PROJECT, Some("failed"), Some(FAILURE), at(hour)).await;
         }
@@ -1716,9 +2283,10 @@ mod tests {
         }
     }
 
-    /// When the gate now says the opposite, the old lesson ends and one reversal succeeds it.
+    /// When the gate now says the opposite, no count-only successor is written; the lesson is
+    /// simply not reinforced and ages out through its normal lifecycle.
     #[tokio::test]
-    async fn a_measurement_that_contradicts_an_active_lesson_supersedes_it_once() {
+    async fn a_measurement_that_contradicts_an_active_lesson_writes_no_successor() {
         let pool = test_pool().await;
         let fingerprint = gate_fingerprint(FAILURE);
         let old = seed_knowledge(
@@ -1737,42 +2305,21 @@ mod tests {
             seed_run_at(&pool, PROJECT, Some("passed"), None, at(hour)).await;
         }
 
+        let before = knowledge_count(&pool).await;
         let first = run_pass(&pool, at(6)).await.unwrap();
-        assert_eq!(first.superseded, 1);
+        assert_eq!(first.superseded, 0);
+        assert_eq!(first.successors, 0);
         let old_row = known(&pool, old).await;
-        assert_eq!(old_row["status"], "superseded");
-        assert_eq!(old_row["ended_at"], at(6).to_rfc3339());
-        let successor =
-            sqlx::query("SELECT id, observations, title, body FROM knowledge WHERE supersedes = ?")
-                .bind(old)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(successor.get::<i64, _>("observations"), 0);
-        assert!(
-            successor
-                .get::<String, _>("title")
-                .starts_with("Gate failure no longer recurs: ")
-        );
-        assert!(
-            successor
-                .get::<String, _>("body")
-                .contains("last 5 gated runs")
-        );
-        let event = sqlx::query(
-            "SELECT from_status, to_status, note FROM knowledge_events
-             WHERE knowledge_id = ? ORDER BY id DESC LIMIT 1",
+        assert_eq!(old_row["status"], "active");
+        assert!(old_row["ended_at"].is_null());
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_events WHERE knowledge_id = ? AND to_status = 'superseded'",
         )
         .bind(old)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(event.get::<String, _>("from_status"), "active");
-        assert_eq!(event.get::<String, _>("to_status"), "superseded");
-        assert_eq!(
-            event.get::<String, _>("note"),
-            "the measurement now says the opposite"
-        );
+        assert_eq!(events, 0);
 
         run_pass(&pool, at(7)).await.unwrap();
         run_pass(&pool, at(8)).await.unwrap();
@@ -1782,7 +2329,8 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(successors, 1);
+        assert_eq!(successors, 0);
+        assert_eq!(knowledge_count(&pool).await, before);
     }
 
     /// A matching fingerprint never gives the consolidator authority over an owner's row.
@@ -1893,49 +2441,46 @@ mod tests {
         )
         .await;
 
+        let rows_before = knowledge_count(&pool).await;
+
         assert_eq!(merge_duplicates(&pool, at(1)).await.unwrap(), 1);
 
-        for id in [first, second] {
-            let row = known(&pool, id).await;
-            assert_eq!(row["status"], "archived");
-            assert_eq!(row["ended_at"], at(1).to_rfc3339());
-        }
-        let successor = sqlx::query_as::<_, Known>(
-            "SELECT * FROM knowledge
-             WHERE source = 'consolidator' AND layer = 'episodic' AND status = 'active'
-               AND fingerprint = ?",
-        )
-        .bind(fingerprint)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(successor.observations, Some(5));
-        assert_eq!(successor.title, "newest title");
-        assert_eq!(successor.body, "newest body");
-        assert!(successor.proposal_id.is_none());
-        assert!(approved(&successor));
-        let mut evidence = serde_json::from_str::<Vec<Value>>(
-            successor.evidence.as_deref().expect("merge evidence"),
-        )
-        .unwrap();
-        evidence.sort_by_key(|item| item["id"].as_i64().unwrap());
-        assert_eq!(
-            evidence,
-            vec![
-                serde_json::json!({"t": "knowledge", "id": first}),
-                serde_json::json!({"t": "knowledge", "id": second}),
-            ]
-        );
-        for id in [first, second] {
-            let note: String = sqlx::query_scalar(
-                "SELECT note FROM knowledge_events WHERE knowledge_id = ? ORDER BY id DESC LIMIT 1",
-            )
-            .bind(id)
+        // No successor row: the oldest id survives and absorbs the others.
+        assert_eq!(knowledge_count(&pool).await, rows_before);
+        let survivor = sqlx::query_as::<_, Known>("SELECT * FROM knowledge WHERE id = ?")
+            .bind(first)
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(note, format!("merged into {}", successor.id));
-        }
+        assert_eq!(survivor.status, "active");
+        assert_eq!(survivor.observations, Some(5));
+        assert_ne!(survivor.title, "newest title");
+        assert!(survivor.ended_at.is_none());
+        assert_eq!(
+            survivor.last_confirmed_at.as_deref(),
+            Some(at(1).to_rfc3339().as_str())
+        );
+        assert!(survivor.proposal_id.is_none());
+        assert!(approved(&survivor));
+        let evidence = serde_json::from_str::<Vec<Value>>(
+            survivor.evidence.as_deref().expect("merge evidence"),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence,
+            vec![serde_json::json!({"t": "knowledge", "id": second})]
+        );
+        let row = known(&pool, second).await;
+        assert_eq!(row["status"], "archived");
+        assert_eq!(row["ended_at"], at(1).to_rfc3339());
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM knowledge_events WHERE knowledge_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(second)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(note, format!("merged into {first}"));
         assert_eq!(known(&pool, owner).await["status"], "active");
         assert_eq!(known(&pool, semantic_first).await["status"], "active");
         assert_eq!(known(&pool, semantic_second).await["status"], "active");
@@ -2108,9 +2653,8 @@ mod tests {
         seed_run(&pool, "delta", "completed", Some("failed"), Some(FAILURE)).await;
         seed_run(&pool, "delta", "completed", Some("failed"), Some(FAILURE)).await;
 
-        let report = run_pass(&pool, at(2)).await.unwrap();
+        run_pass(&pool, at(2)).await.unwrap();
 
-        assert_eq!(report.elsewhere, 1);
         let delta_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM knowledge
              WHERE scope_kind = 'project' AND scope_id = 'delta' AND fingerprint = ?",

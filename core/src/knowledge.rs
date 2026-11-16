@@ -484,6 +484,36 @@ mod tests {
         assert_eq!(first.fingerprint, second.fingerprint);
     }
 
+    /// Colour and cursor escapes are terminal noise, never part of a failure's text.
+    #[test]
+    fn strip_ansi_removes_colour_and_cursor_sequences_and_keeps_the_text() {
+        assert_eq!(strip_ansi("\x1b[31merror\x1b[0m: boom"), "error: boom");
+        assert_eq!(strip_ansi("\x1b[1;31;4mred\x1b[m"), "red");
+        assert_eq!(strip_ansi("\x1b[2K\x1b[1Gdone"), "done");
+        assert_eq!(strip_ansi("\x1b[?25lhidden\x1b[?25h"), "hidden");
+        assert_eq!(strip_ansi("\x1b]0;window title\x07text"), "text");
+        assert_eq!(strip_ansi("\x1b]8;;http://example.test\x1b\\link"), "link");
+        assert_eq!(strip_ansi("end\x1b"), "end");
+        assert_eq!(strip_ansi("ação — ok"), "ação — ok");
+        assert_eq!(strip_ansi(""), "");
+        assert!(!strip_ansi("\x1b[31mx\x1b[0m\x1b[2K").contains('\x1b'));
+    }
+
+    /// Guards that a terminal that painted the same failure in colour does not split its identity.
+    #[test]
+    fn a_failure_that_differs_only_in_ansi_colour_is_the_same_failure() {
+        let plain = failure_signature("error: build failed because the linker refused output.exe")
+            .expect("a failure has a signature");
+        let coloured = failure_signature(
+            "\x1b[1m\x1b[31merror\x1b[0m: build failed because the linker refused \x1b[33moutput.exe\x1b[0m",
+        )
+        .expect("a failure has a signature");
+
+        assert_eq!(plain.fingerprint, coloured.fingerprint);
+        assert!(!coloured.headline.contains('\x1b'));
+        assert_eq!(plain.headline, coloured.headline);
+    }
+
     /// Guards that silence has no identity while non-empty unclassified output keeps a fallback.
     #[test]
     fn an_output_with_nothing_in_it_has_no_signature() {
