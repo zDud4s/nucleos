@@ -26,6 +26,7 @@ pub mod provision;
 pub mod render;
 pub mod runs;
 pub mod store;
+pub mod supersede;
 
 mod caller;
 mod live;
@@ -60,6 +61,7 @@ use crate::verify::postgate as verify_postgate;
 use crate::verify::postgate_worker as verify_postgate_worker;
 use crate::verify::runs::{self as verify_runs, ORIGIN_VERIFY};
 use crate::verify::store::{self as verify_store, CacheKey, NewRequest, PlannedUnit};
+use crate::verify::supersede as verify_supersede;
 use crate::workflow_records;
 
 pub use self::caller::*;
@@ -510,6 +512,16 @@ async fn submit_with(
     })?;
 
     let worktree = root.to_string_lossy().into_owned();
+    if !plan.unclaimed.is_empty() {
+        tracing::warn!(
+            base = base.as_deref().unwrap_or(""),
+            worktree = %worktree,
+            caller = %caller.label(),
+            count = plan.unclaimed.len(),
+            paths = ?plan.unclaimed.iter().take(20).collect::<Vec<_>>(),
+            "verify: unclaimed paths make every group run"
+        );
+    }
     let scope = args.scope.as_str();
     let kind = args.kind.as_str();
     let priority = terms.priority(caller);
@@ -646,23 +658,29 @@ async fn submit_with(
             }
         }
 
+        let since = terms
+            .queued_since_ms
+            .filter(|_| matches!(caller, Caller::Job(_)));
         let submitted = executor
-            .submit(verify_runs::Request {
-                project_id: Some(project_id.clone()),
-                worktree: worktree.clone(),
-                scope: scope.to_owned(),
-                origin: ORIGIN_VERIFY.to_owned(),
-                origin_id: Some(id),
-                requested_by: caller.requested_by(scope),
-                group_name: unit.group.clone(),
-                kind: Some(kind.to_owned()),
-                argv: unit.argv.clone(),
-                fingerprint: unit.fingerprint.clone(),
-                priority,
-                // Zero lets the executor derive both from the argv and its own config.
-                weight: 0,
-                timeout_ms: terms.unit_timeout_ms(caller),
-            })
+            .submit_since(
+                verify_runs::Request {
+                    project_id: Some(project_id.clone()),
+                    worktree: worktree.clone(),
+                    scope: scope.to_owned(),
+                    origin: ORIGIN_VERIFY.to_owned(),
+                    origin_id: Some(id),
+                    requested_by: caller.requested_by(scope),
+                    group_name: unit.group.clone(),
+                    kind: Some(kind.to_owned()),
+                    argv: unit.argv.clone(),
+                    fingerprint: unit.fingerprint.clone(),
+                    priority,
+                    // Zero lets the executor derive both from the argv and its own config.
+                    weight: 0,
+                    timeout_ms: terms.unit_timeout_ms(caller),
+                },
+                since,
+            )
             .await;
         let submitted = match submitted {
             Ok(submitted) => submitted,
@@ -693,6 +711,14 @@ async fn submit_with(
     verify_store::set_plan(pool, id, &units)
         .await
         .map_err(internal)?;
+    // Queued units of this caller's older requests at another fingerprint are now pointless.
+    match verify_supersede::supersede_older(pool, id, &project_id, &worktree, kind, &label, &units)
+        .await
+    {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(request = id, count, "verify: superseded older queued units"),
+        Err(error) => tracing::warn!(%error, request = id, "verify: cannot supersede older units"),
+    }
     if let Some(task_id) = args
         .task_id
         .as_deref()
@@ -1426,6 +1452,7 @@ tests:
             fix: false,
             unit_timeout_secs: 3600,
             recheck: None,
+            queued_since_ms: None,
         };
         assert_eq!(scoped.unit_timeout_ms(job), 3_600_000);
     }

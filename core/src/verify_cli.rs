@@ -193,6 +193,8 @@ fn verdict_code(ticket: &Value) -> Option<i32> {
         "failed" | "errored" => Some(EXIT_FAILED),
         // Covers nothing (verify.rs): not a pass, and not a failure either.
         "nothing_ran" => Some(EXIT_NOT_VERIFIED),
+        // A newer request of the same caller replaced this one: read that ticket instead.
+        "superseded" => Some(EXIT_NOT_VERIFIED),
         // Neither a pass nor a failure to fix: the red belongs to a master incident.
         "inherited" => Some(EXIT_NOT_VERIFIED),
         _ => None,

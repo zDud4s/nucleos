@@ -65,6 +65,14 @@ pub(super) trait GateIo {
 
 /// The verdict of a finished ticket; a red is asked whether the base already has it.
 async fn verdict_from(io: &impl GateIo, ticket: &Ticket) -> Result<GateVerdict, NotMeasured> {
+    // The caller's own newer ticket replaced this one before it ran: that gate answers, so this is
+    // waiting, never a counted failed attempt.
+    if ticket.verdict.as_deref() == Some("superseded") {
+        return Err(NotMeasured::Running(format!(
+            "scope verification ticket {} was superseded by a newer request; the newer gate answers",
+            ticket.ticket
+        )));
+    }
     let verdict = verdict_of(scope_outcome(ticket));
     if let Ok(GateVerdict::Red { .. }) = verdict {
         if let Some(note) = io.inherited(ticket).await {
@@ -88,7 +96,7 @@ pub(super) async fn gate_at_head(
     wait: Duration,
 ) -> Result<GateVerdict, NotMeasured> {
     let mut id = None;
-    // The reason of a remembered ticket that ended without measuring after the last wait gave up.
+    // Why a remembered ticket ended without measuring after the last wait gave up.
     let mut ended = None;
     if let Some(stored) = io.stored().await?
         && stored.head == head
@@ -103,16 +111,14 @@ pub(super) async fn gate_at_head(
                     return Ok(verdict);
                 }
                 // It ended without measuring: only now is a fresh unit allowed.
-                Err(NotMeasured::Failed(reason) | NotMeasured::Running(reason)) => {
-                    ended = Some(reason);
-                }
+                Err(not_measured) => ended = Some(not_measured),
             },
             // Vanished (the queue lost it): it too measured nothing, so it counts once.
             None => {
-                ended = Some(format!(
+                ended = Some(NotMeasured::Failed(format!(
                     "scope verification ticket {} vanished",
                     stored.ticket
-                ));
+                )));
             }
         }
     }
@@ -136,9 +142,12 @@ pub(super) async fn gate_at_head(
     };
     if !ticket.done {
         if let Some(reason) = ended {
-            return Err(NotMeasured::Failed(format!(
-                "{reason}; a fresh unit (ticket {id}) is running"
-            )));
+            let fresh = |reason: String| format!("{reason}; a fresh unit (ticket {id}) is running");
+            // A superseded ticket was waiting, not failing: it spends no attempt.
+            return Err(match reason {
+                NotMeasured::Failed(reason) => NotMeasured::Failed(fresh(reason)),
+                NotMeasured::Running(reason) => NotMeasured::Running(fresh(reason)),
+            });
         }
         return Err(NotMeasured::Running(format!(
             "scope verification ticket {id} is still running ({} of {} units queued); a later tick reads it",
@@ -231,6 +240,18 @@ struct VerifyIo<'a> {
     job_id: &'a str,
     branch: &'a str,
     worktree: &'a str,
+    /// The HEAD this gate measures.
+    head: &'a str,
+}
+
+/// The queue time the test step inherits from the build check: the check's oldest unit, only when
+/// the check measured the same `head`.
+pub(super) fn inherit_since(
+    stored: Option<&Stored>,
+    head: &str,
+    oldest: Option<i64>,
+) -> Option<i64> {
+    stored.filter(|stored| stored.head == head).and(oldest)
 }
 
 impl VerifyIo<'_> {
@@ -245,7 +266,28 @@ impl VerifyIo<'_> {
         let Some(held) = job.manifest.branches.get(self.branch) else {
             return GateTerms::default();
         };
+        let queued_since_ms = if self.kind == Kind::Test && !self.recheck {
+            let check = held.extra.get(CHECK_KEY).and_then(|value| {
+                Some(Stored {
+                    ticket: value.get("ticket")?.as_i64()?,
+                    head: value.get("head")?.as_str()?.to_owned(),
+                })
+            });
+            let oldest = match &check {
+                Some(check) => crate::verify::runs::ticket_queued_since(self.pool, check.ticket)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, job = self.job_id, branch = self.branch, "gate: cannot read the check ticket's queue time");
+                        None
+                    }),
+                None => None,
+            };
+            inherit_since(check.as_ref(), self.head, oldest)
+        } else {
+            None
+        };
         GateTerms {
+            queued_since_ms,
             fix: held.state == "fixing",
             unit_timeout_secs: branch_ceiling_secs(
                 &held.extra,
@@ -433,6 +475,7 @@ pub(super) async fn gate_branch(
         job_id,
         branch,
         worktree,
+        head: &head,
     };
     if recorded_failures(pool, job_id, branch, true)
         .await

@@ -265,7 +265,7 @@ impl Classification {
         let clean = ticket
             .units
             .iter()
-            .all(|unit| !matches!(unit.status.as_str(), "errored" | "unknown"));
+            .all(|unit| !matches!(unit.status.as_str(), "errored" | "unknown" | "superseded"));
         if clean && only_inherited(&classes) {
             ticket.verdict = Some("inherited".to_owned());
             let ids: Vec<String> = inherited.iter().map(|id| format!("#{id}")).collect();
@@ -631,7 +631,7 @@ fn failed_test_ids(ticket: &Ticket) -> Option<BTreeSet<String>> {
         || ticket
             .units
             .iter()
-            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown"))
+            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown" | "superseded"))
     {
         return None;
     }
@@ -653,7 +653,7 @@ async fn master_red_note(pool: &SqlitePool, ticket: &Ticket, now: DateTime<Utc>)
         || ticket.verdict.as_deref() != Some("failed")
         || units
             .iter()
-            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown"))
+            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown" | "superseded"))
     {
         return None;
     }
