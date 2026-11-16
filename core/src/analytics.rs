@@ -11,6 +11,7 @@
 //! the largest value per session — `session_totals`' rule (`project/readings.rs`): the token counts
 //! a resumed run reports ARE cumulative. Different bases, kept different.
 
+pub mod accounts;
 pub mod cost;
 pub mod delivered;
 pub mod devtime;
@@ -163,6 +164,8 @@ pub struct Analytics {
     pub delivered: DeliveredBlock,
     /// The ten costliest sessions of the window (spec §4.8). Runs only: the judge has no run.
     pub top_runs: Vec<TopRun>,
+    /// Tokens and cost grouped by account id; NULL account is its own group.
+    pub accounts: accounts::AccountsBlock,
 }
 
 /// Gate outcomes of finished runs. Five counters so they always add up to `runs_completed`.
@@ -299,6 +302,7 @@ pub async fn report(
         throughput: throughput_block(window, &rows, in_flight),
         delivered: delivered::delivered_block(window, &merges),
         top_runs: sessions::top_sessions(&priced, window, TOP_RUNS),
+        accounts: accounts::accounts_block(pool, scope, window).await?,
     })
 }
 
