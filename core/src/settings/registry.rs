@@ -1,5 +1,5 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the documents: the 19 fixed ones plus one `channels/<id>` row per channel manifest.
+//! and the table of the documents: the 20 fixed ones plus one `channels/<id>` row per channel manifest.
 
 use std::sync::LazyLock;
 
@@ -379,13 +379,13 @@ mod tests {
     }
 
     #[test]
-    fn there_are_nineteen_documents_with_unique_names() {
-        // 19 fixed documents plus one `channels/<id>` per manifest.
+    fn there_are_twenty_documents_with_unique_names() {
+        // 20 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 19 + channels);
+        assert_eq!(docs.len(), 20 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 19 + channels);
+        assert_eq!(names.len(), 20 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
             17 + channels
