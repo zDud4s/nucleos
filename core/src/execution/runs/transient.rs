@@ -215,7 +215,7 @@ pub(in crate::execution::runs) mod account_park {
 
     /// What a run asks of the pool after a limit hit, and what it gets back.
     pub(in crate::execution::runs) struct Relaunch {
-        pub account: super::super::HeldAccount,
+        pub account: crate::execution::runs::spawn::HeldAccount,
         pub env: Vec<(String, String)>,
     }
 
@@ -238,7 +238,7 @@ pub(in crate::execution::runs) mod account_park {
         id: i64,
         project_id: Option<&str>,
         transcript: &std::sync::Arc<std::sync::Mutex<String>>,
-        account: &mut Option<super::super::HeldAccount>,
+        account: &mut Option<crate::execution::runs::spawn::HeldAccount>,
         (stdout, stderr): (&str, &str),
         base_env: &[(String, String)],
         counts: &mut LimitCounts,
@@ -277,8 +277,14 @@ pub(in crate::execution::runs) mod account_park {
                 park_for_account_limit(pool, id, project_id, transcript, &engine, at).await;
             }
             // Cold: no resumed session, so a stuck session cannot block the new account.
-            match super::super::account_for_launch(pool, id, None, base_env.to_vec(), project_id)
-                .await?
+            match crate::execution::runs::spawn::account_for_launch(
+                pool,
+                id,
+                None,
+                base_env.to_vec(),
+                project_id,
+            )
+            .await?
             {
                 (Some(account), env) => {
                     counts.switches += 1;

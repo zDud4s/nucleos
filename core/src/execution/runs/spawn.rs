@@ -1307,17 +1307,17 @@ pub(super) fn spawn_run(
 }
 
 /// The account slot a run holds until its task ends, and the engine it was picked for.
-struct HeldAccount {
+pub(in crate::execution::runs) struct HeldAccount {
     /// How many entries of the launch env the account added (so a re-pick can strip them).
-    env_len: usize,
-    engine: String,
-    reservation: crate::accounts::pool::Reservation,
+    pub(in crate::execution::runs) env_len: usize,
+    pub(in crate::execution::runs) engine: String,
+    pub(in crate::execution::runs) reservation: crate::accounts::pool::Reservation,
 }
 
 /// Picks the run's account and records it. `Err(())` means the run was failed here because its
 /// pinned account cannot take work: a pin is never replaced silently (R1/R2). Any other outcome
 /// without an account launches as today.
-async fn account_for_launch(
+pub(in crate::execution::runs) async fn account_for_launch(
     pool: &sqlx::SqlitePool,
     id: i64,
     resume_session_id: Option<&str>,
