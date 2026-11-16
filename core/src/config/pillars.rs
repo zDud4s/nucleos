@@ -300,6 +300,32 @@ impl Default for KeepAwakeConfig {
     }
 }
 
+/// `~/.nucleos/git.yaml`: how the merge queue treats the history a tree leaf leaves behind.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitConfig {
+    /// Squash checkpoints: on by default. When a tree leaf is merged, its `nucleos: checkpoint` and
+    /// `nucleos: autoformat` commits collapse into one commit and real commits stay as they are.
+    /// Off keeps every checkpoint in the history.
+    pub squash_checkpoints: bool,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            squash_checkpoints: true,
+        }
+    }
+}
+
+/// A blank legacy `git.yaml` means the defaults.
+pub fn parse_git_config(contents: &str) -> Result<GitConfig, String> {
+    if contents.trim().is_empty() {
+        return Ok(GitConfig::default());
+    }
+    serde_yaml::from_str(contents).map_err(|error| error.to_string())
+}
+
 /// `~/.nucleos/background.yaml`: how long a chat's background task may say nothing before its
 /// process stops being kept alive for it.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
