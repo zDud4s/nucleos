@@ -26,6 +26,7 @@ pub mod provision;
 pub mod render;
 pub mod runs;
 pub mod store;
+pub mod supersede;
 
 mod caller;
 mod live;
@@ -60,6 +61,7 @@ use crate::verify::postgate as verify_postgate;
 use crate::verify::postgate_worker as verify_postgate_worker;
 use crate::verify::runs::{self as verify_runs, ORIGIN_VERIFY};
 use crate::verify::store::{self as verify_store, CacheKey, NewRequest, PlannedUnit};
+use crate::verify::supersede as verify_supersede;
 use crate::workflow_records;
 
 pub use self::caller::*;
@@ -709,6 +711,14 @@ async fn submit_with(
     verify_store::set_plan(pool, id, &units)
         .await
         .map_err(internal)?;
+    // Queued units of this caller's older requests at another fingerprint are now pointless.
+    match verify_supersede::supersede_older(pool, id, &project_id, &worktree, kind, &label, &units)
+        .await
+    {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(request = id, count, "verify: superseded older queued units"),
+        Err(error) => tracing::warn!(%error, request = id, "verify: cannot supersede older units"),
+    }
     if let Some(task_id) = args
         .task_id
         .as_deref()

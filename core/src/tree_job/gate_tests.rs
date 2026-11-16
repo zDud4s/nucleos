@@ -293,6 +293,20 @@ async fn a_unit_that_ended_without_measuring_allows_a_fresh_one() {
 }
 
 #[tokio::test]
+async fn a_waiter_on_a_superseded_ticket_is_told_to_wait_for_the_newer_gate() {
+    let fake = Fake::default();
+    assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
+    fake.set(ticket(100, true, Some("superseded")));
+    let verdict = gate_at_head(&fake, "h1", WAIT).await;
+    // Waiting, never a counted failed attempt: the caller's own newer ticket answers.
+    assert_eq!(fake.submits(), 2, "a fresh unit replaces it");
+    assert!(
+        matches!(&verdict, Err(NotMeasured::Running(reason)) if reason.contains("superseded")),
+        "{verdict:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_ticket_still_running_is_answered_as_running() {
     let fake = Fake::default();
     let verdict = gate_at_head(&fake, "h1", WAIT).await;
