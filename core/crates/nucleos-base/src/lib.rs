@@ -21,6 +21,7 @@ pub mod commands;
 pub mod detect;
 pub mod feed;
 pub mod gate;
+pub mod gate_trunk;
 pub mod handoff;
 pub mod inspect;
 pub mod join;

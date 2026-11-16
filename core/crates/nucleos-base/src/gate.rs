@@ -84,6 +84,13 @@ fn tampered_gate_script(
             std::fs::read(worktree.join(relative)),
         ) {
             (Ok(configured), Ok(used)) if configured == used => {}
+            (Ok(_), Ok(used))
+                if crate::gate_trunk::script_matches_trunk(
+                    project_root,
+                    worktree,
+                    relative,
+                    &used,
+                ) => {}
             (Ok(_), Ok(_)) => {
                 return Some(format!(
                     "gate script `{relative}` differs from the project root's copy; the run modified \

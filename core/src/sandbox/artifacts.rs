@@ -61,6 +61,13 @@ pub fn tampered_scripts<'a>(
             };
             match std::fs::read(project_root.join(&word)) {
                 Ok(configured) if configured == used.as_bytes() => {}
+                Ok(_)
+                    if nucleos_base::gate_trunk::script_matches_trunk(
+                        project_root,
+                        worktree,
+                        &word,
+                        used.as_bytes(),
+                    ) => {}
                 Ok(_) => {
                     return Some(format!(
                         "gate script `{word}` differs from the project root's"
