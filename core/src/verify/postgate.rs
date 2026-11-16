@@ -19,6 +19,10 @@ use sqlx::SqlitePool;
 use crate::verify::batch::TargetState;
 use crate::verify::bisect::{Probe, Verdict};
 
+mod revert;
+
+pub use revert::{fail_revert, record_revert, restart_revert, set_fix_branch, set_revert_request};
+
 /// Directory-name prefix of the post-merge gate's worktree.
 pub const POSTGATE_PREFIX: &str = "postgate-";
 
@@ -126,6 +130,12 @@ pub struct State {
     /// The newest tip proven by a daemon verification over a green-or-covered base (F3-12). It
     /// never replaces `last_green_sha`.
     pub covered_sha: Option<String>,
+    /// Targets the last green covered; `None` = recorded before this column (whatever
+    /// `gate_command` ran).
+    pub green_targets: Option<Vec<String>>,
+    /// The local targets the running gate's command was composed from (stored at submit time);
+    /// `None` = no gate runs, or its command ran whole.
+    pub running_targets: Option<Vec<String>>,
     /// Why a gate start is being held right now (`"interval"` / `"busy"`), until a gate starts.
     pub held_note: Option<String>,
     /// How many gates of `last_attempted_sha` ended without a verdict.
@@ -246,6 +256,8 @@ struct Row {
     fix_branch: Option<String>,
     fix_run_id: Option<i64>,
     covered_sha: Option<String>,
+    green_targets: Option<String>,
+    running_targets: Option<String>,
     held_note: Option<String>,
     unmeasured_runs: i64,
 }
@@ -290,6 +302,23 @@ impl From<Row> for State {
             .collect();
         let candidates = decode_list(&row.project_id, "candidates", &row.candidates);
         let also_suspect = decode_list(&row.project_id, "also_suspect", &row.also_suspect);
+        // Unreadable reads as `None`, never as an empty list: "covers nothing" would be a claim.
+        let target_list = |column: &str, raw: Option<&str>| {
+            raw.and_then(|raw| {
+                serde_json::from_str::<Vec<String>>(raw)
+                    .map_err(|error| {
+                        tracing::warn!(
+                            project = %row.project_id,
+                            column,
+                            %error,
+                            "undecodable target list in postgate_state; reading it as none"
+                        );
+                    })
+                    .ok()
+            })
+        };
+        let green_targets = target_list("green_targets", row.green_targets.as_deref());
+        let running_targets = target_list("running_targets", row.running_targets.as_deref());
         State {
             project_id: row.project_id,
             target: row.target,
@@ -315,6 +344,8 @@ impl From<Row> for State {
             fix_branch: row.fix_branch,
             fix_run_id: row.fix_run_id,
             covered_sha: row.covered_sha,
+            green_targets,
+            running_targets,
             held_note: row.held_note,
             unmeasured_runs: row.unmeasured_runs,
         }
@@ -328,7 +359,8 @@ pub async fn load(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<St
                 running_request_id, red_groups, red_since_sha, red_phase, red_sha, red_base_sha, \
                 probe_sha, probe_request_id, probes, reported_sha, culprit_sha, candidates, \
                 also_suspect, revert_merge_sha, revert_request_id, revert_sha, fix_branch, \
-                fix_run_id, covered_sha, held_note, unmeasured_runs \
+                fix_run_id, covered_sha, green_targets, running_targets, held_note, \
+                unmeasured_runs \
          FROM postgate_state WHERE project_id = ?",
     )
     .bind(project_id)
@@ -364,6 +396,7 @@ pub async fn start(
              running_started_at = CURRENT_TIMESTAMP, \
              last_started_at = CURRENT_TIMESTAMP, \
              submit_floor = excluded.submit_floor, \
+             running_targets = NULL, \
              held_note = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE postgate_state.running_sha IS NULL AND postgate_state.red_phase IS NULL",
@@ -376,6 +409,26 @@ pub async fn start(
     .execute(pool)
     .await?;
     Ok(done.rows_affected() > 0)
+}
+
+/// Records the local targets the running gate's command is composed from (`None` = the command
+/// runs whole). Called at submit time with the rules that composed the command; `finish_green`
+/// copies it into `green_targets`. Changes nothing while no gate runs for the project.
+pub async fn set_running_targets(
+    pool: &SqlitePool,
+    project_id: &str,
+    targets: Option<&[String]>,
+) -> sqlx::Result<()> {
+    let encoded = targets.map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
+    sqlx::query(
+        "UPDATE postgate_state SET running_targets = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND running_sha IS NOT NULL",
+    )
+    .bind(encoded)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// A project's post-merge gate colour, as `postgate_transitions.to_state` spells it.
@@ -477,6 +530,10 @@ pub async fn record_transition(
 /// nothing and returns `false`, so a late finish cannot overwrite newer state. Writes the
 /// `→ green` transition in the same transaction when the project was red (spec
 /// analytics-pipeline §5.4).
+///
+/// The green covers exactly the targets the running command was composed from: `running_targets`
+/// (stored by `set_running_targets` at submit time) is copied into `green_targets`, so no later
+/// read of the rules can claim a target the gate did not run. NULL stays NULL.
 pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Result<bool> {
     let mut tx = pool.begin().await?;
     let before = read_before(&mut tx, project_id).await?;
@@ -488,6 +545,7 @@ pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sql
              red_phase = NULL, red_sha = NULL, red_base_sha = NULL, probe_sha = NULL, \
              probe_request_id = NULL, probes = '[]', reported_sha = NULL, culprit_sha = NULL, \
              candidates = '[]', also_suspect = '[]', \
+             green_targets = running_targets, running_targets = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE project_id = ? AND running_sha = ?",
     )
@@ -979,46 +1037,6 @@ pub async fn report_with_revert(
     report_inner(pool, project_id, red_sha, verdict, summary, true).await
 }
 
-/// Starts the revert of `culprit` for a red that was already reported without one (the incident was
-/// held by someone else at the time, and the claim has since lapsed). The same five columns
-/// `report_inner` writes, in one transaction with the feed line. Refused (`false`, nothing
-/// written) unless the project is still red on exactly that reported culprit with no revert
-/// started, so it cannot start a second one.
-pub async fn restart_revert(
-    pool: &SqlitePool,
-    project_id: &str,
-    culprit: &str,
-    summary: &str,
-) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
-    let done = sqlx::query(
-        "UPDATE postgate_state SET \
-             revert_merge_sha = ?, revert_request_id = NULL, revert_sha = NULL, \
-             fix_branch = NULL, fix_run_id = NULL, updated_at = CURRENT_TIMESTAMP \
-         WHERE project_id = ? AND culprit_sha = ? AND revert_merge_sha IS NULL \
-           AND red_phase IS NULL AND red_groups != '[]'",
-    )
-    .bind(culprit)
-    .bind(project_id)
-    .bind(culprit)
-    .execute(&mut *tx)
-    .await?;
-    if done.rows_affected() == 0 {
-        return Ok(false);
-    }
-    crate::feed::append_on(
-        &mut tx,
-        Some(project_id),
-        POSTGATE_RED_KIND,
-        summary,
-        None,
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(true)
-}
-
 async fn report_inner(
     pool: &SqlitePool,
     project_id: &str,
@@ -1100,115 +1118,39 @@ async fn report_inner(
     Ok(true)
 }
 
-/// Stores the vcs ticket of the revert of `merge_sha`. Refused (`false`) when no revert of that
-/// culprit is started, so a late ticket cannot attach itself to a revert that already ended.
-pub async fn set_revert_request(
-    pool: &SqlitePool,
-    project_id: &str,
-    merge_sha: &str,
-    request_id: i64,
-) -> sqlx::Result<bool> {
-    let done = sqlx::query(
-        "UPDATE postgate_state SET revert_request_id = ?, updated_at = CURRENT_TIMESTAMP \
-         WHERE project_id = ? AND revert_merge_sha = ?",
-    )
-    .bind(request_id)
-    .bind(project_id)
-    .bind(merge_sha)
-    .execute(pool)
-    .await?;
-    Ok(done.rows_affected() > 0)
+/// Whether the recorded green covers every gate target the owner placed locally, so that a `push`
+/// automation may answer it (spec 2026-11-15, decision 6).
+///
+/// True only when `gate_targets` is declared and every local target is in the state's
+/// `green_targets`. Without `gate_targets` the owner never chose what "green" means, so no rule may
+/// push on it; a legacy `NULL` `green_targets` proves no target either (the next gate runs in full,
+/// see `needs_full_run`, and records them).
+pub(crate) fn covers_local_targets(state: &State, rules: &crate::config::AutopilotRules) -> bool {
+    rules.gate_targets.is_some()
+        && state.green_targets.as_ref().is_some_and(|covered| {
+            rules
+                .local_targets()
+                .iter()
+                .all(|target| covered.contains(target))
+        })
 }
 
-/// Stores the commit the queue published for the revert of `merge_sha`. Same compare-and-set as
-/// `set_revert_request`.
-pub async fn record_revert(
-    pool: &SqlitePool,
-    project_id: &str,
-    merge_sha: &str,
-    revert_sha: &str,
-) -> sqlx::Result<bool> {
-    let done = sqlx::query(
-        "UPDATE postgate_state SET revert_sha = ?, updated_at = CURRENT_TIMESTAMP \
-         WHERE project_id = ? AND revert_merge_sha = ?",
-    )
-    .bind(revert_sha)
-    .bind(project_id)
-    .bind(merge_sha)
-    .execute(pool)
-    .await?;
-    Ok(done.rows_affected() > 0)
-}
-
-/// The revert of `merge_sha` did not happen, or happened and left no branch: the five revert
-/// columns are cleared so the state is free again, and `summary` goes to the feed, in one
-/// transaction. Refused (`false`, nothing written) when no revert of that culprit is started.
-pub async fn fail_revert(
-    pool: &SqlitePool,
-    project_id: &str,
-    merge_sha: &str,
-    summary: &str,
-) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
-    let done = sqlx::query(
-        "UPDATE postgate_state SET \
-             revert_merge_sha = NULL, revert_request_id = NULL, revert_sha = NULL, \
-             fix_branch = NULL, fix_run_id = NULL, updated_at = CURRENT_TIMESTAMP \
-         WHERE project_id = ? AND revert_merge_sha = ?",
-    )
-    .bind(project_id)
-    .bind(merge_sha)
-    .execute(&mut *tx)
-    .await?;
-    if done.rows_affected() == 0 {
-        return Ok(false);
+/// Some local target is missing from what the last green covered (or no green recorded its
+/// targets): the next gate must run every target once. `false` without `gate_targets`, where
+/// nothing changes.
+///
+/// A running gate's own `running_targets` (what its command was composed from at submit time)
+/// win over `rules`, which this reads later and may have moved: the base must match the command.
+pub fn needs_full_run(state: Option<&State>, rules: &crate::config::AutopilotRules) -> bool {
+    let local = match state.and_then(|state| state.running_targets.clone()) {
+        Some(composed) => composed,
+        None if rules.gate_targets.is_none() => return false,
+        None => rules.local_targets(),
+    };
+    match state.and_then(|state| state.green_targets.as_ref()) {
+        None => true,
+        Some(covered) => local.iter().any(|target| !covered.contains(target)),
     }
-    crate::feed::append_on(
-        &mut tx,
-        Some(project_id),
-        POSTGATE_RED_KIND,
-        summary,
-        None,
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(true)
-}
-
-/// Stores the `fix/` branch built on the revert of `merge_sha` and tells the owner (`summary`), in
-/// one transaction. Refused (`false`, nothing written) when no revert of that culprit is started.
-pub async fn set_fix_branch(
-    pool: &SqlitePool,
-    project_id: &str,
-    merge_sha: &str,
-    branch: &str,
-    summary: &str,
-) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
-    let done = sqlx::query(
-        "UPDATE postgate_state SET fix_branch = ?, updated_at = CURRENT_TIMESTAMP \
-         WHERE project_id = ? AND revert_merge_sha = ?",
-    )
-    .bind(branch)
-    .bind(project_id)
-    .bind(merge_sha)
-    .execute(&mut *tx)
-    .await?;
-    if done.rows_affected() == 0 {
-        return Ok(false);
-    }
-    crate::feed::append_on(
-        &mut tx,
-        Some(project_id),
-        POSTGATE_RED_KIND,
-        summary,
-        None,
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -1345,6 +1287,106 @@ mod tests {
         assert!(s.red_groups.is_empty());
         assert_eq!(s.red_since_sha, None);
         assert_eq!(s.last_attempted_sha.as_deref(), Some("b2"));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// The running gate's command was composed from `targets`, and the gate for `sha` then passes.
+    async fn green_composed_from(pool: &SqlitePool, sha: &str, targets: Option<&[String]>) -> bool {
+        set_running_targets(pool, "p", targets).await.unwrap();
+        finish_green(pool, "p", sha).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn finish_green_records_the_targets_it_covered() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = names(&["core", "hooks"]);
+        assert!(green_composed_from(&pool, "a1", Some(&covered)).await);
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, Some(covered));
+        assert_eq!(s.running_targets, None, "a finished gate keeps no targets");
+    }
+
+    #[tokio::test]
+    async fn a_new_gate_start_forgets_the_previous_running_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        set_running_targets(&pool, "p", Some(&names(&["core"])))
+            .await
+            .unwrap();
+        abandon_unmeasured(&pool, "p", "a1").await.unwrap();
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.running_targets, None);
+        assert!(finish_green(&pool, "p", "b2").await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, None);
+    }
+
+    #[tokio::test]
+    async fn running_targets_are_only_stored_while_a_gate_runs() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        set_running_targets(&pool, "p", Some(&names(&["core"])))
+            .await
+            .unwrap();
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.running_targets, None);
+    }
+
+    #[tokio::test]
+    async fn finish_green_without_targets_stores_null() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, None);
+    }
+
+    #[tokio::test]
+    async fn a_red_keeps_the_last_green_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = names(&["core"]);
+        assert!(green_composed_from(&pool, "a1", Some(&covered)).await);
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        assert!(
+            finish_red(&pool, "p", "b2", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, Some(covered));
+    }
+
+    #[tokio::test]
+    async fn a_late_finish_does_not_overwrite_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = names(&["core"]);
+        assert!(green_composed_from(&pool, "a1", Some(&covered)).await);
+        // "zz" is not the running sha (nothing is running), so the finish is refused.
+        let other = names(&["shell"]);
+        assert!(!green_composed_from(&pool, "zz", Some(&other)).await);
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, Some(covered));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_green_targets_reads_as_none() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        sqlx::query("UPDATE postgate_state SET green_targets = 'x' WHERE project_id = 'p'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.green_targets, None);
     }
 
     #[tokio::test]
@@ -1751,6 +1793,8 @@ mod tests {
             fix_branch: None,
             fix_run_id: None,
             covered_sha: None,
+            green_targets: None,
+            running_targets: None,
             held_note: None,
             unmeasured_runs: 0,
         };
@@ -2250,5 +2294,118 @@ mod tests {
         start(&pool, "p", "master", "v1", None).await.unwrap();
         assert!(finish_green(&pool, "p", "v1").await.unwrap());
         assert_eq!(transitions(&pool).await.last().unwrap().4, 1);
+    }
+
+    fn targets_rules(placed: &str) -> crate::config::AutopilotRules {
+        let yaml = if placed.is_empty() {
+            "gate_after_land: true\n".to_owned()
+        } else {
+            format!("gate_after_land: true\ngate_targets: {{{placed}}}\n")
+        };
+        crate::config::parse_schedule_rules(&yaml).unwrap()
+    }
+
+    /// The state after a green that covered `targets` (`None` = a green that recorded none).
+    async fn state_green_covering(targets: Option<&[&str]>) -> State {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let covered = targets.map(names);
+        assert!(green_composed_from(&pool, "a1", covered.as_deref()).await);
+        load(&pool, "p").await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn covers_is_false_without_gate_targets() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(!covers_local_targets(&state, &targets_rules("")));
+    }
+
+    #[tokio::test]
+    async fn covers_is_true_when_every_local_is_covered() {
+        let state = state_green_covering(Some(&["core", "hooks"])).await;
+        assert!(covers_local_targets(
+            &state,
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn covers_is_false_when_a_local_is_missing() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(!covers_local_targets(
+            &state,
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn covers_ignores_ci_targets() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(covers_local_targets(
+            &state,
+            &targets_rules("core: local, shell: ci")
+        ));
+    }
+
+    #[tokio::test]
+    async fn covers_is_false_for_null_with_gate_targets() {
+        let state = state_green_covering(None).await;
+        assert!(!covers_local_targets(&state, &targets_rules("core: local")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_false_without_gate_targets() {
+        let state = state_green_covering(None).await;
+        assert!(!needs_full_run(Some(&state), &targets_rules("")));
+        assert!(!needs_full_run(None, &targets_rules("")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_true_when_a_local_target_is_missing() {
+        let state = state_green_covering(Some(&["core"])).await;
+        assert!(needs_full_run(
+            Some(&state),
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_false_when_all_covered() {
+        let state = state_green_covering(Some(&["core", "hooks"])).await;
+        assert!(!needs_full_run(
+            Some(&state),
+            &targets_rules("core: local, hooks: local")
+        ));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_true_for_legacy_null_with_gate_targets() {
+        let state = state_green_covering(None).await;
+        assert!(needs_full_run(Some(&state), &targets_rules("core: local")));
+        assert!(needs_full_run(None, &targets_rules("core: local")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_follows_the_running_gates_composed_targets() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(green_composed_from(&pool, "a1", Some(&names(&["core"]))).await);
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        // The command was composed with `hooks` in it, which the last green never covered.
+        set_running_targets(&pool, "p", Some(&names(&["core", "hooks"])))
+            .await
+            .unwrap();
+        let state = load(&pool, "p").await.unwrap().unwrap();
+        // The rules read now have dropped `hooks`: they alone would say "covered".
+        assert!(needs_full_run(Some(&state), &targets_rules("core: local")));
+    }
+
+    #[tokio::test]
+    async fn needs_full_run_is_false_when_a_covered_target_turned_ci() {
+        let state = state_green_covering(Some(&["core", "hooks"])).await;
+        assert!(!needs_full_run(
+            Some(&state),
+            &targets_rules("core: local, hooks: ci")
+        ));
     }
 }

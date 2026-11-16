@@ -137,6 +137,8 @@ tests:
     - scripts/smoke-bundle.sh
     # Dependabot's own config, read by GitHub, not by any test or gate.
     - .github/dependabot.yml
+    # Screenshots the README shows; read by nothing.
+    - .github/readme/
     - docs/
     - design/
     - .githooks/

@@ -419,14 +419,21 @@ async fn newest_proof(
 /// base with `master`) is `HEAD` itself and selects nothing. `None` only when git cannot answer.
 /// Read from the stored state at run time because a unit is started again by crash recovery and by
 /// bisect probes, not only by the tick that first queued it.
+///
+/// With `rules` (the post-land gate only, never a probe) a local gate target the last green did
+/// not cover skips the proof and takes the root commit, so every target runs once.
 pub(super) async fn postgate_gate_base(
     pool: &SqlitePool,
     project_id: &str,
     worktree_root: &Path,
     deadline: Instant,
+    rules: Option<&crate::config::AutopilotRules>,
 ) -> Option<String> {
     let state = verify_postgate::load(pool, project_id).await.ok().flatten();
-    if let Some(state) = state
+    let full_run =
+        rules.is_some_and(|rules| verify_postgate::needs_full_run(state.as_ref(), rules));
+    if !full_run
+        && let Some(state) = state
         && let Ok(Some(sha)) = newest_proof(&state, worktree_root, deadline).await
     {
         return Some(sha);

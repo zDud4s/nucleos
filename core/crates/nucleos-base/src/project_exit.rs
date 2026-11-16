@@ -45,6 +45,9 @@ const CHAT_OBSERVATIONS: &str = "SELECT id FROM knowledge
 /// or not the history does.
 const PROJECT_SCOPED: &[&str] = &[
     "attention_heartbeats",
+    // Firings of the project's automation rules (migration 0313): part of its history, so they go
+    // with it.
+    "automation_firings",
     "browser_profiles",
     "browser_sessions",
     "browser_sites",
@@ -53,6 +56,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "capture_requests",
     // `capture_digests` has no `project_id`: it is not here on purpose; `remove` deletes it
     // through `json_each(job_ids)`.
+    // The project's CI watch rows (migration 0315): history of its runs, gone with the project.
+    "ci_watch",
     // Dev time is project history, and it goes with the project. Its file offsets in
     // `devtime_files` are deliberately KEPT (owner's decision, 2026-10-05): re-adding the folder
     // then counts time from that moment on, instead of resurrecting the old time from transcripts

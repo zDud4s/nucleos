@@ -42,6 +42,11 @@ pub const AUTOPILOT_FILE: &str = "autopilot.yaml";
 /// Parsed by [`crate::workflows::parse_pins`].
 pub const PINS_FILE: &str = "workflows.yaml";
 
+/// The project's automations ("when EVENT and CONDITIONS, do ACTION"). Read from the settings store only
+/// ([`crate::project::rules::automations`]); the name exists so the classifier guards a stray copy in the
+/// state directory, which is why it is in [`ALL_FILES`] and not in [`FILES`].
+pub const AUTOMATIONS_FILE: &str = "automations.yaml";
+
 /// That a person onboarded this project to NucleOS, when, and what they confirmed. Written only by
 /// [`crate::onboarding`] — the onboarding route and its one-time migration — and never copied from
 /// anywhere: it has no older home, because it records a decision this app did not ask for before.
@@ -67,7 +72,13 @@ pub const FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE];
 ///
 /// The materialization record is here too: an agent that could rewrite it could make the next
 /// materialization overwrite a file a person edited, by recording that edit as the app's own.
-pub const ALL_FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE, ONBOARDED_FILE, MATERIALIZED_FILE];
+pub const ALL_FILES: &[&str] = &[
+    AUTOPILOT_FILE,
+    PINS_FILE,
+    AUTOMATIONS_FILE,
+    ONBOARDED_FILE,
+    MATERIALIZED_FILE,
+];
 
 /// Whether `project_id` can name a directory without meaning something else.
 ///

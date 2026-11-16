@@ -5597,7 +5597,7 @@ mod tests {
     /// included. Safe today by being in no table; this is what says no to filing the reads beside the others.
     #[test]
     fn settings_routes_are_in_no_scope_table() {
-        let routes: [(Method, &str, &str); 6] = [
+        let routes: [(Method, &str, &str); 8] = [
             (Method::GET, "/settings", "/settings"),
             (
                 Method::GET,
@@ -5623,6 +5623,16 @@ mod tests {
                 Method::GET,
                 "/settings/{scope}/{name}",
                 "/settings/project:p1/autopilot",
+            ),
+            (
+                Method::PUT,
+                "/settings/{scope}/{name}",
+                "/settings/project:p1/automations",
+            ),
+            (
+                Method::GET,
+                "/settings/{scope}/{name}",
+                "/settings/project:p1/automations",
             ),
         ];
         for (method, pattern, path) in &routes {

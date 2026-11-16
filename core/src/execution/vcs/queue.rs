@@ -115,8 +115,8 @@ where
     }
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
-        "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at, from_resolution)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at, from_resolution, automation_rule)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(op.kind())
     .bind(op.to_args())
@@ -128,6 +128,7 @@ where
     .bind(status)
     .bind(created_at)
     .bind(i64::from(from_resolution))
+    .bind(origin.automation_rule())
     .execute(executor)
     .await?;
     // Fired even when `executor` is an open transaction that has not committed yet: the worker then

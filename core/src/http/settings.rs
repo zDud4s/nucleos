@@ -568,8 +568,8 @@ mod tests {
 
             let (status, rows) = call(&state, "GET", "/settings?scope=project:7", None).await;
             assert_eq!(status, StatusCode::OK, "{rows}");
-            assert_eq!(rows.as_array().map(Vec::len), Some(2), "{rows}");
-            for name in ["autopilot", "workflow_pins"] {
+            assert_eq!(rows.as_array().map(Vec::len), Some(3), "{rows}");
+            for name in ["autopilot", "workflow_pins", "automations"] {
                 let document = row(&rows, name);
                 assert_eq!(document["scope"], "project:7");
                 assert_eq!(document["kind"], "project");
@@ -861,6 +861,64 @@ mod tests {
                 assert_eq!(answer["refusal"], "not_ours", "{scope}/{name}");
             }
             assert!(verify_history(&state).await.is_empty(), "nothing written");
+        }
+
+        fn push_rule(name: &str) -> Value {
+            json!({
+                "name": name,
+                "enabled": false,
+                "on": { "event": "published_green" },
+                "do": { "action": "push", "remote": "origin" },
+            })
+        }
+
+        #[tokio::test]
+        async fn put_of_a_valid_automations_document_is_200_and_the_snapshot_serves_it() {
+            let (_home, state) = fixture().await;
+
+            let body = json!({ "rules": [push_rule("push-when-green")] });
+            let (status, answer) = put_doc(&state, "project:p1", "automations", body, 0).await;
+
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            let stored = crate::project::rules::automations("p1").expect("readable");
+            assert!(stored.rule("push-when-green").is_some(), "{stored:?}");
+        }
+
+        #[tokio::test]
+        async fn put_of_automations_with_two_push_rules_for_one_branch_is_422_invalid() {
+            let (_home, state) = fixture().await;
+
+            let body = json!({ "rules": [push_rule("first"), push_rule("second")] });
+            let (status, answer) = put_doc(&state, "project:p1", "automations", body, 0).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+            assert_eq!(answer["refusal"], "invalid");
+            assert!(
+                answer["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("first") && detail.contains("second")),
+                "the detail names the rules: {answer}"
+            );
+            let stored = crate::project::rules::automations("p1").expect("readable");
+            // Nothing stored: the reader still serves the two shipped presets, never the refused rules.
+            assert!(
+                stored
+                    .rules
+                    .iter()
+                    .all(|rule| rule.name != "first" && rule.name != "second"),
+                "nothing stored: {stored:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn put_of_automations_to_the_machine_scope_is_403_not_ours() {
+            let (_home, state) = fixture().await;
+
+            let body = json!({ "rules": [push_rule("push-when-green")] });
+            let (status, answer) = put_doc(&state, "machine", "automations", body, 0).await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+            assert_eq!(answer["refusal"], "not_ours");
         }
 
         #[tokio::test]

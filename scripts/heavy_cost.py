@@ -684,20 +684,24 @@ def disk_probe(cache_dir=None, paths=(), now=None) -> dict | None:
         return None
 
 
-DEFAULT_DYNAMIC_MAX_JOBS = 8
+DEFAULT_DYNAMIC_MAX_JOBS = 12
 DEFAULT_MIN_AVAIL_MB = 10240.0
-# RAM budgeted per job when sizing the ceiling (cargo test peaks near 7 GB), and its floor.
+# RAM budgeted per job when a batch grant discounts the probe (cargo test peaks near 7 GB).
 JOB_BUDGET_MB = 8192
+# RAM per job when sizing the ceiling: smaller than JOB_BUDGET_MB because the live free-RAM
+# floor (min_avail_mb) is what really stops admission; the ceiling only bounds a runaway.
+# Recalibrated 2026-11-15 for a 64 GB / 32-thread / NVMe machine (was 8 GB per job, cap 8).
+CEILING_JOB_BUDGET_MB = 6144
 MIN_DYNAMIC_MAX_JOBS = 4
 # From this many held jobs on, the settle window is never waived (a burst has not ramped up).
-SETTLE_ALWAYS_HELD = 4
+SETTLE_ALWAYS_HELD = 8
 
 
 def dynamic_max_jobs(p=None) -> int:
     """Ceiling on held jobs in dynamic admission. NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS (an int >= 1)
-    is used verbatim. Otherwise the default 8, limited by RAM when the probe `p` carries a usable
-    total: one job budgets about 8 GB (cargo test peaks near 7 GB), floor 4, so machines up to
-    32 GB stay at 4. Garbage or a value below 1 takes the default path: a zero ceiling would
+    is used verbatim. Otherwise the default 12, limited by RAM when the probe `p` carries a usable
+    total: one job budgets CEILING_JOB_BUDGET_MB (6 GB), floor 4, so a 64 GB machine gets 11
+    and one up to 24 GB stays at 4. Garbage or a value below 1 takes the default path: a zero ceiling would
     deadlock the queue."""
     try:
         v = int(os.environ.get("NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS", ""))
@@ -708,7 +712,7 @@ def dynamic_max_jobs(p=None) -> int:
     total = p.get("total_mb") if isinstance(p, dict) else None
     if _num(total) and total > 0:
         return min(DEFAULT_DYNAMIC_MAX_JOBS,
-                   max(MIN_DYNAMIC_MAX_JOBS, round(total / JOB_BUDGET_MB)))
+                   max(MIN_DYNAMIC_MAX_JOBS, round(total / CEILING_JOB_BUDGET_MB)))
     return DEFAULT_DYNAMIC_MAX_JOBS
 
 

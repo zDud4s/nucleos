@@ -3,7 +3,7 @@
 
 2026-10-04: one `.cargo-target-<branch slug>` per branch grew without bound and filled the
 disk. The broker now leases `<td_root>/.cargo-target-pool-<k>`, k = 1..N with
-N = NUCLEOS_HEAVY_TARGET_SLOTS (default 3), to every eligible cargo child:
+N = NUCLEOS_HEAVY_TARGET_SLOTS (default 4), to every eligible cargo child:
 
 - exclusive: no two running broker children share a pool dir; with one slot, a second
   eligible build waits for the first to finish;
