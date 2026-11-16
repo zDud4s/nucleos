@@ -2,6 +2,8 @@
 
 use super::*;
 
+use super::transient::account_park::{self, relaunch_after_limit};
+
 /// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
 /// aborted, including aborted before its first poll, when the task drops its captured state without
 /// running a line of the body.
@@ -589,6 +591,17 @@ pub(super) fn spawn_run(
             tracing::warn!(run_id = id, %error, "could not record that a resume has launched");
         }
         let mut attempt: u32 = 1;
+        // The launch env before the account added its own: a re-pick starts from this, so a
+        // switch never carries the exhausted account's credentials along.
+        let mut account = account;
+        let base_env = {
+            let held = account.as_ref().map_or(0, |held| held.env_len);
+            env[..env.len() - held].to_vec()
+        };
+        let mut env = env;
+        // Cold after a switch: a session belongs to the account that opened it.
+        let mut resume_for_attempt = resume_session_id.clone();
+        let mut limit_counts = account_park::LimitCounts::default();
         loop {
             // A fresh session channel per attempt: persist session_id the instant the runner parses it
             // (spec §3.3), in a separate task so it lands even if the run is terminated mid-flight.
@@ -644,7 +657,7 @@ pub(super) fn spawn_run(
                 env: env.clone(),
                 cwd: spawn_cwd.clone(),
                 permission,
-                resume_session_id: resume_session_id.clone(),
+                resume_session_id: resume_for_attempt.clone(),
                 mcp_config: job_mcp.as_ref().map(|mcp| mcp.path.clone()),
                 mcp_job: job_mcp
                     .as_ref()
@@ -776,19 +789,34 @@ pub(super) fn spawn_run(
                         };
                     let context_fill = observed_context_fill(&context_fill, &o.stdout);
                     // A limit error marks the account's window exhausted, so the next pick skips it.
-                    if o.exit_code != 0
-                        && let Some(held) = account.as_ref()
-                    {
-                        crate::accounts::launch_chat::note_limit_and_announce(
+                    // The run is not finished by it: it relaunches cold on another account, or
+                    // parks until the earliest reset when none has room (never a blind retry on
+                    // the exhausted one).
+                    // When switches or parks run out the limit error stands as the run's failure
+                    // (`account` is gone, so nothing below touches the pool).
+                    if o.exit_code != 0 {
+                        let output = (o.stdout.as_str(), o.stderr.as_str());
+                        match relaunch_after_limit(
                             &pool,
+                            id,
                             feed_project_id.as_deref(),
-                            &held.engine,
-                            held.reservation.account(),
-                            &o.stdout,
-                            &o.stderr,
-                            chrono::Utc::now(),
+                            &transcript,
+                            &mut account,
+                            output,
+                            &base_env,
+                            &mut limit_counts,
                         )
-                        .await;
+                        .await
+                        {
+                            Err(()) => return,
+                            Ok(Some(next)) => {
+                                account = Some(next.account);
+                                env = next.env;
+                                resume_for_attempt = None;
+                                continue;
+                            }
+                            Ok(None) => {}
+                        }
                     }
                     // Read from the same stream everything else came from, and kept here because
                     // here is where an agent run ends. `assistant.rs` does the equivalent in its
@@ -1279,15 +1307,17 @@ pub(super) fn spawn_run(
 }
 
 /// The account slot a run holds until its task ends, and the engine it was picked for.
-struct HeldAccount {
-    engine: String,
-    reservation: crate::accounts::pool::Reservation,
+pub(in crate::execution::runs) struct HeldAccount {
+    /// How many entries of the launch env the account added (so a re-pick can strip them).
+    pub(in crate::execution::runs) env_len: usize,
+    pub(in crate::execution::runs) engine: String,
+    pub(in crate::execution::runs) reservation: crate::accounts::pool::Reservation,
 }
 
 /// Picks the run's account and records it. `Err(())` means the run was failed here because its
 /// pinned account cannot take work: a pin is never replaced silently (R1/R2). Any other outcome
 /// without an account launches as today.
-async fn account_for_launch(
+pub(in crate::execution::runs) async fn account_for_launch(
     pool: &sqlx::SqlitePool,
     id: i64,
     resume_session_id: Option<&str>,
@@ -1368,9 +1398,12 @@ async fn account_for_launch(
         tracing::warn!(run_id = id, %error, "could not record the account a run launched under");
     }
     let mut env = env;
-    env.extend(std::mem::take(&mut pick.env));
+    let added = std::mem::take(&mut pick.env);
+    let env_len = added.len();
+    env.extend(added);
     Ok((
         Some(HeldAccount {
+            env_len,
             engine,
             reservation,
         }),
