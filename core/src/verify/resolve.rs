@@ -258,10 +258,48 @@ pub(super) async fn clean_tree(
     tree_of(worktree, "HEAD", deadline).await.map(Some)
 }
 
+/// The recorded base, moved forward to the merge base with `target` when the branch has merged it.
+///
+/// The recorded base stays exact while the integration branch moves on without the branch. Once the
+/// branch merges the integration branch, the newer merge base keeps master's own changes out of the
+/// branch's diff. Any failure, a merge base that does not descend from `recorded`, or a HEAD that
+/// `target` already contains, keeps `recorded`.
+pub(super) async fn advance_base(
+    worktree_root: &Path,
+    recorded: &str,
+    target: &str,
+    deadline: Instant,
+) -> String {
+    let Ok(found) = git(worktree_root, &["merge-base", "HEAD", target], deadline).await else {
+        return recorded.to_owned();
+    };
+    let mb = found.stdout.trim();
+    if !found.succeeded() || mb.is_empty() || mb == recorded {
+        return recorded.to_owned();
+    }
+    // A merge base equal to HEAD means HEAD is already contained in `target` (the worktree stands
+    // on the integration branch itself, or has no work of its own): advancing would empty the diff.
+    match git(worktree_root, &["rev-parse", "HEAD"], deadline).await {
+        Ok(head) if head.succeeded() && head.stdout.trim() != mb => {}
+        _ => return recorded.to_owned(),
+    }
+    match git(
+        worktree_root,
+        &["merge-base", "--is-ancestor", recorded, mb],
+        deadline,
+    )
+    .await
+    {
+        Ok(result) if result.succeeded() => mb.to_owned(),
+        _ => recorded.to_owned(),
+    }
+}
+
 /// The commit `own` and `scope` diff against.
 ///
 /// In order: what the caller named; the base the daemon recorded when it created this worktree
-/// (exact, survives the integration branch moving on); else the merge base with the project's
+/// (exact, survives the integration branch moving on, but moved up to the merge base with the
+/// integration branch once the branch has merged it); else the merge base with the project's
 /// integration branch, which is what a hand-made worktree branched from.
 pub async fn resolve_base(
     pool: &SqlitePool,
@@ -299,7 +337,15 @@ pub async fn resolve_base(
     if let Some(root_key) = root_key.as_deref() {
         for (path, base_sha) in recorded {
             if git_exec::canonical(Path::new(&path)).await.ok().as_deref() == Some(root_key) {
-                return Ok(base_sha);
+                return Ok(
+                    match land::integration_branch(pool, project_id, project_root, deadline).await {
+                        Ok(branch) => {
+                            let target = format!("refs/heads/{}", branch.as_str());
+                            advance_base(worktree_root, &base_sha, &target, deadline).await
+                        }
+                        Err(_) => base_sha,
+                    },
+                );
             }
         }
     }
@@ -419,14 +465,21 @@ async fn newest_proof(
 /// base with `master`) is `HEAD` itself and selects nothing. `None` only when git cannot answer.
 /// Read from the stored state at run time because a unit is started again by crash recovery and by
 /// bisect probes, not only by the tick that first queued it.
+///
+/// With `rules` (the post-land gate only, never a probe) a local gate target the last green did
+/// not cover skips the proof and takes the root commit, so every target runs once.
 pub(super) async fn postgate_gate_base(
     pool: &SqlitePool,
     project_id: &str,
     worktree_root: &Path,
     deadline: Instant,
+    rules: Option<&crate::config::AutopilotRules>,
 ) -> Option<String> {
     let state = verify_postgate::load(pool, project_id).await.ok().flatten();
-    if let Some(state) = state
+    let full_run =
+        rules.is_some_and(|rules| verify_postgate::needs_full_run(state.as_ref(), rules));
+    if !full_run
+        && let Some(state) = state
         && let Ok(Some(sha)) = newest_proof(&state, worktree_root, deadline).await
     {
         return Some(sha);
@@ -508,4 +561,72 @@ pub async fn changed_paths(
         .map(str::to_owned)
         .collect();
     Ok(paths.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "core.fsmonitor=",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// Master at C0, branch `work` at C0 (the recorded base), master then
+    /// advances to C1 (adds `img.png`), and `work` commits `core.rs`.
+    /// Returns (dir, C0, C1).
+    fn fixture() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q", "-b", "master"]);
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-q", "-m", "c0"]);
+        let c0 = run_git(root, &["rev-parse", "HEAD"]);
+        run_git(root, &["branch", "work"]);
+        std::fs::write(root.join("img.png"), "png").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-q", "-m", "c1"]);
+        let c1 = run_git(root, &["rev-parse", "HEAD"]);
+        run_git(root, &["checkout", "-q", "work"]);
+        std::fs::write(root.join("core.rs"), "fn main() {}").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-q", "-m", "work change"]);
+        (dir, c0, c1)
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_merged_the_integration_branch_diffs_from_the_newer_merge_base() {
+        let (dir, c0, c1) = fixture();
+        run_git(dir.path(), &["merge", "-q", "--no-edit", "master"]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let base = advance_base(dir.path(), &c0, "refs/heads/master", deadline).await;
+        assert_eq!(base, c1);
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_never_merged_keeps_its_recorded_base() {
+        let (dir, c0, _c1) = fixture();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let base = advance_base(dir.path(), &c0, "refs/heads/master", deadline).await;
+        assert_eq!(base, c0);
+    }
 }

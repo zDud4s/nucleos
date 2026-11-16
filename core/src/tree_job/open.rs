@@ -535,7 +535,9 @@ pub async fn open_branch(
         .get(branch_name)
         .cloned()
         .ok_or_else(|| OpenError::BranchNotFound(branch_name.to_owned()))?;
-    if branch.state == "open" {
+    // A `building` branch with its node bound was opened and bound already: a start that failed
+    // after `bind_branch` replays here, so the launch can be retried.
+    if branch.state == "open" || (branch.state == "building" && branch.node_id.is_some()) {
         return Ok(opened_from(&branch, true, Vec::new()));
     }
     if branch.state != "queued" {

@@ -21,6 +21,7 @@ mod ops;
 mod publish;
 mod repo;
 mod resolution;
+mod squash;
 mod step_renumber;
 mod steps;
 mod transport;
@@ -33,6 +34,7 @@ use self::ops::*;
 pub use self::publish::*;
 pub use self::repo::*;
 pub use self::resolution::*;
+use self::squash::*;
 pub use self::steps::*;
 pub use self::transport::*;
 pub use self::worktrees::*;
@@ -6031,6 +6033,45 @@ integration_steps:
     }
 
     #[tokio::test]
+    async fn promote_when_master_already_equals_green_still_dispatches_promoted_once() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        crate::project::rules::testing::publish_automations("alpha", PUSH_RULE_ON);
+        // The state a crash after the publish leaves: the release is at the green sha, no event sent.
+        let tip = sha_of(&repo, "refs/heads/master");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &tip)
+            .await
+            .expect("the master tip is the green sha");
+
+        for attempt in 1..=2 {
+            let outcome = execute_promote(&repo, &pool, "integ", "master").await;
+            assert!(
+                matches!(outcome, Outcome::Succeeded { .. }),
+                "attempt {attempt}: {outcome:?}"
+            );
+            let firings: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM automation_firings WHERE event_key = ?")
+                    .bind(format!("green:{tip}"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                firings, 1,
+                "attempt {attempt}: one firing for the green sha"
+            );
+            let pushes: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM vcs_requests WHERE op IN ('push', 'push-sha')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pushes, 1, "attempt {attempt}: one push queued, never two");
+        }
+    }
+
+    #[tokio::test]
     async fn promote_refuses_when_master_diverged_and_leaves_master_untouched() {
         let _lock = crate::execution::worktree::test_env_lock();
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -6086,13 +6127,24 @@ integration_steps:
         assert_eq!(sha_of(&repo, "refs/heads/other"), other_before);
     }
 
-    #[tokio::test]
-    async fn promote_success_queues_a_push_of_master_only() {
-        let _lock = crate::execution::worktree::test_env_lock();
-        let roots = space_free_tempdir("nucleos-gitexec-wt-");
-        let _env = WorktreeRootEnv::set(roots.path());
-        let (_container, repo, pool) = promote_fixture().await;
-        commit_on(&repo, "integ", &[("green.txt", "green\n")], "green work");
+    /// Promotes a green `integ` to `master` with `automations` (if any) published first.
+    async fn promote_green_integ(
+        automations: Option<&str>,
+    ) -> (tempfile::TempDir, sqlx::SqlitePool, String) {
+        let (container, repo, pool) = promote_fixture().await;
+        if let Some(yaml) = automations {
+            crate::project::rules::testing::publish_automations("alpha", yaml);
+        }
+        commit_on(
+            &repo,
+            "integ",
+            &[(
+                "green.txt",
+                "green
+",
+            )],
+            "green work",
+        );
         let green = sha_of(&repo, "refs/heads/integ");
         crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
             .await
@@ -6100,23 +6152,365 @@ integration_steps:
 
         let outcome = execute_promote(&repo, &pool, "integ", "master").await;
         assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+        assert_eq!(
+            sha_of(&repo, "refs/heads/master"),
+            green,
+            "the promote itself works"
+        );
+        (container, pool, green)
+    }
 
-        let pushes: Vec<(String, String, String)> =
-            sqlx::query_as("SELECT op, args, origin FROM vcs_requests WHERE op = 'push'")
-                .fetch_all(&pool)
-                .await
-                .expect("read the queue");
-        assert_eq!(pushes.len(), 1, "exactly one push is queued: {pushes:?}");
-        let args: serde_json::Value = serde_json::from_str(&pushes[0].1).unwrap();
-        assert_eq!(args["branch"].as_str(), Some("master"));
-        assert_eq!(pushes[0].2, "daemon", "the daemon queued it");
-        let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vcs_requests WHERE op = 'push' AND args LIKE '%integ%'",
+    #[tokio::test]
+    async fn promote_success_with_no_automation_rule_queues_no_push() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, pool, _green) = promote_green_integ(None).await;
+
+        let pushes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vcs_requests WHERE op IN ('push', 'push-sha')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(others, 0, "the integration branch is never pushed");
+        assert_eq!(pushes, 0, "nothing leaves the machine without a rule");
+    }
+
+    #[tokio::test]
+    async fn promote_success_with_the_push_rule_on_queues_one_push_sha_of_the_release_branch() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, pool, green) = promote_green_integ(Some(PUSH_RULE_ON)).await;
+
+        let pushes: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT op, args, origin, automation_rule FROM vcs_requests WHERE op IN ('push', 'push-sha')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read the queue");
+        assert_eq!(pushes.len(), 1, "exactly one push is queued: {pushes:?}");
+        assert_eq!(pushes[0].0, "push-sha");
+        let args: serde_json::Value = serde_json::from_str(&pushes[0].1).unwrap();
+        assert_eq!(args["branch"].as_str(), Some("master"));
+        assert_eq!(args["sha"].as_str(), Some(green.as_str()));
+        assert_eq!(pushes[0].2, "daemon", "the daemon queued it");
+        assert_eq!(pushes[0].3.as_deref(), Some("push-when-green"));
+        assert!(
+            !pushes[0].1.contains("integ"),
+            "the integration branch is never pushed"
+        );
+    }
+
+    // ---- `Op::PushSha`: an automation's fast-forward push (plan 2026-11-15 A, T4) ---------------
+
+    /// `repo` (master + feat/x) with a bare `origin` beside it that already holds `master`.
+    fn repo_with_an_origin(prefix: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (container, repo) = repo_with_a_branch_to_merge(prefix);
+        let remote = container.path().join("origin.git");
+        let out = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .output()
+            .expect("git should start");
+        assert!(out.status.success(), "git init --bare failed");
+        let remote_text = remote.to_string_lossy().into_owned();
+        git_stdout(&repo, &["remote", "add", "origin", &remote_text]);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["push", "-q", "origin", "master"])
+            .output()
+            .expect("git should start");
+        assert!(out.status.success(), "the first push failed");
+        (container, repo, remote)
+    }
+
+    /// Puts `sha` on `origin`'s `master` directly, as somebody else's push would.
+    fn move_origin_master(repo: &Path, sha: &str) {
+        let refspec = format!("{sha}:refs/heads/master");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["push", "-q", "--force", "origin", &refspec])
+            .output()
+            .expect("git should start");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn push_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    #[tokio::test]
+    async fn push_sha_ff_pushes_the_given_sha_not_the_branch_tip() {
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-ff-");
+        commit_on(&repo, "master", &[("a.txt", "a\n")], "green");
+        let green = sha_of(&repo, "refs/heads/master");
+        commit_on(&repo, "master", &[("b.txt", "b\n")], "not yet green");
+
+        let (outcome, verdict) =
+            push_sha_ff(&repo, "origin", "master", green.clone(), push_deadline()).await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(verdict, PushVerdict::Pushed);
+        assert_eq!(sha_of(&remote, "refs/heads/master"), green);
+    }
+
+    #[tokio::test]
+    async fn push_sha_ff_reports_rejected_when_the_remote_is_ahead_and_never_forces() {
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-ahead-");
+        let old = sha_of(&repo, "refs/heads/master");
+        commit_on(&repo, "master", &[("a.txt", "a\n")], "newer");
+        let newer = sha_of(&repo, "refs/heads/master");
+        move_origin_master(&repo, &newer);
+
+        let (outcome, verdict) = push_sha_ff(&repo, "origin", "master", old, push_deadline()).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
+        assert_eq!(verdict, PushVerdict::Rejected);
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            newer,
+            "the remote was forced"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_sha_ff_reports_diverged_when_neither_side_contains_the_other() {
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-split-");
+        git_stdout(&repo, &["branch", "elsewhere"]);
+        commit_on(&repo, "elsewhere", &[("theirs.txt", "theirs\n")], "theirs");
+        let theirs = sha_of(&repo, "refs/heads/elsewhere");
+        move_origin_master(&repo, &theirs);
+        commit_on(&repo, "master", &[("ours.txt", "ours\n")], "ours");
+        let ours = sha_of(&repo, "refs/heads/master");
+
+        let (outcome, verdict) =
+            push_sha_ff(&repo, "origin", "master", ours, push_deadline()).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
+        assert_eq!(
+            verdict,
+            PushVerdict::Diverged {
+                remote_sha: theirs.clone()
+            }
+        );
+        assert_eq!(sha_of(&remote, "refs/heads/master"), theirs);
+    }
+
+    #[tokio::test]
+    async fn push_sha_ff_reports_other_when_the_remote_does_not_exist() {
+        let (_container, repo, _remote) = repo_with_an_origin("nucleos-gitexec-pushsha-none-");
+        let tip = sha_of(&repo, "refs/heads/master");
+
+        let (outcome, verdict) =
+            push_sha_ff(&repo, "nowhere", "master", tip, push_deadline()).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
+        assert_eq!(verdict, PushVerdict::Other);
+    }
+
+    const PUSH_RULE_ON: &str = "rules:\n  - name: push-when-green\n    enabled: true\n    on: {event: published_green}\n    do: {action: push, remote: origin}\n";
+    const PUSH_RULE_OFF: &str = "rules:\n  - name: push-when-green\n    enabled: false\n    on: {event: published_green}\n    do: {action: push, remote: origin}\n";
+
+    /// Records the `queued` firing an automation writes, queues the `push-sha` row with `rule` (or
+    /// the plain daemon origin, which stores none) and runs it through the executor.
+    async fn execute_push_sha(
+        repo: &Path,
+        pool: &sqlx::SqlitePool,
+        sha: &str,
+        rule: Option<&str>,
+    ) -> Outcome {
+        use crate::automations::firings;
+        use crate::execution::vcs::{Branch, CommitSha, Op, Origin, Remote, VcsExecutor};
+        let event_key = format!("local_green:{sha}");
+        firings::record(
+            pool,
+            &firings::NewFiring {
+                project_id: "alpha",
+                rule: "push-when-green",
+                event_key: &event_key,
+                branch: "master",
+                sha,
+                action: "push",
+                outcome: firings::QUEUED,
+                detail: "",
+            },
+        )
+        .await
+        .expect("record")
+        .expect("a new firing");
+        let op = Op::PushSha {
+            remote: Remote::new("origin").unwrap(),
+            branch: Branch::new("master").unwrap(),
+            sha: CommitSha::new(sha).unwrap(),
+        };
+        let root = repo.to_string_lossy().into_owned();
+        let resolved = crate::execution::vcs::ResolvedRepo::synthetic("alpha", &root, "alpha");
+        let origin = match rule {
+            Some(rule) => Origin::Automation {
+                rule: rule.to_owned(),
+            },
+            None => Origin::Daemon,
+        };
+        let id = crate::execution::vcs::submit_declared(pool, &resolved, &op, origin)
+            .await
+            .expect("queued");
+        crate::project::rules::testing::hold_shared();
+        GitExecutor {
+            pool: Some(pool.clone()),
+            ..GitExecutor::default()
+        }
+        .execute(&crate::execution::vcs::ClaimedRequest {
+            id,
+            op,
+            project_id: "alpha".to_owned(),
+            project_root: root,
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: None,
+            integration_branch: None,
+        })
+        .await
+    }
+
+    async fn firing_outcome(pool: &sqlx::SqlitePool, sha: &str) -> String {
+        sqlx::query_scalar("SELECT outcome FROM automation_firings WHERE sha = ?")
+            .bind(sha)
+            .fetch_one(pool)
+            .await
+            .expect("the firing")
+    }
+
+    async fn automation_feed_lines(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'automation_firing'")
+            .fetch_one(pool)
+            .await
+            .expect("count")
+    }
+
+    async fn remote_diverged_live(pool: &sqlx::SqlitePool) -> bool {
+        let key = crate::task_claims::machine::remote_diverged_key("master");
+        crate::task_claims::store::live_by_key(pool, "alpha", &key, chrono::Utc::now())
+            .await
+            .expect("read")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn push_sha_executes_and_settles_the_firing_as_pushed() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-run-");
+        crate::project::rules::testing::publish_automations("alpha", PUSH_RULE_ON);
+        let pool = crate::testdb::fresh_pool().await;
+        commit_on(&repo, "master", &[("a.txt", "a\n")], "green");
+        let green = sha_of(&repo, "refs/heads/master");
+
+        let outcome = execute_push_sha(&repo, &pool, &green, Some("push-when-green")).await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(sha_of(&remote, "refs/heads/master"), green);
+        assert_eq!(firing_outcome(&pool, &green).await, "pushed");
+        assert_eq!(automation_feed_lines(&pool).await, 1);
+    }
+
+    /// Review Focus 1: switching a rule off stops the pushes it already queued.
+    #[tokio::test]
+    async fn push_sha_is_refused_when_the_rule_was_switched_off_after_queueing() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-off-");
+        crate::project::rules::testing::publish_automations("alpha", PUSH_RULE_OFF);
+        let pool = crate::testdb::fresh_pool().await;
+        let before = sha_of(&remote, "refs/heads/master");
+        commit_on(&repo, "master", &[("a.txt", "a\n")], "green");
+        let green = sha_of(&repo, "refs/heads/master");
+
+        let outcome = execute_push_sha(&repo, &pool, &green, Some("push-when-green")).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            before,
+            "the remote moved"
+        );
+        assert_eq!(firing_outcome(&pool, &green).await, "skipped");
+    }
+
+    #[tokio::test]
+    async fn push_sha_without_an_automation_rule_on_its_row_is_refused() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-norule-");
+        crate::project::rules::testing::publish_automations("alpha", PUSH_RULE_ON);
+        let pool = crate::testdb::fresh_pool().await;
+        let before = sha_of(&remote, "refs/heads/master");
+        commit_on(&repo, "master", &[("a.txt", "a\n")], "green");
+        let green = sha_of(&repo, "refs/heads/master");
+
+        let outcome = execute_push_sha(&repo, &pool, &green, None).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            before,
+            "the remote moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_diverged_push_opens_remote_diverged_and_settles_the_firing_diverged() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-div-");
+        crate::project::rules::testing::publish_automations("alpha", PUSH_RULE_ON);
+        let pool = crate::testdb::fresh_pool().await;
+        git_stdout(&repo, &["branch", "elsewhere"]);
+        commit_on(&repo, "elsewhere", &[("theirs.txt", "theirs\n")], "theirs");
+        let theirs = sha_of(&repo, "refs/heads/elsewhere");
+        move_origin_master(&repo, &theirs);
+        commit_on(&repo, "master", &[("ours.txt", "ours\n")], "ours");
+        let ours = sha_of(&repo, "refs/heads/master");
+
+        let outcome = execute_push_sha(&repo, &pool, &ours, Some("push-when-green")).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
+        assert_eq!(sha_of(&remote, "refs/heads/master"), theirs);
+        assert_eq!(firing_outcome(&pool, &ours).await, "diverged");
+        assert!(
+            remote_diverged_live(&pool).await,
+            "remote-diverged:master opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_push_opens_no_incident_and_settles_the_firing_rejected() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo, remote) = repo_with_an_origin("nucleos-gitexec-pushsha-rej-");
+        crate::project::rules::testing::publish_automations("alpha", PUSH_RULE_ON);
+        let pool = crate::testdb::fresh_pool().await;
+        let old = sha_of(&repo, "refs/heads/master");
+        commit_on(&repo, "master", &[("a.txt", "a\n")], "newer");
+        let newer = sha_of(&repo, "refs/heads/master");
+        move_origin_master(&repo, &newer);
+
+        let outcome = execute_push_sha(&repo, &pool, &old, Some("push-when-green")).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "got {outcome:?}");
+        assert_eq!(sha_of(&remote, "refs/heads/master"), newer);
+        assert_eq!(firing_outcome(&pool, &old).await, "rejected");
+        assert!(
+            !remote_diverged_live(&pool).await,
+            "no incident for a remote that moved on"
+        );
     }
 
     // ---- The `renumber-sequence` builtin through the executor (plan 2026-11-09, P6) -----------

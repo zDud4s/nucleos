@@ -59,6 +59,46 @@ pub async fn close_parked_decision(
     decisions::mark_obsolete(pool, id, reason).await
 }
 
+/// Closes every open park decision (`d-…`) of node `node_id` in tree `tree_id`: the branch it tops
+/// was dropped, so nothing can act on an answer. A branch's `park` record names only the last
+/// decision it was parked on, so an earlier one still open is found by node, not by that record.
+/// Returns how many changed.
+pub async fn close_node_decisions(
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    reason: &str,
+) -> Result<u64, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM decisions WHERE tree_id = ? AND node_id = ? AND status = ? AND id LIKE ?",
+    )
+    .bind(tree_id)
+    .bind(node_id)
+    .bind(decisions::STATUS_OPEN)
+    .bind(format!("{PARK_PREFIX}%"))
+    .fetch_all(pool)
+    .await?;
+    let mut closed = 0;
+    for id in ids {
+        if decisions::mark_obsolete(pool, &id, reason).await? {
+            closed += 1;
+        }
+    }
+    Ok(closed)
+}
+
+/// [`close_node_decisions`], logged the same way as [`close_tree_logged`].
+pub async fn close_node_decisions_logged(
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    reason: &str,
+) {
+    if let Err(error) = close_node_decisions(pool, tree_id, node_id, reason).await {
+        tracing::warn!(job = tree_id, node = node_id, %error, "could not close the decisions of a dropped branch");
+    }
+}
+
 /// [`close_tree`] for a caller that has already written its own state: a failure is logged and the
 /// sweep catches the rest.
 pub async fn close_tree_logged(pool: &SqlitePool, tree_id: &str, reason: &str) {
@@ -361,6 +401,26 @@ mod tests {
         assert_eq!(close_tree(&pool, TREE, "abandoned").await.unwrap(), 2);
         assert_eq!(status(&pool, "d-a").await, "obsolete");
         assert_eq!(status(&pool, "d-other").await, "open");
+    }
+
+    #[tokio::test]
+    async fn close_node_decisions_closes_every_open_park_of_that_node_only() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_tree(&pool, "open", &[("api", "parked", "node-api")]).await;
+        // The park record names only the latest decision: the earlier one is still open.
+        set_park(&pool, "api", "parked", Some("d-new")).await;
+        insert(&pool, "d-old", Some(TREE), Some("node-api")).await;
+        insert(&pool, "d-new", Some(TREE), Some("node-api")).await;
+        insert(&pool, "pending-x", Some(TREE), Some("node-api")).await;
+        insert(&pool, "d-sibling", Some(TREE), Some("node-other")).await;
+        let closed = close_node_decisions(&pool, TREE, "node-api", "dropped")
+            .await
+            .unwrap();
+        assert_eq!(closed, 2);
+        assert_eq!(status(&pool, "d-old").await, "obsolete");
+        assert_eq!(status(&pool, "d-new").await, "obsolete");
+        assert_eq!(status(&pool, "pending-x").await, "open");
+        assert_eq!(status(&pool, "d-sibling").await, "open");
     }
 
     #[tokio::test]

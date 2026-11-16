@@ -910,8 +910,13 @@ pub(super) async fn continue_paused_run(
     }
     // The paused run names its continuation, so every reader that walks `successor_run_id` (the
     // lineage walk, the brief's chain end) follows an approval the same way it follows a handoff.
-    sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+    let reason = match how {
+        Continuation::Approve => crate::handoff::SuccessorReason::ApprovalApproved,
+        Continuation::Decline => crate::handoff::SuccessorReason::ApprovalDeclined,
+    };
+    sqlx::query("UPDATE runs SET successor_run_id = ?, successor_reason = ? WHERE id = ?")
         .bind(resume_id)
+        .bind(reason.as_wire())
         .bind(original_run_id)
         .execute(&mut *tx)
         .await?;
@@ -1316,7 +1321,8 @@ async fn return_unspawned_resume(
     }
     // `completed_at` keeps the pause time, as the supersede kept it.
     sqlx::query(
-        "UPDATE runs SET status = 'awaiting_approval', successor_run_id = NULL
+        "UPDATE runs SET status = 'awaiting_approval', successor_run_id = NULL,
+                successor_reason = NULL
          WHERE id = ? AND status = 'superseded' AND successor_run_id = ?",
     )
     .bind(original)
@@ -1478,6 +1484,16 @@ mod unspawned_resume_tests {
         .await
         .unwrap();
         assert_eq!((successor, decided_at), (None, None));
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT successor_reason FROM runs WHERE id = ?")
+                .bind(original)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            reason, None,
+            "a returned resume leaves no reason for a link that is gone"
+        );
         let marker: Option<i64> =
             sqlx::query_scalar("SELECT pending_resume_proposal_id FROM runs WHERE id = ?")
                 .bind(resume_id)

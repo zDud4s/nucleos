@@ -823,6 +823,61 @@ mod tests {
         assert_eq!(next, 4);
     }
 
+    /// Migration `0312` adds `runs.successor_reason` and backfills it from recorded facts only.
+    #[tokio::test]
+    async fn migration_0312_backfills_the_successor_reason_from_recorded_facts() {
+        let pool = crate::testdb::pool_migrated_through(311).await;
+        for (id, pending) in [
+            (1_i64, None),
+            (2, None),
+            (3, None),
+            (4, Some(9_i64)),
+            (5, None),
+            (6, None),
+            (7, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, mode, created_at, successor_run_id, \
+                 pending_resume_proposal_id) \
+                 VALUES (?, 'p', 'completed', 'real', '2026-10-01T00:00:00Z', NULL, ?)",
+            )
+            .bind(id)
+            .bind(pending)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // `successor_run_id` is a self-reference: link it once every run exists.
+        for (id, successor) in [(1_i64, 2_i64), (3, 4), (5, 6)] {
+            sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+                .bind(successor)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO run_events (run_id, seq, kind, payload, created_at) \
+             VALUES (1, 0, 'context_handoff', '{}', '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        crate::testdb::apply_migrations_after(&pool, 311).await;
+
+        let reasons: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, successor_reason FROM runs ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let reason = |id: i64| reasons.iter().find(|(i, _)| *i == id).unwrap().1.as_deref();
+        assert_eq!(reason(1), Some("context_full"));
+        assert_eq!(reason(3), Some("approval_approved"));
+        assert_eq!(reason(5), None);
+        assert_eq!(reason(7), None);
+    }
+
     /// Every stored value of `table`, quoted and joined, keyed by `id` — a byte-level snapshot of
     /// the named columns.
     async fn rows_of(pool: &SqlitePool, table: &str, columns: &[&str]) -> Vec<(i64, String)> {

@@ -213,6 +213,19 @@ pub async fn compute_merge(
     target: &str,
     deadline: std::time::Instant,
 ) -> Result<Computed, Outcome> {
+    compute_merge_of(project_root, source, source, target, deadline).await
+}
+
+/// `compute_merge` of `merge_ref` (a branch or a sha) under the name `source`, which is the one the
+/// merge message and the errors use. Squashed checkpoints (`squash.rs`) merge a rebuilt tip that
+/// has no branch of its own while still reading as the leaf's branch.
+pub async fn compute_merge_of(
+    project_root: &Path,
+    source: &str,
+    merge_ref: &str,
+    target: &str,
+    deadline: std::time::Instant,
+) -> Result<Computed, Outcome> {
     let integration = prepare_integration_worktree(project_root, deadline).await?;
 
     // Detach rather than checkout: `--detach` is permitted even when `target` is checked out in
@@ -234,7 +247,7 @@ pub async fn compute_merge(
             "--no-ff",
             "-m",
             &format!("merge {source} into {target}"),
-            source,
+            merge_ref,
         ],
         deadline,
     )

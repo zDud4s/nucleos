@@ -149,8 +149,19 @@ pub(super) async fn spawn_gh(
     token: &str,
     deadline: Duration,
 ) -> Result<Outcome, Failure> {
-    let argv = op.argv();
+    spawn_gh_argv(runtime, op.kind(), op.argv(), token, deadline).await
+}
 
+/// `spawn_gh` for an argv the caller already built: the daemon's internal operations (`ci_ops`) that are
+/// deliberately not an [`Op`] share every obligation above (token by environment, no shell, tree kill,
+/// capped and redacted output) by going through here. `kind` only labels the outcome and the logs.
+pub(super) async fn spawn_gh_argv(
+    runtime: &GithubRuntime,
+    kind: &'static str,
+    argv: Vec<String>,
+    token: &str,
+    deadline: Duration,
+) -> Result<Outcome, Failure> {
     let mut command = tokio::process::Command::new(&runtime.binary);
     command
         .args(&argv)
@@ -212,10 +223,7 @@ pub(super) async fn spawn_gh(
             let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
-            tracing::warn!(
-                kind = op.kind(),
-                "gh timed out; its process tree was killed"
-            );
+            tracing::warn!(kind, "gh timed out; its process tree was killed");
             return Err(Failure::TimedOut);
         }
     };
@@ -233,7 +241,7 @@ pub(super) async fn spawn_gh(
         // The exit code survives a stuck drain: `gh` ran and said how it ended, and only the tail is
         // short. The killer stays ARMED, so dropping it takes whatever still holds the pipe down.
         tracing::warn!(
-            kind = op.kind(),
+            kind,
             "gh's output did not finish draining; reporting the result with a truncated tail"
         );
     }
@@ -248,11 +256,11 @@ pub(super) async fn spawn_gh(
         // A line, and never a row: see `Outcome`. The kind and the code, and deliberately not the
         // output — the caller has that, and a log file is a worse place for a stranger's prose than
         // a turn's context is.
-        tracing::warn!(kind = op.kind(), ?exit_code, "a gh operation failed");
+        tracing::warn!(kind, ?exit_code, "a gh operation failed");
     }
 
     Ok(Outcome {
-        kind: op.kind(),
+        kind,
         exit_code,
         // Through `redact.rs`, which already knows the five `gh*_` prefixes and `github_pat_`. A
         // token can come back out of `gh`'s own diagnostics, and the shortest path from there to a

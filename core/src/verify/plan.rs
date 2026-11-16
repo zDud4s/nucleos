@@ -13,7 +13,7 @@ use crate::test_select::{Reason, select};
 use crate::tests_map::MapState;
 use crate::verify::runs::{
     STATUS_ERRORED, STATUS_FAILED, STATUS_PASSED, STATUS_QUEUED, STATUS_RUNNING,
-    STATUS_SKIPPED_CACHED, State,
+    STATUS_SKIPPED_CACHED, STATUS_SUPERSEDED, State,
 };
 use crate::verify::store::{PlannedUnit, RequestRow};
 
@@ -348,7 +348,7 @@ pub struct UnitReport {
     pub group: Option<String>,
     pub argv: Vec<String>,
     pub why: String,
-    /// queued|running|passed|failed|errored|skipped_cached|skipped|unknown
+    /// queued|running|passed|failed|errored|skipped_cached|skipped|superseded|unknown
     pub status: String,
     pub duration_ms: Option<i64>,
     pub exit_code: Option<i64>,
@@ -383,7 +383,7 @@ pub struct UnitReport {
 pub struct Ticket {
     pub ticket: i64,
     pub done: bool,
-    /// Some exactly when `done`: "passed" | "failed" | "errored" | "nothing_ran".
+    /// Some exactly when `done`: "passed" | "failed" | "errored" | "superseded" | "nothing_ran".
     pub verdict: Option<String>,
     pub project_id: String,
     pub worktree: String,
@@ -434,6 +434,9 @@ fn report(unit: &PlannedUnit, live: &HashMap<i64, State>) -> UnitReport {
         if state.status == STATUS_FAILED || state.status == STATUS_ERRORED {
             report.output_tail = state.output_tail.clone();
         }
+        if state.status == STATUS_SUPERSEDED {
+            report.skipped_reason = state.output_tail.clone();
+        }
         if state.status == STATUS_FAILED
             && let Some(failures) = &state.failed_tests
         {
@@ -472,6 +475,9 @@ pub fn assemble(request: &RequestRow, live: &HashMap<i64, State>) -> Ticket {
             "failed"
         } else if any(STATUS_ERRORED) || any("unknown") {
             "errored"
+        } else if any(STATUS_SUPERSEDED) {
+            // A unit that never ran leaves the ticket unmeasured: never a pass, never a red.
+            "superseded"
         } else if any(STATUS_PASSED) || any(STATUS_SKIPPED_CACHED) {
             "passed"
         } else {
@@ -505,7 +511,7 @@ pub fn assemble(request: &RequestRow, live: &HashMap<i64, State>) -> Ticket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verify::runs::{STATUS_ERRORED, STATUS_FAILED};
+    use crate::verify::runs::{STATUS_ERRORED, STATUS_FAILED, STATUS_SUPERSEDED};
 
     const MAP: &str = "version: 1
 tests:
@@ -934,6 +940,23 @@ tests:
         assert_eq!(ticket.base.as_deref(), Some("main"));
         assert_eq!(ticket.note.as_deref(), Some("a note"));
         assert_eq!(ticket.unclaimed, ["x"]);
+    }
+
+    #[test]
+    fn a_superseded_unit_makes_the_ticket_done_and_superseded_unless_a_unit_failed() {
+        let request = request(vec![unit("core", Some(1)), unit("py", Some(2))]);
+        let ticket = assemble(
+            &request,
+            &live(vec![state(1, STATUS_PASSED), state(2, STATUS_SUPERSEDED)]),
+        );
+        assert!(ticket.done);
+        assert_eq!(ticket.verdict.as_deref(), Some("superseded"));
+        assert_eq!(ticket.units[1].skipped_reason.as_deref(), Some("tail"));
+        let ticket = assemble(
+            &request,
+            &live(vec![state(1, STATUS_FAILED), state(2, STATUS_SUPERSEDED)]),
+        );
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"));
     }
 
     #[test]

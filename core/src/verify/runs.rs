@@ -36,6 +36,10 @@ pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_ERRORED: &str = "errored";
 /// A unit that did not run because a green with the same fingerprint is still fresh (spec section 5.3).
 pub const STATUS_SKIPPED_CACHED: &str = "skipped_cached";
+/// A queued unit that never ran because the same caller asked for the same group at a newer HEAD
+/// (`verify::supersede`). Terminal and not a failure: the ticket reads `superseded`, which is
+/// neither a pass nor a red.
+pub const STATUS_SUPERSEDED: &str = "superseded";
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
 
@@ -294,7 +298,13 @@ pub async fn enqueue(pool: &SqlitePool, request: &Request, now_ms: i64) -> sqlx:
     // IMMEDIATE takes the write lock up front: in a deferred transaction two equal submits could
     // both run the join SELECT, both miss, and both insert (or the second would get SQLITE_BUSY).
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    if let Some(fingerprint) = &request.fingerprint {
+    // A recheck (`flake-check`) or a bisection probe exists to run again: it never joins a unit
+    // that is already in flight, whatever the fingerprint says.
+    let rerun = matches!(
+        request.requested_by.as_str(),
+        REQUESTED_BY_FLAKE_CHECK | REQUESTED_BY_BISECT | REQUESTED_BY_PROBE
+    );
+    if let Some(fingerprint) = request.fingerprint.as_ref().filter(|_| !rerun) {
         let existing: Option<i64> = sqlx::query_scalar(
             "SELECT id FROM verify_runs WHERE status IN ('queued', 'running') \
              AND project_id IS ? AND worktree = ? AND group_name IS ? AND kind IS ? \
@@ -345,6 +355,19 @@ pub async fn enqueue(pool: &SqlitePool, request: &Request, now_ms: i64) -> sqlx:
     .last_insert_rowid();
     tx.commit().await?;
     Ok(Submitted { id, joined: false })
+}
+
+/// When a `verify` request's oldest unit was queued: the queue position a follow-up request can
+/// inherit. Cache-hit rows carry no enqueue time, so a fully cached request yields `None`.
+pub async fn ticket_queued_since(pool: &SqlitePool, request_id: i64) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT MIN(enqueued_ms) FROM verify_runs \
+         WHERE origin = ? AND origin_id = ? AND enqueued_ms IS NOT NULL",
+    )
+    .bind(ORIGIN_VERIFY)
+    .bind(request_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Records the workflow task on the unit rows one `verify` request created: the rows it queued and
@@ -875,6 +898,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recheck_never_joins_a_unit_in_flight() {
+        let pool = test_pool().await;
+        let first = enqueue(&pool, &request(Some("fp"), 1), 100).await.unwrap();
+        let mut recheck = request(Some("fp"), 1);
+        recheck.requested_by = REQUESTED_BY_FLAKE_CHECK.to_owned();
+        let second = enqueue(&pool, &recheck, 101).await.unwrap();
+        assert!(!second.joined);
+        assert_ne!(first.id, second.id);
+    }
+
+    #[tokio::test]
     async fn joining_raises_the_priority_of_a_queued_row() {
         let pool = test_pool().await;
         let first = enqueue(&pool, &request(Some("fp"), 1), 100).await.unwrap();
@@ -1119,6 +1153,20 @@ mod tests {
         r.argv = vec![argv.to_owned()];
         let unit = enqueue(pool, &r, 100).await.unwrap().id;
         (ticket, unit)
+    }
+
+    #[tokio::test]
+    async fn a_ticket_queued_since_is_its_oldest_unit_enqueue_time() {
+        let pool = test_pool().await;
+        for (origin_id, at) in [(7, 150), (7, 100), (8, 50)] {
+            let mut r = request(None, 1);
+            r.origin = ORIGIN_VERIFY.to_owned();
+            r.origin_id = Some(origin_id);
+            enqueue(&pool, &r, at).await.unwrap();
+        }
+        assert_eq!(ticket_queued_since(&pool, 7).await.unwrap(), Some(100));
+        assert_eq!(ticket_queued_since(&pool, 8).await.unwrap(), Some(50));
+        assert_eq!(ticket_queued_since(&pool, 99).await.unwrap(), None);
     }
 
     #[tokio::test]

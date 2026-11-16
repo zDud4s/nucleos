@@ -166,7 +166,10 @@ mod tests {
     /// A main checkout with the workflow and a linked worktree beside it, laid out the way git
     /// leaves them, without running git.
     fn checkout_and_worktree(hook: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let root = tempfile::TempDir::new().unwrap();
+        // Canonical temp root: `seed_if_empty` canonicalizes the main checkout, and CI's TEMP is an
+        // 8.3 short name whose spelling would key a different unit config dir than the wiring above.
+        let root = tempfile::TempDir::new_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+            .unwrap();
         let main = root.path().join("main");
         let tree = root.path().join("tree");
         let private = main.join(".git/worktrees/tree");

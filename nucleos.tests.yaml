@@ -44,6 +44,8 @@ tests:
         - scripts/test-gates-summary.py
         - scripts/own-cargo-target.sh
         - scripts/test-own-cargo-target.py
+        - scripts/gate_seed.py
+        - scripts/test-gate-seed.py
         - scripts/build-slot.sh
         - scripts/test-build-slot.py
         - scripts/run-daemon.ps1
@@ -133,6 +135,8 @@ tests:
     - scripts/smoke-bundle.sh
     # Dependabot's own config, read by GitHub, not by any test or gate.
     - .github/dependabot.yml
+    # Screenshots the README shows; read by nothing.
+    - .github/readme/
     - docs/
     - design/
     - .githooks/

@@ -819,16 +819,18 @@ impl NucleosTools {
         description = "Answer an open tree decision (`d-…`), the same way the shell does: the \
                        parked branch resumes, or its node is relaunched with your answer. The \
                        answer is recorded with origin `conductor`. Owner-level: refused from a \
-                       run of a tree job. Unknown id is 404, an already answered decision 409."
+                       run of a tree job. Unknown id is 404, an already answered decision 409. \
+                       Pass `drop: true` (the answer is then optional) to drop the branch parked \
+                       on the decision instead: nothing is relaunched."
     )]
     pub(super) async fn decision_answer(
         &self,
-        Parameters(DecisionAnswerParams { id, answer }): Parameters<DecisionAnswerParams>,
+        Parameters(DecisionAnswerParams { id, answer, drop }): Parameters<DecisionAnswerParams>,
     ) -> String {
         if let Some(refusal) = tree_run_decision_refusal(&self.served) {
             return json_result::<serde_json::Value>(Err(refusal));
         }
-        json_result(self.client.decision_answer(&id, &answer).await)
+        json_result(self.client.decision_answer(&id, &answer, drop).await)
     }
 
     #[tool(
