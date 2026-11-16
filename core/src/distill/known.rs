@@ -1,28 +1,48 @@
 //! What the distiller already knows about a project, so the model is not asked to repeat it
 //! (spec 2026-11-16-memoria-agentes-captura, F3 C4): the live titles, and the titles of lessons
 //! that were thrown away.
-//!
-//! RED stage: both bodies are stubs that compile and answer nothing, so the tests fail at run time.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
+
+use super::{MAX_REFUSED, REFUSED_DAYS};
 
 /// Titles of the live lessons of a project (`active` or `proposed`), without the rows the
 /// consolidator wrote.
 #[allow(dead_code)]
-pub(super) async fn titles(_pool: &SqlitePool, _project_id: &str) -> sqlx::Result<Vec<String>> {
-    Ok(Vec::new())
+pub(super) async fn titles(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT title FROM knowledge
+         WHERE status IN ('active', 'proposed') AND scope_kind = 'project' AND scope_id = ?
+           AND source IS NOT 'consolidator'
+         ORDER BY id DESC LIMIT 50",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Titles of the lessons of a project that were reverted, rejected or expired within the last
 /// `REFUSED_DAYS` days, newest first, at most `MAX_REFUSED`.
 #[allow(dead_code)]
 pub(super) async fn refused(
-    _pool: &SqlitePool,
-    _project_id: &str,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    project_id: &str,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<Vec<String>> {
-    Ok(Vec::new())
+    let since = (now - Duration::days(REFUSED_DAYS)).to_rfc3339();
+    sqlx::query_scalar(
+        "SELECT title FROM knowledge
+         WHERE status IN ('reverted', 'rejected', 'expired')
+           AND scope_kind = 'project' AND scope_id = ?
+           AND COALESCE(ended_at, created_at) >= ?
+         ORDER BY id DESC LIMIT ?",
+    )
+    .bind(project_id)
+    .bind(since)
+    .bind(MAX_REFUSED as i64)
+    .fetch_all(pool)
+    .await
 }
 
 #[cfg(test)]

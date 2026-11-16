@@ -114,11 +114,41 @@ pub struct CommitSummary {
 /// The diff stat and commit subjects of `sha` against its first parent; an error when either git
 /// read fails.
 pub async fn commit_summary(
-    _project_root: &std::path::Path,
-    _sha: &str,
-    _deadline: std::time::Instant,
+    project_root: &std::path::Path,
+    sha: &str,
+    deadline: std::time::Instant,
 ) -> Result<CommitSummary, String> {
-    Err("todo".into())
+    let parent = format!("{sha}^1");
+    let stat = git_read(
+        project_root,
+        &["diff", "--stat", &parent, sha, "--"],
+        deadline,
+    )
+    .await?;
+    if !stat.succeeded() {
+        return Err(format!(
+            "could not summarise what {sha} changed: {}",
+            stat.output_tail
+        ));
+    }
+    let range = format!("{parent}..{sha}");
+    let log = git_read(project_root, &["log", "--format=%s", &range, "--"], deadline).await?;
+    if !log.succeeded() {
+        return Err(format!(
+            "could not list the commits of {sha}: {}",
+            log.output_tail
+        ));
+    }
+    Ok(CommitSummary {
+        stat: stat.stdout.trim_end().to_owned(),
+        subjects: log
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    })
 }
 
 #[cfg(test)]

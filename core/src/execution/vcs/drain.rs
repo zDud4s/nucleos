@@ -518,6 +518,11 @@ pub(super) async fn write_terminal(
             {
                 tracing::warn!(request_id = id, %error, "distill: could not queue a landed job");
             }
+            if matches!(outcome, Outcome::Succeeded { .. })
+                && let Err(error) = crate::distill::enqueue_branch_landed_in(&mut tx, id).await
+            {
+                tracing::warn!(request_id = id, %error, "distill: could not queue a landed branch");
+            }
             tx.commit().await
         }
         .await;

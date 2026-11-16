@@ -1,10 +1,7 @@
 //! The dossier of a finished tree (spec 2026-11-16-memoria-agentes-captura, F3): the blocks the
 //! gatherer reads, cut by priority and clipped per block, with every text scrubbed.
-//!
-//! RED stage: every body below is a stub that compiles and does nothing, so the tests of this file
-//! fail at run time. The GREEN packet replaces them.
 
-use super::{DOSSIER_CEILING, Dossier};
+use super::{DOSSIER_CEILING, Dossier, clip_head, scrub};
 
 /// The tree dossier is cut at the same ceiling as the job dossier.
 pub const TREE_DOSSIER_CEILING: usize = DOSSIER_CEILING;
@@ -58,23 +55,241 @@ pub struct TreeBlocks {
     pub refused: Vec<String>,
 }
 
-/// Build the dossier of a tree: blocks in priority order, the last one going first when over
-/// `ceiling`.
-pub fn tree_dossier(_blocks: &TreeBlocks, _ceiling: usize) -> Dossier {
-    Dossier {
-        text: String::new(),
-        runs: vec![],
-    }
+/// Characters kept of the outcome line block.
+const OUTCOME_CHARS: usize = 1000;
+/// Characters kept of one agent final message.
+const FINAL_CHARS: usize = 1500;
+/// Agent final messages kept.
+const MAX_FINALS: usize = 3;
+/// Known titles listed.
+const MAX_KNOWN: usize = 50;
+
+fn present(s: &str) -> bool {
+    !s.trim().is_empty()
 }
 
-/// `SIGNAL_LINES` lines around the first line that names an error, else the tail.
-pub fn signal_window(_output: &str, _lines: usize) -> String {
-    String::new()
+/// Scrub `text`, then clip it to `cap` characters, so the cap holds for what the model reads.
+fn clipped(text: &str, cap: usize) -> String {
+    clip_head(scrub(text).trim(), cap)
+}
+
+/// A block of `heading` over its `parts` (blank ones dropped); `None` when nothing is left.
+fn block(heading: &str, parts: Vec<String>, runs: Vec<i64>) -> Option<(String, Vec<i64>)> {
+    let parts: Vec<String> = parts.into_iter().filter(|p| present(p)).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some((format!("## {heading}
+{}", parts.join("
+
+")), runs))
+}
+
+/// Build the dossier of a tree: blocks in priority order, the last one going first when over
+/// `ceiling`.
+pub fn tree_dossier(blocks: &TreeBlocks, ceiling: usize) -> Dossier {
+    let mut all: Vec<(String, Vec<i64>)> = Vec::new();
+    let mut push = |b: Option<(String, Vec<i64>)>| all.extend(b);
+
+    push(block(
+        "Node reports",
+        blocks
+            .node_reports
+            .iter()
+            .take(MAX_NODES)
+            .map(|n| {
+                format!(
+                    "Node {} ({}):
+{}",
+                    scrub(&n.node_id),
+                    scrub(&n.status),
+                    clipped(&n.text, NODE_CHARS)
+                )
+            })
+            .collect(),
+        Vec::new(),
+    ));
+    push(block(
+        "Answered decisions",
+        blocks
+            .decisions
+            .iter()
+            .take(MAX_DECISIONS)
+            .map(|d| format!("- {}", clipped(d, DECISION_CHARS)))
+            .collect(),
+        Vec::new(),
+    ));
+    let failures: Vec<&(i64, String)> = blocks.red_failures.iter().take(MAX_FAILURES).collect();
+    push(block(
+        "Failed verifications",
+        failures
+            .iter()
+            .map(|(id, t)| format!("Run #{id}:
+{}", clipped(t, FAILURE_CHARS)))
+            .collect(),
+        failures.iter().map(|(id, _)| *id).collect(),
+    ));
+    push(block(
+        "Outcome",
+        blocks
+            .outcome
+            .iter()
+            .map(|o| clipped(o, OUTCOME_CHARS))
+            .collect(),
+        Vec::new(),
+    ));
+    let finals: Vec<&(i64, String)> = blocks.agent_final.iter().take(MAX_FINALS).collect();
+    push(block(
+        "Agent final message",
+        finals
+            .iter()
+            .map(|(id, t)| format!("Run #{id}:
+{}", clipped(t, FINAL_CHARS)))
+            .collect(),
+        finals.iter().map(|(id, _)| *id).collect(),
+    ));
+    push(block(
+        "Diff stat",
+        blocks
+            .diff_stat
+            .iter()
+            .map(|d| clipped(d, DIFF_CHARS))
+            .collect(),
+        Vec::new(),
+    ));
+    push(block(
+        "Commit subjects",
+        blocks
+            .commits
+            .iter()
+            .map(|c| {
+                let lines: Vec<&str> = c.lines().take(COMMIT_LINES).collect();
+                clipped(&lines.join("
+"), COMMITS_CHARS)
+            })
+            .collect(),
+        Vec::new(),
+    ));
+    let list = |titles: &[String], cap: usize| -> Vec<String> {
+        let items: Vec<String> = titles
+            .iter()
+            .take(cap)
+            .map(|t| scrub(t))
+            .filter(|t| present(t))
+            .map(|t| format!("- {}", t.trim()))
+            .collect();
+        if items.is_empty() {
+            Vec::new()
+        } else {
+            vec![items.join("
+")]
+        }
+    };
+    push(block(
+        "Already known (do not repeat)",
+        list(&blocks.known_titles, MAX_KNOWN),
+        Vec::new(),
+    ));
+    push(block(
+        "Already refused (the owner rejected these; do not propose them again)",
+        list(&blocks.refused, MAX_REFUSED),
+        Vec::new(),
+    ));
+
+    let total = all.len();
+    let join = |n: usize| -> String {
+        all[..n]
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("
+
+")
+    };
+    let mut kept = total;
+    while kept > 1 && join(kept).chars().count() > ceiling {
+        kept -= 1;
+    }
+    let mut text = join(kept);
+    if kept == 1 && text.chars().count() > ceiling {
+        text = clip_head(&text, ceiling);
+    }
+    let dropped = total - kept;
+    if dropped > 0 {
+        let noun = if dropped == 1 { "block" } else { "blocks" };
+        text.push_str(&format!(
+            "
+
+[{dropped} {noun} left out to keep this within its size limit]"
+        ));
+    }
+    let mut runs: Vec<i64> = all[..kept]
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    runs.sort_unstable();
+    runs.dedup();
+    Dossier { text, runs }
+}
+
+/// Words that mark a line as the one that says what went wrong (the markers of
+/// `knowledge::signature`, by hand).
+const ERROR_MARKERS: [&str; 9] = [
+    "error",
+    "failed",
+    "panicked",
+    "denied",
+    "acesso negado",
+    "cannot",
+    "could not",
+    "not found",
+    "assert",
+];
+
+/// `lines` lines around the first line that names an error, else the tail.
+pub fn signal_window(output: &str, lines: usize) -> String {
+    let all: Vec<&str> = output.lines().collect();
+    if lines == 0 || all.len() <= lines {
+        return all.join("
+");
+    }
+    let first_error = all.iter().position(|line| {
+        let lower = line.to_lowercase();
+        ERROR_MARKERS.iter().any(|m| lower.contains(m))
+    });
+    let start = match first_error {
+        Some(i) => i.saturating_sub(lines / 2).min(all.len() - lines),
+        None => all.len() - lines,
+    };
+    all[start..start + lines].join("
+")
 }
 
 /// The summary, decisions, open items and blocked reason of a node report, clipped to `NODE_CHARS`.
-pub fn node_report_block(_report: &crate::tree_job::report::Report, _status: &str) -> String {
-    String::new()
+pub fn node_report_block(report: &crate::tree_job::report::Report, status: &str) -> String {
+    let mut parts: Vec<String> = vec![format!("Node {} ({status})", report.node_id)];
+    if present(&report.summary) {
+        parts.push(format!("Summary: {}", report.summary.trim()));
+    }
+    let decisions: Vec<&str> = report
+        .decisions
+        .iter()
+        .map(String::as_str)
+        .filter(|d| present(d))
+        .collect();
+    if !decisions.is_empty() {
+        parts.push(format!("Decisions:
+- {}", decisions.join("
+- ")));
+    }
+    if present(&report.open_items) {
+        parts.push(format!("Open items: {}", report.open_items.trim()));
+    }
+    if present(&report.blocked_reason) {
+        parts.push(format!("Blocked: {}", report.blocked_reason.trim()));
+    }
+    clip_head(&parts.join("
+"), NODE_CHARS)
 }
 
 #[cfg(test)]

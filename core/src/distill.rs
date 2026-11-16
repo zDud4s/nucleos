@@ -79,12 +79,11 @@ impl Cause {
             Cause::CalendarWeek => "calendar_week",
             Cause::ChatExchanges => "chat_exchanges",
             Cause::OwnerAnswered => "owner_answered",
-            // RED stub: the wire names arrive with the GREEN packet.
-            Cause::TreeLanded
-            | Cause::TreeFailed
-            | Cause::TreeParked
-            | Cause::BranchRecovered
-            | Cause::BranchLanded => "",
+            Cause::TreeLanded => "tree_landed",
+            Cause::TreeFailed => "tree_failed",
+            Cause::TreeParked => "tree_parked",
+            Cause::BranchRecovered => "branch_recovered",
+            Cause::BranchLanded => "branch_landed",
         }
     }
 
@@ -303,6 +302,10 @@ pub async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
 /// Take the oldest due row, marking it `running` in the same statement. A row whose cause this
 /// build does not know is failed on the spot and the next one is tried.
 pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Option<QueueRow>> {
+    // The daily cap on model calls: the rows wait for the next UTC day.
+    if tree::model_calls_today(pool, now).await? >= DISTILL_MODEL_CALLS_PER_DAY {
+        return Ok(None);
+    }
     loop {
         // IMMEDIATE: the claim writes, and a deferred transaction that read first could fail to
         // upgrade to the write lock in WAL mode.
@@ -458,14 +461,7 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
         None
     };
 
-    let known_titles: Vec<String> = sqlx::query_scalar(
-        "SELECT title FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND status IN ('active', 'proposed')
-          ORDER BY id DESC LIMIT 50",
-    )
-    .bind(&row.project_id)
-    .fetch_all(pool)
-    .await?;
+    let known_titles: Vec<String> = known::titles(pool, &row.project_id).await?;
 
     let gate_rows: Vec<(i64, Option<String>)> = sqlx::query_as(
         "SELECT id, gate_output FROM runs WHERE job_id = ? AND gate_status = 'failed' ORDER BY id",
@@ -924,6 +920,11 @@ pub async fn process_one_with(
         chats::process(pool, asked, embedder, &row, now).await;
         return;
     }
+    // Trees, parked decisions and branch lands read no job either: their own worker.
+    if TREE_CAUSES.contains(&cause) {
+        tree_worker::process(pool, asked, embedder, &row, now).await;
+        return;
+    }
     let inputs = match gather(pool, &row).await {
         Ok(Some(inputs)) => inputs,
         Ok(None) => {
@@ -1067,6 +1068,9 @@ pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn
     .await
     {
         tracing::warn!(%error, "distillation: could not sweep the chats");
+    }
+    if let Err(error) = tree::sweep_trees(pool, Utc::now()).await {
+        tracing::warn!(%error, "distillation: could not sweep the finished trees");
     }
     if let Err(error) = crate::knowledge::sweep_observations(pool, Utc::now()).await {
         tracing::warn!(%error, "distillation: could not sweep the observations");

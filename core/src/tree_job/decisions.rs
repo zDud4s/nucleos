@@ -557,6 +557,11 @@ pub async fn answer_widening(
         write_manifest(&mut tx, tree_id, manifest, &at).await?;
     }
     tx.commit().await?;
+    if decision.tree_id.is_some()
+        && let Err(error) = crate::distill::enqueue_tree_parked_in(pool, decision_id).await
+    {
+        tracing::warn!(decision_id, %error, "distill: could not queue a parked tree decision");
+    }
     // The branch this answer resumes is ready to move: wake the driver instead of leaving it to the
     // next tick.
     crate::conductor::sweep::wake();
@@ -639,6 +644,9 @@ pub async fn answer_dropping(
     tx.commit().await?;
     // An earlier park of the same node may still be open: a dropped branch leaves none.
     super::obsolete::close_node_decisions_logged(pool, &tree_id, &node_id, "branch dropped").await;
+    if let Err(error) = crate::distill::enqueue_tree_parked_in(pool, decision_id).await {
+        tracing::warn!(decision_id, %error, "distill: could not queue a parked tree decision");
+    }
     crate::conductor::sweep::wake();
 
     decision.answer = Some(text.to_owned());

@@ -1,15 +1,39 @@
 //! Tree and land causes of the distiller (spec 2026-11-16-memoria-agentes-captura, F1): how a
 //! finished tree, an answered tree decision, a recovered branch and a land of a branch nobody owns
 //! reach `distill_queue`, plus the pre-filter and the volume caps that keep the model calls few.
-//!
-//! RED stage: every body below is a stub that compiles and does nothing, so the tests of this file
-//! fail at run time. The GREEN packet replaces them.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
 
-use super::Cause;
-use crate::tree_job::store::TreeJob;
+use super::{Cause, STATUS_PENDING};
+use crate::tree_job::store::{self, TreeJob};
+
+/// A store failure as the `sqlx` error the enqueue helpers return.
+fn store_error(error: store::StoreError) -> sqlx::Error {
+    match error {
+        store::StoreError::Db(error) => error,
+        other => sqlx::Error::Protocol(other.to_string()),
+    }
+}
+
+/// The first instant of the UTC day of `now`, as the text `finished_at` is stored in.
+fn day_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map_or(now, |naive| naive.and_utc())
+}
+
+/// The first instant of the UTC day after `now`: when a capped row becomes due again.
+pub(super) fn next_day_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    day_start(now) + Duration::days(1)
+}
+
+/// Whether the manifest holds a non-empty value under `key`.
+fn has_extra(job: &TreeJob, key: &str) -> bool {
+    job.manifest.extra.get(key).is_some_and(|value| {
+        !value.is_null() && value.as_str().is_none_or(|text| !text.is_empty())
+    })
+}
 
 /// Trees (and branches) of one project the distiller reads per UTC day.
 pub const DISTILL_TREE_PER_PROJECT_DAY: i64 = 6;
@@ -30,7 +54,23 @@ pub const TREE_CAUSES: [Cause; 5] = [
 ];
 
 /// Why a finished tree is queued: `TreeFailed` on real evidence of failure, else `TreeLanded`.
-pub fn classify_end(_job: &TreeJob, _bad_nodes: i64) -> Cause {
+pub fn classify_end(job: &TreeJob, bad_nodes: i64) -> Cause {
+    let abandoned = job
+        .manifest
+        .extra
+        .get("finish")
+        .and_then(|finish| finish.get("status"))
+        .and_then(|status| status.as_str())
+        == Some("abandoned");
+    if abandoned {
+        return Cause::TreeFailed;
+    }
+    if has_extra(job, "land_sha") {
+        return Cause::TreeLanded;
+    }
+    if has_extra(job, "land_failure") || has_extra(job, "land_refusal") || bad_nodes > 0 {
+        return Cause::TreeFailed;
+    }
     Cause::TreeLanded
 }
 
@@ -46,56 +86,262 @@ pub struct TreeFacts {
 }
 
 /// Whether there is anything to learn from: false closes the row as `nothing: clean run`.
-pub fn tree_has_lesson(_facts: &TreeFacts) -> bool {
-    false
+pub fn tree_has_lesson(facts: &TreeFacts) -> bool {
+    facts.red_failures > 0
+        || facts.fixing_branches > 0
+        || facts.answered_decisions > 0
+        || facts.bad_nodes > 0
+        || facts.open_item_nodes > 0
 }
 
 /// What the gathered blocks of a tree say about it, before any model is asked.
-pub fn tree_facts(_job: &TreeJob, _blocks: &super::TreeBlocks) -> TreeFacts {
-    TreeFacts::default()
+pub fn tree_facts(job: &TreeJob, blocks: &super::TreeBlocks) -> TreeFacts {
+    // A branch that is `fixing` is mid-repair; a gate entry with a `red` verdict is a repair done.
+    let fixing_branches = job
+        .manifest
+        .branches
+        .values()
+        .filter(|branch| {
+            branch.state == "fixing"
+                || branch
+                    .gates
+                    .iter()
+                    .any(|gate| gate.get("verdict").and_then(|v| v.as_str()) == Some("red"))
+        })
+        .count();
+    TreeFacts {
+        red_failures: blocks.red_failures.len(),
+        fixing_branches,
+        answered_decisions: blocks.decisions.len(),
+        bad_nodes: blocks.bad_nodes,
+        open_item_nodes: blocks.open_item_nodes,
+        has_diff: blocks.diff_stat.is_some() || blocks.commits.is_some(),
+    }
+}
+
+/// The project of a tree, `None` when the tree has none (or is gone).
+async fn tree_project(pool: &SqlitePool, tree_id: &str) -> sqlx::Result<Option<String>> {
+    let project: Option<Option<String>> =
+        sqlx::query_scalar("SELECT project_id FROM tree_jobs WHERE id = ?")
+            .bind(tree_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(project.flatten().filter(|project| !project.is_empty()))
 }
 
 /// Queue a finished tree once. `true` when a row was inserted.
-pub async fn enqueue_tree_end_in(_pool: &SqlitePool, _tree_id: &str) -> sqlx::Result<bool> {
-    Ok(false)
+pub async fn enqueue_tree_end_in(pool: &SqlitePool, tree_id: &str) -> sqlx::Result<bool> {
+    let Some(job) = store::load(pool, tree_id).await.map_err(store_error)? else {
+        return Ok(false);
+    };
+    let Some(project) = job.project_id.as_deref().filter(|project| !project.is_empty()) else {
+        return Ok(false);
+    };
+    if job.state != "finished" {
+        return Ok(false);
+    }
+    let bad_nodes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_nodes WHERE tree_job_id = ? AND status IN ('failed', 'blocked')",
+    )
+    .bind(tree_id)
+    .fetch_one(pool)
+    .await?;
+    let cause = classify_end(&job, bad_nodes);
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO distill_queue
+             (cause, project_id, tree_id, status, attempts, created_at)
+         SELECT ?, ?, ?, ?, 0, ?
+          WHERE NOT EXISTS (SELECT 1 FROM distill_queue
+                             WHERE tree_id = ? AND cause IN ('tree_landed', 'tree_failed'))",
+    )
+    .bind(cause.as_str())
+    .bind(project)
+    .bind(tree_id)
+    .bind(STATUS_PENDING)
+    .bind(super::now())
+    .bind(tree_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
 }
 
 /// Queue an answered tree decision, at most once per tree per [`TREE_PARKED_COOLOFF_HOURS`].
-pub async fn enqueue_tree_parked_in(_pool: &SqlitePool, _decision_id: &str) -> sqlx::Result<bool> {
-    Ok(false)
+pub async fn enqueue_tree_parked_in(pool: &SqlitePool, decision_id: &str) -> sqlx::Result<bool> {
+    let decision: Option<(Option<String>, Option<String>, String)> =
+        sqlx::query_as("SELECT tree_id, node_id, status FROM decisions WHERE id = ?")
+            .bind(decision_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((Some(tree_id), node_id, status)) = decision else {
+        return Ok(false);
+    };
+    if status != "answered" {
+        return Ok(false);
+    }
+    let Some(project) = tree_project(pool, &tree_id).await? else {
+        return Ok(false);
+    };
+    let since = (Utc::now() - Duration::hours(TREE_PARKED_COOLOFF_HOURS)).to_rfc3339();
+    let recent: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM distill_queue WHERE cause = 'tree_parked' AND tree_id = ? AND created_at >= ?
+          LIMIT 1",
+    )
+    .bind(&tree_id)
+    .bind(since)
+    .fetch_optional(pool)
+    .await?;
+    if recent.is_some() {
+        return Ok(false);
+    }
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO distill_queue
+             (cause, project_id, tree_id, node_id, decision_id, status, attempts, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+    )
+    .bind(Cause::TreeParked.as_str())
+    .bind(project)
+    .bind(&tree_id)
+    .bind(node_id)
+    .bind(decision_id)
+    .bind(STATUS_PENDING)
+    .bind(super::now())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
 }
 
 /// Queue a tree branch whose worktree failed a verification and later passed one.
 pub async fn enqueue_branch_recovered_in(
-    _pool: &SqlitePool,
-    _tree_id: &str,
-    _node_id: &str,
-    _worktree: &str,
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    worktree: &str,
 ) -> sqlx::Result<bool> {
-    Ok(false)
+    let Some(project) = tree_project(pool, tree_id).await? else {
+        return Ok(false);
+    };
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM verify_runs WHERE worktree = ? ORDER BY id")
+            .bind(worktree)
+            .fetch_all(pool)
+            .await?;
+    let mut failed = false;
+    let mut recovered = false;
+    for status in &statuses {
+        match status.as_str() {
+            "failed" => failed = true,
+            "passed" if failed => {
+                recovered = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !recovered {
+        return Ok(false);
+    }
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO distill_queue
+             (cause, project_id, tree_id, node_id, status, attempts, created_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?)",
+    )
+    .bind(Cause::BranchRecovered.as_str())
+    .bind(project)
+    .bind(tree_id)
+    .bind(node_id)
+    .bind(STATUS_PENDING)
+    .bind(super::now())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
 }
 
 /// Queue a succeeded merge that is neither a job's land nor a tree's own merge.
 pub async fn enqueue_branch_landed_in(
-    _conn: &mut SqliteConnection,
-    _request_id: i64,
+    conn: &mut SqliteConnection,
+    request_id: i64,
 ) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO distill_queue
+             (cause, project_id, request_id, status, attempts, created_at)
+         SELECT ?, v.project_id, v.id, ?, 0, ?
+           FROM vcs_requests v
+          WHERE v.id = ? AND v.status = 'succeeded' AND v.op = 'merge'
+            AND v.project_id <> ''
+            AND json_extract(v.args, '$.source') NOT GLOB 'nucleos/job-*'
+            AND json_extract(v.args, '$.target') NOT GLOB 'nucleos/*'
+            AND json_extract(v.args, '$.source') NOT IN
+                (SELECT feature_branch FROM tree_jobs WHERE feature_branch IS NOT NULL)
+            AND json_extract(v.args, '$.target') NOT IN
+                (SELECT feature_branch FROM tree_jobs WHERE feature_branch IS NOT NULL)",
+    )
+    .bind(Cause::BranchLanded.as_str())
+    .bind(STATUS_PENDING)
+    .bind(super::now())
+    .bind(request_id)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
 /// Queue the finished trees of the last [`DISTILL_BACKFILL_DAYS`] days that have no row. Returns
 /// how many rows were inserted.
-pub async fn sweep_trees(_pool: &SqlitePool, _now: DateTime<Utc>) -> sqlx::Result<u64> {
-    Ok(0)
+pub async fn sweep_trees(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
+    let since = (now - Duration::days(DISTILL_BACKFILL_DAYS)).to_rfc3339();
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT t.id FROM tree_jobs t
+          WHERE t.state = 'finished' AND t.updated_at >= ?
+            AND t.project_id IS NOT NULL AND t.project_id <> ''
+            AND NOT EXISTS (SELECT 1 FROM distill_queue q
+                             WHERE q.tree_id = t.id AND q.cause IN ('tree_landed', 'tree_failed'))
+          ORDER BY t.updated_at DESC LIMIT 50",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    let mut queued = 0;
+    for id in ids {
+        if enqueue_tree_end_in(pool, &id).await? {
+            queued += 1;
+        }
+    }
+    Ok(queued)
 }
 
-/// Model calls made since the start of the UTC day of `now`.
-#[allow(dead_code)]
+/// Model calls made since the start of the UTC day of `now`: rows closed `done` without an error
+/// note. A row closed `nothing: ...`, `gone`, `ingest` or `disabled` never asked the model.
 pub(super) async fn model_calls_today(
-    _pool: &SqlitePool,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<i64> {
-    Ok(0)
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM distill_queue
+          WHERE status = 'done' AND error IS NULL AND finished_at >= ?",
+    )
+    .bind(day_start(now).to_rfc3339())
+    .fetch_one(pool)
+    .await
+}
+
+/// Tree-side rows of `project_id` the model has read since the start of the UTC day of `now`.
+pub(super) async fn tree_reads_today(
+    pool: &SqlitePool,
+    project_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM distill_queue
+          WHERE project_id = ? AND status = 'done' AND error IS NULL AND finished_at >= ?
+            AND cause IN ('tree_landed', 'tree_failed', 'tree_parked', 'branch_recovered',
+                          'branch_landed')",
+    )
+    .bind(project_id)
+    .bind(day_start(now).to_rfc3339())
+    .fetch_one(pool)
+    .await
 }
 
 #[cfg(test)]
@@ -464,7 +710,7 @@ mod tests {
             vec![(
                 "tree_parked".to_owned(),
                 Some(id.clone()),
-                None,
+                Some("node-api".to_owned()),
                 None,
                 Some("d-1".to_owned())
             )]

@@ -105,6 +105,9 @@ pub async fn close_tree_logged(pool: &SqlitePool, tree_id: &str, reason: &str) {
     if let Err(error) = close_tree(pool, tree_id, reason).await {
         tracing::warn!(job = tree_id, %error, "could not close the decisions of a finished tree");
     }
+    if let Err(error) = crate::distill::enqueue_tree_end_in(pool, tree_id).await {
+        tracing::warn!(job = tree_id, %error, "could not queue a finished tree for distillation");
+    }
 }
 
 /// [`close_parked_decision`], logged the same way.

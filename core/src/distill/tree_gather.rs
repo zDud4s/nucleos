@@ -2,37 +2,204 @@
 //! (spec 2026-11-16-memoria-agentes-captura, F3 P1): node handoffs, answered decisions, failed
 //! verifications, the last message of each node's run and, when the repository answers, the diff
 //! stat and the commit subjects.
-//!
-//! RED stage: both bodies are stubs that compile and answer an empty set of blocks, so the tests of
-//! this file fail at run time.
+
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
-use super::TreeBlocks;
+use super::{
+    COMMIT_LINES, COMMITS_CHARS, DECISION_CHARS, DIFF_CHARS, ENTRY_CHARS, MAX_DECISIONS,
+    MAX_FAILURES, MAX_NODES, NodeReport, SIGNAL_LINES, TreeBlocks, clip_head, known,
+    node_report_block, signal_window,
+};
 use crate::tree_job::store::TreeJob;
+
+/// Most commits whose summary is read for one tree.
+const MAX_SHAS: usize = 8;
+/// Deadline of each git read.
+const GIT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The blocks of a tree. `focus_node` restricts the node reports and the failures to that node.
 #[allow(dead_code)]
 pub(super) async fn gather_blocks(
-    _pool: &SqlitePool,
-    _job: &TreeJob,
-    _focus_node: Option<&str>,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    job: &TreeJob,
+    focus_node: Option<&str>,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<TreeBlocks> {
-    Ok(TreeBlocks::default())
+    let mut blocks = TreeBlocks::default();
+
+    // Node reports: counts run over every node, the report list over the focused ones, capped.
+    let nodes: Vec<(String, String, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, status, summary, handoff_path, run_id FROM work_nodes
+             WHERE tree_job_id = ? ORDER BY created_at, id",
+        )
+        .bind(&job.id)
+        .fetch_all(pool)
+        .await?;
+    for (id, status, summary, handoff_path, run_id) in &nodes {
+        let report = handoff_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|text| crate::tree_job::report::parse_report(&text));
+        let has_open_items = report.as_ref().is_some_and(|r| !r.open_items.trim().is_empty());
+        if matches!(status.as_str(), "failed" | "blocked") {
+            blocks.bad_nodes += 1;
+        }
+        if has_open_items {
+            blocks.open_item_nodes += 1;
+        }
+        let in_focus = focus_node.is_none_or(|focus| focus == id);
+        if in_focus && blocks.node_reports.len() < MAX_NODES {
+            let text = match &report {
+                Some(report) => node_report_block(report, status),
+                None => clip_head(summary.as_deref().unwrap_or_default(), ENTRY_CHARS),
+            };
+            blocks.node_reports.push(NodeReport {
+                node_id: id.clone(),
+                status: status.clone(),
+                text,
+                has_open_items,
+            });
+        }
+        // The last message of the node's run.
+        if in_focus
+            && let Some(run) = run_id.as_deref().and_then(|raw| raw.parse::<i64>().ok())
+        {
+            let stdout: Option<Option<String>> =
+                sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ?")
+                    .bind(run)
+                    .fetch_optional(pool)
+                    .await?;
+            if let Some(reply) = stdout
+                .flatten()
+                .and_then(|out| crate::execution::runner::extract_reply(&out))
+                .filter(|reply| !reply.trim().is_empty())
+            {
+                blocks.agent_final.push((run, clip_head(&reply, ENTRY_CHARS)));
+            }
+        }
+    }
+
+    // Answered decisions of the tree.
+    let decisions: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT question, answer, origin FROM decisions
+         WHERE tree_id = ? AND status = 'answered' ORDER BY at, id LIMIT ?",
+    )
+    .bind(&job.id)
+    .bind(MAX_DECISIONS as i64)
+    .fetch_all(pool)
+    .await?;
+    for (question, answer, origin) in decisions {
+        let line = format!(
+            "Q: {question}\nA: {}\n(answered via {})",
+            answer.unwrap_or_default(),
+            origin.unwrap_or_else(|| "unknown".to_owned()),
+        );
+        blocks.decisions.push(clip_head(&line, DECISION_CHARS));
+    }
+
+    // Failed verifications of the branches' worktrees.
+    let worktrees: Vec<&str> = job
+        .manifest
+        .branches
+        .values()
+        .filter(|branch| focus_node.is_none_or(|focus| branch.node_id.as_deref() == Some(focus)))
+        .filter_map(|branch| branch.worktree.as_deref())
+        .collect();
+    if !worktrees.is_empty() {
+        let list = serde_json::to_string(&worktrees).unwrap_or_else(|_| "[]".to_owned());
+        let failures: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT id, output_tail FROM verify_runs
+             WHERE status = 'failed' AND worktree IN (SELECT value FROM json_each(?))
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(list)
+        .bind(MAX_FAILURES as i64)
+        .fetch_all(pool)
+        .await?;
+        for (id, tail) in failures {
+            let clean = crate::knowledge::strip_ansi(&tail.unwrap_or_default());
+            let window = signal_window(&clean, SIGNAL_LINES);
+            if !window.trim().is_empty() {
+                blocks.red_failures.push((id, window));
+            }
+        }
+    }
+
+    // What landed, when the repository still answers.
+    let mut shas: Vec<String> = match job.manifest.extra.get("land_sha").and_then(|v| v.as_str()) {
+        Some(sha) if !sha.is_empty() => vec![sha.to_owned()],
+        _ => job
+            .manifest
+            .branches
+            .values()
+            .filter_map(|branch| branch.extra.get("merge_sha").and_then(|v| v.as_str()))
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    };
+    shas.truncate(MAX_SHAS);
+    let (diff_stat, commits) = summarise(Path::new(&job.manifest.project_root), &shas).await;
+    blocks.diff_stat = diff_stat;
+    blocks.commits = commits;
+
+    if let Some(project) = job.project_id.as_deref().filter(|p| !p.is_empty()) {
+        blocks.known_titles = known::titles(pool, project).await?;
+        blocks.refused = known::refused(pool, project, now).await?;
+    }
+    Ok(blocks)
 }
 
 /// The blocks of a merge request: the commit summary of its result, plus the known and refused
 /// titles of the project.
 #[allow(dead_code)]
 pub(super) async fn gather_request_blocks(
-    _pool: &SqlitePool,
-    _request_id: i64,
-    _project_id: &str,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    request_id: i64,
+    project_id: &str,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<TreeBlocks> {
-    Ok(TreeBlocks::default())
+    let mut blocks = TreeBlocks::default();
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT project_root, result_sha FROM vcs_requests WHERE id = ?")
+            .bind(request_id)
+            .fetch_optional(pool)
+            .await?;
+    if let Some((root, Some(sha))) = row
+        && !sha.is_empty()
+    {
+        let (diff_stat, commits) = summarise(Path::new(&root), &[sha]).await;
+        blocks.diff_stat = diff_stat;
+        blocks.commits = commits;
+    }
+    blocks.known_titles = known::titles(pool, project_id).await?;
+    blocks.refused = known::refused(pool, project_id, now).await?;
+    Ok(blocks)
+}
+
+/// The diff stats and commit subjects of `shas`; a sha git cannot answer for is left out, and
+/// nothing readable leaves both as `None`.
+async fn summarise(root: &Path, shas: &[String]) -> (Option<String>, Option<String>) {
+    let mut stats = Vec::new();
+    let mut subjects: Vec<String> = Vec::new();
+    for sha in shas {
+        let deadline = Instant::now() + GIT_DEADLINE;
+        if let Ok(summary) = crate::execution::git_exec::commit_summary(root, sha, deadline).await {
+            if !summary.stat.trim().is_empty() {
+                stats.push(summary.stat);
+            }
+            subjects.extend(summary.subjects);
+        }
+    }
+    subjects.truncate(COMMIT_LINES);
+    let diff_stat = (!stats.is_empty()).then(|| clip_head(&stats.join("\n"), DIFF_CHARS));
+    let commits = (!subjects.is_empty()).then(|| clip_head(&subjects.join("\n"), COMMITS_CHARS));
+    (diff_stat, commits)
 }
 
 #[cfg(test)]

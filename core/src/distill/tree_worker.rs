@@ -1,29 +1,284 @@
 //! The worker half of the tree and land causes (spec 2026-11-16-memoria-agentes-captura, F1): what
 //! happens to a claimed `tree_landed`, `tree_failed`, `tree_parked`, `branch_recovered` or
 //! `branch_landed` row once `process_one_with` hands it over.
-//!
-//! RED stage: `process` is a stub, so the tests of this file fail at run time. The GREEN packet
-//! replaces the body.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
 
-use super::QueueRow;
+use super::tree::{
+    DISTILL_BACKFILL_DAYS, DISTILL_TREE_PER_PROJECT_DAY, next_day_start, tree_facts,
+    tree_has_lesson, tree_reads_today,
+};
+use super::{
+    Cause, DOSSIER_CEILING, Item, QueueRow, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, Subject,
+    TreeBlocks, Written, ask, close_row, embed_items, extraction_prompt, fail, items_format,
+    parse_items, standing_for, tree_dossier, tree_gather, write_one_item_at,
+};
 use crate::embed::Embedder;
 use crate::map::intent::Extractor;
+
+/// Close a row as `done`, keeping `note` (`nothing: ...`) as the reason no model was asked.
+async fn close(pool: &SqlitePool, row: &QueueRow, now: DateTime<Utc>, note: &str) {
+    let closed = async {
+        let mut tx = pool.begin().await?;
+        close_row(&mut tx, row.id, now, Some(note)).await?;
+        tx.commit().await
+    }
+    .await;
+    if let Err(error) = closed {
+        tracing::warn!(%error, "distillation: could not close tree row {}", row.id);
+    }
+}
+
+/// Fail a row whose subject was deleted: nothing a retry can fix.
+async fn gone(pool: &SqlitePool, row: &QueueRow, now: DateTime<Utc>, message: &str) {
+    let written = sqlx::query(
+        "UPDATE distill_queue SET status = ?, error = ?, finished_at = ?
+          WHERE id = ? AND status = ?",
+    )
+    .bind(STATUS_FAILED)
+    .bind(message)
+    .bind(now.to_rfc3339())
+    .bind(row.id)
+    .bind(STATUS_RUNNING)
+    .execute(pool)
+    .await;
+    if let Err(error) = written {
+        tracing::warn!(%error, "distillation: could not fail tree row {}", row.id);
+    }
+}
+
+/// Put a capped row back in line for the start of the next UTC day. `attempts` stays: a deferral
+/// is not a failed try.
+async fn defer(pool: &SqlitePool, row: &QueueRow, now: DateTime<Utc>) {
+    let written = sqlx::query(
+        "UPDATE distill_queue SET status = ?, not_before = ? WHERE id = ? AND status = ?",
+    )
+    .bind(STATUS_PENDING)
+    .bind(next_day_start(now).to_rfc3339())
+    .bind(row.id)
+    .bind(STATUS_RUNNING)
+    .execute(pool)
+    .await;
+    if let Err(error) = written {
+        tracing::warn!(%error, "distillation: could not defer tree row {}", row.id);
+    }
+}
+
+/// Whether the row has waited longer than the sweep's backfill window.
+async fn is_stale(pool: &SqlitePool, row: &QueueRow, now: DateTime<Utc>) -> bool {
+    let created: Option<String> =
+        sqlx::query_scalar("SELECT created_at FROM distill_queue WHERE id = ?")
+            .bind(row.id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    created
+        .and_then(|text| DateTime::parse_from_rfc3339(&text).ok())
+        .is_some_and(|at| at.with_timezone(&Utc) < now - Duration::days(DISTILL_BACKFILL_DAYS))
+}
+
+/// What a row reads: its blocks, and what to name as evidence.
+struct Gathered {
+    blocks: TreeBlocks,
+    lesson: bool,
+    /// The `{"t":..,"id":..}` element that names the subject.
+    subject: serde_json::Value,
+    /// Why a row without a lesson closes.
+    nothing: &'static str,
+    /// The text the reasoning names.
+    label: String,
+}
+
+/// Read the blocks of the row's subject. `Ok(None)` means the subject is gone.
+async fn gather(
+    pool: &SqlitePool,
+    row: &QueueRow,
+    cause: Cause,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Option<Gathered>> {
+    if cause == Cause::BranchLanded {
+        let Some(request_id) = row.request_id else {
+            return Ok(None);
+        };
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM vcs_requests WHERE id = ?")
+            .bind(request_id)
+            .fetch_optional(pool)
+            .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let blocks =
+            tree_gather::gather_request_blocks(pool, request_id, &row.project_id, now).await?;
+        let lesson = blocks.diff_stat.is_some() || blocks.commits.is_some();
+        return Ok(Some(Gathered {
+            blocks,
+            lesson,
+            subject: serde_json::json!({"t": "request", "id": request_id}),
+            nothing: "nothing: no diff",
+            label: format!("request {request_id}"),
+        }));
+    }
+    let Some(tree_id) = row.tree_id.as_deref() else {
+        return Ok(None);
+    };
+    let job = match crate::tree_job::store::load(pool, tree_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Ok(None),
+        Err(crate::tree_job::store::StoreError::Db(error)) => return Err(error),
+        // A manifest nobody can read is as good as gone for the distiller.
+        Err(_) => return Ok(None),
+    };
+    let blocks = tree_gather::gather_blocks(pool, &job, row.node_id.as_deref(), now).await?;
+    let lesson = tree_has_lesson(&tree_facts(&job, &blocks));
+    Ok(Some(Gathered {
+        blocks,
+        lesson,
+        subject: serde_json::json!({"t": "tree", "id": tree_id}),
+        nothing: "nothing: clean run",
+        label: format!("tree {tree_id}"),
+    }))
+}
+
+/// Write the extracted items and close the row, all in one transaction. Returns how many items
+/// were recorded or proposed.
+#[allow(clippy::too_many_arguments)]
+async fn write(
+    pool: &SqlitePool,
+    row: &QueueRow,
+    cause: Cause,
+    gathered: &Gathered,
+    runs: &[i64],
+    items: &[Item],
+    vectors: &[Option<Vec<f32>>],
+    model: Option<&str>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<usize> {
+    let mut evidence_list = vec![gathered.subject.clone()];
+    evidence_list.extend(
+        runs.iter()
+            .map(|r| serde_json::json!({"t": "run", "id": r})),
+    );
+    let evidence = serde_json::Value::Array(evidence_list).to_string();
+    let reasoning = format!("distilled from {} ({})", gathered.label, cause.as_str());
+    let subject = Subject {
+        cause,
+        project_id: &row.project_id,
+        evidence: &evidence,
+        reasoning: &reasoning,
+        // No owner text rides these rows.
+        sources: &[],
+        model,
+    };
+    let mut tx = pool.begin().await?;
+    let mut proposed_any = false;
+    let mut kept = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        let vector = vectors.get(index).and_then(|v| v.as_deref());
+        match write_one_item_at(&mut tx, &subject, item, vector, now).await? {
+            Written::Skipped => {}
+            Written::Recorded => kept += 1,
+            Written::Proposed => {
+                proposed_any = true;
+                kept += 1;
+            }
+        }
+    }
+    close_row(&mut tx, row.id, now, None).await?;
+    tx.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    if proposed_any {
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
+    }
+    Ok(kept)
+}
 
 /// Distil one tree-side row: close it as `nothing: ...` when there is nothing to learn, defer it
 /// when the project's daily cap is spent, fail it as `gone` when its subject was deleted, else ask
 /// the model and write what it answers.
-#[allow(dead_code)]
 pub(super) async fn process(
-    _pool: &SqlitePool,
-    _asked: Extractor<'_>,
-    _embedder: Option<&dyn Embedder>,
-    _row: &QueueRow,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    asked: Extractor<'_>,
+    embedder: Option<&dyn Embedder>,
+    row: &QueueRow,
+    now: DateTime<Utc>,
 ) {
-    todo!()
+    let Some(cause) = Cause::parse(&row.cause) else {
+        fail(pool, row, "vocabulary", "unknown cause", now).await;
+        return;
+    };
+    if is_stale(pool, row, now).await {
+        close(pool, row, now, "nothing: stale").await;
+        return;
+    }
+    if row.project_id.is_empty() {
+        close(pool, row, now, "nothing: no project").await;
+        return;
+    }
+    match tree_reads_today(pool, &row.project_id, now).await {
+        Ok(read) if read >= DISTILL_TREE_PER_PROJECT_DAY => {
+            defer(pool, row, now).await;
+            return;
+        }
+        Ok(_) => {}
+        Err(_) => {
+            fail(pool, row, "db", "counting the day's reads failed", now).await;
+            return;
+        }
+    }
+    let gathered = match gather(pool, row, cause, now).await {
+        Ok(Some(gathered)) => gathered,
+        Ok(None) => {
+            gone(pool, row, now, "gone: the tree no longer exists").await;
+            return;
+        }
+        Err(_) => {
+            fail(pool, row, "db", "reading the tree failed", now).await;
+            return;
+        }
+    };
+    if !gathered.lesson {
+        close(pool, row, now, gathered.nothing).await;
+        return;
+    }
+    let built = tree_dossier(&gathered.blocks, DOSSIER_CEILING);
+    let answer = match ask(
+        asked,
+        extraction_prompt(cause, &built.text),
+        &standing_for(cause),
+        items_format(),
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            fail(pool, row, "model", &format!("{:?}", error.kind()), now).await;
+            return;
+        }
+    };
+    let items = match parse_items(&answer) {
+        Ok(items) => items,
+        Err(_) => {
+            fail(pool, row, "parse", "the answer is not a JSON array", now).await;
+            return;
+        }
+    };
+    let vectors = embed_items(embedder, &items).await;
+    let model = embedder.map(|e| e.model());
+    match write(
+        pool, row, cause, &gathered, &built.runs, &items, &vectors, model, now,
+    )
+    .await
+    {
+        Ok(written) => tracing::info!(
+            "distillation: tree row {} ({}): parsed {}, written {written}",
+            row.id,
+            cause.as_str(),
+            items.len()
+        ),
+        Err(_) => fail(pool, row, "db", "writing the learnings failed", now).await,
+    }
 }
 
 #[cfg(test)]

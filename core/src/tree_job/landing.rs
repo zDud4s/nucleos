@@ -766,7 +766,18 @@ pub async fn settle_merge(
             held.extra.insert("merged_at".to_owned(), json!(now_iso()));
             held.extra.remove("merge_request_id");
             held.extra.remove("merge_failure");
+            let recovered_node = held.node_id.clone();
+            let recovered_worktree = held.worktree.clone();
             persist(pool, job).await?;
+            // A branch that failed a verification and then passed one is a lesson; fail open.
+            if let (Some(node_id), Some(worktree)) = (recovered_node, recovered_worktree)
+                && let Err(error) = crate::distill::enqueue_branch_recovered_in(
+                    pool, &job.id, &node_id, &worktree,
+                )
+                .await
+            {
+                tracing::warn!(tree_id = %job.id, %error, "distill: could not queue a recovered branch");
+            }
             Ok(MergeSettlement::Merged { sha })
         }
         RequestEnd::Failed { reason, .. } => {
