@@ -125,8 +125,23 @@ run() {
 #   NUCLEOS_GATE_JOBS           cargo `-j` (build parallelism).
 #   NUCLEOS_GATE_TEST_THREADS   `--test-threads` for nextest / the libtest binaries.
 # gate_build_args sets `gate_args` (flags for a compiling subcommand), gate_threads sets `gate_tt`.
+# gate_seed_target: a cold warm target dir (no `debug/` yet) gets the registry crates' fingerprints
+# and artifacts from a recent sibling (scripts/gate_seed.py), so ~290 dependencies do not recompile
+# in every new worktree. Once per gate, fail-open, NUCLEOS_GATE_SEED=0 turns it off.
+gate_seed_target() {
+  [ -n "${NUCLEOS_TARGET_DIR:-}" ] || return 0
+  [ -z "${gate_seed_done:-}" ] || return 0
+  gate_seed_done=1
+  [ "${NUCLEOS_GATE_SEED:-}" != 0 ] || return 0
+  local seed_py
+  if [ "${OS:-}" = Windows_NT ]; then seed_py="${NUCLEOS_HEAVY_PYTHON:-python}"; else seed_py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
+  "$seed_py" "$repo_root/scripts/gate_seed.py" "$NUCLEOS_TARGET_DIR" || true
+  return 0
+}
+
 gate_build_args() {
   gate_args=()
+  gate_seed_target
   [ -n "${NUCLEOS_TARGET_DIR:-}" ] && gate_args+=(--target-dir "$NUCLEOS_TARGET_DIR")
   [ -n "${NUCLEOS_GATE_JOBS:-}" ] && gate_args+=(-j "$NUCLEOS_GATE_JOBS")
   return 0
