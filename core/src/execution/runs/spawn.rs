@@ -2,10 +2,7 @@
 
 use super::*;
 
-// Declared here, not in runs.rs: the file sits beside spawn.rs, and `#[path]` is relative to it.
-#[path = "account_park.rs"]
-mod account_park;
-use account_park::relaunch_after_limit;
+use super::transient::account_park::{self, relaunch_after_limit};
 
 /// Releases a run's abort handle when its task ends — by returning, by panicking, or by being
 /// aborted, including aborted before its first poll, when the task drops its captured state without
