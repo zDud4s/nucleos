@@ -383,11 +383,11 @@ pub(super) async fn park_or_ask(
 ) -> Result<Option<Decision>, DecisionError> {
     let loaded = store::load(pool, tree_id).await?;
     if let Some(job) = &loaded
-        && job
-            .manifest
-            .branches
-            .values()
-            .any(|branch| branch.node_id.as_deref() == Some(node_id) && branch.state == PARKED)
+        && job.manifest.branches.values().any(|branch| {
+            branch.node_id.as_deref() == Some(node_id)
+                && (branch.state == PARKED
+                    || matches!(branch.state.as_str(), "merged" | "dropped" | "done"))
+        })
     {
         return Ok(None);
     }
@@ -1286,6 +1286,22 @@ mod tests {
             .park
             .expect("the root branch keeps its park record");
         assert_eq!(record["decision_id"].as_str(), Some(first.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn park_or_ask_on_a_dropped_branch_answers_none() {
+        for state in ["dropped", "merged", "done"] {
+            let pool = crate::testdb::fresh_pool().await;
+            seed_one_branch(&pool, state).await;
+            let before = job(&pool).await;
+
+            let answer = park_or_ask(&pool, TREE, NODE, QUESTION).await.unwrap();
+
+            assert_eq!(answer, None, "{state}");
+            assert_eq!(decision_rows(&pool).await, 0, "{state}");
+            assert_eq!(feed_rows(&pool).await, 0, "{state}");
+            assert_eq!(job(&pool).await, before, "{state}");
+        }
     }
 
     #[tokio::test]

@@ -2522,7 +2522,8 @@ def bundle_hooks(payload: dict, extra: str = "") -> None:
     results = []
     try:
         cwd = payload.get("cwd") or os.getcwd()
-        token, _why = read_control_token(cwd, 2, 3)
+        # A run's key is refused by `/hooks/bundle` (it only opens the fixed hook routes): skip the call.
+        token, _why = (None, None) if os.environ.get("NUCLEOS_RUN_ID") is not None else read_control_token(cwd, 2, 3)
         if token:
             daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
             request = urllib.request.Request(

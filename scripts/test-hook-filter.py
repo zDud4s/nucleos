@@ -1559,6 +1559,29 @@ def session_start_cases():
         "SessionStart fails open when the daemon is unreachable",
         "" if code == 0 and printed == "" else f"exit {code!r}, printed {printed!r}",
     ))
+
+    # A run's key is refused by `/hooks/bundle`, so a governed run must not make the call at all.
+    calls = []
+
+    def run_urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        return reply
+
+    captured = io.StringIO()
+    code = "no exit"
+    with mock.patch.dict(os.environ, {"NUCLEOS_RUN_ID": "7"}):
+        with mock.patch.object(hook, "read_control_token", return_value=("tok", None)) as token:
+            with mock.patch.object(hook.urllib.request, "urlopen", side_effect=run_urlopen):
+                with mock.patch("sys.stdout", captured):
+                    try:
+                        hook.bundle_hooks(payload)
+                    except SystemExit as exit_:
+                        code = exit_.code
+    cases.append((
+        "bundle_hooks in a governed run (NUCLEOS_RUN_ID) skips the daemon call and fails open",
+        "" if code == 0 and not calls and not token.called and captured.getvalue() == ""
+        else f"exit {code!r}, calls {calls!r}, token read {token.called!r}, printed {captured.getvalue()!r}",
+    ))
     return cases
 
 

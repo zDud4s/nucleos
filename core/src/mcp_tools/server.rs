@@ -297,6 +297,12 @@ pub(super) fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> 
         .map(String::as_str)
 }
 
+/// Whether this box beats the daemon. Only an owner-keyed worktree box does: a run's key is
+/// refused by `POST /verify/box/beat` on purpose (a run must not keep a worktree alive).
+pub(super) fn beats_for(served: &McpBox, in_run: bool) -> bool {
+    matches!(served, McpBox::Worktree(_)) && !in_run
+}
+
 /// Serves this process's stdin/stdout as the NucleOS MCP server.
 ///
 /// `served` is the box and its scope, and `McpBox::All` — everything except the named job-node
@@ -308,7 +314,10 @@ pub async fn run_stdio(
 ) -> Result<(), String> {
     // The worktree box keeps its session live for the daemon. Errors are ignored and nothing is
     // printed: stdout is the protocol, and a missed beat only lets the liveness expire.
-    if let McpBox::Worktree(path) = &served {
+    if let (true, McpBox::Worktree(path)) = (
+        beats_for(&served, std::env::var_os("NUCLEOS_RUN_ID").is_some()),
+        &served,
+    ) {
         let beat_client = client.clone();
         let path = path.clone();
         tokio::spawn(async move {
@@ -325,4 +334,20 @@ pub async fn run_stdio(
         .map_err(|e| e.to_string())?;
     service.waiting().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod beat_tests {
+    use super::*;
+
+    #[test]
+    fn a_run_scoped_mcp_worktree_box_does_not_beat() {
+        let worktree = McpBox::Worktree("/w".to_owned());
+        assert!(
+            !beats_for(&worktree, true),
+            "a run's key is refused by the beat"
+        );
+        assert!(beats_for(&worktree, false));
+        assert!(!beats_for(&McpBox::All, false));
+    }
 }

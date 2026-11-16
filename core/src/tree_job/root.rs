@@ -238,6 +238,20 @@ pub async fn retry_failed_starts(state: &AppState) {
     }
 }
 
+/// Whether the failed root start of `job` used up its allowance (or waits on a decision): its
+/// retries then belong to `retry_failed_starts`, which asks the owner, not to a blind sweep.
+pub(super) fn start_exhausted(job: &TreeJob) -> bool {
+    let Some(record) = job.manifest.extra.get(ROOT_START_KEY) else {
+        return false;
+    };
+    if record.get("decision_id").is_some() {
+        return true;
+    }
+    let attempts = record["attempts"].as_u64().unwrap_or(0);
+    let error = record["error"].as_str().unwrap_or("unknown");
+    attempts >= super::root_disk::start_cap(error, ROOT_START_CAP)
+}
+
 async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> Result<(), String> {
     let pool = &state.pool;
     let run: Option<Option<String>> =
@@ -811,6 +825,43 @@ mod tests {
         assert!(run.is_some(), "the sweep started the root");
     }
 
+    /// A daemon that died (or a launch that failed) after `bind_branch` left the root `building`
+    /// with its node bound and no run: the start replays and launches, and makes one run only.
+    #[tokio::test]
+    async fn root_start_replays_when_branch_is_already_building_without_run() {
+        let container = space_free_tempdir("tree-root-building-");
+        let repo = container.path().join("repo");
+        let (state, _runner) = start_tree(&repo, Some(Duration::from_secs(5))).await;
+        let (root, run) = root_run(&state).await;
+        assert_eq!(run, None, "no repository yet: the start failed");
+
+        tree_repo(&container);
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        super::add_root_branch(&state, TREE).await.unwrap();
+        let config = crate::tree_job::open::open_config(&job.manifest.project_root).await;
+        crate::tree_job::open::open_branch(&state.pool, TREE, super::ROOT_BRANCH, &config)
+            .await
+            .unwrap();
+        crate::tree_job::open::bind_branch(&state.pool, TREE, super::ROOT_BRANCH, &root)
+            .await
+            .unwrap();
+        let (_, run) = root_run(&state).await;
+        assert_eq!(run, None, "bound, but nothing launched");
+
+        super::start(&state, &job).await.expect("the start replays");
+
+        let (_, run) = root_run(&state).await;
+        assert!(run.is_some(), "the root run was launched");
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1, "one run, never a second");
+    }
+
     /// A root that keeps failing to start is not retried forever in silence: past a cap the owner
     /// is asked once, and an answer is a fresh allowance of retries.
     #[tokio::test]
@@ -844,5 +895,40 @@ mod tests {
 
         let (_, run) = root_run(&state).await;
         assert!(run.is_some(), "the answer gave the start a fresh try");
+    }
+
+    /// Past its allowance (or once the owner is asked) a failed root start is exhausted, so
+    /// `root_pending::retry` leaves it to `retry_failed_starts` instead of retrying blindly.
+    #[tokio::test]
+    async fn start_exhausted_is_true_past_the_cap_or_once_asked() {
+        let container = space_free_tempdir("tree-root-exhausted-");
+        let missing = container.path().join("repo");
+        let (state, _runner) = start_tree(&missing, Some(Duration::from_secs(5))).await;
+        let load = || async {
+            crate::tree_job::store::load(&state.pool, TREE)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        let mut job = load().await;
+        job.manifest.extra.remove(super::ROOT_START_KEY);
+        assert!(!super::start_exhausted(&job), "no failed start recorded");
+        job.manifest.extra.insert(
+            super::ROOT_START_KEY.to_owned(),
+            serde_json::json!({"attempts": 1, "error": "boom"}),
+        );
+        assert!(!super::start_exhausted(&job), "attempts left");
+        job.manifest.extra.insert(
+            super::ROOT_START_KEY.to_owned(),
+            serde_json::json!({"attempts": super::ROOT_START_CAP, "error": "boom"}),
+        );
+        assert!(super::start_exhausted(&job), "cap reached");
+
+        for _ in 0..10 {
+            age_start_record(&state).await;
+            crate::tree_job::wrap::tick(&state).await;
+        }
+        assert!(super::start_exhausted(&load().await), "owner asked");
     }
 }
