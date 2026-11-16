@@ -605,3 +605,63 @@ pub(super) async fn push_sha(
         output_tail: pushed.output_tail,
     }
 }
+
+/// How an automation's push of one sha ended, for the firing log and the incident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PushVerdict {
+    /// The remote branch now points at the sha.
+    Pushed,
+    /// Git refused a non-fast-forward, and one side contains the other: the remote moved on (or
+    /// already holds the sha). Nothing for a person to settle; the next green pushes again.
+    Rejected,
+    /// Neither the remote tip nor the sha contains the other: two lines of history. The owner decides.
+    Diverged { remote_sha: String },
+    /// Anything else: the network, credentials, a remote that does not exist, the deadline.
+    Other,
+}
+
+/// Pushes `sha` to `<remote>/<branch>` as a fast-forward and classifies a refusal.
+///
+/// **Never forced, by constraint, not by taste.** No `--force`, no `--force-with-lease`, no `+` on
+/// the refspec: an automation that may overwrite the remote can lose somebody else's work with no
+/// one watching. `push_sha_ff_reports_rejected_when_the_remote_is_ahead_and_never_forces` is the
+/// proof. The returned `Outcome` is always [`push_sha`]'s own; the classification only reads git
+/// and the remote-tracking ref after a refusal, it never writes the remote.
+pub(super) async fn push_sha_ff(
+    project_root: &Path,
+    remote: &str,
+    branch: &str,
+    sha: String,
+    deadline: std::time::Instant,
+) -> (Outcome, PushVerdict) {
+    let outcome = push_sha(project_root, remote, branch, sha.clone(), deadline).await;
+    let output = match &outcome {
+        Outcome::Succeeded { .. } => return (outcome, PushVerdict::Pushed),
+        Outcome::Failed { output_tail, .. } => output_tail.to_ascii_lowercase(),
+        _ => return (outcome, PushVerdict::Other),
+    };
+    let refused = ["rejected", "non-fast-forward", "fetch first"]
+        .iter()
+        .any(|marker| output.contains(marker));
+    if !refused {
+        return (outcome, PushVerdict::Other);
+    }
+    if !matches!(
+        fetch(project_root, remote, deadline).await,
+        Outcome::Succeeded { .. }
+    ) {
+        return (outcome, PushVerdict::Other);
+    }
+    let tracking = format!("refs/remotes/{remote}/{branch}");
+    let Ok(remote_sha) = revision(project_root, &tracking, deadline).await else {
+        return (outcome, PushVerdict::Other);
+    };
+    let remote_ahead = is_ancestor(project_root, &sha, &remote_sha, deadline).await;
+    let local_ahead = is_ancestor(project_root, &remote_sha, &sha, deadline).await;
+    let verdict = match (remote_ahead, local_ahead) {
+        (Ok(true), _) | (_, Ok(true)) => PushVerdict::Rejected,
+        (Ok(false), Ok(false)) => PushVerdict::Diverged { remote_sha },
+        _ => PushVerdict::Other,
+    };
+    (outcome, verdict)
+}

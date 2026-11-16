@@ -261,6 +261,13 @@ svg {
   max-width: 100%;
 }
 
+/* xyflow draws each edge in an unsized svg inside a 0x0 box and relies on
+   overflow: visible. The cap above makes that svg 0 wide, and a zero-width svg
+   is not rendered at all, so every canvas (Fleet, workflows) lost its edges. */
+.react-flow__edges svg {
+  max-width: none;
+}
+
 /* Panels scroll independently all over this app, so the scrollbar is part of
    the surface rather than a strip of operating system laid over it. */
 * {

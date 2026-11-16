@@ -13,6 +13,8 @@ import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
 import { clockText } from "../lib/when";
 import { ErrorNote, Section, StaleNote, StatCard } from "../ui";
 import { AutopilotRules } from "./AutopilotRules";
+import { Automations } from "./Automations";
+import { GateTargets } from "./GateTargets";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
 import { Occupancy } from "./Occupancy";
@@ -128,6 +130,14 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
 
           <Section label="Autopilot rules">
             <AutopilotRules projectId={projectId} />
+          </Section>
+
+          <Section label="Gate targets">
+            <GateTargets projectId={projectId} />
+          </Section>
+
+          <Section label="Automations">
+            <Automations projectId={projectId} />
           </Section>
 
           <Section label="Test map">

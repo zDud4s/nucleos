@@ -11,8 +11,11 @@
 //! It landed first, deliberately: building the launcher before the check would have meant a window
 //! in which an agent can publish a resolution nothing verified.
 
+mod gate_retry;
+
 use crate::execution::vcs;
 use crate::state::AppState;
+use gate_retry::{GateRequest, GateRunner, Refusals, Retry};
 
 /// How often the daemon looks for a conflict nobody has attempted.
 ///
@@ -43,7 +46,7 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// because of work that is about to be cancelled for being pointless.
 pub async fn run_resolution_loop(state: AppState) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
-    let mut refused = std::collections::HashSet::new();
+    let mut refused = Refusals::default();
     loop {
         interval.tick().await;
         // Steps that only read and then write one self-contained row are bounded, so a wedged one
@@ -983,6 +986,8 @@ struct Finished {
     completed_at: Option<String>,
     gate_status: Option<String>,
     run_status: String,
+    run_id: i64,
+    gate_output: Option<String>,
 }
 
 /// How long a completed run is left alone before its worktree is read, so a run that is about to
@@ -1010,9 +1015,20 @@ const HANDOFF_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 /// feed is not, so a still-escalated request is not re-announced each time the daemon starts. A
 /// request that is moot (its source branch is gone, or already part of its target) is not announced
 /// at all. Fails closed under the kill switch.
-async fn land_finished(
+async fn land_finished(pool: &sqlx::SqlitePool, refused: &mut Refusals) {
+    land_finished_with(pool, refused, &gate_retry::project_gate()).await;
+}
+
+/// `land_finished` with the gate re-run behind `gate_runner`, which tests replace.
+///
+/// A resolution whose run's gate `failed` gets the gate re-run once at its head (`gate_retry`): the
+/// re-run is spawned, so this tick does not wait for it, and the next one reads its outcome. Green
+/// on the retry goes on to the queue like a `passed` run; red again, or a retry that could not run,
+/// is announced with what failed.
+async fn land_finished_with(
     pool: &sqlx::SqlitePool,
-    refused: &mut std::collections::HashSet<(i64, String)>,
+    refused: &mut Refusals,
+    gate_runner: &GateRunner,
 ) {
     if crate::governance::autopilot::kill_switch_engaged(pool)
         .await
@@ -1022,7 +1038,8 @@ async fn land_finished(
     }
     let finished: Vec<Finished> = match sqlx::query_as(
         "SELECT c.id, c.op, c.args, c.project_id, w.path AS worktree_path, w.branch,
-                w.base_sha, r.completed_at, r.gate_status, r.status AS run_status
+                w.base_sha, r.completed_at, r.gate_status, r.status AS run_status,
+                r.id AS run_id, r.gate_output
            FROM vcs_requests AS c
            JOIN runs AS r ON r.id = c.resolution_run_id
            JOIN worktrees AS w
@@ -1119,16 +1136,43 @@ async fn land_finished(
         match row.gate_status.as_deref() {
             None | Some("passed") => {}
             Some(gate) => {
-                let summary = format!(
-                    "{}'s conflict resolution on {} at {} is merged but its run's gate {gate}; \
-                     it was not handed to the queue and needs a person",
-                    row.project_id,
-                    row.branch,
-                    short_head(&head)
-                );
-                refused.insert((row.id, head));
-                announce_once(pool, &summary).await;
-                continue;
+                // Only a red gate is retried: an `errored` one is infrastructure and has its own
+                // path (`release_unfinished`).
+                let retry = if gate == "failed" {
+                    let request = GateRequest {
+                        pool: pool.clone(),
+                        project_id: row.project_id.clone(),
+                        run_id: row.run_id,
+                        worktree: std::path::PathBuf::from(&row.worktree_path),
+                    };
+                    Some(
+                        refused
+                            .retry_gate((row.id, head.clone()), request, gate_runner)
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                match retry {
+                    Some(Retry::Pending) => continue,
+                    Some(Retry::Passed) => tracing::info!(
+                        vcs_request_id = row.id,
+                        "resolver: the gate of a finished resolution passed on its one retry"
+                    ),
+                    _ => {
+                        let summary = gate_retry::refusal(
+                            &row.project_id,
+                            &row.branch,
+                            short_head(&head),
+                            gate,
+                            row.gate_output.as_deref(),
+                            retry.as_ref(),
+                        );
+                        refused.insert((row.id, head));
+                        announce_once(pool, &summary).await;
+                        continue;
+                    }
+                }
             }
         }
         let repo = match crate::execution::vcs::resolve_repo(pool, &row.project_id).await {
@@ -2317,46 +2361,127 @@ mod tests {
             .unwrap();
     }
 
+    /// A gate that answers `results[n]` (`true` = green) to its n-th run, and the last one after
+    /// that, plus how many times it ran.
+    fn fake_gate(
+        results: Vec<bool>,
+    ) -> (GateRunner, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = runs.clone();
+        let runner: GateRunner = std::sync::Arc::new(move |_request| {
+            let nth = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let green = results[nth.min(results.len() - 1)];
+            Box::pin(async move {
+                if green {
+                    crate::gate::GateOutcome::Passed
+                } else {
+                    crate::gate::GateOutcome::Failed {
+                        exit_code: 101,
+                        output: "test flaky::one ... FAILED
+"
+                        .to_owned(),
+                    }
+                }
+            })
+        });
+        (runner, runs)
+    }
+
+    /// One tick, then a chance for the spawned gate retry to finish before the next.
+    async fn tick(pool: &sqlx::SqlitePool, refused: &mut Refusals, gate: &GateRunner) {
+        land_finished_with(pool, refused, gate).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+
+    async fn gate_announcements(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
+            .bind(crate::execution::land::RESOLUTION_FAILED_KIND)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
     /// `completed` says the agent stopped, not that the project's gate passed, and the queue's land
-    /// builds nothing: a resolution whose gate failed (real reds) is announced once and never
-    /// handed over, and never retried either.
+    /// builds nothing: a resolution whose gate failed twice (real red) is announced once, with the
+    /// reason, and never handed over.
     #[tokio::test]
-    async fn a_failed_resolution_gate_is_still_refused() {
-        for status in ["failed"] {
-            let pool = test_pool().await;
-            let scenario = resolution_scenario(
-                &pool,
-                "nucleos-resolver-gate-",
-                "completed",
-                Progress::Committed,
-            )
-            .await;
-            gate(&pool, status).await;
+    async fn a_resolution_whose_gate_fails_twice_is_refused_with_the_reason() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-gate-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "failed").await;
+        sqlx::query("UPDATE runs SET gate_output = 'test first::red ... FAILED' WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (runner, runs) = fake_gate(vec![false]);
 
-            let mut refused = Default::default();
-            land_finished(&pool, &mut refused).await;
-            land_finished(&pool, &mut refused).await;
-
-            assert!(
-                admitted_resolutions(&pool, &scenario).await.is_empty(),
-                "a gate that {status} keeps the resolution from the queue"
-            );
-            let linked: Option<i64> =
-                sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
-                    .bind(scenario.request)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(linked, None);
-            let summaries: Vec<String> =
-                sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
-                    .bind(crate::execution::land::RESOLUTION_FAILED_KIND)
-                    .fetch_all(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(summaries.len(), 1, "announced once, not every tick");
-            assert!(summaries[0].contains(status), "{}", summaries[0]);
+        let mut refused = Default::default();
+        for _ in 0..3 {
+            tick(&pool, &mut refused, &runner).await;
         }
+
+        assert!(
+            admitted_resolutions(&pool, &scenario).await.is_empty(),
+            "a gate that fails twice keeps the resolution from the queue"
+        );
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                .bind(scenario.request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, None);
+        let summaries = gate_announcements(&pool).await;
+        assert_eq!(summaries.len(), 1, "announced once, not every tick");
+        assert!(
+            summaries[0].contains("resolved and committed"),
+            "{}",
+            summaries[0]
+        );
+        assert!(summaries[0].contains("failed twice"), "{}", summaries[0]);
+        assert!(summaries[0].contains("first::red"), "{}", summaries[0]);
+        assert!(summaries[0].contains("flaky::one"), "{}", summaries[0]);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the gate is re-run once for a head, however many ticks look at it"
+        );
+    }
+
+    /// A red that does not repeat (a flaky test, a file elsewhere) is not a verdict on the
+    /// resolution: the retry goes green and the branch is handed to the queue like a passed one.
+    #[tokio::test]
+    async fn a_gate_that_passes_on_its_retry_hands_the_resolution_to_the_queue() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-gate-retry-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "failed").await;
+        let (runner, runs) = fake_gate(vec![true]);
+
+        let mut refused = Default::default();
+        tick(&pool, &mut refused, &runner).await;
+        assert!(
+            admitted_resolutions(&pool, &scenario).await.is_empty(),
+            "the tick that starts the retry does not wait for it"
+        );
+        tick(&pool, &mut refused, &runner).await;
+        tick(&pool, &mut refused, &runner).await;
+
+        assert_eq!(admitted_resolutions(&pool, &scenario).await.len(), 1);
+        assert!(gate_announcements(&pool).await.is_empty());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// An `errored` gate is infrastructure (a pool timeout, an unreadable config), not a verdict on
@@ -2500,14 +2625,19 @@ mod tests {
         )
         .await;
         gate(&pool, "failed").await;
+        // The retry is forgotten on a restart, so it runs again; the announcement is not repeated.
+        let (always_red, runs) = fake_gate(vec![false]);
 
-        let mut before_restart = Default::default();
-        land_finished(&pool, &mut before_restart).await;
-        let mut after_restart = Default::default();
-        land_finished(&pool, &mut after_restart).await;
+        let mut before_restart = Refusals::default();
+        tick(&pool, &mut before_restart, &always_red).await;
+        tick(&pool, &mut before_restart, &always_red).await;
+        let mut after_restart = Refusals::default();
+        tick(&pool, &mut after_restart, &always_red).await;
+        tick(&pool, &mut after_restart, &always_red).await;
 
         let summaries = resolution_failed_summaries(&pool).await;
         assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

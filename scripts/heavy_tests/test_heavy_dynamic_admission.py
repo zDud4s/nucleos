@@ -406,17 +406,17 @@ class Pure(unittest.TestCase):
     # T4
     def test_dynamic_max_jobs_default_and_invalid(self) -> None:
         c = self.load()
-        self.assertEqual(c.dynamic_max_jobs(), 8)
-        os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = "12"
         self.assertEqual(c.dynamic_max_jobs(), 12)
+        os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = "7"
+        self.assertEqual(c.dynamic_max_jobs(), 7)
         for bad in ("abc", "0", "-3", "4.5", ""):
             os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = bad
-            self.assertEqual(c.dynamic_max_jobs(), 8, bad)
+            self.assertEqual(c.dynamic_max_jobs(), 12, bad)
 
     # T5
     def test_dynamic_ceiling_and_idle_floor(self) -> None:
         c = self.load()
-        ceiling = c.dynamic_max_jobs()
+        ceiling = 8  # explicit: the default ceiling is 12
         idle = self.probe(2)
         ok, _ = c.dynamic_fit(7, idle, 100.0, ceiling, True)
         self.assertTrue(ok)
@@ -456,28 +456,28 @@ class Pure(unittest.TestCase):
         def p(total):
             return {"logical": 32, "total_mb": total, "avail_mb": 20000, "busy_cores": 2}
 
-        for total, want in ((65536, 8), (65400, 8), (49152, 6), (32768, 4),
+        for total, want in ((65536, 11), (65400, 11), (49152, 8), (32768, 5),
                             (16384, 4), (8192, 4)):
             self.assertEqual(c.dynamic_max_jobs(p(total)), want, total)
-        self.assertEqual(c.dynamic_max_jobs({"logical": 32}), 8)
-        self.assertEqual(c.dynamic_max_jobs(None), 8)
-        self.assertEqual(c.dynamic_max_jobs(), 8)
+        self.assertEqual(c.dynamic_max_jobs({"logical": 32}), 12)
+        self.assertEqual(c.dynamic_max_jobs(None), 12)
+        self.assertEqual(c.dynamic_max_jobs(), 12)
         # An explicit env value is used verbatim, whatever the probe.
-        os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = "12"
-        self.assertEqual(c.dynamic_max_jobs(p(16384)), 12)
+        os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = "9"
+        self.assertEqual(c.dynamic_max_jobs(p(16384)), 9)
 
     # T8
-    def test_from_four_held_the_settle_window_is_never_waived(self) -> None:
+    def test_from_eight_held_the_settle_window_is_never_waived(self) -> None:
         c = self.load()
         p = {"logical": 32, "total_mb": 65536, "avail_mb": 60000, "busy_cores": 2}
-        ok, _ = c.dynamic_fit(3, p, 0.0, 8, True)
+        ok, _ = c.dynamic_fit(7, p, 0.0, 12, True)
         self.assertTrue(ok)
-        ok, adm = c.dynamic_fit(4, p, 0.0, 8, True)
+        ok, adm = c.dynamic_fit(8, p, 0.0, 12, True)
         self.assertFalse(ok)
         self.assertEqual(adm["rule"], "room")
-        ok, _ = c.dynamic_fit(4, p, 100.0, 8, True)
+        ok, _ = c.dynamic_fit(8, p, 100.0, 12, True)
         self.assertTrue(ok)
-        ok, _ = c.dynamic_fit(7, p, 0.0, 8, True)
+        ok, _ = c.dynamic_fit(11, p, 0.0, 12, True)
         self.assertFalse(ok)
 
 

@@ -210,6 +210,16 @@ pub enum Op {
         from: Branch,
         to: Branch,
     },
+    /// Fast-forwards `remote`'s `branch` to `sha`, the sha a project automation saw green
+    /// (`automations::dispatch`). Daemon-only like `Promote`: not declarable, refused by
+    /// `from_request`, refused at `admit` from a run or a job, and queued with `Origin::Automation`.
+    /// Never forced: the refspec is `<sha>:refs/heads/<branch>`, so a remote that moved is a refusal.
+    #[serde(rename = "push-sha")]
+    PushSha {
+        remote: Remote,
+        branch: Branch,
+        sha: CommitSha,
+    },
 }
 /// A branch name the daemon is willing to put on a git command line.
 ///
@@ -421,6 +431,8 @@ fn named_tag(value: Option<&str>, operation: &str, which: &str) -> Result<TagNam
 pub const MERGE_KIND: &str = "merge";
 /// `vcs_requests.op` for a revert, which the post-merge gate's revert files as `origin = 'daemon'`.
 pub const REVERT_KIND: &str = "revert";
+/// `vcs_requests.op` for an automation's push of a green sha.
+pub const PUSH_SHA_KIND: &str = "push-sha";
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -432,6 +444,7 @@ impl Op {
             Op::Rebase { .. } => "rebase",
             Op::Revert { .. } => REVERT_KIND,
             Op::Promote { .. } => "promote",
+            Op::PushSha { .. } => PUSH_SHA_KIND,
         }
     }
 
@@ -500,6 +513,10 @@ impl Op {
             "promote" => Err(
                 "promote is not something a caller asks for: the daemon queues it to move the \
                  release branch to the last green sha"
+                    .to_owned(),
+            ),
+            "push-sha" => Err(
+                "push-sha is not something a caller asks for: an automation rule queues it"
                     .to_owned(),
             ),
             // **What is left on the spec's list of nine is NOT a backlog, and this arm no longer
@@ -586,7 +603,7 @@ pub const GRANT_ONLY_KINDS: [&str; 1] = [REBASE_OWN_WORKTREE];
 /// project declares them, the picker never draws them and `Op::from_request` refuses them.
 /// `every_op_kind_is_in_the_declarable_catalogue` requires every kind to sit in one list or the
 /// other. `admit` refuses these kinds when they come from a run or a job origin.
-pub const DAEMON_OP_KINDS: [&str; 2] = ["revert", "promote"];
+pub const DAEMON_OP_KINDS: [&str; 3] = ["revert", "promote", PUSH_SHA_KIND];
 /// One operation a project may declare, with the flag the shell draws it by.
 ///
 /// `declarable` is always `true` today and the field is not decoration: the GitHub catalogue's
@@ -1227,6 +1244,11 @@ mod tests {
                 from: Branch::new("integration").unwrap(),
                 to: Branch::new("master").unwrap(),
             },
+            Op::PushSha {
+                remote: Remote::new("origin").unwrap(),
+                branch: Branch::new("master").unwrap(),
+                sha: CommitSha::new(&"b".repeat(40)).unwrap(),
+            },
         ];
         for op in &one_of_each {
             assert!(
@@ -1273,6 +1295,32 @@ mod tests {
             "a project must not be able to declare a revert"
         );
         assert!(DAEMON_OP_KINDS.contains(&"revert"));
+    }
+
+    /// An automation's push of a green sha is daemon-only: no tool call asks for one.
+    #[test]
+    fn from_request_refuses_push_sha_for_a_caller() {
+        let refused = Op::from_request("push-sha", Some("master"), Some("origin")).unwrap_err();
+        assert!(refused.contains("automation"), "{refused}");
+        assert!(!GIT_OP_KINDS.contains(&"push-sha"));
+        assert!(DAEMON_OP_KINDS.contains(&"push-sha"));
+    }
+
+    #[test]
+    fn push_sha_round_trips_through_to_args_and_from_stored() {
+        let op = Op::PushSha {
+            remote: Remote::new("origin").unwrap(),
+            branch: Branch::new("master").unwrap(),
+            sha: CommitSha::new(&"c".repeat(40)).unwrap(),
+        };
+        assert_eq!(op.kind(), "push-sha");
+        let payload: serde_json::Value = serde_json::from_str(&op.to_args()).unwrap();
+        assert_eq!(payload["op"].as_str(), Some("push-sha"));
+        assert_eq!(Op::from_stored("push-sha", &op.to_args()), Ok(op.clone()));
+        assert!(Op::from_stored("push", &op.to_args()).is_err());
+        // The sha is an id: a branch name in its place does not parse back.
+        let forged = r#"{"op":"push-sha","remote":"origin","branch":"master","sha":"master"}"#;
+        assert!(Op::from_stored("push-sha", forged).is_err());
     }
 
     /// A promote is the daemon's own operation: it sits in the daemon-only vocabulary, out of the
@@ -2690,6 +2738,11 @@ mod tests {
                 from: "integration".into(),
                 to: "master".into(),
             },
+            Op::PushSha {
+                remote: Remote::new("origin").unwrap(),
+                branch: "master".into(),
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
         ];
 
         for op in &all {
@@ -2725,7 +2778,8 @@ mod tests {
                 "branch-delete",
                 "rebase",
                 "revert",
-                "promote"
+                "promote",
+                "push-sha"
             ],
             "the `op` column's vocabulary is the one the door speaks"
         );
@@ -4961,6 +5015,60 @@ mod tests {
         );
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
+    }
+
+    fn push_sha() -> Op {
+        Op::PushSha {
+            remote: Remote::new("origin").unwrap(),
+            branch: Branch::new("master").unwrap(),
+            sha: CommitSha::new(&"d".repeat(40)).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_automation_origin_queues_as_daemon_and_stores_its_rule() {
+        let pool = test_pool().await;
+        let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "alpha");
+        let id = submit_declared(
+            &pool,
+            &repo,
+            &push_sha(),
+            Origin::Automation {
+                rule: "push-quando-verde".to_string(),
+            },
+        )
+        .await
+        .expect("an automation's push-sha is admitted");
+        let (origin, rule, status): (String, Option<String>, String) =
+            sqlx::query_as("SELECT origin, automation_rule, status FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(origin, "daemon");
+        assert_eq!(rule.as_deref(), Some("push-quando-verde"));
+        assert_eq!(status, "queued");
+    }
+
+    #[tokio::test]
+    async fn a_run_cannot_queue_a_push_sha() {
+        let pool = test_pool().await;
+        let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "alpha");
+        assert!(
+            submit(&pool, &repo, &push_sha(), Origin::Run(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            submit_declared(&pool, &repo, &push_sha(), Origin::Job(1))
+                .await
+                .is_err()
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     /// A promote is the daemon's own operation too: a run or job origin is refused at `admit`

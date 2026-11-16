@@ -275,7 +275,7 @@ pub async fn drain_once(
         std::path::Path::new(&claimed.project_root),
         &claimed.op,
         claimed.from_resolution,
-        queue_origin,
+        queue_origin.clone(),
         claimed.run_id,
         claimed.integration_branch.as_ref(),
     )

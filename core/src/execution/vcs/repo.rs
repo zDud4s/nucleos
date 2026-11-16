@@ -8,7 +8,7 @@ use super::*;
 /// later is friction with no safety gain. An autonomous run or job's request is not: nothing else
 /// in the system has consented to it yet, so it waits. The queue itself never decides consent, only
 /// ordering and mutual exclusion — this is where consent, already decided elsewhere, is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Human,
     // **A person's own editor session, asking through its safety hook** — `hooks::session_git_decision`.
@@ -35,17 +35,24 @@ pub enum Origin {
     /// approval of its own, and it is not recorded as `Human` or `Shell` because nobody clicked or
     /// typed anything. Readers that mean the revert alone filter on `op` as well (`postgate.rs`).
     Daemon,
+    /// A project automation acting on the rule the owner switched on (`automations::dispatch`).
+    /// Stored as `daemon`, because that is what it is — the daemon on a standing order of the owner —
+    /// and the `origin` column's CHECK knows five words; the rule's name goes to
+    /// `vcs_requests.automation_rule` ([`Origin::automation_rule`]).
+    Automation {
+        rule: String,
+    },
     Run(i64),
     // Constructed by Chunk 4, when jobs submit requests of their own.
     Job(i64),
 }
 impl Origin {
     /// The exact spelling the `origin` column's CHECK constraint accepts — do not invent others.
-    pub(super) fn as_str(self) -> &'static str {
+    pub(super) fn as_str(&self) -> &'static str {
         match self {
             Origin::Human => "human",
             Origin::Shell => "shell",
-            Origin::Daemon => "daemon",
+            Origin::Daemon | Origin::Automation { .. } => "daemon",
             Origin::Run(_) => "run",
             Origin::Job(_) => "job",
         }
@@ -53,13 +60,13 @@ impl Origin {
 
     /// Human and shell requests carry their own approval; run and job requests are autonomous and
     /// have not been approved by anything yet.
-    pub(super) fn needs_approval(self) -> bool {
+    pub(super) fn needs_approval(&self) -> bool {
         matches!(self, Origin::Run(_) | Origin::Job(_))
     }
 
     /// Whether this origin may queue `op`. The daemon-only kinds (`DAEMON_OP_KINDS`) are refused to
     /// the autonomous origins: a run or a job asking for a revert would be an agent undoing a merge.
-    pub(super) fn may_queue(self, op: &Op) -> bool {
+    pub(super) fn may_queue(&self, op: &Op) -> bool {
         !(matches!(self, Origin::Run(_) | Origin::Job(_)) && DAEMON_OP_KINDS.contains(&op.kind()))
     }
 
@@ -68,9 +75,17 @@ impl Origin {
     /// sequences and would collide (see `worktree::Owner::feed_run_id`'s doc comment for the same
     /// mistake made once already). A `job_id` column arrives once jobs actually submit requests,
     /// which is not this chunk.
-    pub(super) fn run_id(self) -> Option<i64> {
+    pub(super) fn run_id(&self) -> Option<i64> {
         match self {
-            Origin::Run(id) => Some(id),
+            Origin::Run(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// The automation rule that queued the request, for `vcs_requests.automation_rule`.
+    pub fn automation_rule(&self) -> Option<&str> {
+        match self {
+            Origin::Automation { rule } => Some(rule),
             _ => None,
         }
     }

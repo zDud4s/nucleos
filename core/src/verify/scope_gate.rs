@@ -110,6 +110,10 @@ pub fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
                 reason: time_ceiling_reason(secs, units),
             })
         }
+        Some("superseded") => ScopeVerdict::Measured(GateOutcome::Errored {
+            reason: "scope verification was superseded by a newer request of the same caller"
+                .to_owned(),
+        }),
         Some("inherited") => ScopeVerdict::Measured(GateOutcome::Errored {
             reason: "every red unit is inherited from a master incident; wait for it to close"
                 .to_owned(),

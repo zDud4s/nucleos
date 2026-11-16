@@ -41,6 +41,7 @@ const MIGRATION_PREFIX: &str = "migration:";
 const DIRECT_WRITE_PREFIX: &str = "direct-write:";
 /// Keys that belong to a spec's own tree.
 const SPEC_ITEM_PREFIX: &str = "spec-item:";
+const CI_RED_PREFIX: &str = "ci-red:";
 
 /// What a launch asks for: one branch with no sub-nodes, or a full tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +93,10 @@ fn package_of(path: &str) -> &str {
 /// `Leaf` when the ticket's paths span at most one package and it carries no spec; `Tree` otherwise.
 pub fn launch_kind(task: &TaskRow) -> LaunchKind {
     let has_spec = !matches!(task.detail.get("spec"), None | Some(Value::Null));
-    if has_spec || task.key.as_str().starts_with(SPEC_ITEM_PREFIX) {
+    if has_spec
+        || task.key.as_str().starts_with(SPEC_ITEM_PREFIX)
+        || task.key.as_str().starts_with(CI_RED_PREFIX)
+    {
         return LaunchKind::Tree;
     }
     let packages: BTreeSet<&str> = task
@@ -110,12 +114,16 @@ pub fn launch_kind(task: &TaskRow) -> LaunchKind {
 
 /// False for the keys whose owners are decided elsewhere: `master-red` (verify and the postgate) and
 /// `migration:` (the branch the land gate refused) and `direct-write:` (the owner resolves it), and
-/// `release-diverged` (the release branch moved outside the promotion; the incident needs the owner).
+/// `release-diverged` (the release branch moved outside the promotion; the incident needs the owner),
+/// and `remote-diverged:` (the remote branch split from the local green sha; only the owner decides
+/// which history wins). `ci-red:` is launchable here; whether one actually launches is the ticket's
+/// `detail.auto_fix` (see [`due`]).
 pub fn auto_launchable(key: &str) -> bool {
     key != MASTER_RED_KEY
         && key != crate::task_claims::keys::TaskKey::release_diverged().as_str()
         && !key.starts_with(MIGRATION_PREFIX)
         && !key.starts_with(DIRECT_WRITE_PREFIX)
+        && !key.starts_with("remote-diverged:")
 }
 
 fn parse(at: &str) -> Option<DateTime<Utc>> {
@@ -138,6 +146,12 @@ pub fn due(task: &TaskRow, history: &KeyHistory, all_declined: bool, now: DateTi
     if !auto_launchable(task.key.as_str())
         || task.status != Status::Open
         || task.parked_at.is_some()
+    {
+        return Due::No;
+    }
+    // `auto_fix: false` (explicit) means the owner wants a ci-red incident reported, not fixed.
+    if task.key.as_str().starts_with(CI_RED_PREFIX)
+        && task.detail.get("auto_fix") == Some(&Value::Bool(false))
     {
         return Due::No;
     }
@@ -583,6 +597,57 @@ mod tests {
             due(&row, &launched(2, t0() - mins(60)), true, t0()),
             Due::No
         );
+    }
+
+    #[test]
+    fn a_remote_diverged_ticket_is_never_auto_launched() {
+        assert!(!auto_launchable("remote-diverged:master"));
+        assert!(auto_launchable("file:core/a.rs"));
+    }
+
+    #[test]
+    fn a_ci_red_ticket_is_auto_launchable_with_auto_fix_and_not_without() {
+        assert!(auto_launchable("ci-red:master"));
+        let mut fixing = ticket_row("ci-red:master", t0() - mins(10));
+        fixing.detail = json!({ "auto_fix": true });
+        assert_eq!(due(&fixing, &never(), false, t0()), Due::Launch);
+        let mut absent = ticket_row("ci-red:master", t0() - mins(10));
+        absent.detail = json!({});
+        assert_eq!(due(&absent, &never(), false, t0()), Due::Launch);
+        let mut reporting = ticket_row("ci-red:master", t0() - mins(10));
+        reporting.detail = json!({ "auto_fix": false });
+        assert_eq!(due(&reporting, &never(), false, t0()), Due::No);
+        assert_eq!(due(&reporting, &never(), true, t0()), Due::No);
+    }
+
+    #[test]
+    fn a_ci_red_ticket_launches_a_tree() {
+        let row = ticket_row("ci-red:master", t0());
+        assert!(row.hint_paths.is_empty());
+        assert_eq!(launch_kind(&row), LaunchKind::Tree);
+    }
+
+    #[test]
+    fn the_cap_parks_a_ci_red_ticket_after_two_launches() {
+        let mut row = ticket_row("ci-red:master", t0() - mins(60));
+        row.detail = json!({ "auto_fix": true });
+        assert_eq!(
+            due(&row, &launched(2, t0() - mins(10)), false, t0()),
+            Due::Park
+        );
+        assert_eq!(
+            due(&row, &launched(2, t0() - mins(5)), false, t0()),
+            Due::No
+        );
+    }
+
+    #[test]
+    fn master_red_and_direct_write_stay_excluded() {
+        assert!(!auto_launchable(MASTER_RED_KEY));
+        assert!(!auto_launchable("direct-write:master"));
+        assert!(!auto_launchable("migration:master:0286"));
+        assert!(!auto_launchable("remote-diverged:master"));
+        assert!(!auto_launchable("release-diverged"));
     }
 
     #[test]

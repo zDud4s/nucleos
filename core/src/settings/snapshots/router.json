@@ -29,7 +29,7 @@
         "type": "string"
       },
       "default": {},
-      "description": "Surface name (`runs`, `team`, `council`, `recruit`) to mode.",
+      "description": "Surface name (`runs`, `team`, `council`, `recruit`, `agents`) to mode.",
       "type": "object"
     },
     "timeout_ms": {
@@ -39,7 +39,7 @@
       "type": "integer"
     },
     "url": {
-      "default": "http://127.0.0.1:18733",
+      "default": "http://127.0.0.1:8080",
       "type": "string"
     }
   },

@@ -14,6 +14,7 @@ import { createAppRouter } from "../router";
 import { adoptStyleNonce } from "../lib/style-nonce";
 import { CHAT_HELD_ID, NOW, answer, answerText, refusal } from "./daemon";
 import { answerFleet } from "./fleet-live";
+import { answerStory, answerStoryFleet, storyActive } from "./story";
 import { holdMessage } from "../chats/held";
 
 /**
@@ -100,8 +101,14 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 
   // The fleet's stream, transcript and pins: a stream needs a Response of its own, which
   // `answer()` (plain data) cannot be.
-  const fleet = answerFleet(path);
+  // `?story=demo` is consulted first and answers only the routes it names (`story.ts`).
+  const story = storyActive();
+  const fleet = story ? (answerStoryFleet(path) ?? answerFleet(path)) : answerFleet(path);
   if (fleet !== null) return fleet;
+  const told = story ? answerStory(path) : undefined;
+  if (told !== undefined) {
+    return new Response(JSON.stringify(told), { status: 200, headers: { "content-type": "application/json" } });
+  }
 
   /*
     Three answers and not one, because the núcleo gives three. A refusal carries

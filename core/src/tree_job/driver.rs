@@ -397,7 +397,26 @@ async fn at_work(
     if report.live {
         return Ok(());
     }
-    match report.result.as_deref() {
+    // The report is written by `node_close` while the run is still alive, so a run that is over
+    // with no report died before closing (typically a daemon restart relaunched it and it died
+    // within seconds). A node already closed `done` through another path is not that case.
+    let outcome_of = match report.result.as_deref() {
+        Some(result) => Some(result),
+        None if report.run_id.is_some() => {
+            let closed_done = work_nodes::get(pool, &node)
+                .await
+                .map(|n| n.closed_at.is_some() && n.status == "done")
+                .map_err(|e| e.to_string())?;
+            if closed_done {
+                Some("done")
+            } else {
+                Some("failed")
+            }
+        }
+        None => None,
+    };
+    let no_report = report.result.is_none();
+    match outcome_of {
         Some("done") => {}
         Some(outcome @ ("blocked" | "failed")) => {
             let handoff = rescue::handoff_text(pool, &node).await;
@@ -422,13 +441,23 @@ async fn at_work(
             if !formatted {
                 // One rescue run with the failure in its prompt, then the owner is asked.
                 if let Some(run) = &report.run_id {
-                    let suffix = rescue::stopped_suffix(outcome, handoff.as_deref());
+                    let ended = if no_report {
+                        "without a report"
+                    } else {
+                        outcome
+                    };
+                    let suffix = rescue::stopped_suffix(ended, handoff.as_deref());
                     if rescue::attempt(state, &node, run, &suffix).await? {
                         return Ok(());
                     }
                 }
-                let question = stopped_question(&node, Some(name), outcome)
-                    + &super::gate_summary::reason_suffix(pool, &node).await;
+                let question = if no_report {
+                    format!(
+                        "node {node} of branch {name} ended its run without a report; how should it go on?"
+                    )
+                } else {
+                    stopped_question(&node, Some(name), outcome)
+                } + &super::gate_summary::reason_suffix(pool, &node).await;
                 parks.push((node.clone(), question));
                 return Ok(());
             }
@@ -3928,6 +3957,57 @@ pub(super) mod tests {
         );
         fx.assert_not_landing(JOB).await;
         assert_eq!(fx.job(JOB).await.state, "open", "the job is not finished");
+    }
+
+    /// A run killed by a daemon restart ends with no report: the branch must not sit in `building`
+    /// for ever. The one rescue is spent, so it parks with a question about the missing report.
+    #[tokio::test]
+    async fn a_branch_whose_run_ended_without_a_report_parks_and_asks() {
+        const JOB: &str = "drv-no-report";
+        let fx = Fixture::new().await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "building", Some("api-node"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.save_launch("api-node").await;
+        fx.save_launch_keyed("api-node", "rescue-0").await;
+        fx.run_ended("api-node", None).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.branch(JOB, "api").await.state, "parked");
+        let asked = fx.open_questions(JOB, "api-node").await;
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains("without a report"), "{:?}", asked[0]);
+        assert!(gate.calls().is_empty());
+    }
+
+    /// No misfire: a live run with no report yet, and a node closed `done` with no report row, are
+    /// neither parked nor asked about.
+    #[tokio::test]
+    async fn a_live_run_without_a_report_is_left_alone() {
+        const JOB: &str = "drv-no-report-live";
+        let fx = Fixture::new().await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "building", Some("api-node"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.save_launch("api-node").await;
+        fx.run_live("api-node").await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.branch(JOB, "api").await.state, "building");
+        assert!(fx.open_questions(JOB, "api-node").await.is_empty());
+        assert_eq!(fx.launches("api-node", "rescue-").await, 0);
     }
 
     /// Guard: this passes today because the second park failure is only logged. It ensures that a

@@ -41,7 +41,12 @@ struct DepRequest {
 
 #[derive(Debug, Deserialize)]
 struct DecisionRequest {
+    #[serde(default)]
     answer: String,
+    /// For a decision a branch is parked on: drop that branch instead of relaunching its node. The
+    /// answer text is then optional.
+    #[serde(default)]
+    drop: bool,
     /// For a decision a fence refusal opened: the paths the owner widens the branch by, exactly.
     #[serde(default)]
     widen_paths: Option<Vec<String>>,
@@ -399,15 +404,28 @@ async fn post_decision(
         };
     }
     if id.starts_with("d-") {
-        return match crate::tree_job::open::answer_and_relaunch_widening(
-            &state,
-            &id,
-            &request.answer,
-            "shell",
-            request.widen_paths.as_deref(),
-        )
-        .await
-        {
+        let answered = if request.drop {
+            let text = match request.answer.trim() {
+                "" => "drop the branch",
+                text => text,
+            };
+            crate::tree_job::decisions::answer_dropping(&state.pool, &id, text, "shell")
+                .await
+                .map(|decision| crate::tree_job::open::Answered {
+                    decision,
+                    relaunched: None,
+                })
+        } else {
+            crate::tree_job::open::answer_and_relaunch_widening(
+                &state,
+                &id,
+                &request.answer,
+                "shell",
+                request.widen_paths.as_deref(),
+            )
+            .await
+        };
+        return match answered {
             Ok(answered) => (
                 StatusCode::OK,
                 Json(json!({ "question": answered.decision.question })),
@@ -664,6 +682,46 @@ mod tests {
                 .unwrap();
         assert_eq!(stored, "answered");
         assert_eq!(answer.as_deref(), Some("ten dollars"));
+    }
+
+    /// `drop: true` needs a branch parked on the decision: with none it is refused (400) and the
+    /// decision stays open; an unknown id is a 404. A blank answer is fine when dropping.
+    #[tokio::test]
+    async fn post_decision_with_drop_refuses_a_decision_no_branch_is_parked_on() {
+        let state = state().await;
+        sqlx::query(
+            "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status) \
+             VALUES ('d-http-drop', 'tree-h', 'node-h', 'Park?', NULL, 'agent', \
+             '2026-10-30T09:00:00+00:00', 'open')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/decisions/d-http-drop",
+            json!({"drop": true}),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (stored,): (String,) =
+            sqlx::query_as("SELECT status FROM decisions WHERE id = 'd-http-drop'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "open");
+
+        let (missing, _) = request(
+            &app(&state),
+            "POST",
+            "/decisions/d-http-nope",
+            json!({"drop": true}),
+        )
+        .await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

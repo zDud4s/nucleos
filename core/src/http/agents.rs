@@ -5,6 +5,12 @@ use super::*;
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/agents", get(list_agents).post(create_agent))
+        // Cost per completed task and the shadow -> apply gate for subagent spawns. Only numbers;
+        // see `agent_report.rs`.
+        .route(
+            "/agents/route-report",
+            get(crate::models::agent_report::get_agent_report),
+        )
         .route(
             "/agents/{id}",
             get(get_agent).put(update_agent).delete(delete_agent),
