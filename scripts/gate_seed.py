@@ -16,6 +16,7 @@ Usage: gate_seed.py <target_dir>
 Env:   NUCLEOS_GATE_SEED=0 disables.
 """
 import os
+import re
 import shutil
 import sys
 import time
@@ -141,11 +142,22 @@ def seed_from(donor, target_dir):
     return n
 
 
+def native_path(path, windows=(os.name == "nt")):
+    """Turn a Git Bash path (/c/Users/...) into C:/Users/... on Windows.
+
+    Python's abspath would otherwise read it as C:\\c\\Users\\..., find no
+    donor, and silently skip the seed."""
+    m = re.match(r"^/([A-Za-z])(/.*)?$", path)
+    if windows and m:
+        return m.group(1).upper() + ":" + (m.group(2) or "/")
+    return path
+
+
 def main(argv, env=os.environ, now=None):
     if len(argv) != 2:
         print("usage: gate_seed.py <target_dir>", file=sys.stderr)
         return 0
-    target = argv[1]
+    target = native_path(argv[1])
     if env.get("NUCLEOS_GATE_SEED") == "0":
         return 0
     if os.path.exists(os.path.join(target, "debug")):

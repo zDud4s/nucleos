@@ -112,5 +112,22 @@ class SeedTests(unittest.TestCase):
         self.assertFalse((self.target / "debug").exists())
 
 
+class NativePathTests(unittest.TestCase):
+    def test_drive_path_converted(self):
+        self.assertEqual(gate_seed.native_path("/c/Users/x", windows=True), "C:/Users/x")
+
+    def test_bare_drive_converted(self):
+        self.assertEqual(gate_seed.native_path("/c", windows=True), "C:/")
+
+    def test_native_path_unchanged(self):
+        self.assertEqual(gate_seed.native_path("C:/a", windows=True), "C:/a")
+
+    def test_multi_letter_segment_unchanged(self):
+        self.assertEqual(gate_seed.native_path("/usr/lib", windows=True), "/usr/lib")
+
+    def test_not_windows_unchanged(self):
+        self.assertEqual(gate_seed.native_path("/c/Users/x", windows=False), "/c/Users/x")
+
+
 if __name__ == "__main__":
     unittest.main()
