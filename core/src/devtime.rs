@@ -718,6 +718,8 @@ async fn set_status(pool: &SqlitePool, key: &str, status: &str) {
     }
 }
 
+// Eight arguments: the per-file identity (project, worktree, account) plus the cycle accumulators.
+#[allow(clippy::too_many_arguments)]
 async fn ingest_file(
     pool: &SqlitePool,
     file: &Found,
