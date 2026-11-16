@@ -306,7 +306,6 @@ async fn insert_measurement(
     Ok(id)
 }
 
-
 /// Exact duplicates collapse into the oldest row: it absorbs the observations and the others are
 /// archived, so the surviving id never changes and no successor is inserted.
 async fn merge_duplicates(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<usize> {
@@ -550,7 +549,8 @@ async fn expire_trials(
             .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
             .map(|at| at.with_timezone(&Utc));
         let note = if baseline.is_some_and(|baseline| {
-            outcomes >= TRIAL_MIN_OUTCOMES && (green as f64 / outcomes as f64) < baseline - TRIAL_MARGIN
+            outcomes >= TRIAL_MIN_OUTCOMES
+                && (green as f64 / outcomes as f64) < baseline - TRIAL_MARGIN
         }) {
             Some("trial: not helping, clearly worse than the permanent rows")
         } else if shown == 0 && started.is_some() && {
@@ -969,13 +969,12 @@ mod tests {
             assert_eq!(column.3, None, "{name}");
         }
 
-        let row = sqlx::query(
-            "SELECT trial, cause_key, trial_started_at FROM knowledge WHERE id = ?",
-        )
-        .bind(existing)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row =
+            sqlx::query("SELECT trial, cause_key, trial_started_at FROM knowledge WHERE id = ?")
+                .bind(existing)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(row.get::<i64, _>("trial"), 0);
         assert!(row.get::<Option<String>, _>("cause_key").is_none());
         assert!(row.get::<Option<String>, _>("trial_started_at").is_none());
@@ -986,7 +985,10 @@ mod tests {
     async fn distill_queue_once_tells_apart_trees_nodes_requests_and_decisions() {
         let pool = test_pool().await;
 
-        assert_eq!(queue_row(&pool, None, None, None, None, None, None, None).await, 1);
+        assert_eq!(
+            queue_row(&pool, None, None, None, None, None, None, None).await,
+            1
+        );
         assert_eq!(
             queue_row(&pool, None, None, None, Some("tree-1"), None, None, None).await,
             1
@@ -1004,11 +1006,24 @@ mod tests {
             1
         );
         assert_eq!(
-            queue_row(&pool, None, None, None, None, None, None, Some("decision-1")).await,
+            queue_row(
+                &pool,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("decision-1")
+            )
+            .await,
             1
         );
         // An exact repeat of any of them is ignored.
-        assert_eq!(queue_row(&pool, None, None, None, None, None, None, None).await, 0);
+        assert_eq!(
+            queue_row(&pool, None, None, None, None, None, None, None).await,
+            0
+        );
         assert_eq!(
             queue_row(&pool, None, None, None, Some("tree-1"), None, None, None).await,
             0
@@ -1018,7 +1033,17 @@ mod tests {
             0
         );
         assert_eq!(
-            queue_row(&pool, None, None, None, None, None, None, Some("decision-1")).await,
+            queue_row(
+                &pool,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("decision-1")
+            )
+            .await,
             0
         );
 
@@ -1104,8 +1129,14 @@ mod tests {
         // Machine scope has scope_id NULL: the pair must dedupe all the same.
         let machine_a = seed_machine_knowledge(&pool, "gate:machine-a", "active").await;
         let machine_b = seed_machine_knowledge(&pool, "gate:machine-b", "active").await;
-        set_cause_key(&pool, machine_a, "machine-cause").await.unwrap();
-        assert!(set_cause_key(&pool, machine_b, "machine-cause").await.is_err());
+        set_cause_key(&pool, machine_a, "machine-cause")
+            .await
+            .unwrap();
+        assert!(
+            set_cause_key(&pool, machine_b, "machine-cause")
+                .await
+                .is_err()
+        );
     }
 
     /// A gate signature nobody explained is not a lesson: the consolidator no longer writes it.
@@ -1194,8 +1225,7 @@ mod tests {
         let row = known(&pool, cause).await;
         assert_eq!(row["observations"], 3);
         assert_eq!(row["last_confirmed_at"], at(2).to_rfc3339());
-        let evidence: Vec<Value> =
-            serde_json::from_str(row["evidence"].as_str().unwrap()).unwrap();
+        let evidence: Vec<Value> = serde_json::from_str(row["evidence"].as_str().unwrap()).unwrap();
         assert_eq!(evidence.len(), 3, "an evidence item is never added twice");
 
         assert_eq!(knowledge_count(&pool).await, 2);
@@ -1460,8 +1490,7 @@ mod tests {
     #[tokio::test]
     async fn a_pass_over_ansi_coloured_gate_failures_writes_no_escape_bytes() {
         let pool = test_pool().await;
-        let coloured =
-            "\x1b[1m\x1b[31merror\x1b[0m: build failed because the \x1b[33mlinker\x1b[0m refused output.exe";
+        let coloured = "\x1b[1m\x1b[31merror\x1b[0m: build failed because the \x1b[33mlinker\x1b[0m refused output.exe";
         let plain = "error: build failed because the linker refused output.exe";
         // A row with a cause is reinforced from coloured output.
         let cause = seed_knowledge(
