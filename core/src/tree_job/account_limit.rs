@@ -61,7 +61,8 @@ pub(super) async fn judge(
     let Ok(number) = run_id.parse::<i64>() else {
         return Ok(Verdict::NotAccountLimit);
     };
-    let row: Option<(Option<String>, Option<String>, Option<String>, String)> = sqlx::query_as(
+    type RunRow = (Option<String>, Option<String>, Option<String>, String);
+    let row: Option<RunRow> = sqlx::query_as(
         "SELECT stdout, stderr, account_id, COALESCE(completed_at, created_at) \
          FROM runs WHERE id = ? AND status = 'failed'",
     )
