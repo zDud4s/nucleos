@@ -31,6 +31,7 @@ export function ThemeEdit({ id, name, others }: { id: number; name: string; othe
   const rename = useRenameTheme();
   const merge = useMergeTheme();
   const [mode, setMode] = useState<"idle" | "rename" | "merge">("idle");
+  const [menuOpen, setMenuOpen] = useState(false);
   const [draft, setDraft] = useState(name);
   const targets = others.filter((t) => t.id !== id);
   const [into, setInto] = useState<number | null>(null);
@@ -53,31 +54,51 @@ export function ThemeEdit({ id, name, others }: { id: number; name: string; othe
   return (
     <>
       {mode === "idle" && (
-        <>
+        <span className="themes-menu">
           <Button
             variant="quiet"
-            aria-label={`Rename theme ${id}`}
-            onClick={() => {
-              rename.reset();
-              setDraft(name);
-              setMode("rename");
+            aria-label={`More actions for theme ${id}`}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            onClick={() => setMenuOpen((v) => !v)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setMenuOpen(false);
             }}
           >
-            Rename
+            ⋯
           </Button>
-          <Button
-            variant="quiet"
-            aria-label={`Merge theme ${id}`}
-            disabled={targets.length === 0}
-            onClick={() => {
-              merge.reset();
-              setInto(null);
-              setMode("merge");
-            }}
-          >
-            Merge
-          </Button>
-        </>
+          {menuOpen && (
+            <span className="themes-menu-pop" role="menu">
+              <Button
+                variant="quiet"
+                role="menuitem"
+                aria-label={`Rename theme ${id}`}
+                onClick={() => {
+                  rename.reset();
+                  setDraft(name);
+                  setMenuOpen(false);
+                  setMode("rename");
+                }}
+              >
+                Rename
+              </Button>
+              <Button
+                variant="quiet"
+                role="menuitem"
+                aria-label={`Merge theme ${id}`}
+                disabled={targets.length === 0}
+                onClick={() => {
+                  merge.reset();
+                  setInto(null);
+                  setMenuOpen(false);
+                  setMode("merge");
+                }}
+              >
+                Merge
+              </Button>
+            </span>
+          )}
+        </span>
       )}
       {mode === "rename" && (
         <>

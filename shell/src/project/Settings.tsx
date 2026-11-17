@@ -241,6 +241,7 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         }}
         busy={setMode.isPending}
         focusableWhenInert
+        fill
         onChoose={(mode) => change(mode)}
       />
 

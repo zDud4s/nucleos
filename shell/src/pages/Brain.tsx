@@ -12,8 +12,7 @@ import { WaitingPanel } from "../brain/knowledge/WaitingPanel";
 import { UnifiedList } from "../brain/UnifiedList";
 import { rememberView, rememberedView } from "../brain/view-memory";
 import { WeeklyReview } from "../brain/WeeklyReview";
-import { ThemesProposed } from "../brain/ThemesProposed";
-import { ThemesAccepted } from "../brain/ThemesAccepted";
+import { Themes } from "../brain/Themes";
 import { useGraphThemes } from "../data/themes";
 import { ForceGraph } from "../brain/ForceGraph";
 import { buildModel } from "../brain/graph-model";
@@ -101,8 +100,7 @@ export function Brain() {
         <div className="brain-page">
           <Capture />
           <WeeklyReview onItem={showItem} />
-          <ThemesProposed />
-          <ThemesAccepted />
+          <Themes />
           <BrainListView item={item} onItem={showItem} onClose={closeItem} />
         </div>
       )}
@@ -393,8 +391,7 @@ export function BrainGraphView({
         {tool === "review" && (
           <div className="brain-pop">
             <WeeklyReview onItem={onItem} />
-            <ThemesProposed />
-            <ThemesAccepted />
+            <Themes />
           </div>
         )}
         {tool === "filters" && (

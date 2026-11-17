@@ -1667,7 +1667,7 @@ describe("the answer at the top, and the gestures that widen", () => {
 
     const standing = screen.getByRole("group", { name: "Standing" });
     expect(within(standing).getByText("CI").nextElementSibling?.textContent).toBe(
-      "1 did not succeed",
+      "1 failed",
     );
   });
 

@@ -118,10 +118,11 @@ describe("Autopilot - exclusions", () => {
     expect(screen.getByRole("button", { name: "Ask" })).toBeDefined();
   });
 
-  it("is a section of the Autopilot page, beside the jobs", async () => {
+  it("sits with Judge on the Autopilot page, so it is not drawn before a project is chosen", async () => {
     daemon.apiFetch.mockImplementation(respond({ jobs: [], rules: [] }));
     daemon.probeHealth.mockResolvedValue(true);
     await renderWithRouter(<Autopilot />, { initialPath: "/autopilot" });
-    expect(await screen.findByRole("heading", { name: "Never at the same time" })).toBeDefined();
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.queryByRole("heading", { name: "Never at the same time" })).toBeNull();
   });
 });

@@ -1,4 +1,24 @@
-/* "Proposed themes" and the accepted themes' synthesis (see ThemesProposed.tsx, ThemesAccepted.tsx). */
+/* The "Themes" block: one header line, then one row per theme (see Themes.tsx, ThemesProposed.tsx, ThemesAccepted.tsx). */
+.themes-block {
+  display: flex;
+  flex-direction: column;
+  font-size: var(--text-sm);
+}
+
+.themes-toggle {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.themes-toggle:hover {
+  text-decoration: underline;
+}
+
 .themes-list {
   display: flex;
   flex-direction: column;
@@ -7,17 +27,19 @@
   list-style: none;
 }
 
+/* A theme is one row: name and meta, the synthesis (one line), the actions at the end. */
 .themes-list li {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-2) 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-1) 0;
   border-top: var(--hairline) solid var(--border);
   font-size: var(--text-sm);
 }
 
-.themes-list li:first-child {
-  border-top: 0;
+.themes-block > .themes-toggle + .themes-list {
+  margin-top: var(--space-1);
 }
 
 .themes-head {
@@ -35,14 +57,50 @@
   color: var(--text-muted);
 }
 
-.themes-act {
-  display: flex;
-  gap: var(--space-2);
+.themes-badge {
+  padding: 0 var(--space-2);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
 }
 
+.themes-act {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: auto;
+}
+
+.themes-act .ui-button {
+  padding-block: 0;
+}
+
+.themes-menu {
+  position: relative;
+}
+
+.themes-menu-pop {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+}
+
+/* The synthesis is content, kept to one line; the full text is in its title. */
 .themes-synthesis {
+  flex: 1 1 12rem;
+  min-width: 0;
   margin: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   color: var(--text);
 }

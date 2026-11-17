@@ -197,7 +197,7 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
   return (
     <div className="flex flex-col gap-3" aria-label="Standing" role="group">
 
-      <dl className="flex flex-wrap items-baseline gap-x-6 gap-y-2 text-sm">
+      <dl className="ws-stats">
         <Fact term="GitHub reads" value={githubReads} />
         <Fact term="Git operations" value={gitGranted} />
         <Fact term="Commands allowed" value={allowed} />
@@ -206,7 +206,7 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
         {ci === null || ci.listed === 0 ? null : (
           <Fact
             term="CI"
-            value={ci.failed === 0 ? "no failures listed" : `${ci.failed} did not succeed`}
+            value={ci.failed === 0 ? "passing" : `${ci.failed} failed`}
             wrong={ci.failed > 0}
           />
         )}
@@ -334,17 +334,9 @@ function Fact({
   wrong?: boolean;
 }) {
   return (
-    <div className="flex items-baseline gap-1.5">
-      <dt className="text-text-muted">{term}</dt>
-      <dd
-        className={
-          wrong
-            ? "rounded-sm border border-tone-danger-border bg-tone-danger-bg px-1.5 font-mono text-xs tabular-nums text-tone-danger-fg"
-            : "font-mono text-xs tabular-nums text-text"
-        }
-      >
-        {value === undefined ? "—" : value}
-      </dd>
+    <div className={wrong ? "ws-stat ws-stat-wrong" : "ws-stat"}>
+      <dt>{term}</dt>
+      <dd>{value === undefined ? "—" : value}</dd>
     </div>
   );
 }

@@ -23,21 +23,7 @@
   gap: var(--space-4);
 }
 
-/* Secondary, in-page section switcher (not top-level tabs): smaller type and tighter gaps. It sits
-   directly under the project cards, so it reads as the sections of that project. */
-.ap-nav {
-  margin: 0;
-}
-
-.ap-nav .ui-section-nav-list {
-  gap: var(--space-1);
-}
-
-.ap-nav .ui-section-nav-link {
-  font-size: var(--text-xs);
-}
-
-/* One group of panels, a stop on the section nav: it clears the sticky nav when jumped to. */
+/* One group of panels, a stop for the palette's "Go to" jumps. */
 .ap-block {
   display: flex;
   flex-direction: column;
@@ -205,7 +191,7 @@
 /* Small panels side by side at their own height: one small control never gets a full-width card. */
 .ap-panel-pair {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(22rem, 100%), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(18rem, 100%), 1fr));
   gap: var(--space-4);
   align-items: start;
 }
