@@ -289,7 +289,17 @@ impl Executor {
     }
 
     /// Queues (or joins) a unit and wakes the worker.
-    pub async fn submit(&self, mut request: Request) -> sqlx::Result<Submitted> {
+    pub async fn submit(&self, request: Request) -> sqlx::Result<Submitted> {
+        self.submit_since(request, None).await
+    }
+
+    /// `submit`, queued as of `since_ms` (never later than now) so a follow-up request keeps the
+    /// position its predecessor already waited for.
+    pub async fn submit_since(
+        &self,
+        mut request: Request,
+        since_ms: Option<i64>,
+    ) -> sqlx::Result<Submitted> {
         let capacity = self.capacity();
         request.weight = if request.weight > 0 {
             request.weight.min(capacity)
@@ -299,7 +309,9 @@ impl Executor {
         if request.timeout_ms <= 0 {
             request.timeout_ms = seconds_to_ms(self.limits.unit_timeout_seconds());
         }
-        let submitted = verify_runs::enqueue(&self.writes(), &request, now_ms()).await?;
+        let now = now_ms();
+        let enqueued = since_ms.map_or(now, |since| since.min(now));
+        let submitted = verify_runs::enqueue(&self.writes(), &request, enqueued).await?;
         self.wake.notify_one();
         Ok(submitted)
     }
@@ -485,11 +497,19 @@ impl Executor {
             return Vec::new();
         };
         let deadline = Instant::now() + GATE_BASE_TIMEOUT;
+        // Only the post-land gate runs the composed targets command; a probe runs the whole
+        // `gate_command`, so it never forces the root base on a new local target.
+        let rules = if claimed.requested_by == verify_runs::REQUESTED_BY_POSTGATE {
+            crate::project::rules::autopilot(project).ok()
+        } else {
+            None
+        };
         match resolve::postgate_gate_base(
             &self.pool,
             project,
             Path::new(&claimed.worktree),
             deadline,
+            rules.as_ref(),
         )
         .await
         {
@@ -515,6 +535,7 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     }
     let mut env = executor.warm_env(&claimed).await;
     env.extend(executor.gate_env(&claimed).await);
+    env.extend(crate::verify::skip_clippy::env(&executor.pool, claimed.id).await);
     let argv = final_argv(&executor.config.broker_prefix, &claimed.argv);
     let timeout_ms = if claimed.timeout_ms > 0 {
         u64::try_from(claimed.timeout_ms).unwrap_or(u64::MAX)
@@ -993,6 +1014,96 @@ mod tests {
         assert_eq!(waiting.status, verify_runs::STATUS_QUEUED);
         ex.release_removal(&parked);
         wait_terminal(&ex, first.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_submitted_since_the_check_is_picked_ahead_of_later_units() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let t0 = now_ms() - 10_000;
+        let argv = ["git", "--version"];
+        // The check unit, enqueued at T0 and already finished.
+        let check = verify_runs::enqueue(&ex.pool, &request(wt.path(), &argv, None, 1), t0)
+            .await
+            .unwrap();
+        verify_runs::claim(&ex.pool, check.id)
+            .await
+            .unwrap()
+            .unwrap();
+        verify_runs::finish(
+            &ex.pool,
+            check.id,
+            verify_runs::STATUS_PASSED,
+            Some(0),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        // Another branch's unit, queued 50 ms after the check.
+        let other = verify_runs::enqueue(&ex.pool, &request(wt.path(), &argv, None, 1), t0 + 50)
+            .await
+            .unwrap();
+        // The test step of the first branch is submitted later but keeps the check's position.
+        let follow_up = ex
+            .submit_since(request(wt.path(), &argv, None, 1), Some(t0))
+            .await
+            .unwrap();
+
+        let queued = verify_runs::queued(&ex.pool).await.unwrap();
+        let order: Vec<i64> = queued.iter().map(|q| q.id).collect();
+        assert_eq!(order, vec![follow_up.id, other.id]);
+
+        let candidates: Vec<Candidate> = queued
+            .iter()
+            .map(|q| Candidate {
+                id: q.id,
+                project: q.project_id.as_deref(),
+                priority: q.priority,
+                weight: q.weight,
+                enqueued_ms: q.enqueued_ms,
+            })
+            .collect();
+        let picked = verify_sched::pick(&candidates, 4, &HashMap::new(), now_ms(), 3_600_000);
+        assert_eq!(picked, Some(follow_up.id));
+    }
+
+    async fn stored_enqueued_ms(ex: &Arc<Executor>, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT enqueued_ms FROM verify_runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&ex.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_since_later_than_now_is_clamped_to_now() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let argv = ["git", "--version"];
+        let before = now_ms();
+        let future = ex
+            .submit_since(request(wt.path(), &argv, None, 1), Some(before + 3_600_000))
+            .await
+            .unwrap();
+        let after_future = now_ms();
+        let stored = stored_enqueued_ms(&ex, future.id).await;
+        assert!(
+            stored >= before && stored <= after_future,
+            "clamped to now, got {stored}"
+        );
+
+        let plain = ex
+            .submit_since(request(wt.path(), &argv, None, 1), None)
+            .await
+            .unwrap();
+        let stored = stored_enqueued_ms(&ex, plain.id).await;
+        assert!(
+            stored >= after_future && stored <= now_ms(),
+            "no since means now, got {stored}"
+        );
     }
 
     #[tokio::test]
@@ -1560,6 +1671,61 @@ mod tests {
         let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
         let env = ex.gate_env(&claimed).await;
         assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    /// `proj`'s rules, as `gate_env` reads them from the settings snapshot of this thread.
+    fn publish_proj_rules(yaml: &str) -> crate::project::rules::testing::Home {
+        let home = crate::project::rules::testing::Home::scoped();
+        crate::project::rules::testing::publish_rules("proj", yaml);
+        home
+    }
+
+    async fn store_green_covering(pool: &SqlitePool, green: &str, targets: &str) {
+        store_postgate(pool, Some(green), None).await;
+        sqlx::query("UPDATE postgate_state SET green_targets = ? WHERE project_id = 'proj'")
+            .bind(targets)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    const NEW_LOCAL: &str = "gate_command: \"git --version\"\ngate_after_land: true\n\
+                             gate_targets: {core: local, hooks: local}\n";
+
+    #[tokio::test]
+    async fn a_newly_local_target_gets_the_root_as_gate_base() {
+        let _home = publish_proj_rules(NEW_LOCAL);
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_green_covering(&ex.pool, &shas[1], "[\"core\"]").await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_covered_gate_keeps_the_proven_base() {
+        let _home = publish_proj_rules(NEW_LOCAL);
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_green_covering(&ex.pool, &shas[1], "[\"core\",\"hooks\"]").await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_probe_keeps_the_proven_base_even_when_a_target_is_new() {
+        let _home = publish_proj_rules(NEW_LOCAL);
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_green_covering(&ex.pool, &shas[1], "[\"core\"]").await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_PROBE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
     }
 
     #[tokio::test]

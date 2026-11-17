@@ -3031,6 +3031,12 @@ const RUN_DETAIL = {
   advised_model: "haiku",
   advised_effort: "low",
   route_failed: null,
+  // A loose run is a chain of one: its own leg.
+  lineage: [
+    { id: 1, status: "completed", num_turns: 7, started_at: null, ended_at: null, ended_because: null, gate_status: "passed", gate_exit_code: 0, exit_code: 0 },
+  ],
+  lineage_truncated: false,
+  part_of: null,
 } satisfies RunDetail;
 
 /*
@@ -3100,6 +3106,9 @@ const LIVE_RUN_DETAIL = {
   cost_usd: null,
   num_turns: null,
   session_id: "6ea4f44e-a137-4b99-ae21-211a852c7439",
+  lineage: [
+    { id: 2, status: "running", num_turns: null, started_at: null, ended_at: null, ended_because: null, gate_status: null, gate_exit_code: null, exit_code: null },
+  ],
 } satisfies RunDetail;
 
 const LIVE_TAIL_TEXT = [

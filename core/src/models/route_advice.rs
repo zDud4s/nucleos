@@ -39,7 +39,7 @@ use engines::{codex_runner, engines_without_headroom_now, resolve_pin};
 pub use item_context::{ItemContext, ItemRef, failed_label, item_context};
 
 /// Where the router listens unless `router.yaml` says otherwise.
-pub const DEFAULT_URL: &str = "http://127.0.0.1:18733";
+pub const DEFAULT_URL: &str = "http://127.0.0.1:8080";
 /// The ceiling on one route call. A run waits at most this long before launching without advice.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2500;
 pub(crate) const MIN_TIMEOUT_MS: u64 = 100;
@@ -93,6 +93,8 @@ pub enum Surface {
     Team,
     Council,
     Recruit,
+    /// Subagent spawns made through the Agent tool.
+    Agents,
 }
 
 impl Surface {
@@ -102,10 +104,17 @@ impl Surface {
             Self::Team => "team",
             Self::Council => "council",
             Self::Recruit => "recruit",
+            Self::Agents => "agents",
         }
     }
 
-    pub(crate) const ALL: [Self; 4] = [Self::Runs, Self::Team, Self::Council, Self::Recruit];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Runs,
+        Self::Team,
+        Self::Council,
+        Self::Recruit,
+        Self::Agents,
+    ];
 }
 
 /// A CLI the daemon can launch, named as the router names it (`route_api.RUNNERS`).
@@ -430,6 +439,17 @@ impl Router {
     /// The request, with the daemon's rules in it: `runners` as given (already eligible and clear of
     /// the quota brake), `models` as the union of those runners' globs, and the item's history.
     pub fn build_request(&self, query: &RouteQuery, runners: &[RunnerKind]) -> RouteRequest {
+        self.build_request_for(Surface::Runs, query, runners)
+    }
+
+    /// [`Self::build_request`] for a given surface. Fable is excluded from every request except an
+    /// orchestration stage of the runs surface; the agents surface (subagent spawns) never gets it.
+    pub fn build_request_for(
+        &self,
+        surface: Surface,
+        query: &RouteQuery,
+        runners: &[RunnerKind],
+    ) -> RouteRequest {
         let mut models: Vec<String> = Vec::new();
         for kind in runners {
             if let Some(available) = self.available(*kind) {
@@ -458,7 +478,7 @@ impl Router {
                 .collect(),
             packet: None,
             models,
-            exclude: Vec::new(),
+            exclude: fable_exclusion(surface, query.stage.as_deref()),
         }
     }
 
@@ -679,6 +699,27 @@ pub fn choose(
                 .map(|effort| clamp_effort(effort, ceiling)),
         },
         _ => configured,
+    }
+}
+
+/// The glob that keeps fable out of a request.
+const FABLE_GLOB: &str = "*fable*";
+
+/// Whether `stage` names an orchestration phase (a tree's orchestrator or an orchestrating node).
+fn is_orchestration_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "tree_orchestrate" | "orchestrate_node" | "orchestrate"
+    ) || stage.contains("orchestrator")
+}
+
+/// The `exclude` globs: fable unless this is an orchestration stage of the runs surface.
+fn fable_exclusion(surface: Surface, stage: Option<&str>) -> Vec<String> {
+    let allowed = surface == Surface::Runs && stage.is_some_and(is_orchestration_stage);
+    if allowed {
+        Vec::new()
+    } else {
+        vec![FABLE_GLOB.to_owned()]
     }
 }
 
@@ -1301,6 +1342,38 @@ mod tests {
         }
     }
 
+    fn fable_router() -> Router {
+        Router::new(
+            config(Mode::Apply, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_non_orchestration_run_request_excludes_fable() {
+        let sent = fable_router().build_request(&query(), &[RunnerKind::Claude]);
+        assert_eq!(sent.exclude, vec!["*fable*".to_owned()]);
+    }
+
+    #[test]
+    fn an_orchestration_stage_run_request_may_use_fable() {
+        for stage in ["tree_orchestrate", "orchestrate_node"] {
+            let mut q = query();
+            q.stage = Some(stage.into());
+            let sent = fable_router().build_request(&q, &[RunnerKind::Claude]);
+            assert!(sent.exclude.is_empty(), "{stage}");
+        }
+    }
+
+    #[test]
+    fn an_agents_surface_request_always_excludes_fable() {
+        let mut q = query();
+        q.stage = Some("tree_orchestrate".into());
+        let sent = fable_router().build_request_for(Surface::Agents, &q, &[RunnerKind::Claude]);
+        assert_eq!(sent.exclude, vec!["*fable*".to_owned()]);
+    }
+
     fn advice(runner: &str, model: &str, effort: Option<&str>) -> RouteAdvice {
         RouteAdvice {
             decision_id: "rt_1".into(),
@@ -1371,7 +1444,7 @@ mod tests {
     #[test]
     fn a_router_off_this_machine_is_refused() {
         for url in [
-            "http://10.0.0.5:18733",
+            "http://10.0.0.5:8080",
             "http://router.example.com",
             "ftp://127.0.0.1:1",
             "http://user@127.0.0.1:1",
@@ -1383,7 +1456,7 @@ mod tests {
             );
         }
         for url in [
-            "http://127.0.0.1:18733",
+            "http://127.0.0.1:8080",
             "http://localhost:9",
             "http://[::1]:9",
         ] {

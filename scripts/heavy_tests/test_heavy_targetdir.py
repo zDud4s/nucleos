@@ -8,7 +8,7 @@ broker-chosen target dir, so the broker injects CARGO_TARGET_DIR when the caller
 
 Revised 2026-10-04: one `.cargo-target-<branch slug>` per branch grew without bound and filled
 the disk, so the broker now leases a dir from a FIXED POOL, `<root>/.cargo-target-pool-<k>`
-(k = 1..NUCLEOS_HEAVY_TARGET_SLOTS, default 3). Eligibility is unchanged; only the name of the
+(k = 1..NUCLEOS_HEAVY_TARGET_SLOTS, default 4). Eligibility is unchanged; only the name of the
 dir an eligible run gets is. The lease itself (exclusivity, affinity, owner-change clean) is
 pinned in test_heavy_target_pool.py.
 
@@ -209,7 +209,7 @@ class TargetDirTests(unittest.TestCase):
         seen = json.loads(self.out.read_text(encoding="utf-8")) if self.out.exists() else {}
         return cp.returncode, seen, rows[-1]
 
-    def pool_index(self, td, slots: int = 3) -> int:
+    def pool_index(self, td, slots: int = 4) -> int:
         """`td` is `<td_root>/.cargo-target-pool-<k>` with 1 <= k <= slots; returns k."""
         self.assertTrue(td, "the child got no CARGO_TARGET_DIR")
         p = Path(real(td))

@@ -15,6 +15,7 @@
 //! | `fmt:<target>:<crate>` | red formatting on the target (daemon only) |
 //! | `conflict:<source>-><target>` | a branch that no longer merges (daemon only) |
 //! | `direct-write:<target>` | the target advanced outside the queue (daemon only) |
+//! | `ci-red:<branch>` | the CI of a pushed sha on the branch finished red (daemon only) |
 
 use std::path::Path;
 
@@ -34,16 +35,35 @@ impl TaskKey {
         Self("release-diverged".to_owned())
     }
 
+    /// The `remote-diverged:<branch>` incident key: an automation's push found the remote branch on
+    /// a line of history that neither contains nor is contained by the local green sha.
+    pub fn remote_diverged(branch: &str) -> Self {
+        Self(format!("remote-diverged:{branch}"))
+    }
+
+    /// The `ci-red:<branch>` incident key: the CI of a pushed sha finished red. `None` for an
+    /// empty branch.
+    pub fn ci_red(branch: &str) -> Option<Self> {
+        normalize(&format!("ci-red:{branch}"), Path::new("/")).ok()
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// True for the keys only the daemon opens: `master-red` and `migration:`, `fmt:`, `conflict:`,
-    /// `direct-write:` and `release-diverged`.
+    /// `direct-write:`, `release-diverged`, `remote-diverged:` and `ci-red:`.
     pub fn is_machine(&self) -> bool {
         matches!(
             self.prefix(),
-            "master-red" | "migration" | "fmt" | "conflict" | "direct-write" | "release-diverged"
+            "master-red"
+                | "migration"
+                | "fmt"
+                | "conflict"
+                | "direct-write"
+                | "release-diverged"
+                | "remote-diverged"
+                | "ci-red"
         )
     }
 
@@ -89,7 +109,7 @@ impl std::fmt::Display for KeyError {
             Self::Empty => write!(formatter, "empty task key"),
             Self::UnknownPrefix(prefix) => write!(
                 formatter,
-                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt:, conflict:, direct-write: or release-diverged)"
+                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt:, conflict:, direct-write:, release-diverged, remote-diverged: or ci-red:)"
             ),
             Self::Malformed { prefix, expected } => {
                 write!(formatter, "malformed '{prefix}' key: expected {expected}")
@@ -216,6 +236,18 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
                 return Err(malformed("release-diverged", "no body (one per project)"));
             }
             "release-diverged".to_owned()
+        }
+        "remote-diverged" => {
+            if body.is_empty() {
+                return Err(malformed("remote-diverged", "remote-diverged:<branch>"));
+            }
+            format!("remote-diverged:{body}")
+        }
+        "ci-red" => {
+            if body.is_empty() {
+                return Err(malformed("ci-red", "ci-red:<branch>"));
+            }
+            format!("ci-red:{body}")
         }
         other => return Err(KeyError::UnknownPrefix(other.to_owned())),
     };
@@ -469,6 +501,37 @@ mod tests {
             key("conflict:fix/a"),
             Err(KeyError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn remote_diverged_key_needs_a_branch_and_is_machine() {
+        assert!(matches!(
+            key("remote-diverged"),
+            Err(KeyError::Malformed { .. })
+        ));
+        let diverged = normalize("remote-diverged:master", Path::new("/repo")).unwrap();
+        assert_eq!(diverged.as_str(), "remote-diverged:master");
+        assert!(diverged.is_machine());
+        assert_eq!(diverged.prefix(), "remote-diverged");
+        assert_eq!(TaskKey::remote_diverged("master"), diverged);
+    }
+
+    #[test]
+    fn ci_red_key_takes_a_branch_body_and_is_machine() {
+        assert_eq!(key("CI-RED:fix/x").unwrap(), "ci-red:fix/x");
+        assert!(matches!(key("ci-red"), Err(KeyError::Malformed { .. })));
+        assert!(matches!(key("ci-red:  "), Err(KeyError::Malformed { .. })));
+        let red = normalize("ci-red:fix/x", Path::new("/repo")).unwrap();
+        assert!(red.is_machine());
+        assert_eq!(red.prefix(), "ci-red");
+        assert_eq!(TaskKey::ci_red("fix/x"), Some(red));
+        assert_eq!(TaskKey::ci_red(""), None);
+    }
+
+    #[test]
+    fn unknown_prefix_message_lists_ci_red() {
+        let message = key("nope:x").unwrap_err().to_string();
+        assert!(message.contains("ci-red:"), "{message}");
     }
 
     #[test]

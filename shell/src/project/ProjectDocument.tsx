@@ -8,6 +8,8 @@ export interface ProjectDocumentProps {
   name: string;
   /** Called when the stored document's version moves, by this form or by anybody else. */
   onChanged?: () => void;
+  /** JSON pointers of fields another editor owns; passed to the form. */
+  hide?: readonly string[];
 }
 
 /**
@@ -17,7 +19,7 @@ export interface ProjectDocumentProps {
  * request that can only 404. If the index itself failed the form mounts anyway: it has its own words
  * for a daemon that does not answer, and two notes saying the same thing would be noise.
  */
-export function ProjectDocument({ projectId, name, onChanged }: ProjectDocumentProps) {
+export function ProjectDocument({ projectId, name, onChanged, hide }: ProjectDocumentProps) {
   const scope = `project:${projectId}`;
   const index = useSettingsIndex(scope);
 
@@ -29,7 +31,7 @@ export function ProjectDocument({ projectId, name, onChanged }: ProjectDocumentP
   }
 
   return (
-    <WatchedForm scope={scope} name={name} takesEffect={row?.takes_effect} onChanged={onChanged} />
+    <WatchedForm scope={scope} name={name} takesEffect={row?.takes_effect} onChanged={onChanged} hide={hide} />
   );
 }
 
@@ -44,11 +46,13 @@ function WatchedForm({
   name,
   takesEffect,
   onChanged,
+  hide,
 }: {
   scope: string;
   name: string;
   takesEffect: string | undefined;
   onChanged: (() => void) | undefined;
+  hide: readonly string[] | undefined;
 }) {
   const doc = useSettingDoc(scope, name);
   const version = doc.data?.version;
@@ -60,5 +64,5 @@ function WatchedForm({
     seen.current = version;
   }, [version, onChanged]);
 
-  return <SettingsForm scope={scope} name={name} takesEffect={takesEffect} />;
+  return <SettingsForm scope={scope} name={name} takesEffect={takesEffect} hide={hide} />;
 }

@@ -99,6 +99,11 @@ pub async fn retry(state: &AppState, job_id: &str) -> Result<(), String> {
     if job.state == JOB_TERMINAL_STATE || reason_of(&job).is_none() {
         return Ok(());
     }
+    // Past the cap `root::retry_failed_starts` asks the owner (`park_or_ask`); retrying here every
+    // sweep would never let it stop, and its answer is the fresh allowance.
+    if super::root::start_exhausted(&job) {
+        return Ok(());
+    }
     match start(state, &job).await {
         Ok(_) => {
             let line = format!(

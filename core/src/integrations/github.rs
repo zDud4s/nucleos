@@ -50,12 +50,14 @@ macro_rules! validating_deserialize {
     };
 }
 
+mod ci_ops;
 mod exec;
 mod gh_map;
 mod ops;
 mod policy;
 mod types;
 
+pub use self::ci_ops::{CiError, CiGh, CommitSha, FailedJob, RealCiGh, RunState, RunSummary};
 pub use self::exec::*;
 pub use self::gh_map::*;
 pub use self::ops::*;

@@ -28,6 +28,14 @@
       },
       "type": "object"
     },
+    "GatePlace": {
+      "description": "Where a gate target runs. `Ci` means \"not run locally\"; CI itself always runs everything.",
+      "enum": [
+        "local",
+        "ci"
+      ],
+      "type": "string"
+    },
     "GraphConfig": {
       "additionalProperties": false,
       "description": "Turns one scheduled rule into a job: a sequence of runs over one shared worktree, rather than a\nsingle run capped by one context window.",
@@ -326,6 +334,17 @@
         "null"
       ],
       "x-widget": "command"
+    },
+    "gate_targets": {
+      "additionalProperties": {
+        "$ref": "#/$defs/GatePlace"
+      },
+      "default": null,
+      "description": "Where each `scripts/gates.sh` target runs: `local` (the postgate runs it) or `ci` (only CI\ndoes). Keys are drawn from [`GATE_TARGETS`]; at least one must be `local`.\n\n**Absent means the postgate runs `gate_command` whole, exactly as before this key existed.**\nIt only affects the postgate: the merge queue, `gate_before_publish`, bisect probes and\n`gate_retry` keep running `gate_command`. Leaving every target `ci` is not expressible here;\nomit the key for that.",
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "health_breach_intent": {
       "default": false,

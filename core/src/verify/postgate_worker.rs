@@ -57,6 +57,7 @@ use crate::verify::postgate::{self as verify_postgate, RedPhase, State};
 use crate::verify::runs::{STATUS_FAILED, STATUS_PASSED};
 use crate::verify::{self, Caller, VerifyArgs};
 
+mod automation_emit;
 mod correction;
 mod incident;
 mod promotion;
@@ -298,6 +299,9 @@ async fn tick_project(
         incident::close_if_green(pool, project_id, project_root, state).await;
         // With a release branch, the green sha is promoted to it by the queue.
         promotion::enqueue_promotion_if_due(pool, project_id, project_root, state, rules).await;
+        // Without one, the green sha itself is what a `push` automation answers.
+        automation_emit::emit_local_green_if_due(pool, project_id, project_root, state, rules)
+            .await;
     }
 
     // A gate is running: finish it from its ticket, never start another. This needs neither the
@@ -545,6 +549,10 @@ async fn machine_idle(command: &str, root: &Path) -> Result<(), String> {
 }
 
 /// Reads the ticket of the gate running for `sha` and records its verdict once it is done.
+///
+/// No rules are read here: the targets a green covers were stored at submit time
+/// (`running_targets`), from the rules read that composed the command, and `finish_green` copies
+/// them.
 async fn follow(pool: &sqlx::SqlitePool, project_id: &str, sha: &str, request: i64) -> Step {
     let ticket = match verify::read_ticket(pool, request).await {
         Ok(Some((ticket, _))) => ticket,
@@ -1209,12 +1217,12 @@ mod tests {
     /// Counts the fixtures built, so each repository gets commits no other fixture's repository has.
     static FIXTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    struct Fixture {
-        pool: sqlx::SqlitePool,
+    pub(super) struct Fixture {
+        pub(super) pool: sqlx::SqlitePool,
         ex: Arc<Executor>,
-        root: PathBuf,
+        pub(super) root: PathBuf,
         /// The tip of `main`.
-        tip: String,
+        pub(super) tip: String,
         _env: crate::execution::worktree::WorktreeRootOverride,
         _roots: tempfile::TempDir,
         /// The stand-in home, and the rules this test thread reads.
@@ -1232,7 +1240,7 @@ mod tests {
     /// Every fixture is project `alpha`, so what the process-wide caches key by `(project, sha)`
     /// (`probe::PASSES`/`ABORTS`) is kept apart by giving each repository a root commit of its own:
     /// no two fixtures share a sha.
-    async fn fixture(rules: Option<&str>) -> Fixture {
+    pub(super) async fn fixture(rules: Option<&str>) -> Fixture {
         let machine = crate::project::rules::testing::Home::scoped();
         let repo = space_free_tempdir("nucleos-postgate-");
         let root = repo.path().to_path_buf();
@@ -1324,7 +1332,7 @@ mod tests {
                  {WAIT_CAP:?} in all; last seen: {}",
                 patience.last()
             );
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -1335,7 +1343,7 @@ mod tests {
             .unwrap()
     }
 
-    const GATE_ON: &str = "gate_command: \"git --version\"\ngate_after_land: true\n";
+    pub(super) const GATE_ON: &str = "gate_command: \"git --version\"\ngate_after_land: true\n";
 
     async fn assert_a_switched_off_tick_does_nothing(rules: Option<&str>) {
         let f = fixture(rules).await;
@@ -1433,6 +1441,65 @@ mod tests {
         assert_eq!(s.running_sha, None);
         assert_eq!(s.running_request_id, None);
         assert!(s.red_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_green_with_gate_targets_records_the_launch_time_ones() {
+        // The gate launches under `gate_targets {core: local}`, so its command runs `--only core`.
+        // The composed `gate-diff.sh` command cannot run in this fixture repo, so no executor is
+        // started: the test settles the queued unit as passed itself. Mid-run the owner adds
+        // `hooks: local`; the green must still cover only what the command was composed from.
+        let f = fixture(Some(&format!(
+            "{GATE_ON}gate_targets: {{core: local, shell: ci}}\n"
+        )))
+        .await;
+        tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.running_targets,
+            Some(vec!["core".to_owned()]),
+            "the launch stores the targets its command was composed from"
+        );
+
+        let later = format!("{GATE_ON}gate_targets: {{core: local, hooks: local}}\n");
+        crate::project::rules::testing::publish_rules("alpha", &later);
+        sqlx::query(
+            "UPDATE verify_runs SET status = 'passed', finished_at = ? WHERE status = 'queued'",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        tick_until(&f, |s| matches!(s, Step::Green(_))).await;
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.green_targets,
+            Some(vec!["core".to_owned()]),
+            "a mid-run rules change must not add a target the gate never ran"
+        );
+        assert_eq!(s.running_targets, None);
+    }
+
+    #[tokio::test]
+    async fn a_green_without_gate_targets_stays_null() {
+        let f = fixture(Some(GATE_ON)).await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+
+        tick_until(&f, |s| matches!(s, Step::Green(_))).await;
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.green_targets, None);
     }
 
     #[tokio::test]
@@ -3494,7 +3561,7 @@ gate_after_land: true
 
     // ---- Promotion of the integration branch to the release branch (spec 2026-11-11, D4) -------
 
-    const RELEASE_ON: &str =
+    pub(super) const RELEASE_ON: &str =
         "gate_command: \"git --version\"\ngate_after_land: true\nrelease_branch: main\n";
 
     /// Creates `integ` on `main`'s tip with one more commit, and returns its tip. The checkout

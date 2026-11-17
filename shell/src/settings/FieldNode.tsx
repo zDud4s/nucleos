@@ -36,6 +36,8 @@ export interface FieldNodeProps {
   /** The document root: its properties are drawn with no fieldset around them. */
   bare?: boolean;
   depth?: number;
+  /** JSON pointers of fields not drawn. Their values stay in the body, so a save writes them back unchanged. */
+  hide?: readonly string[];
 }
 
 /** A schema that refers to itself would otherwise draw forever; past this depth a node is a JSON box. */
@@ -119,7 +121,7 @@ function MapAdder(props: { label: string; exists: (key: string) => boolean; onAd
 }
 
 export function FieldNode(props: FieldNodeProps): ReactElement {
-  const { node, root, value, onChange, path, label, errors, required = false, bare = false, depth = 0 } = props;
+  const { node, root, value, onChange, path, label, errors, required = false, bare = false, depth = 0, hide } = props;
   const { node: inner, nullable } = unwrapNullable(node, root);
   const optional = nullable || !required;
   const kind = depth > MAX_FIELD_DEPTH ? "raw" : nodeKind(inner);
@@ -166,6 +168,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
       errors={errors}
       required={childRequired}
       depth={depth + 1}
+      hide={hide}
     />
   );
 
@@ -174,7 +177,9 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
       const properties = inner.properties ?? {};
       const record = isRecord(value) ? value : {};
       const requiredKeys = inner.required ?? [];
-      const fields = Object.keys(properties).map((key) =>
+      const fields = Object.keys(properties)
+        .filter((key) => !(hide?.includes(pointerJoin(path, key)) ?? false))
+        .map((key) =>
         child(
           properties[key],
           key,
