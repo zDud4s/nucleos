@@ -90,7 +90,12 @@ tests:
         # Its test, heavy_tests/test_heavy_watch.py, is picked up by the same unittest discovery.
         - scripts/heavy_watch.py
         - scripts/heavy_tests/
+        # The gate script runs the broker's unittest line itself.
+        - scripts/gates.sh
       command: bash scripts/gates.sh broker
+      # About 13 min, 47+ under load, and nothing outside the paths above can change its result:
+      # an unrelated branch (or a full-sweep path like a workflow) must not plan it.
+      sweep: false
   gate_entrypoints: [scripts/gates.sh, scripts/gate-diff.sh]
   tools:
     cargo: { allow: [fmt, metadata, tree, add, remove, update, search] }
