@@ -273,6 +273,7 @@ mod tests {
             env: Vec::new(),
             include_ignored: false,
             filters: Vec::new(),
+            sweep: true,
         }
     }
 

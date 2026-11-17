@@ -46,6 +46,8 @@ pub struct Selection {
 /// 3. a path in `no_test` is ignored;
 /// 4. any other path is unclaimed and runs every group's `command`.
 ///
+/// A group with `sweep: false` sits out 1 and 4: only the paths it claims activate it.
+///
 /// An active group with a `select` template runs it filled with its paths that are in
 /// `fillable` (see [`vet`]); with none of them fillable — every one deleted, say — it runs
 /// `command`, which tests at least as much.
@@ -76,7 +78,7 @@ pub fn select(
     let mut units = Vec::new();
     for (name, group) in &map.tests.groups {
         let command = || crate::gate::split_command(&group.command).unwrap_or_default();
-        if full {
+        if full && group.sweep {
             let reason = match &sweep {
                 Some(path) => Reason::FullSweep { path: path.clone() },
                 None => Reason::Unclaimed,
@@ -405,6 +407,44 @@ tests:
             assert!(selection.full, "{path}");
             assert_eq!(selection.units.len(), 3);
         }
+    }
+
+    const NO_SWEEP: &str = "version: 1
+tests:
+  groups:
+    core:
+      paths: [core/]
+      command: cargo test
+    broker:
+      paths: [scripts/heavy.py, scripts/gates.sh, scripts/heavy_tests/]
+      command: bash scripts/gates.sh broker
+      sweep: false
+  full_sweep: [scripts/gates.sh, .github/workflows/]
+";
+
+    fn groups_for(changed: &[&str]) -> Vec<String> {
+        let map = parse(NO_SWEEP).unwrap();
+        select(&map, &paths(changed), &BTreeSet::new(), false)
+            .units
+            .into_iter()
+            .map(|unit| unit.group)
+            .collect()
+    }
+
+    #[test]
+    fn a_no_sweep_group_sits_out_unrelated_and_swept_branches() {
+        assert_eq!(groups_for(&["core/src/a.rs"]), ["core"]);
+        assert_eq!(groups_for(&["README.md"]), ["core"]);
+        assert_eq!(groups_for(&[".github/workflows/ci.yml"]), ["core"]);
+    }
+
+    #[test]
+    fn a_no_sweep_group_still_runs_on_its_own_paths() {
+        for path in ["scripts/heavy.py", "scripts/heavy_tests/x.py"] {
+            assert_eq!(groups_for(&[path]), ["broker"], "{path}");
+        }
+        // gates.sh is a full-sweep path too, so core runs with it.
+        assert_eq!(groups_for(&["scripts/gates.sh"]), ["broker", "core"]);
     }
 
     #[test]
