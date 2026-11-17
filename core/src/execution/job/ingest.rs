@@ -124,6 +124,46 @@ pub(super) async fn reconcile_nodes_at(
         // Any other failure, and one past the cap, falls through to the arms below unchanged.
         let mut transient_retries = 0i64;
         if run_status == "failed" {
+            // **A node that died on an account's usage limit is not a transient API error to wait
+            // out against the same account.** The account is marked exhausted and re-picked: the
+            // item goes straight back to `pending`, uncounted and without backoff, and the node
+            // that starts next gets another account from the pool (cold). When none is left the
+            // job's brake parks the job until the earliest reset, so nothing is retried blind.
+            match note_limit_of_run(pool, job, run_id, now).await? {
+                LimitOutcome::NotALimit => {}
+                outcome => {
+                    let moved = sqlx::query(
+                        "UPDATE job_nodes SET status = 'pending', transient_retry_at = NULL
+                         WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+                    )
+                    .bind(job.id)
+                    .bind(ordinal)
+                    .execute(pool)
+                    .await?;
+                    if moved.rows_affected() == 1 {
+                        let what = match outcome {
+                            LimitOutcome::Switch(next) => {
+                                format!("it runs again now on account {}", next.0)
+                            }
+                            _ => "every account is at its limit, so the job waits for the first \
+                                  reset"
+                                .to_owned(),
+                        };
+                        say(
+                            pool,
+                            job,
+                            "job_item_account_limit",
+                            &format!(
+                                "job {} item {}: its node hit an account usage limit; {what}",
+                                job.id,
+                                ordinal + 1
+                            ),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+            }
             let stdout: Option<String> =
                 sqlx::query_scalar::<_, Option<String>>("SELECT stdout FROM runs WHERE id = ?")
                     .bind(run_id)

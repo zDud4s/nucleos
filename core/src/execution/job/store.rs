@@ -152,9 +152,7 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         // itself says a second attempt can get past. A node that never reached the model judged
         // nothing. Everything else — `timed_out`, `cancelled`, a review a hook gave up on, any
         // other failure, and every second review — stays `Done`. See `ReviewState::Retry`.
-        (true, Some((_, Some(stdout), 1)))
-            if crate::execution::runner::failed_on_a_transient_api_error(&stdout) =>
-        {
+        (true, Some((_, Some(stdout), 1))) if failed_on_a_retryable_error(&stdout) => {
             ReviewState::Retry
         }
         // A review that failed is still a review that happened. Its verdict is advisory — §5.5 of
