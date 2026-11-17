@@ -5,7 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import { MAX_UPLOAD_BYTES, browserDropFiles, browserDropsApply, diskPath, downloadFile, dropTargetFolder, fileName, formatBytes, joinPath, openFile, parentPath, readFolder, runsOnOpen, sortEntries, useCreateFolder, useDelete, useFileSearch, useFolder, useMove, useRestore, useTrash, useUpload, type DeleteRequest, type Dropped, type Entry, type Hit, type SortColumn, type SortDirection, type Trashed } from "../data/files";
-import { Button, ErrorNote, Field, PageHeader, Tip, usePaletteGroup } from "../ui";
+import { Button, ErrorNote, Field, PageHeader, usePaletteGroup } from "../ui";
 import { registerPrefetcher } from "../lib/prefetch";
 import { type ClashChoice, DELETE_SENTENCES, DOWNLOAD_SENTENCES, MOVE_SENTENCES, type MoveDone, type PathFailure, type PendingBatch, RESTORE_SENTENCES, RefusalOrError, UPLOAD_SENTENCES, type Undo, type UploadItem, type UploadProgress, type UploadRefusal, type UploadReport, type UploadSaved, describeUploadFailure, readHintRetired, storeHintRetired, useNarrow } from "./files/shared";
 import { DRAG_THRESHOLD_PX, Dismissable, FailureNotes, FilesUnavailableTeach, type FocusAfter, ghostTransform, moveRefusal, pageHeadline, swallowClick } from "./files/pageParts";
@@ -873,19 +873,13 @@ export function Files() {
             value={qInput}
             aria-keyshortcuts="Control+F /"
             placeholder="Search"
+            title="Double-click a file to open it in its default app · drop files here to upload · Ctrl- or Shift-click to select several"
             onChange={(event) => setQInput(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Escape") setQInput("");
             }}
           />
         </Field>
-        {/* The gestures hint is on demand, beside the search; it retires with the first use. */}
-        {!hintRetired && (
-          <Tip
-            name="File gestures"
-            tip="Double-click a file to open it in its default app · drop files here to upload · Ctrl- or Shift-click to select several"
-          />
-        )}
       </div>
       {/* Making things sits together on the right: the two ways a folder
           gets new contents are one intent. */}

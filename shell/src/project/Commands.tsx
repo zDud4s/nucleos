@@ -243,13 +243,14 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
         name and the folder side by side, the command on its own line because it is the long one.
       */}
       <div className="flex flex-col gap-4">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[10rem_1fr]">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
           <Field label="Command name">
             <input
               placeholder="gate"
               value={name}
               spellCheck={false}
               onChange={(event) => setName(event.target.value)}
+              className="box-border w-full min-w-0"
             />
           </Field>
           <Field label="Folder it runs in">
@@ -258,7 +259,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
               value={cwd}
               spellCheck={false}
               onChange={(event) => setCwd(event.target.value)}
-              className="font-mono!"
+              className="box-border w-full min-w-0 font-mono!"
             />
           </Field>
           <div className="sm:col-span-2">
@@ -281,7 +282,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
               checked={isGate}
               onChange={(event) => setIsGate(event.target.checked)}
             />
-            its result says whether this project is green
+            Its result says whether this project is green
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -289,7 +290,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
               checked={agentMayRun}
               onChange={(event) => setAgentMayRun(event.target.checked)}
             />
-            an agent may run it on its own
+            An agent may run it on its own
           </label>
         </div>
 

@@ -23,14 +23,10 @@
   gap: var(--space-4);
 }
 
-/* The section nav is a map, not the first line of the setting: air between it and "Setting for". */
-.ap-nav + .ap-sections {
-  margin-top: var(--space-5);
-}
-
-/* Secondary, in-page section switcher (not top-level tabs): smaller type and tighter gaps. */
+/* Secondary, in-page section switcher (not top-level tabs): smaller type and tighter gaps. It sits
+   directly under the project cards, so it reads as the sections of that project. */
 .ap-nav {
-  margin-top: var(--space-4);
+  margin: 0;
 }
 
 .ap-nav .ui-section-nav-list {
@@ -204,6 +200,14 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
+}
+
+/* Small panels side by side at their own height: one small control never gets a full-width card. */
+.ap-panel-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(22rem, 100%), 1fr));
+  gap: var(--space-4);
+  align-items: start;
 }
 
 /* The judge's switch and the reason a segment is shut, kept together. */
@@ -1050,118 +1054,15 @@
   text-align: center;
 }
 
-/* ============================================ roster list, project bar, agreement == */
+/* ====================================================== stage focus, agreement == */
 
-/* The fan hidden: the stage goes and the control takes the whole width. */
-.ap-fan.ap-fan-nofan {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.ap-fan-nofan .ap-fan-pane {
-  display: none;
-}
-
-/* With the fan hidden, one line heads the list: how many, in what order, and the way back. */
-.ap-roster-head {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-3);
-  min-width: 0;
-}
-
-.ap-roster-count {
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
-/* The roster as a list, most urgent first: every project on one screen, no pointer needed. */
-.ap-roster {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  max-height: 20rem;
-  overflow-y: auto;
-}
-
-.ap-roster-row {
-  display: grid;
-  grid-template-columns: minmax(8rem, 14rem) auto minmax(0, 1fr);
-  align-items: center;
-  gap: var(--space-3);
-  width: 100%;
-  min-height: var(--hit-min);
-  padding: 0 var(--space-3);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: none;
-  color: var(--text);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.ap-roster-row:hover {
-  background: var(--surface-raised);
-}
-
-.ap-roster-row:focus-visible {
+/* The stage is the keyboard's one tab stop (a listbox of the project cards): it shows focus itself. */
+.ap-fan-stage:focus-visible {
   outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
-.ap-roster-row[aria-selected="true"] {
-  background: var(--surface-raised);
-  box-shadow: inset 2px 0 0 var(--text-muted);
-}
-
-.ap-roster-name {
-  font-family: var(--font-display);
-  font-weight: var(--weight-semibold);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ap-roster-reading {
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* The project in focus, kept in view once the carousel has scrolled away. */
-.ap-project-bar {
-  position: sticky;
-  /* Under the section nav, which sticks at the top of the same column. */
-  top: calc(var(--hit-min) + var(--space-2) * 2 + var(--hairline));
-  z-index: var(--z-sticky);
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--border-strong);
-  background: var(--bg);
-}
-
-.ap-project-bar-label {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.ap-project-bar-name {
-  font-family: var(--font-display);
-  font-weight: var(--weight-bold);
-  color: var(--text);
-}
 
 /* Agreement: the figure, a bar to the readiness bar, and what is still missing. */
 .ap-agree {

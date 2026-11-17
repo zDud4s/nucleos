@@ -78,14 +78,13 @@ export function Settings({ projectId }: SettingsProps) {
   const stale = projects.isError;
 
   /*
-    Two blocks side by side and the evidence under both. Each card takes the height its own
-    content needs (`items-start`): stretched to share a row, the shorter one was a card with a
-    large empty area under three words and a sentence.
+    Two blocks side by side and the evidence under both. The two cards stretch to one height so
+    the row reads as a pair, with the same padding and heading.
   */
   return (
     <div className="flex flex-col gap-3">
       {stale ? <StaleNote dataUpdatedAt={projects.dataUpdatedAt} /> : null}
-      <div className="ws-autonomy grid grid-cols-1 items-start gap-3 lg:grid-cols-2">
+      <div className="ws-autonomy grid grid-cols-1 items-stretch gap-3 lg:grid-cols-2">
         <ModeChoice project={project} />
         <Ceiling project={project} stale={stale} />
         <div className="lg:col-span-2">
@@ -368,7 +367,11 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
   const taken = limit === null ? 0 : Math.min(open, limit);
   const meter =
     limit === null || limit === 0 ? null : (
-      <div aria-hidden="true" className="flex gap-1">
+      <div
+        aria-hidden="true"
+        className="flex w-full gap-1"
+        title={project.queue_full ? "Holding new work" : undefined}
+      >
         {limit <= 12 ? (
           Array.from({ length: limit }, (_, i) => (
             <span
@@ -391,49 +394,56 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
     <Block
       label="Open-proposal ceiling"
       id={headingId}
-      about="How many proposals may wait on you before new work here is held."
+      about={
+        project.queue_full
+          ? "How many proposals may wait on you before new work here is held. The ceiling is reached, so new work is being held."
+          : "How many proposals may wait on you before new work here is held."
+      }
     >
-      {reading}
+      {/* The reading and the stepper share one line, the stepper at the right edge; the gauge
+          sits under both, inside the card's padding. */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        {reading}
+        {stale ? null : (
+          <div
+            role="group"
+            aria-labelledby={headingId}
+            aria-busy={busy}
+            className="flex items-center gap-1"
+          >
+            <span className="inline-flex items-center rounded-md border border-border-strong">
+              <Step
+                label="Lower the ceiling"
+                inert={limit === null || limit <= 0 || busy}
+                describedBy={readingId}
+                onPress={() => set(limit === null ? null : limit - 1)}
+              >
+                −
+              </Step>
+              {figure}
+              <Step
+                label="Raise the ceiling"
+                inert={busy}
+                describedBy={readingId}
+                onPress={() => set(limit === null ? 1 : limit + 1)}
+              >
+                +
+              </Step>
+            </span>
+            {/* Unsetting the ceiling, as a small icon rather than a standalone button. */}
+            <Step
+              label="No ceiling"
+              title="No ceiling"
+              inert={limit === null || busy}
+              describedBy={readingId}
+              onPress={() => set(null)}
+            >
+              ×
+            </Step>
+          </div>
+        )}
+      </div>
       {meter}
-
-      {/*
-        The stepper is one joined control, the way off at the far end.
-      */}
-      {stale ? null : (
-        <div
-          role="group"
-          aria-labelledby={headingId}
-          aria-busy={busy}
-          className="flex flex-wrap items-center justify-between gap-2 pt-1"
-        >
-          <span className="inline-flex items-center rounded-md border border-border-strong">
-            <Step
-              label="Lower the ceiling"
-              inert={limit === null || limit <= 0 || busy}
-              describedBy={readingId}
-              onPress={() => set(limit === null ? null : limit - 1)}
-            >
-              −
-            </Step>
-            {figure}
-            <Step
-              label="Raise the ceiling"
-              inert={busy}
-              describedBy={readingId}
-              onPress={() => set(limit === null ? 1 : limit + 1)}
-            >
-              +
-            </Step>
-          </span>
-          <Step inert={limit === null || busy} describedBy={readingId} onPress={() => set(null)}>
-            No ceiling
-          </Step>
-        </div>
-      )}
-
-      {project.queue_full ? (
-        <p className="text-xs text-tone-paused-fg">Holding new work</p>
-      ) : null}
 
       {/* A failed write used to say nothing, so the number on screen was the only answer — and it
           was the old number, looking like a change that had not landed yet. */}
@@ -458,12 +468,14 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
  */
 function Step({
   label,
+  title,
   inert,
   describedBy,
   onPress,
   children,
 }: {
   label?: string;
+  title?: string;
   inert: boolean;
   describedBy: string;
   onPress: () => void;
@@ -473,6 +485,7 @@ function Step({
     <button
       type="button"
       aria-label={label}
+      title={title}
       aria-disabled={inert ? "true" : undefined}
       aria-describedby={describedBy}
       onClick={() => {

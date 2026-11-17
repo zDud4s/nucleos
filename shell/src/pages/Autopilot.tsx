@@ -84,7 +84,6 @@ import {
   cardPose,
   circularOffset,
   describeProject,
-  evidence,
   fanConfig,
   gateFor,
   holdOrder,
@@ -268,12 +267,6 @@ export function Autopilot() {
         <RosterError error={projects.error} />
       )}
 
-      {/* A secondary, in-page switcher: it sits under the project cards, so it reads as sections
-          of the selected project. */}
-      <div className="ap-nav">
-        <SectionNav label="Autopilot sections" items={SECTIONS} current={currentSection} />
-      </div>
-
       <div className="ap-sections">
         <div id="ap-setting" className="ap-block">
           <ProjectCarousel
@@ -285,6 +278,11 @@ export function Autopilot() {
             refusals={refusals}
             onRefusals={setRefusals}
           />
+        </div>
+        {/* A secondary, in-page switcher: it sits under the project cards, so it reads as sections
+            of the selected project. */}
+        <div className="ap-nav">
+          <SectionNav label="Autopilot sections" items={SECTIONS} current={currentSection} />
         </div>
         {/* The brakes sit with the ledger, before any evidence: the order this page's doc-comment
             promises (brakes, then the setting, then the proof, then the work). */}
@@ -299,22 +297,25 @@ export function Autopilot() {
         {/* The panels below act on the project in focus. With none (the roster is still being read,
             or it is empty and the carousel already says so) they would each repeat the same absence. */}
         <div id="ap-evidence" className="ap-block">
-          {focused !== undefined && <ProjectBar project={focused} />}
           {selected !== null && <ShadowReviewPanel projectId={selected} project={focused} />}
           {selected !== null && <ScoreboardPanel projectId={selected} project={focused} />}
           {selected !== null && (
             // Open from the first view: which judge rules this project is a decision only the
             // owner makes, so it is folded only by somebody who has seen it.
             <Disclosure label="Advanced: judge and resolve" defaultOpen>
-              <JudgePanel projectId={selected} project={focused} />
+              <div className="ap-panel-pair">
+                <JudgePanel projectId={selected} project={focused} />
+                <ResolvePanel projectId={selected} project={focused} />
+              </div>
               <JudgeReviewPanel projectId={selected} />
-              <ResolvePanel projectId={selected} project={focused} />
             </Disclosure>
           )}
         </div>
         <div id="ap-jobs" className="ap-block">
           <JobsPanel rows={rows} selected={selected} />
-          <ExclusionsPanel />
+          <div className="ap-panel-pair">
+            <ExclusionsPanel />
+          </div>
         </div>
         {/* Records of what the night and the barrier already settled. They were on the Waiting
             page, which now holds only what asks for a decision. Records, not controls: shut until
@@ -449,28 +450,6 @@ function reducedMotion(): boolean {
   );
 }
 
-/** Where this machine remembers that somebody hid the fan. */
-const FAN_KEY = "nucleos.autopilot.fan";
-
-/** Whether the fan shows: yes unless it was hidden here. Storage that throws counts as never hidden. */
-function readFanShown(): boolean {
-  try {
-    return window.localStorage.getItem(FAN_KEY) !== "hidden";
-  } catch {
-    return true;
-  }
-}
-
-/** Remember the choice; storage that throws leaves it for this visit only. */
-function writeFanShown(shown: boolean): void {
-  try {
-    if (shown) window.localStorage.removeItem(FAN_KEY);
-    else window.localStorage.setItem(FAN_KEY, "hidden");
-  } catch {
-    // Nothing to do: the toggle still works until the page is left.
-  }
-}
-
 /** The map without one project's entry — the same map when it had none, so nothing re-renders. */
 function without(
   map: ReadonlyMap<string, Refused>,
@@ -480,15 +459,6 @@ function without(
   const next = new Map(map);
   next.delete(id);
   return next;
-}
-
-/** A roster row's reading: the map's word, the exceptions, and the evidence. */
-function readingOf(project: ProjectSummary, refused: boolean): string {
-  const bits = [readState("autopilot", project.mode)?.label ?? project.mode];
-  if (project.queue_full) bits.push("queue full");
-  if (refused) bits.push("setting refused");
-  bits.push(evidence(project));
-  return bits.join(" · ");
 }
 
 /** A drag in progress: where it started, where it is, and the last tenth of a second of it. */
@@ -505,12 +475,10 @@ interface Drag {
 /**
  * The roster as a fan, one project in focus at a time, and the setting for that project under it.
  *
- * Three parts. The setting is the selected project's, and nobody else's. The stage is drawing, not
- * controls: hidden from assistive technology as a whole, it takes pointer input only (a drag, a
- * fling, a click on a neighbouring card, a sideways swipe) and never a tab stop. The list is every
- * project at once, most urgent first — the answer to "is everything fine?" that one card cannot
- * give — and it is the keyboard's only way in: a listbox with one tab stop whose selection follows
- * focus, and the fan follows the selection.
+ * Two parts. The setting is the selected project's, and nobody else's. The stage takes pointer
+ * input (a drag, a fling, a click on a card, a sideways swipe) and, from two projects up, is one
+ * listbox with one tab stop: the arrows, Home and End walk the cards, most urgent first, and the
+ * selection follows. A single project is drawn, not controlled, and hidden from assistive technology.
  *
  * One mutation for the whole roster, each refusal kept against the project that caused it: only one
  * project's switch is on screen at a time, and a refusal has to outlive walking to another project
@@ -542,17 +510,6 @@ function ProjectCarousel({
   const [said, setSaid] = useState("");
   const [cfg, setCfg] = useState<FanConfig>(() => fanConfig(900));
   const [dragging, setDragging] = useState(false);
-  /**
-   * The fan is a picture of the roster; the list under it carries the same triage in words. Shown
-   * by default, and hiding it is remembered on this machine.
-   */
-  const [fanPreferred, setFanPreferred] = useState(readFanShown);
-  function toggleFan() {
-    const next = !fanPreferred;
-    writeFanShown(next);
-    setFanPreferred(next);
-  }
-
   const base = useId();
   const panelId = `${base}-panel`;
 
@@ -569,10 +526,6 @@ function ProjectCarousel({
   const focused: ProjectSummary | undefined = shown[index];
   const many = total >= 2;
   const hasStage = total > 0;
-  // The toggle lives with the list, which only exists for two projects or more: a single
-  // project always shows its card, so a remembered "hidden" can never strand the page without a
-  // way back.
-  const fanOn = fanPreferred || !many;
 
   const stageRef = useRef<HTMLDivElement>(null);
   const cards = useRef(new Map<string, HTMLElement>());
@@ -726,6 +679,24 @@ function ProjectCarousel({
     [],
   );
 
+  /**
+   * The keyboard's way in: the stage is one tab stop, and the arrows walk it (a ring at three or
+   * more, a line below), Home and End go to its ends. Selection follows; the fan catches up.
+   */
+  function onStageKey(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const at = latest.current.index;
+    const count = latest.current.shown.length;
+    const step = (by: number) => (count >= 3 ? wrap(at + by, count) : clamp(at + by, 0, count - 1));
+    let next: number | null = null;
+    if (event.key === "ArrowDown" || event.key === "ArrowRight") next = step(1);
+    else if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = step(-1);
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = count - 1;
+    if (next === null) return;
+    event.preventDefault();
+    if (next !== at) chooseFromStage(next);
+  }
+
   function onStageDown(event: ReactPointerEvent<HTMLDivElement>) {
     if (total <= 1 || event.button !== 0) return;
     // The name and path of the card in focus can be selected and copied; a drag there would steal it.
@@ -837,7 +808,7 @@ function ProjectCarousel({
     // The setting for the project in focus is the first thing under the header, with the fan beside it
     // (no section title above either: the list names every project). The fan is the roster's picture and
     // the setting is the control, so the control is never pushed below the picture.
-    <section className={fanOn ? "ap-fan" : "ap-fan ap-fan-nofan"} aria-label="Projects">
+    <section className="ap-fan" aria-label="Projects">
       {answered && rows.length === 0 && (
         <Quiet says="No project is under autopilot">
           <p className="ap-note">
@@ -876,7 +847,16 @@ function ProjectCarousel({
               <div
                 ref={stageRef}
                 className={stageClass}
-                aria-hidden="true"
+                {...(many
+                  ? {
+                      role: "listbox",
+                      "aria-label": "All projects by urgency",
+                      "aria-controls": panelId,
+                      "aria-activedescendant": `${base}-card-${index}`,
+                      tabIndex: 0,
+                      onKeyDown: onStageKey,
+                    }
+                  : { "aria-hidden": true })}
                 onPointerDown={onStageDown}
                 onPointerMove={onStageMove}
                 onPointerUp={onStageUp}
@@ -890,6 +870,9 @@ function ProjectCarousel({
                       else cards.current.set(row.project_id, element);
                     }}
                     data-index={at}
+                    id={`${base}-card-${at}`}
+                    {...(many ? { role: "option", "aria-selected": at === index } : {})}
+                    onClick={many ? () => onSelect(row.project_id) : undefined}
                     className={at === index ? "ap-fan-card ap-fan-card-focus" : "ap-fan-card"}
                   >
                     <FanCard
@@ -900,34 +883,7 @@ function ProjectCarousel({
                   </article>
                 ))}
               </div>
-              {many && fanOn && (
-                <p className="ap-fan-hint" title="Arrow keys on the list, or drag the cards">
-                  <Button variant="quiet" onClick={toggleFan}>
-                    Hide the fan
-                  </Button>
-                </p>
-              )}
             </div>
-            {/* With the fan hidden, one line heads the list, with the way back to the fan. */}
-            {many && !fanOn && (
-              <div className="ap-roster-head">
-                <span className="ap-roster-count">
-                  {total} projects, most urgent first
-                </span>
-                <Button variant="quiet" onClick={toggleFan}>
-                  Show the fan
-                </Button>
-              </div>
-            )}
-            {many && (
-              <RosterList
-                rows={shown}
-                selected={focused.project_id}
-                refusals={refusals}
-                onSelect={onSelect}
-                controls={panelId}
-              />
-            )}
           </div>
         </>
       )}
@@ -935,98 +891,6 @@ function ProjectCarousel({
         {said}
       </p>
     </section>
-  );
-}
-
-/**
- * The roster as a list, most urgent first: name, the map's word for its mode, and a one-line
- * reading. It is the triage the fan only draws, and the keyboard's way to choose: a listbox with one
- * tab stop, where the arrows walk it (a ring at three or more, a line below), Home and End go to its
- * ends, and selection follows focus — the setting above and the fan follow the selection. Ten or
- * twenty projects fit on one screen.
- */
-function RosterList({
-  rows,
-  selected,
-  refusals,
-  onSelect,
-  controls,
-}: {
-  rows: readonly ProjectSummary[];
-  selected: string;
-  refusals: ReadonlyMap<string, Refused>;
-  onSelect: (projectId: string) => void;
-  controls: string;
-}) {
-  const options = useRef<(HTMLLIElement | null)[]>([]);
-  const total = rows.length;
-  const index = Math.max(
-    0,
-    rows.findIndex((row) => row.project_id === selected),
-  );
-
-  function onKey(event: ReactKeyboardEvent<HTMLUListElement>) {
-    const from = options.current.findIndex((option) => option === event.target);
-    const at = from < 0 ? index : from;
-    const step = (by: number) => (total >= 3 ? wrap(at + by, total) : clamp(at + by, 0, total - 1));
-    let next: number | null = null;
-    if (event.key === "ArrowDown" || event.key === "ArrowRight") next = step(1);
-    else if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = step(-1);
-    else if (event.key === "Home") next = 0;
-    else if (event.key === "End") next = total - 1;
-    if (next === null) return;
-    event.preventDefault();
-    const row = rows[next];
-    if (row === undefined) return;
-    onSelect(row.project_id);
-    options.current[next]?.focus();
-  }
-
-  return (
-    <ul
-      className="ap-roster"
-      role="listbox"
-      aria-label="All projects by urgency"
-      aria-controls={controls}
-      onKeyDown={onKey}
-    >
-      {rows.map((row, at) => (
-        <li
-          key={row.project_id}
-          ref={(element) => {
-            options.current[at] = element;
-          }}
-          role="option"
-          className="ap-roster-row"
-          aria-selected={at === index}
-          tabIndex={at === index ? 0 : -1}
-          onClick={() => onSelect(row.project_id)}
-        >
-          <span className="ap-roster-name">{row.project_id}</span>
-          <StateBadge domain="autopilot" state={row.mode} />
-          <span className="ap-roster-reading">
-            {readingOf(row, refusals.has(row.project_id))}
-          </span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-/**
- * The project every panel below acts on, kept in view while the page scrolls.
- *
- * Eight panels read or change the project in focus but the picker is at the top, so somebody in
- * "Start a job" could send work to a project they stopped looking at. This bar sits in the flow
- * after the brakes and sticks once the carousel has scrolled away.
- */
-function ProjectBar({ project }: { project: ProjectSummary }) {
-  return (
-    <div className="ap-project-bar" role="group" aria-label="Project in focus">
-      <span className="ap-project-bar-label">Acting on</span>
-      <strong className="ap-project-bar-name">{project.project_id}</strong>
-      <StateBadge domain="autopilot" state={project.mode} />
-    </div>
   );
 }
 
@@ -1881,10 +1745,8 @@ function RosterSkeleton() {
       <div className="ap-fan-view">
         <div className="ap-fan-pane">
           <Skeleton label="Reading the fan" variant="block" height="calc(316px + 4rem)" />
-          <Skeleton label="Reading the fan hint" variant="line" width="60%" />
         </div>
       </div>
-      <Skeleton label="Reading the roster list" variant="row" count={4} height="1.9rem" />
       <Skeleton label="Reading the spend" variant="block" height="2.5rem" />
     </>
   );
