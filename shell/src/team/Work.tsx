@@ -265,7 +265,7 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
  */
 function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   if (items.length === 0) {
-    return <Quiet says="Nothing planned yet. The background service has not picked this up." />;
+    return <Quiet says="Nothing planned yet">The background service has not picked this up.</Quiet>;
   }
 
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);

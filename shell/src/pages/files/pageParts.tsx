@@ -2,7 +2,7 @@ import { useState, type ReactNode } from "react";
 import { DAEMON_NAME } from "../../copy";
 import { formatBytes, joinPath, type Entry } from "../../data/files";
 import { plural } from "../../lib/plural";
-import { Button, Teach } from "../../ui";
+import { Button, Quiet } from "../../ui";
 import { type PathFailure, RefusalOrError } from "./shared";
 
 /** How far the pointer travels with a row held before it is a drag and not a click. */
@@ -133,7 +133,7 @@ export function FilesUnavailableTeach() {
   const path = "%LOCALAPPDATA%\\nucleos\\NucleOS\\data\\files";
   const [copied, setCopied] = useState(false);
   return (
-    <Teach title="The files folder could not be opened">
+    <Quiet says="The files folder could not be opened">
       <p>
         Check that <code>{path}</code> exists and can be written to, then restart NucleOS. Until then every
         action on this page is refused rather than pointed at somewhere else.
@@ -156,6 +156,6 @@ export function FilesUnavailableTeach() {
         filed mail and team workspaces. It could not create or open that folder when it started; its log names
         the error it hit.
       </p>
-    </Teach>
+    </Quiet>
   );
 }

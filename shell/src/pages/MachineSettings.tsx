@@ -3,7 +3,7 @@ import { isApiRefusal } from "../data/client";
 import { useForgetSecret, useMachineSecrets, useStoreSecret, type MachineSecret } from "../data/secrets";
 import { useSettingsIndex, type SettingIndexRow } from "../data/settings";
 import { SettingsForm } from "../settings/SettingsForm";
-import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, Skeleton, StateBadge } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, Skeleton, StateBadge, Tip } from "../ui";
 import { EngineOptIn } from "./EngineOptIn";
 import { DistillerModel } from "./DistillerModel";
 import { CaptureWait } from "./CaptureWait";
@@ -77,10 +77,7 @@ export function MachineSettings() {
         <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
       </Panel>
 
-      <p className="sy-machine-intro">
-        These settings belong to the daemon rather than to any project. Each is checked before anything is written: a
-        change that would not read is refused with the daemon's own words, and what is stored is left alone.
-      </p>
+      <Tip name="About machine settings" tip="These settings belong to the daemon rather than to any project. Each is checked before anything is written: a change that would not read is refused with the daemon's own words, and what is stored is left alone." />
 
       {/* A list of the documents and one of them open, rather than nine forms stacked. */}
       <div className="sy-settings">
@@ -218,9 +215,8 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
   return (
     <div className="sy-secret">
       <div className="sy-secret-head">
-        <span className="sy-secret-key" title={secret.what}>
-          {secret.key}
-        </span>
+        <span className="sy-secret-key">{secret.key}</span>
+        <Tip tip={secret.what} name={`About ${secret.key}`} persist />
         {/* "unknown" is not the same as "not set", and acting on the two differs: one wants a
             credential pasted, the other wants somebody to look at the store. */}
         <StateBadge
@@ -228,7 +224,6 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
           state={secret.present === true ? "set" : secret.present === false ? "unset" : "unknown"}
         />
       </div>
-      <p className="sy-field-hint">{secret.what}</p>
       <div className="sy-setting-controls">
         <input
           type="password"

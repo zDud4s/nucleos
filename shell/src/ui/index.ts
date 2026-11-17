@@ -151,6 +151,7 @@ export { Segmented, type SegmentedOption, type SegmentedProps } from "./Segmente
 export { Select, type SelectProps } from "./Select";
 export { Switch, type SwitchProps } from "./Switch";
 export { Callout, type CalloutProps } from "./Callout";
+export { ClampedText, type ClampedTextProps } from "./ClampedText";
 export { Drawer, type DrawerProps } from "./Drawer";
 /**
  * A table and its two cells in one module — the exception to one primitive per file `Rows.tsx`

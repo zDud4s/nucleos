@@ -375,7 +375,7 @@ describe("Teams - the table", () => {
     const table = await departments();
     // The unit moved out of the header cell into the legend row above the table.
     expect(within(table).getByRole("columnheader", { name: /Pulse/ })).toBeDefined();
-    expect(screen.getByText(/a bar per day/)).toBeDefined();
+    expect(screen.getByTitle(/a bar per day/i)).toBeDefined();
 
     // Oldest first, plural where the count earns it, and the day spelled out.
     const said = [...table.querySelectorAll("svg title")].map((node) => node.textContent);

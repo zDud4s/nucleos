@@ -582,7 +582,7 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
           <Quiet says="this folder is empty." />
         )}
         {listing.data !== undefined && entries.length > 0 && ordered.length === 0 && (
-          <Quiet says="nothing in this folder is named like that." />
+          <Quiet says="No match">Nothing in this folder is named like that.</Quiet>
         )}
         {ordered.length > 0 && (
           <ul className="pj-listing" aria-label="Folder contents">
@@ -779,7 +779,7 @@ function FileView({
       )}
       {!file.isError && file.data === undefined && <Skeleton label="Reading the file" variant="block" height="12rem" />}
       {file.data !== undefined && file.data === "" && (
-        <Quiet says="that file is empty: a real answer, not a failed read." />
+        <Quiet says="File is empty">A real answer, not a failed read.</Quiet>
       )}
       {file.data !== undefined && file.data !== "" && <FileBody text={file.data} line={line} />}
     </Panel>
@@ -935,7 +935,7 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
         <Skeleton label="Searching" variant="row" count={3} />
       )}
       {matches.data !== undefined && groups.length === 0 && (
-        <Quiet says="nothing in that folder contains it." />
+        <Quiet says="No match">Nothing in that folder contains it.</Quiet>
       )}
       {groups.length > 0 && (
         <ul className="pj-matches" aria-label="Matches">
@@ -1017,7 +1017,7 @@ function DiffPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
       )}
       {!diff.isError && diff.data === undefined && <Skeleton label="Reading the tree" variant="block" height="10rem" />}
       {diff.data !== undefined && diff.data.trim() === "" && (
-        <Quiet says="nothing is uncommitted: the tree is clean." />
+        <Quiet says="Tree is clean">Nothing is uncommitted.</Quiet>
       )}
       {diff.data !== undefined && diff.data.trim() !== "" && <DiffBody diff={diff.data} />}
     </Panel>

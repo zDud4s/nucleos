@@ -32,7 +32,9 @@ function AcceptedTheme({ id, name, others }: { id: number; name: string; others:
           <Skeleton label="Loading the synthesis" lines={2} />
         )
       ) : synthesis === null || synthesis === "" ? (
-        <Quiet compact says="No synthesis yet: it is made after a theme is accepted, and weekly." />
+        <span title="It is made after a theme is accepted, and weekly.">
+          <Quiet compact says="No synthesis yet" />
+        </span>
       ) : (
         <p className="themes-synthesis">{synthesis}</p>
       )}

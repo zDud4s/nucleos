@@ -53,7 +53,7 @@ describe("ScopedTools - own tools", () => {
 
     await renderWithRouter(<ScopedTools ownerKind="team" ownerId="crew" />);
 
-    await screen.findByText("No tool beyond the base has been approved here yet.");
+    await screen.findByText("No extra tools");
     const paths = daemon.apiFetch.mock.calls.map((call) => call[0] as string);
     expect(paths).toContain("/loadout/tools?status=active&owner_kind=team&owner_id=crew");
   });

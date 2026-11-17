@@ -91,9 +91,7 @@ function CommandItem({ line }: { line: ConsentCommand }) {
       <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text">{line.command}</pre>
       {line.project_override !== undefined ? (
         <div className="flex flex-col gap-0.5">
-          <span className="text-xs text-text-muted">
-            this project runs this instead, through its own override:
-          </span>
+          <span className="text-xs text-text-muted">this project overrides it with:</span>
           <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text">
             {line.project_override}
           </pre>
@@ -118,15 +116,12 @@ function Lead({ consent }: { consent: WorkflowConsent }) {
   return (
     <div className="flex flex-col gap-1">
       {count === 0 ? (
-        <p>
-          {consent.version} declares no command nodes, so it runs no program of its own. Agents
-          still run on whatever model the graph names.
+        <p title="It runs no program of its own. Agents still run on whatever model the graph names.">
+          {consent.version}: no commands
         </p>
       ) : (
-        <p>
-          {consent.version} runs {count} {count === 1 ? "command" : "commands"} in this project,
-          with no hook and no classifier in front of {count === 1 ? "it" : "them"}. This is each
-          one, exactly as the bundle writes it.
+        <p title="Run in this project with no hook and no classifier in front of them, exactly as the bundle writes them.">
+          {consent.version}: {count} {count === 1 ? "command" : "commands"}
         </p>
       )}
       {consent.baseline === null ? null : moved === 0 ? (
@@ -260,7 +255,7 @@ export function WorkflowConsentPanel({
           />
         )}
         <Button variant="quiet" onClick={onCancel}>
-          cancel
+          Cancel
         </Button>
       </div>
     </div>

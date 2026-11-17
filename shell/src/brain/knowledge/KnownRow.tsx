@@ -107,7 +107,7 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
                     if (id !== null) setChainId(chainId === id ? null : id);
                   }}
                 >
-                  knowledge {ref.id}
+                  Knowledge {ref.id}
                 </Button>
               ) : ref.t === "note" ? (
                 <Link to="/brain" search={{ item: `note:${String(ref.id)}` }}>

@@ -175,7 +175,7 @@ export function Why({ lead, children }: { lead: ReactNode; children: ReactNode }
           aria-describedby={leadId}
           onClick={() => setOpen(!open)}
         >
-          {open ? "less" : "why?"}
+          {open ? "Less" : "Why?"}
         </button>
       </p>
       <div className="pj-why-rest" id={restId} hidden={!open}>
@@ -257,9 +257,8 @@ function RulesFileState({
             <code>{rules.rules_error ?? `the ${DAEMON_NAME} reported no detail`}</code>
           </pre>
           <p className="pj-note">
-            The file is parsed strictly on purpose: an unknown key is an error rather than a silently
-            empty ruleset. Until it parses, nothing this project might run is known, not because
-            there is nothing, but because none of it could be loaded.
+            Parsed strictly: an unknown key is an error. Until it parses, nothing this project
+            might run is known.
           </p>
           {editable && (
             <p className="pj-fix">
@@ -270,9 +269,7 @@ function RulesFileState({
       )}
       {rules.rules_file === "absent" && (
         <p className="pj-note">
-          There is no {file} yet. That is an ordinary state and not a fault: it lives with this
-          machine&rsquo;s settings rather than in the project, and exists once somebody writes rules,
-          and it means this project starts nothing by itself.
+          There is no {file} yet, so this project starts nothing by itself.
         </p>
       )}
     </div>
@@ -518,8 +515,9 @@ function GatePanel({
            click behind it — the sentence is kept rather than cut, because "no gate
            is configured" alone reads as a field that failed to load rather than as
            a project nobody has gated. */
-        <Quiet says="No gate is configured, so nothing measures this project’s work.">
+        <Quiet says="No gate configured">
           <p>
+            Nothing measures this project’s work.
             That is why a job item can read <em>passed</em> with no gate status: there was nothing
             to pass.
           </p>
@@ -536,8 +534,8 @@ function GatePanel({
       ) : (
         <p className="pj-note">
           {beforePublish
-            ? "Merges wait for it. The queue runs it on the merged result and publishes only if it passes; nothing is reverted, because nothing is published first."
-            : "Merges do not wait for it: the queue publishes without measuring the tree the two branches make together."}
+            ? "Merges wait for it and publish only if it passes."
+            : "Merges do not wait for it."}
         </p>
       )}
     </Panel>
@@ -737,13 +735,11 @@ function JudgePanel({
       <p className="pj-wip-state">
         {judge.state === "default" ? (
           <>
-            The <strong>local</strong> brain answers, on whatever model it is configured with.
-            Nobody has chosen otherwise for this project.
+            The <strong>local</strong> brain answers, on its configured model.
           </>
         ) : judge.state === "off" ? (
           <>
-            <strong>Nobody</strong> answers but you. Every question a conversation on Auto raises
-            here waits for a person.
+            <strong>Nobody</strong> answers but you. Every question waits for a person.
           </>
         ) : (
           <>
@@ -776,8 +772,7 @@ function JudgePanel({
 
       {stale ? (
         <p className="pj-note">
-          The judge can be changed again once the rules read is current: changing it beside a
-          reading nobody can vouch for would be deciding on a guess.
+          The judge can be changed again once the rules read is current.
         </p>
       ) : (
         <div className="pj-form">
@@ -1020,8 +1015,7 @@ function WipPanel({
 
       {draft.trim() !== "" && !valid && (
         <p className="pj-note">
-          A ceiling is a whole number, zero or more. The {DAEMON_NAME} refuses a negative one outright: it
-          would read like a number somebody chose and mean &ldquo;never start anything again&rdquo;.
+          A ceiling is a whole number, zero or more.
         </p>
       )}
       {setLimit.isError && <WipError error={setLimit.error} />}

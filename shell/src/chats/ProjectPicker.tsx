@@ -103,7 +103,9 @@ export function ProjectPicker({
           <Quiet compact says={`The ${DAEMON_NAME} did not list its projects`} />
         )}
         {projects.data !== undefined && choices.length === 0 && (
-          <Quiet compact says="No project on the roster has a folder yet. Add one on the Projects page." />
+          <p className="ui-quiet-compact" title="Add one on the Projects page.">
+            No project with a folder
+          </p>
         )}
         {projects.data !== undefined && (
           /* First, and set apart: it is not a project but the folder NucleOS itself runs from. */

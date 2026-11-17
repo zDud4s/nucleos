@@ -64,6 +64,7 @@ import {
   PageHeader,
   Panel,
   Quiet,
+  Tip,
   RefusalNote,
   RelativeTime,
   Row,
@@ -521,7 +522,7 @@ function RouterReportPanel() {
   }
   if (data === undefined) return null;
   if (data.runs <= 0) {
-    return <Section label="Router"><Quiet says="no routed runs in the last 30 days." /></Section>;
+    return <Section label="Router"><Quiet says="No routed runs">Nothing was routed in the last 30 days.</Quiet></Section>;
   }
   // Among shadow runs with advice only: an apply run launched its advice and cannot disagree.
   const shadowAdvised = data.shadow_advised;
@@ -714,11 +715,17 @@ function ScopedKillsPanel() {
 
   return (
     <Panel title="Project brakes" aside={aside}>
-      <p className="sy-note">
-        A project brake holds what that project would START; it stops nothing already running. An
-        absent row means the daemon was never told, which reads as released. The trigger brakes
-        (scheduled rules, repo triggers, e-mail triage) live on <Link to="/autopilot">Autopilot</Link>.
-      </p>
+      <Tip
+        name="About project brakes"
+        persist
+        tip={
+          <>
+            A project brake holds what that project would START; it stops nothing already running. An
+            absent row means the daemon was never told, which reads as released. The trigger brakes
+            (scheduled rules, repo triggers, e-mail triage) live on <Link to="/autopilot">Autopilot</Link>.
+          </>
+        }
+      />
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
       {!kills.isError && kills.data === undefined && <Skeleton label="Reading the project brakes" variant="row" count={1} />}
       {projects.isError && projects.data === undefined && (
@@ -1070,10 +1077,10 @@ function BudgetPanel() {
               </div>
             </div>
             <div className="sy-group-foot">
-            <p className="sy-field-hint">
-              The relay chain limit is what one chain of conversations handing work to each other may
-              spend.
-            </p>
+            <Tip
+              name="About the relay chain limit"
+              tip="The relay chain limit is what one chain of conversations handing work to each other may spend."
+            />
             <div className="sy-save-row">
             <ConfirmButton
               label="Save budget"
@@ -1164,10 +1171,10 @@ function BudgetPanel() {
               </div>
             </div>
             <div className="sy-group-foot">
-            <p className="sy-field-hint">
-              When {quotaBrake.data.provider}'s usage passes either level, new autonomous work
-              waits until the window resets. Only {quotaBrake.data.provider}'s windows count.
-            </p>
+            <Tip
+              name="About the quota brake"
+              tip={`When ${quotaBrake.data.provider}'s usage passes either level, new autonomous work waits until the window resets. Only ${quotaBrake.data.provider}'s windows count.`}
+            />
             <div className="sy-save-row">
             <ConfirmButton
               label="Save quota brake"
@@ -1624,11 +1631,10 @@ function TokensPanel() {
 
   return (
     <Panel title="API tokens">
-      <p className="sy-note">
-        A read-only token cannot read the budget or the kill switch, since both sit
-        outside its read allowlist. A run-creating token may start work. An
-        admin token is everything.
-      </p>
+      <Tip
+        name="About token levels"
+        tip="A read-only token cannot read the budget or the kill switch, since both sit outside its read allowlist. A run-creating token may start work. An admin token is everything."
+      />
 
       {minted !== null && (
         <CopyOnce
@@ -1683,11 +1689,14 @@ function TokensPanel() {
         >
           {adminAsked ? "Mint an admin token" : "Mint token"}
         </Button>
+        <span id="sy-token-hint">
+          <Tip
+            name="About token names and levels"
+            persist
+            tip={`1–64 characters: letters, digits, hyphen or underscore. The ${level} level ${TOKEN_LEVEL_HINT[level]}`}
+          />
+        </span>
       </form>
-      <p className="sy-note" id="sy-token-hint">
-        1&ndash;64 characters: letters, digits, hyphen or underscore. The {level} level{" "}
-        {TOKEN_LEVEL_HINT[level]}
-      </p>
       {adminAsked && (
         <Notice tone="pending" role="status">
           An admin token can do everything this machine can, including the budget and the kill
@@ -2015,7 +2024,7 @@ function Notice({
 
 function PanelNote({ empty, says, children }: { empty: boolean; says: string; children: ReactNode }) {
   if (empty) return <Quiet says={says}>{children}</Quiet>;
-  return <p className="sy-note">{children}</p>;
+  return <Tip name="About restoring" tip={children} />;
 }
 
 /**

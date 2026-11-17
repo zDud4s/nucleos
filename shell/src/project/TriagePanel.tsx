@@ -16,7 +16,7 @@ import {
   type TriageReport,
 } from "../data/project-map";
 import { pluralWord } from "../lib/plural";
-import { Button, ErrorNote, Inset, RelativeTime, SectionTitle, Segmented } from "../ui";
+import { Button, ErrorNote, Inset, RelativeTime, SectionTitle, Segmented, Tip } from "../ui";
 import { GiveStamp } from "./GiveStamp";
 
 /**
@@ -157,29 +157,24 @@ export function TriagePanel({
   return (
     <section aria-label="The triager" className="flex flex-col gap-6">
       <SectionTitle level={2}>
-        What a model thought was worth your eyes
+        <Tip tip="A model reads one decision at a time, with the mechanical evidence beside it, and answers a single question: does this deserve your eyes? It may say yes, or silence with a reason on record. It may never turn anything green: that is your word.">
+          What a model thought was worth your eyes
+        </Tip>
       </SectionTitle>
 
-      <p className="max-w-prose text-sm text-text-muted">
-        A model reads one decision at a time, with the mechanical evidence beside it, and answers a
-        single question: does this deserve your eyes? It may say yes, and it may silence with a
-        reason on record. It may never turn anything green: that is your word and §6 takes it away
-        from the model on purpose.
-      </p>
-
       {neverRun ? (
-        <p className="max-w-prose text-sm text-text-muted">
-          The triager has never run on this project. Nothing below is an empty pile that a model
-          looked at and found nothing in: nothing has been looked at, which is a different answer
-          and the one that is true.
+        <p
+          className="text-sm text-text-muted"
+          title="Nothing below is an empty pile a model looked at and found nothing in: nothing has been looked at."
+        >
+          The triager has never run on this project.
         </p>
-      ) : null}
-
-      {neverRun ? null : (
-        <p className="max-w-prose text-xs text-text-muted">
-          The triager last answered <RelativeTime at={lastTriagedAt} />. Everything below is what
-          that answer became when it was read against the code as it stands now, which is not the
-          same thing, and is why a judgement can be here, gone, or unchecked.
+      ) : (
+        <p
+          className="text-xs text-text-muted"
+          title="Everything below is that answer read against the code as it stands now, which is why a judgement can be here, gone, or unchecked."
+        >
+          The triager last answered <RelativeTime at={lastTriagedAt} />.
         </p>
       )}
 
@@ -230,15 +225,17 @@ function Run({ projectId }: { projectId: string }) {
         }))}
         onChange={setBrain}
       />
-      <p className="max-w-prose text-xs text-text-faint">
-        {brain === "cloud"
-          ? "The cloud brain answers through the CLI installed on this machine. One question per decision, billed, and the decisions leave the machine."
-          : `The local brain answers through the model on this machine. Nothing leaves and nothing is billed, and where no such model is set up, the ${DAEMON_NAME} refuses rather than quietly asking the cloud instead.`}
-      </p>
-
       <div>
-        <Button disabled={triage.isPending} onClick={() => triage.mutate({ brain })}>
-          run the triager with the {brain} brain
+        <Button
+          disabled={triage.isPending}
+          onClick={() => triage.mutate({ brain })}
+          title={
+            brain === "cloud"
+              ? "The cloud brain answers through the CLI installed on this machine. One question per decision, billed, and the decisions leave the machine."
+              : `The local brain answers through the model on this machine. Nothing leaves and nothing is billed; without such a model the ${DAEMON_NAME} refuses rather than asking the cloud.`
+          }
+        >
+          Run the triager with the {brain} brain
         </Button>
       </div>
 
@@ -248,9 +245,11 @@ function Run({ projectId }: { projectId: string }) {
         working.
       */}
       {triage.isPending ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          Asking the {brain} brain about the decisions nobody has stamped. That is one question per
-          decision and the answer arrives only when the batch has finished.
+        <p
+          className="text-xs text-text-muted"
+          title="One question per decision; the answer arrives only when the batch has finished."
+        >
+          Asking the {brain} brain…
         </p>
       ) : null}
 
@@ -283,43 +282,43 @@ function Report({ report }: { report: TriageReport }) {
 
   lines.push(
     report.in_scope === 0
-      ? "Nothing was in scope: every approved decision already carries a verdict of yours, and the triager only ever looks at the ones that do not."
-      : `${report.in_scope} ${pluralWord(report.in_scope, "decision was", "decisions were")} in scope: everything nobody has stamped.`,
+      ? "Nothing in scope: every approved decision already carries a verdict of yours."
+      : `${report.in_scope} ${pluralWord(report.in_scope, "decision", "decisions")} in scope.`,
   );
   if (report.already_current > 0) {
     lines.push(
-      `${report.already_current} already carried a judgement about inputs that have not moved since, so nothing was asked about them and nothing was spent.`,
+      `${report.already_current} already carried a judgement, so nothing was spent on them.`,
     );
   }
   lines.push(
     report.judged === 0
-      ? "Nothing new was judged, so the table is exactly as it was."
+      ? "Nothing new was judged."
       : `${report.judged} ${pluralWord(report.judged, "was", "were")} answered and written down.`,
   );
   if (report.unreadable > 0) {
     lines.push(
-      `${report.unreadable} came back as something that was not one of the two answers. Each of those was written down as a flag by NucleOS rather than dropped, so it costs you a look instead of disappearing, an answer nobody can read is a question that needs rewriting.`,
+      `${report.unreadable} came back unreadable; each was written down as a flag by NucleOS.`,
     );
   }
   if (report.unanswered > 0) {
     lines.push(
-      `${report.unanswered} got no answer at all: the run itself failed on them. That is a machine that did not reply, and not a question it could not read.`,
+      `${report.unanswered} got no answer: the run itself failed on them.`,
     );
   }
   if (report.unreadable_anchors > 0) {
     lines.push(
-      `${report.unreadable_anchors} were skipped because git would not say what their anchor code is. Nothing was written for them, so nothing has to be bought again once git answers.`,
+      `${report.unreadable_anchors} were skipped: git would not say what their anchor code is.`,
     );
   }
   if (report.vanished > 0) {
     lines.push(
-      `${report.vanished} stopped being decisions this map holds between the reading and the write, which is not supposed to be able to happen.`,
+      `${report.vanished} stopped being decisions this map holds before the write.`,
     );
   }
   lines.push(
     report.left_over === 0
-      ? "Nothing was left over: the batch cap did not stop this run."
-      : `${report.left_over} were stale and the batch cap stopped the run before reaching them. Press it again for the next batch.`,
+      ? "Nothing was left over."
+      : `${report.left_over} left over: the batch cap stopped the run. Run it again for the next batch.`,
   );
 
   return (
@@ -353,7 +352,7 @@ function Failed({ error }: { error: unknown }) {
 
   const sentence =
     error.status === 503
-      ? `This machine has no local model configured, so the local brain has nothing to answer with. The ${DAEMON_NAME} refuses rather than spending a cloud you did not ask for, which is the whole reason the choice is yours to make.`
+      ? "This machine has no local model configured. Nothing was sent to the cloud."
       : error.status === 404
         ? "This project is not there any more, or its folder cannot be read."
         : error.status === 422
@@ -376,18 +375,20 @@ function Failed({ error }: { error: unknown }) {
 function Ordering({ window }: { window: number | null }) {
   if (window === null) {
     return (
-      <p className="max-w-prose text-xs text-text-muted">
-        Git would not say when anything last moved, so nothing below is in §10&rsquo;s order at all:
-        what you are looking at is the map&rsquo;s own order, by document and line. That is a fact
-        about this reading and not about the project; read it again in a moment.
+      <p
+        className="text-xs text-text-muted"
+        title="Git would not say when anything last moved, so this is the map's own order, by document and line. Read it again in a moment."
+      >
+        Not ordered by recency.
       </p>
     );
   }
   return (
-    <p className="max-w-prose text-xs text-text-muted">
-      Ordered by what moved in the last {window} commits, which is one walk of the git log and the
-      whole of what this order knows. A decision whose anchor code last moved a thousand commits ago
-      and one whose anchor code has never moved sort the same here.
+    <p
+      className="text-xs text-text-muted"
+      title="One walk of the git log is the whole of what this order knows: code that moved a thousand commits ago and code that never moved sort the same."
+    >
+      Ordered by the last {window} commits.
     </p>
   );
 }
@@ -424,16 +425,11 @@ function Flagged({
       <SectionTitle>
         The triager asked for your eyes
       </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {rows.length} {pluralWord(rows.length, "decision", "decisions")} nobody had stamped, which a
-        model thought you should look at. What it says is that something looked odd to it, never
-        that anything is wrong, and never that anything is right.
-      </p>
-      <p className="max-w-prose text-xs text-text-muted">
-        There is no dismiss button here and there must not be one. A flag you have read and decided
-        is noise leaves through &ldquo;part-way, and I know&rdquo;, with a note saying so: that
-        verdict exists to turn a didn&rsquo;t-know into a knew, which is half the cure. Dismissing
-        without saying anything is the didn&rsquo;t-know this map is here to convert.
+      <p
+        className="text-xs text-text-muted"
+        title="Something looked odd to the model: never that anything is wrong, and never that anything is right. There is no dismiss; a flag you decided is noise leaves through 'part-way, and I know', with a note."
+      >
+        {rows.length} {pluralWord(rows.length, "decision", "decisions")}
       </p>
       <Banded rows={shown} recency={recency} label="Decisions the triager flagged">
         {(pair) => <GiveStamp projectId={projectId} row={pair.row} />}
@@ -460,15 +456,11 @@ function Silenced({ rows, recency }: { rows: Judged[]; recency: Recency }) {
       <SectionTitle>
         Silenced, which is not a verdict
       </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {rows.length} {pluralWord(rows.length, "decision", "decisions")} the triager saw no sign of a
-        problem in. That is a claim about the triager and about nothing else. Nobody looked. It is
-        not green, and it is still counted in the debt below.
-      </p>
-      <p className="max-w-prose text-xs text-text-muted">
-        Read them when you want to know whether the triager is any good. One that silences what it
-        should have shown you is a bug in the triager, and the reason it gave is the only way to
-        find it.
+      <p
+        className="text-xs text-text-muted"
+        title="A claim about the triager and nothing else: nobody looked. Still counted in the debt below. Read them to judge whether the triager is any good."
+      >
+        {rows.length} {pluralWord(rows.length, "decision", "decisions")} · Not green
       </p>
       <Banded rows={shown} recency={recency} label="Decisions the triager silenced" />
       {hidden > 0 ? <Hidden count={hidden} /> : null}
@@ -504,30 +496,35 @@ function Debt({ counts }: { counts: TriageCounts }) {
   return (
     <div className="flex flex-col gap-1">
       {counts.unseen > 0 ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          {`${counts.unseen} ${pluralWord(counts.unseen, "decision", "decisions")} nobody has ever given a verdict on.`}{" "}
-          That is §5.3&rsquo;s debt, it is meant to be uncomfortable, and nothing on this panel
-          makes it smaller.
+        <p
+          className="text-xs text-text-muted"
+          title="This is the debt. It is meant to be uncomfortable, and nothing on this panel makes it smaller."
+        >
+          {`${counts.unseen} ${pluralWord(counts.unseen, "decision", "decisions")} nobody has ever given a verdict on.`}
         </p>
       ) : null}
       {counts.silenced > 0 ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          {counts.silenced} of them the triager silenced, and that leaves the number above exactly
-          where it was. Silencing buys one thing: not being in the queue on your desk. It never buys
-          having been looked at.
+        <p
+          className="text-xs text-text-muted"
+          title="Silencing buys one thing: not being in the queue on your desk. It never buys having been looked at."
+        >
+          {counts.silenced} of them silenced by the triager.
         </p>
       ) : null}
       {counts.untriaged > 0 ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          {counts.untriaged} of them carry no judgement at all: never asked about, or asked about
-          before their code moved, which makes the old answer an opinion of a file it never saw.
+        <p
+          className="text-xs text-text-muted"
+          title="Never asked about, or asked about before their code moved, which makes the old answer an opinion of a file it never saw."
+        >
+          {counts.untriaged} of them carry no judgement.
         </p>
       ) : null}
       {counts.unchecked > 0 ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          {counts.unchecked} of the judgements above could not be re-checked against the code as it
-          stands, because git would not say what their anchor code is. They still count where they
-          are; what is missing is the confirmation that they are still about the same thing.
+        <p
+          className="text-xs text-text-muted"
+          title="Git would not say what their anchor code is. They still count where they are; what is missing is the confirmation that they are still about the same thing."
+        >
+          {counts.unchecked} of the judgements above could not be re-checked.
         </p>
       ) : null}
     </div>
@@ -557,10 +554,11 @@ function Record({
 }) {
   if (query.isError) {
     return (
-      <p className="max-w-prose text-xs text-text-faint">
-        The {DAEMON_NAME} could not say what the triager has silenced in this project, so §6.2&rsquo;s
-        record is not on screen. What is above is what the map itself is holding, which is less than
-        the whole of it.
+      <p
+        className="text-xs text-text-faint"
+        title="What is above is what the map itself is holding, which is less than the whole record."
+      >
+        The {DAEMON_NAME} could not say what the triager has silenced.
       </p>
     );
   }
@@ -582,11 +580,11 @@ function Record({
       <SectionTitle>
         Every silencing this project has ever had
       </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {total} {pluralWord(total, "silencing is", "silencings are")} on record. The list above is only
-        the ones that still describe the map: a silencing about a decision you have since stamped,
-        about code that has since moved, or about a decision that was retired is not an answer about
-        the map as it stands, and it is worth reading more afterwards, not less.
+      <p
+        className="text-xs text-text-muted"
+        title="The list above is only the ones that still describe the map. One about a decision you have since stamped, code that has moved, or a retired decision is worth reading more afterwards, not less."
+      >
+        {total} {pluralWord(total, "silencing is", "silencings are")} on record.
       </p>
       {/*
         The núcleo's cap, said unconditionally. §6.2 asks for the pile to be *sempre acessível* and
@@ -596,14 +594,11 @@ function Record({
       */}
       <p className="max-w-prose text-xs text-text-faint">
         {uncollected === 0
-          ? "Every one of them came back on this reading: nothing was left behind by the daemon's own limit."
-          : `${uncollected} older ${pluralWord(uncollected, "one is", "ones are")} not on this reading at all: the daemon answers the newest ${rows.length} and keeps the rest. They are in the table, and this list is not the whole record.`}
+          ? "All of them are on this reading."
+          : `${uncollected} older ${pluralWord(uncollected, "one is", "ones are")} not on this reading: the daemon answers the newest ${rows.length} and keeps the rest.`}
       </p>
       {superseded.length === 0 ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          All of the ones that came back still describe the map, so there is nothing here you have
-          not already seen above.
-        </p>
+        <p className="text-xs text-text-muted">Nothing here that is not above.</p>
       ) : (
         <>
           <div
@@ -635,9 +630,11 @@ function Record({
                   */}
                   <Whose model={entry.model} machineWritten={false} />
                   {entry.retired ? (
-                    <p className="max-w-prose text-xs text-text-muted">
-                      That decision has since been retired, so it is not in the map any more. The
-                      silencing is kept: a record deleted by its own subject is not one.
+                    <p
+                      className="text-xs text-text-muted"
+                      title="The silencing is kept: a record deleted by its own subject is not one."
+                    >
+                      Retired: no longer in the map.
                     </p>
                   ) : null}
                 </Inset>
@@ -728,46 +725,48 @@ function BandSentence({ age, count, window }: { age: Age; count: number; window:
       );
     }
     return (
-      <p className={style}>
-        {count} whose anchor code last moved at the same moment (<RelativeTime at={at} />). Nothing
-        here orders them against each other. That is the ordinary case rather than a coincidence
-        today: while no citation says which document its § belongs to, a decision&rsquo;s anchor set
-        is every file naming that section number, so most of them are dated by whichever of dozens
-        of files was touched last.
+      <p
+        className={style}
+        title="Nothing here orders them against each other. While no citation says which document its § belongs to, most are dated by whichever of dozens of files was touched last."
+      >
+        {count} whose anchor code last moved at the same moment (<RelativeTime at={at} />).
       </p>
     );
   }
   if (age.state === "older") {
     return (
-      <p className={style}>
+      <p
+        className={style}
+        title="This walk cannot see further back, so nothing here says which of them is older than which."
+      >
         {count} whose anchor code did not move
-        {window === null ? " inside the walk" : ` in the last ${window} commits`}. This walk cannot
-        see further back, so nothing here says which of them is older than which.
+        {window === null ? " inside the walk" : ` in the last ${window} commits`}.
       </p>
     );
   }
   if (age.state === "unanchored") {
     return (
-      <p className={style}>
-        {count} with nothing to move: no file this map can read, and no file it cannot read, names
-        the section at all. That is a different fact from having sat still, and it sorts last for
-        that reason.
+      <p
+        className={style}
+        title="No file this map can read, and no file it cannot read, names the section at all. That is different from having sat still, and it sorts last."
+      >
+        {count} with nothing to move.
       </p>
     );
   }
   if (age.state === "foreign_only") {
     return (
-      <p className={style}>
-        {count} named only by code this map cannot read: a Go sidecar, or a file beside one.
-        Something out there does name the section; nothing here can open that file and say what it
-        does with it. The map cannot tell, which is not the same answer as having looked and found
-        the section unclaimed.
+      <p
+        className={style}
+        title="A Go sidecar, or a file beside one. Something out there does name the section; the map cannot tell what it does with it, which is not the same as finding the section unclaimed."
+      >
+        {count} named only by code this map cannot read.
       </p>
     );
   }
   return (
     <p className={style}>
-      {count} whose last movement git would not say, so nothing here is ordered by recency.
+      {count} whose last movement git would not say.
     </p>
   );
 }
@@ -799,10 +798,11 @@ function Line({ pair, children }: { pair: Judged; children?: ReactNode }) {
       <p className="max-w-prose text-sm text-text">{held.reason}</p>
       <Whose model={held.model} machineWritten={held.machine_written} />
       {held.checked ? null : (
-        <p className="max-w-prose text-xs text-text-muted">
-          This map could not re-check what the judgement was about: git would not say what the
-          anchor code is. So it neither still stands nor has expired: it is an answer nobody could
-          test just now, kept because dropping it would read as nobody ever having looked.
+        <p
+          className="text-xs text-text-muted"
+          title="Git would not say what the anchor code is, so this neither still stands nor has expired. It is kept because dropping it would read as nobody ever having looked."
+        >
+          Could not re-check this judgement.
         </p>
       )}
       {children}
@@ -830,10 +830,11 @@ function Line({ pair, children }: { pair: Judged; children?: ReactNode }) {
 function Whose({ model, machineWritten }: { model: string; machineWritten: boolean }) {
   if (machineWritten) {
     return (
-      <p className="max-w-prose text-xs text-text-muted">
-        Written by NucleOS and not by a model: the {model} brain answered and nobody could read the
-        answer, so this flag is the record of that. The sentence above is a machine&rsquo;s note
-        about a failure, not an opinion about your code.
+      <p
+        className="text-xs text-text-muted"
+        title={`The ${model} brain answered and nobody could read the answer, so this flag records that. The sentence above is a note about a failure, not an opinion about your code.`}
+      >
+        Written by NucleOS, not by a model.
       </p>
     );
   }
@@ -848,8 +849,8 @@ function Whose({ model, machineWritten }: { model: string; machineWritten: boole
  */
 function Hidden({ count }: { count: number }) {
   return (
-    <p className="text-xs text-text-faint">
-      {count} more not shown here. The count above is the whole pile.
+    <p className="text-xs text-text-faint" title="The count above is the whole pile.">
+      {count} more not shown.
     </p>
   );
 }

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Channel, ChannelState } from "../data/channels";
 import { sidecarKeyOf } from "../data/system";
-import { Button, Callout, Panel, Quiet, StateBadge } from "../ui";
+import { Button, Callout, Panel, Quiet, StateBadge, Tip } from "../ui";
 import { RelativeTime } from "../ui/readings";
 import { CapabilityList } from "./CapabilityList";
 import { IdentitiesPanel } from "./IdentitiesPanel";
@@ -10,6 +10,15 @@ import { PairingDialog } from "./PairingDialog";
 import { PrimaryChannelControl } from "./PrimaryChannelControl";
 import { RestartSidecar } from "./RestartSidecar";
 import "./card.css";
+
+/** The short line shown beside each state; the sentence below opens from its tip. */
+const LABEL: Record<ChannelState, string> = {
+  not_configured: "Not configured",
+  starting: "Starting",
+  online: "Connected",
+  offline: "Offline",
+  incompatible: "Incompatible",
+};
 
 /** What each state means in a sentence. Its tone and label are the state map's (`channel`). */
 const SENTENCE: Record<ChannelState, string> = {
@@ -42,7 +51,9 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
       }
     >
       <div className="ch-card">
-        <Quiet compact says={SENTENCE[channel.state]} />
+        <Quiet compact says={LABEL[channel.state]}>
+          <Tip name={`About ${channel.state.replace("_", " ")}`} persist tip={SENTENCE[channel.state]} />
+        </Quiet>
 
         {!configured ? (
           <Callout tone="pending" title="Missing secrets">

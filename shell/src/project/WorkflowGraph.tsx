@@ -96,7 +96,9 @@ export function WorkflowGraph({ projectId, name, originPath, ejected }: Workflow
       it simply has no order declared in it yet, and `Teach` would answer that with a poster.
     */
     return (
-      <Quiet says="This bundle has no sequence in it yet: skills and scripts and nothing saying in what order." />
+      <Quiet says="No sequence yet">
+        <p>This bundle has skills and scripts and nothing saying in what order.</p>
+      </Quiet>
     );
   }
 
@@ -176,8 +178,7 @@ function GraphMissing({ error }: { error: unknown }) {
   if (error.code === "no_graph") {
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        This bundle has no <span className="font-mono">graph.yaml</span> in it. Skills and scripts
-        with no sequence yet is a halfway state, not a broken bundle.
+        This bundle has no <span className="font-mono">graph.yaml</span> yet.
       </p>
     );
   }
@@ -185,8 +186,7 @@ function GraphMissing({ error }: { error: unknown }) {
     return (
       <div className="max-w-prose rounded-md border border-tone-paused-border bg-tone-paused-bg p-3">
         <p className="text-sm text-text">
-          <span className="font-mono">graph.yaml</span> does not parse, so nothing here can be drawn
-          honestly.
+          <span className="font-mono">graph.yaml</span> does not parse.
         </p>
         <p className="mt-1 font-mono text-xs text-text-muted">{error.detail}</p>
       </div>
@@ -214,8 +214,7 @@ function Orphaned({ graph }: { graph: Graph }) {
       <p>
         This project overrides {count === 1 ? "a node" : `${count} nodes`} that{" "}
         <span className="font-mono">{graph.version}</span> does not have. Those overrides apply to
-        nothing; they are kept rather than dropped, so installing an older version again loses none
-        of them.
+        nothing and are kept.
       </p>
       <ul
         aria-label="Overrides that apply to nothing"
@@ -296,8 +295,7 @@ function Inspector({
     return (
       <aside aria-label="Node inspector" className={INSPECTOR}>
         <p className="text-sm text-text-muted">
-          Pick a node to see what it is and what this project has changed about it. Click it, or
-          Tab to it and press Enter.
+          Pick a node.
         </p>
       </aside>
     );
@@ -454,18 +452,18 @@ function Inspector({
       <div className="border-t border-border pt-3">
         {node.fields.find((field) => field.name === "body") === undefined ? (
           <p className="text-xs text-text-muted">
-            This node has no instructions file: there is nothing to open.
+            This node has no instructions file.
           </p>
         ) : !editorAvailable() ? (
           <p className="text-xs text-text-muted">
-            The instructions are edited in VS Code, which opens on the main machine only.
+            Instructions open in VS Code on the main machine only.
           </p>
         ) : ejected || source === "project" ? (
           <Button
             disabled={originPath === null}
             onClick={() => originPath !== null && void openInVscode(originPath, null)}
           >
-            edit the instructions
+            Edit the instructions
           </Button>
         ) : guard.open ? (
           <EditGuard
@@ -475,7 +473,7 @@ function Inspector({
           />
         ) : (
           <Button id={editId} onClick={guard.show}>
-            edit the instructions
+            Edit the instructions
           </Button>
         )}
       </div>
@@ -576,9 +574,8 @@ function EditGuard({
       className="ui-well ui-well-reading flex flex-col gap-2"
     >
       <p>
-        This node belongs to a bundle this project references. Editing it in the library changes it
-        for every project that uses it, which is usually what improving a workflow means. Ejecting
-        gives this project its own copy and stops the updates.
+        Editing it in the library changes it for every project that uses it. Ejecting gives this
+        project its own copy.
       </p>
       <div className="flex flex-wrap items-center gap-3">
         <Button
@@ -589,13 +586,12 @@ function EditGuard({
             onOpened();
           }}
         >
-          edit in the library
+          Edit in the library
         </Button>
         <Button variant="quiet" onClick={onCancel}>
-          cancel
+          Cancel
         </Button>
       </div>
-      <p className="text-xs text-text-muted">To diverge instead, eject the workflow above.</p>
     </div>
   );
 }

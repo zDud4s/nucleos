@@ -42,11 +42,18 @@
   margin: 0;
   padding: 0 var(--space-4);
   font-family: var(--font-body);
-  font-size: var(--text-sm);
+  font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   letter-spacing: 0;
   text-transform: none;
-  color: var(--text-muted);
+  color: var(--text);
+}
+
+/* Section headings on a project page read as headings: full ink, one step up. */
+.ws-page .ui-section-title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
 }
 
 /**
@@ -203,6 +210,51 @@
   white-space: nowrap;
 }
 
+/* One dense line per branch; the skeleton rows use the same height so nothing jumps on load. */
+.ws-page .ui-rows-row.ws-branch-line {
+  min-height: 1.75rem;
+  padding-block: var(--space-1);
+  gap: var(--space-2);
+}
+
+.ws-branch-skeleton {
+  padding-inline: var(--space-4);
+}
+
+/* The real rows arrive with a short fade instead of popping in. */
+.ws-fade-in {
+  animation: ws-fade-in 160ms ease-out;
+}
+
+@keyframes ws-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-fade-in {
+    animation: none;
+  }
+}
+
+/* A collapsed "Details" disclosure for the long explanation a Setup row used to carry as prose. */
+.ws-details > summary {
+  cursor: pointer;
+  width: fit-content;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.ws-details > p {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
 /* --------------------------------------------------------- the primitives, in this page -- */
 
 /**
@@ -355,11 +407,11 @@
   flex-flow: row wrap;
   align-items: baseline;
   column-gap: var(--space-3);
-  min-height: 2.75rem;
-  padding: var(--space-3) var(--space-4);
+  min-height: 2.5rem;
+  padding: var(--space-2) var(--space-4);
 }
 
-.ws-setup > .ui-section + .ui-section::before {
+.ws-setup > .ui-section +.ui-section::before {
   content: "";
   position: absolute;
   top: 0;
@@ -370,9 +422,9 @@
 }
 
 .ws-setup > .ui-section > .ui-section-title {
-  min-width: 10rem;
+  min-width: 7rem;
   padding: 0;
-  font-size: var(--text-base);
+  font-size: var(--text-sm);
   font-weight: var(--weight-regular);
   color: var(--text);
 }
@@ -383,7 +435,7 @@
 }
 
 .ws-setup > .ui-section > :not(.ui-section-title) {
-  flex: 1 1 18rem;
+  flex: 1 1 12rem;
   min-width: 0;
 }
 
@@ -466,6 +518,13 @@ a.ws-lead-door:hover {
 
 /* A group's title, as its first line: the body face in sentence case, one step under the page's. */
 .ws-subhead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* A section's heading with its ⓘ right after the text, not at the far edge. */
+.ws-headline {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -592,6 +651,174 @@ a.ws-lead-door:hover {
 */
 .ws-trail .ui-confirm-stack > [aria-hidden="true"] {
   display: none;
+}
+
+/*
+  A shell rule is one short line: effect badge, the command or path in the machine's face, the
+  justification and the day trailing off in muted text, the controls on the right. A group of
+  forty rules is then forty lines, and past a screenful the list scrolls inside itself rather than
+  pushing the next section away.
+*/
+.ws-rule-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ws-rule-count {
+  min-width: 1.5rem;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.ws-rule-head .ui-button {
+  margin-inline-start: auto;
+}
+
+.ws-rule-filter {
+  width: 100%;
+  max-width: 24rem;
+  font-size: var(--text-sm);
+}
+
+.ws-rule-list {
+  max-height: 20rem;
+  overflow-y: auto;
+}
+
+.ws-rule {
+  min-height: 2rem;
+  padding-block: var(--space-1);
+}
+
+.ws-rule .ws-item-main {
+  flex-direction: row;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.ws-rule .ws-item-name {
+  display: block;
+  flex: 0 1 auto;
+  max-width: 60%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--text-sm);
+}
+
+.ws-rule .ws-item-sub {
+  display: block;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ws-rule .ws-item-sub > * + *::before {
+  display: inline;
+  /* Block flow has no column-gap, so the dot brings its own space before it. */
+  margin-inline-start: var(--space-2);
+}
+
+/* The one row that explains itself needs its sentence whole, so it may wrap. */
+.ws-rule-wrap .ws-item-main {
+  flex-wrap: wrap;
+}
+
+.ws-rule-wrap .ws-item-name,
+.ws-rule-wrap .ws-item-sub {
+  max-width: none;
+  white-space: normal;
+}
+
+.ws-rule-effect {
+  display: inline-block;
+  margin-inline-end: var(--space-2);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-snug);
+}
+
+.ws-rule-effect-allow {
+  color: var(--tone-active-fg);
+  background: var(--tone-active-bg);
+  border-color: var(--tone-active-border);
+}
+
+.ws-rule-effect-deny {
+  color: var(--tone-danger-fg);
+  background: var(--tone-danger-bg);
+  border-color: var(--tone-danger-border);
+}
+
+.ws-rule-effect-inert {
+  color: var(--tone-pending-fg);
+  background: var(--tone-pending-bg);
+  border-color: var(--tone-pending-border);
+}
+
+/* ------------------------------------------------------------- autonomy block -- */
+
+/*
+  Mode and the proposal ceiling are two short blocks and each takes the height its content needs:
+  stretched to share a row, the shorter one was a card half empty. The switch sizes to its three
+  words (the generic \`.ws-page .ui-switch\` above spans its card, which is for the cards that
+  hold nothing else).
+*/
+.ws-authority .ws-autonomy {
+  align-items: start;
+  /* A small gap between the "Autonomy" heading and the cards under it. */
+  margin-top: var(--space-1);
+}
+
+/*
+  The offer to act is not the setting, so on this page it wears the same plain segment as its
+  neighbours instead of the teal inset edge, whose right side read as detached from the track.
+  The armed state (the fill and ring) is untouched.
+*/
+.ws-page.ws-authority
+  .ui-switch-seg-wrap
+  > .ui-confirm:not(.ui-confirm-armed)
+  > .ui-button-approve:not(:disabled):not([aria-disabled="true"]),
+.ws-page.ws-authority
+  .ui-switch-seg-wrap
+  > .ui-confirm:not(.ui-confirm-armed)
+  > .ui-button-approve:not(:disabled):not([aria-disabled="true"]):hover {
+  background: none;
+  box-shadow: none;
+  color: var(--text-muted);
+}
+
+.ws-page.ws-authority
+  .ui-switch-seg-wrap
+  > .ui-confirm:not(.ui-confirm-armed)
+  > .ui-button-approve:not(:disabled):not([aria-disabled="true"]):hover {
+  color: var(--text);
+}
+
+.ws-page.ws-authority .ui-switch {
+  display: inline-flex;
+  align-self: flex-start;
+}
+
+.ws-page.ws-authority .ui-switch > * {
+  flex: 0 0 auto;
+}
+
+.ws-page.ws-authority .ui-switch-seg-wrap > .ui-confirm,
+.ws-page.ws-authority .ui-switch-seg-wrap > .ui-confirm > .ui-button {
+  width: auto;
 }
 
 /*

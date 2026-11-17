@@ -262,7 +262,7 @@ function collect(
       action:
         onMatrix === undefined ? undefined : (
           <Button variant="quiet" onClick={onMatrix}>
-            show them
+            Show them
           </Button>
         ),
     });
@@ -301,8 +301,11 @@ function collect(
       key: "seam",
       weight: "limit",
       line: (
-        <span className="text-text-muted">
-          This daemon does not report the boundary, so what runs between these sides is unread here.
+        <span
+          className="text-text-muted"
+          title="This daemon does not report the boundary, so what runs between these sides is unread here."
+        >
+          Boundary not reported
         </span>
       ),
     });
@@ -316,9 +319,11 @@ function collect(
       key: "seam",
       weight: "limit",
       line: (
-        <span className="text-text-muted">
-          Nothing here registers a route this map knows how to read, so the boundary could not be
-          read from the daemon&apos;s side.
+        <span
+          className="text-text-muted"
+          title="Nothing here registers a route this map knows how to read, so the boundary could not be read from the daemon's side."
+        >
+          No route found
         </span>
       ),
       detail:
@@ -382,14 +387,13 @@ function ImportList({ lines, label }: { lines: MapImport[]; label: string }) {
 function SidesLine({ sides, seam }: { sides: Sides; seam: Seam | undefined }) {
   const served = seam !== undefined && seam.served.length > 0 ? seam : null;
   const says = [
-    sides.crossing === 0 && sides.sides.length > 1 ? "These sides share no source." : null,
+    sides.crossing === 0 && sides.sides.length > 1 ? "No shared source" : null,
     served === null
       ? null
-      : `What passes between them is HTTP: ${served.served.length} ${pluralWord(served.served.length, "route", "routes")}, and ${served.matched} of the shell's ${served.calls} ${pluralWord(served.calls, "call", "calls")} match one exactly.` +
-        (served.unmatched.length === 0 ? " Nothing asks for a route that does not exist." : ""),
+      : `HTTP: ${served.served.length} ${pluralWord(served.served.length, "route", "routes")} · ${served.matched}/${served.calls} matched`,
   ]
     .filter((part) => part !== null)
-    .join(" ");
+    .join(" · ");
 
   /*
     One card per side, in the strip the State page's readings use: the folder is the label, its
@@ -452,6 +456,12 @@ function SeamWhy({ sides, seam }: { sides: Sides; seam: Seam | null }) {
       ) : null}
       {seam === null ? null : (
         <>
+          <p className="m-0">
+            What passes between the sides is HTTP: {seam.served.length}{" "}
+            {pluralWord(seam.served.length, "route", "routes")}, and {seam.matched} of the
+            shell&apos;s {seam.calls} {pluralWord(seam.calls, "call", "calls")} match one exactly.
+            {seam.unmatched.length === 0 ? " Nothing asks for a route that does not exist." : ""}
+          </p>
           <p className="m-0">
             Matching is a measurement and not a property: it is checked every time this is read, and
             the day somebody renames a route without renaming its caller it stops being true here

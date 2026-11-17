@@ -6,6 +6,7 @@ import { heldBy } from "../data/roster";
 import { Button } from "../ui/Button";
 import { Field } from "../ui/Field";
 import { RefusalNote } from "../ui/RefusalNote";
+import { Tip } from "../ui/Tip";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -132,9 +133,8 @@ export function DeleteFolder({ projectId, onClose, onBusyChange, warningRef }: D
         />
         <span className="flex flex-col gap-0.5">
           <span className="font-medium text-text">Forget its history too</span>
-          <span>
-            Its runs, proposals and stamps. Left unticked they stay in the {DAEMON_NAME}, which is
-            what happens by default.
+          <span title={`Left unticked they stay in the ${DAEMON_NAME}, which is the default.`}>
+            Its runs, proposals and stamps.
           </span>
         </span>
       </label>
@@ -179,14 +179,14 @@ export function DeleteFolder({ projectId, onClose, onBusyChange, warningRef }: D
       {/* The modal's answer row: bottom edge, right-aligned, the act last. */}
       <div className="ws-dialog-actions">
         <Button variant="ghost" onClick={close}>
-          cancel
+          Cancel
         </Button>
         <Button
           variant="danger-solid"
           disabled={!armed || deletion.isPending}
           onClick={() => deletion.mutate({ projectId, forgetHistory: forget })}
         >
-          {deletion.isPending ? "deleting…" : "delete the folder"}
+          {deletion.isPending ? "Deleting…" : "Delete the folder"}
         </Button>
       </div>
     </div>
@@ -212,8 +212,7 @@ function Standing({
   if (!reading.exists) {
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        That folder is not on this disk any more, so there is nothing here to delete. Removing the
-        project from the roster is the thing left to do.
+        That folder is not on this disk any more.
       </p>
     );
   }
@@ -225,8 +224,8 @@ function Standing({
     <div className="flex flex-col gap-3 text-sm">
       {only === null ? (
         <p className="max-w-prose text-tone-paused-fg">
-          That folder is not a git repository, so nothing in it exists anywhere else. Everything
-          there is only there.
+          Not a git repository{" "}
+          <Tip tip="Everything in that folder is only there." name="About this folder" />
         </p>
       ) : (
         <p className="max-w-prose text-text-muted">

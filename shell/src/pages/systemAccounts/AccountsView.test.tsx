@@ -263,7 +263,7 @@ describe("token accounts", () => {
     fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
     fireEvent.click(screen.getByRole("radio", { name: /Codex/ }));
     expect((screen.getByRole("button", { name: "Paste token" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText("Only Claude accounts can use a token.")).toBeTruthy();
+    expect(screen.getByTitle("Only Claude accounts can use a token.")).toBeTruthy();
   });
 
   it("replaces the token of a token account through the card", async () => {

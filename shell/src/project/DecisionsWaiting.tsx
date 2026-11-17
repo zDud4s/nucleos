@@ -72,9 +72,11 @@ export function DecisionsWaiting({ projectId }: DecisionsWaitingProps) {
   return (
     <section aria-label="Decisions waiting" className="flex flex-col gap-2">
       <SectionTitle level={2}>Waiting on you</SectionTitle>
-      <p className="m-0 text-sm text-text-muted">
-        {count} {count === 1 ? "line" : "lines"} from the specs, answered one at a time; none is in
-        the map yet.
+      <p
+        className="m-0 text-sm text-text-muted"
+        title="Lines from the specs, answered one at a time. None is in the map yet."
+      >
+        {count} {count === 1 ? "line" : "lines"}
       </p>
 
       <div className="ws-waiting">
@@ -152,7 +154,7 @@ function Line({ projectId, row, number }: { projectId: string; row: MapDecision;
           disabled={decide.isPending}
           onClick={() => decide.mutate({ id: row.id, approved: true })}
         >
-          approve
+          Approve
         </Button>
         {/*
           Beside approve and never smaller than it. A rejected line is not a mistake being cleaned
@@ -164,7 +166,7 @@ function Line({ projectId, row, number }: { projectId: string; row: MapDecision;
           disabled={decide.isPending}
           onClick={() => decide.mutate({ id: row.id, approved: false })}
         >
-          reject
+          Reject
         </Button>
       </div>
 
@@ -192,7 +194,7 @@ function Refused({ error }: { error: unknown }) {
   return (
     <ErrorNote>
       {error.status === 404
-        ? "That line is not yours to answer now: it has been answered already, or it is gone."
+        ? "That line was already answered, or is gone."
         : error.detail}
     </ErrorNote>
   );

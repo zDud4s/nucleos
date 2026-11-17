@@ -24,6 +24,7 @@ import {
   Row,
   Rows,
   Skeleton,
+  Tip,
 } from "../ui";
 import "./context.css";
 
@@ -142,11 +143,18 @@ export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
         setDropNote(BROWSER_DROP_SENTENCE);
       }}
     >
-      <h3>Context</h3>
-      <p className="context-lede">
-        Files and folders this {ownerKind}&rsquo;s runs may read. Type an absolute path
-        {browserDropsApply() ? " on the main machine." : ", or drop a file or folder on the window."}
-      </p>
+      <h3>
+        Context
+        <Tip
+          name="About context"
+          tip={
+            <>
+              Files and folders this {ownerKind}&rsquo;s runs may read. Type an absolute path
+              {browserDropsApply() ? " on the main machine." : ", or drop a file or folder on the window."}
+            </>
+          }
+        />
+      </h3>
       {dropNote !== "" && <ErrorNote>{dropNote}</ErrorNote>}
       {body}
       <form className="context-add" onSubmit={submit}>

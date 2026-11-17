@@ -177,7 +177,7 @@ describe("whether a decision with no code lost the comment that anchored it", ()
     press();
 
     const said = await screen.findByText(/last 1000 commits/i);
-    expect(said.textContent).toMatch(/older history this did not read/i);
+    expect(said.textContent).toMatch(/older history was not read/i);
     // The sentence `never_named` would have put here, asserted absent by its own words rather than
     // by the phrase "never named" — which this very paragraph writes on purpose, to say which of
     // the two it is NOT.
@@ -231,7 +231,7 @@ describe("whether a decision with no code lost the comment that anchored it", ()
     press();
 
     const said = await screen.findByText(/no repository/i);
-    expect(said.textContent).toMatch(/nothing to retry/i);
+    expect(said.textContent).toMatch(/no history to ask/i);
     expect(screen.queryAllByRole("button")).toHaveLength(0);
   });
 

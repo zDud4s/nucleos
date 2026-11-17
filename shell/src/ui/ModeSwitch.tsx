@@ -55,6 +55,11 @@ export interface ModeSwitchProps {
    * button that already has focus and is not re-announced by any major screen reader.
    */
   actDescribedBy?: string;
+  /**
+   * What each segment means, shown only on hover or focus as the segment's `title`.
+   * Keeps the track to its short labels: no sentence has to sit beside it.
+   */
+  titles?: Partial<Record<SwitchMode, string>>;
   /** A write is in flight; every segment is inert. */
   busy?: boolean;
   /**
@@ -128,6 +133,7 @@ export function ModeSwitch({
   actConsequence,
   onArmedChange,
   actDescribedBy,
+  titles,
   busy,
   focusableWhenInert,
   onChoose,
@@ -183,6 +189,7 @@ export function ModeSwitch({
         type="button"
         className="ui-switch-seg"
         aria-pressed={value === "off"}
+        title={titles?.off}
         {...inertness(offInert)}
         onClick={() => choose("off", offInert)}
       >
@@ -192,13 +199,20 @@ export function ModeSwitch({
         type="button"
         className="ui-switch-seg"
         aria-pressed={value === "shadow"}
+        title={titles?.shadow}
         {...inertness(shadowInert)}
         onClick={() => choose("shadow", shadowInert)}
       >
         Watch in shadow
       </button>
       {value === "active" ? (
-        <button type="button" className="ui-switch-seg" aria-pressed {...inertness(true)}>
+        <button
+          type="button"
+          className="ui-switch-seg"
+          aria-pressed
+          title={titles?.active}
+          {...inertness(true)}
+        >
           Let it act
         </button>
       ) : proven ? (
@@ -214,6 +228,7 @@ export function ModeSwitch({
             unavailable={focusable ? busy === true : undefined}
             onArmedChange={onArmedChange}
             describedBy={actDescribedBy}
+            title={titles?.active}
             onConfirm={() => onChoose("active")}
           />
         </span>
@@ -227,6 +242,7 @@ export function ModeSwitch({
           aria-describedby={actDescribedBy}
           aria-expanded={warningOpen}
           aria-controls={warningOpen ? warningId : undefined}
+          title={titles?.active}
           {...inertness(busy)}
           onClick={() => {
             if (busy === true) return;

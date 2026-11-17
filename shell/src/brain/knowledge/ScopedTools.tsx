@@ -38,7 +38,9 @@ export function ScopedTools({ ownerKind, ownerId }: ScopedToolsProps) {
     body = (
       <>
         {rows.length === 0 ? (
-          <Quiet says="No tool beyond the base has been approved here yet." />
+          <Quiet says="No extra tools">
+            <p>No tool beyond the base has been approved here yet.</p>
+          </Quiet>
         ) : (
           <Rows label={`Tools of ${ownerKind} ${ownerId}`}>
             {rows.map((row) => (

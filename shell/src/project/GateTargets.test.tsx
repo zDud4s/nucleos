@@ -44,14 +44,18 @@ describe("GateTargets", () => {
   it("says so when the project has no autopilot document", async () => {
     world({}, 1, false);
     open();
-    expect(await screen.findByText("This project has no autopilot document to edit.")).toBeTruthy();
+    expect(await screen.findByTitle("This project has no autopilot document to edit.")).toBeTruthy();
   });
 
   it("draws one row per known target in order, each with Local and CI only, and a read-only security row", async () => {
     world();
     open();
     await screen.findByRole("group", { name: "core" });
-    const groups = screen.getAllByRole("group").map((g) => g.getAttribute("aria-label"));
+    // The collapsed "Details" disclosure is an unnamed group of its own; only named rows count.
+    const groups = screen
+      .getAllByRole("group")
+      .map((g) => g.getAttribute("aria-label"))
+      .filter((name) => name !== null);
     expect(groups).toEqual(TARGETS);
     for (const target of TARGETS) {
       expect(within(group(target)).getByRole("button", { name: "Local" })).toBeTruthy();

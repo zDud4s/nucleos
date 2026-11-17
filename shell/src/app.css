@@ -944,7 +944,10 @@
  */
 .nav {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  /* `minmax(0, 1fr)` for the list row too: a bare `1fr` floors at the list's content height, so on
+     a short window the row never shrank and `.nav-scroll` had nothing to scroll (Files got cut). */
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
   /*
     `minmax(0, 1fr)` and not the implicit `auto`, which is the difference between
     a rail 56px wide and a rail 56px wide with 115px of content hanging out of it

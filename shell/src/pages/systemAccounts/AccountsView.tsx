@@ -272,7 +272,7 @@ export function AccountsView() {
       {setDefault.isError ? <div role="alert" className="ac-error">The default could not be saved.</div> : null}
 
       {list.length === 0 ? (
-        <Quiet says="no accounts yet: add one to start the pool" />
+        <Quiet says="No accounts yet">Add one to start the pool.</Quiet>
       ) : (
         <div className="ac-grid">
           {list.map((account) => (

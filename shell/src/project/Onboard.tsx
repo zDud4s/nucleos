@@ -45,23 +45,18 @@ export function OnboardPanel({
   const shown = gate ?? found.configured_gate ?? proposal?.command ?? "";
   const source =
     found.configured_gate !== null
-      ? "the gate this project's rules already name"
+      ? "from the project's rules"
       : proposal === null
-        ? "nothing in the folder suggests one: leave it blank for none"
+        ? "no proposal; blank for none"
         : `proposed from ${proposal.source}`;
 
   return (
     <div className="flex flex-col gap-3" aria-label={`Onboard ${projectId}`} role="group">
-      <p className="max-w-(--measure) text-sm text-text">
-        Onboarding <span className="font-mono">{projectId}</span> installs the classifier hook in{" "}
-        <span className="font-mono">{found.root}</span>, stores the gate below, and records that it
-        was done in <span className="font-mono">{found.marker_path}</span>.
-      </p>
-      <p className="text-sm text-text-muted">
-        {found.harnesses.length === 0
-          ? "No way of working found in the folder, which is fine; none is needed."
-          : `Found: ${found.harnesses.map((harness) => harness.path).join(", ")}.`}
-      </p>
+      {found.harnesses.length === 0 ? null : (
+        <p className="text-sm text-text-muted">
+          {`Found: ${found.harnesses.map((harness) => harness.path).join(", ")}`}
+        </p>
+      )}
       <Field label="Gate command" helper={source}>
         <input
           value={shown}
@@ -75,6 +70,7 @@ export function OnboardPanel({
           intent="go"
           disabled={onboard.isPending}
           aria-busy={onboard.isPending}
+          title={`Installs the classifier hook in ${found.root}, stores the gate, and records it in ${found.marker_path}.`}
           onClick={() =>
             onboard.mutate(
               { projectId, projectRoot: root === "" ? null : root, gateCommand: shown },
@@ -82,7 +78,7 @@ export function OnboardPanel({
             )
           }
         >
-          {onboard.isPending ? "onboarding…" : found.onboarded === null ? "onboard it" : "onboard it again"}
+          {onboard.isPending ? "Onboarding…" : found.onboarded === null ? "Onboard it" : "Onboard it again"}
         </Button>
         {onboard.isSuccess ? <span className="text-sm text-text-muted">onboarded</span> : null}
       </div>

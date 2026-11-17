@@ -279,7 +279,7 @@ describe("Projects - a rules file that cannot be read", () => {
 
     // And the empty rule lists below are explained rather than read as "there
     // are none": nothing could be loaded, which is a different fact.
-    expect(within(alert).getByText(/none of it could be loaded/)).toBeDefined();
+    expect(within(alert).getByText(/nothing this project might run is known/)).toBeDefined();
     expect(screen.getByText("unreadable")).toBeDefined();
 
     /*
@@ -298,7 +298,7 @@ describe("Projects - a rules file that cannot be read", () => {
 
     await renderProjects("/projects/alpha/rules");
 
-    expect(await screen.findByText(/ordinary state and not a fault/)).toBeDefined();
+    expect(await screen.findByText(/starts nothing by itself/)).toBeDefined();
     // The gitignored file is absent in every worktree and every fresh clone, so
     // it must not raise an alarm.
     expect(screen.queryByRole("alert")).toBeNull();
@@ -343,7 +343,7 @@ describe("Projects - who answers for a conversation on Auto", () => {
   it("tells the default apart from a judge somebody switched off", async () => {
     answerWith(projectsWorld({ rules: rules({ judge: { state: "default" } }) }));
     await renderProjects("/projects/alpha/rules");
-    expect(await screen.findByText(/Nobody has chosen otherwise/)).toBeDefined();
+    expect(await screen.findByText(/brain answers, on its configured model/)).toBeDefined();
 
     answerWith(projectsWorld({ rules: rules({ judge: { state: "off" } }) }));
     await renderProjects("/projects/alpha/rules");
@@ -1045,7 +1045,7 @@ describe("Projects - a change says what it replaced", () => {
 
     expect(await screen.findByText(/view is stale — last good read/)).toBeDefined();
     // The reading stays; the controls that would act beside it go.
-    expect(screen.getByText(/Nobody has chosen otherwise/)).toBeDefined();
+    expect(screen.getByText(/brain answers, on its configured model/)).toBeDefined();
     expect(screen.queryByLabelText("Who answers")).toBeNull();
     expect(screen.queryByLabelText("Ceiling")).toBeNull();
   });
@@ -1119,7 +1119,7 @@ describe("Projects - a search hit is a way to the line", () => {
     expect(within(list).getAllByRole("link").map((link) => link.textContent)).toEqual(["gate.rs"]);
 
     fireEvent.change(box, { target: { value: "zzz" } });
-    expect(screen.getByText("nothing in this folder is named like that.")).toBeDefined();
+    expect(screen.getByText("No match")).toBeDefined();
   });
 
   it("closes the open file on Escape", async () => {

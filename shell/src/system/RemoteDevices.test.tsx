@@ -163,6 +163,7 @@ describe("RemoteDevices", () => {
       throw new Error(`unexpected ${path}`);
     });
     renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "About tailnet HTTPS" }));
     expect(await screen.findByText(/HTTPS\s+certificates switched off/)).toBeDefined();
     expect(screen.getByRole("button", { name: "Open the Tailscale admin console" })).toBeDefined();
     // Nothing to turn on yet, and no platform is named as a prerequisite.
@@ -223,7 +224,9 @@ describe("RemoteDevices", () => {
     });
     renderPanel();
     fireEvent.click(await screen.findByRole("button", { name: "Turn on remote access" }));
-    expect(await screen.findByText(/needs you to approve Serve/)).toBeDefined();
+    expect(await screen.findByText(/Approve Serve in Tailscale/)).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "About approving Serve" }));
+    expect(screen.getByText(/needs you to approve Serve/)).toBeDefined();
     fireEvent.click(screen.getByRole("button", { name: "Open the Tailscale approval page" }));
     await waitFor(() => {
       expect(opener.openUrl).toHaveBeenCalledWith(link);

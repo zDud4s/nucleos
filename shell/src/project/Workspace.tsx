@@ -417,8 +417,7 @@ export function Workspace() {
       {missing ? (
         <section className="ws-missing" aria-label="Project not found">
           <p className="ui-note">
-            No project called <code>{projectId}</code> is registered. It may have been removed, or the link
-            is out of date.
+            No project called <code>{projectId}</code> is registered.
           </p>
           <Link to="/projects">Back to Projects</Link>
         </section>

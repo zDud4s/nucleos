@@ -46,6 +46,7 @@ import {
   ErrorNote,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   Row,
@@ -53,7 +54,7 @@ import {
   Skeleton,
   StaleNote,
   StateBadge,
-  Teach,
+  Tip,
   usePaletteGroup,
 } from "../ui";
 import "./council.css";
@@ -136,12 +137,12 @@ export function Council() {
           </div>
 
           {councils.data !== undefined && rows.length === 0 && (
-            <Teach title="No council has met yet">
+            <Quiet says="No council has met yet">
               <p>
                 Ask a question above. Each seat answers on its own, and the chair writes one answer. It pays off when
                 a question has no single right answer, such as which of two designs to build.
               </p>
-            </Teach>
+            </Quiet>
           )}
         </div>
       ) : (
@@ -266,7 +267,13 @@ function CourtSetup() {
           question={question}
           court={court}
           config={config}
-          refusal={<p className="council-dossier-hint">{reason ?? COMPOSER_HELPER}</p>}
+          refusal={
+            reason !== null && reason !== undefined ? (
+              <p className="council-dossier-hint">{reason}</p>
+            ) : (
+              <Tip persist name="How a council runs" tip={COMPOSER_HELPER} />
+            )
+          }
           onDraft={setEdited}
           onClear={() => setSelection(null)}
         />

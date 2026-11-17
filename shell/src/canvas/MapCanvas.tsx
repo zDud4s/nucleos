@@ -17,7 +17,6 @@ import type {
   Standing,
 } from "../data/project-map";
 import { useFileItems } from "../data/project-map";
-import { DAEMON_NAME } from "../copy";
 import { plural, pluralWord } from "../lib/plural";
 import { SectionTitle } from "../ui";
 import { NODE_H, type Layout } from "./layered";
@@ -381,7 +380,7 @@ function Crumbs({
         <span className="text-text">whole project</span>
       ) : (
         <button type="button" onClick={onTop} className={step}>
-          whole project
+          Whole project
         </button>
       )}
       {community === null ? null : (
@@ -671,10 +670,6 @@ function Around({
   return (
     <div className="flex flex-col gap-2">
       <Refused reasons={refused} />
-      <p className="max-w-prose text-xs text-text-muted">
-        One file at a time, then. This shows the chosen one and everything in this community that
-        touches it, either way. It is a smaller picture and not a looser one.
-      </p>
       {/*
         **The chosen one is marked in `--text`, and was marked in the brand colour.** The This-One
         Rule settles that a selection is `.ui-current` — a 2px inset rule on the leading edge, in
@@ -733,9 +728,11 @@ function TooSmall({ reasons }: { reasons: string[] }) {
     size took away is given back one mark at a time, in the readout under this line.
   */
   return (
-    <p className="max-w-prose text-xs text-text-muted">
-      <span className="text-text">Numbers hidden at this size</span> ({reasons.join("; ")}). Point
-      at a mark to read it, or zoom in.
+    <p
+      className="max-w-prose text-xs text-text-muted"
+      title="Point at a mark to read it, or zoom in."
+    >
+      <span className="text-text">Numbers hidden at this size</span> ({reasons.join("; ")})
     </p>
   );
 }
@@ -744,7 +741,7 @@ function TooSmall({ reasons }: { reasons: string[] }) {
 function Refused({ reasons }: { reasons: string[] }) {
   return (
     <div className="rounded-lg border border-border bg-surface-sunken px-4 py-3">
-      <p className="text-sm text-text">This one does not draw, and pretending otherwise would help nobody.</p>
+      <p className="text-sm text-text">Not drawn</p>
       <ul className="mb-0 mt-1 list-disc pl-5 text-xs text-text-muted">
         {reasons.map((reason) => (
           <li key={reason}>{reason}</li>
@@ -783,8 +780,11 @@ function FileLevel({
   return (
     <div className="flex flex-col gap-2">
       {found.isError ? (
-        <p className="text-sm text-text-muted">
-          The {DAEMON_NAME} could not read this file. It may have moved since the map was walked.
+        <p
+          className="text-sm text-text-muted"
+          title="It may have moved since the map was walked."
+        >
+          Could not read this file
         </p>
       ) : found.data === undefined ? (
         <p className="text-sm text-text-faint">Reading the file…</p>
@@ -820,9 +820,11 @@ function Claims({
 }) {
   if (claims.length === 0) {
     return (
-      <p className="max-w-prose text-xs text-text-muted">
-        No approved decision names this file, which puts it with the code nobody asked for &mdash;
-        a fact about what has been declared, not a verdict about the code.
+      <p
+        className="max-w-prose text-xs text-text-muted"
+        title="It sits with the code nobody asked for: a fact about what has been declared, not a verdict about the code."
+      >
+        No approved decision names this file
       </p>
     );
   }
@@ -883,18 +885,18 @@ function FileDrawing({
 
   if (found.reader === null) {
     return (
-      <p className="text-sm text-text-muted">
-        Nothing here reads this language yet, so this file has no declarations to draw. It is not
-        missing from the map. The level above counts it, and says the same thing about it.
+      <p
+        className="text-sm text-text-muted"
+        title="This file has no declarations to draw. It is not missing from the map: the level above counts it."
+      >
+        No reader for this language yet
       </p>
     );
   }
 
   if (found.items.length === 0) {
     return (
-      <p className="text-sm text-text-muted">
-        This file declares nothing of its own. It is imports, or a list of modules, or both.
-      </p>
+      <p className="text-sm text-text-muted">Declares nothing of its own</p>
     );
   }
 
@@ -1330,7 +1332,7 @@ function Stage({
             onClick={() => setChosen(null)}
             className={step}
           >
-            fit
+            Fit
           </button>
           </span>
           {/* A track of one, so it wears the same edge as the zoom beside it. */}
@@ -1340,7 +1342,7 @@ function Stage({
               onClick={() => onFull(!full)}
               className={step}
             >
-              {full ? "close" : "full screen"}
+              {full ? "Close" : "Full screen"}
             </button>
           </span>
         </span>

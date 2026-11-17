@@ -24,8 +24,21 @@
 }
 
 /* The section nav is a map, not the first line of the setting: air between it and "Setting for". */
-.ui-section-nav + .ap-sections {
+.ap-nav + .ap-sections {
   margin-top: var(--space-5);
+}
+
+/* Secondary, in-page section switcher (not top-level tabs): smaller type and tighter gaps. */
+.ap-nav {
+  margin-top: var(--space-4);
+}
+
+.ap-nav .ui-section-nav-list {
+  gap: var(--space-1);
+}
+
+.ap-nav .ui-section-nav-link {
+  font-size: var(--text-xs);
 }
 
 /* One group of panels, a stop on the section nav: it clears the sticky nav when jumped to. */
@@ -84,17 +97,6 @@
   margin: var(--space-3) 0 0;
   font-size: var(--text-xs);
   color: var(--text-muted);
-  max-width: var(--measure-prose);
-}
-
-/**
- * The page's one sentence. Two lines tall whatever it says, and before it says anything, so the
- * page never moves down when the roster answers or when a promotion adds a clause. Prose, so it
- * takes prose's measure.
- */
-.ap-headline {
-  display: block;
-  min-height: 2lh;
   max-width: var(--measure-prose);
 }
 
@@ -376,6 +378,12 @@
   cursor: grab;
   -webkit-mask-image: linear-gradient(to right, transparent 0, black var(--space-7), black calc(100% - var(--space-7)), transparent 100%);
   mask-image: linear-gradient(to right, transparent 0, black var(--space-7), black calc(100% - var(--space-7)), transparent 100%);
+}
+
+/* A narrow stage has no room for the wide fade: the neighbours must stay readable. */
+.ap-fan-stage-compact {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, black var(--space-3), black calc(100% - var(--space-3)), transparent 100%);
+  mask-image: linear-gradient(to right, transparent 0, black var(--space-3), black calc(100% - var(--space-3)), transparent 100%);
 }
 
 .ap-fan-stage-dragging {
@@ -792,15 +800,64 @@
   color: var(--text);
 }
 
+/* The scoreboard table has fifteen columns. It scrolls sideways inside its own box rather than
+   spilling out of the panel; `min-width: 0` lets a flex/grid parent shrink below the table's width. */
+.ap-score-scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.ap-score-scroll:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* Tighter cells so more of the row is in view, and heads that wrap instead of forcing the width. */
+.ap-score-scroll .ui-table th,
+.ap-score-scroll .ui-table td {
+  padding: var(--space-2);
+}
+
+.ap-score-scroll .ui-table thead th {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  vertical-align: bottom;
+}
+
+/* The action class may be a long identifier: it breaks rather than widening the column. */
+.ap-score-scroll .ui-table .ap-score-class {
+  min-width: 8rem;
+  overflow-wrap: anywhere;
+}
+
+.ap-score-scroll .ap-agree {
+  min-width: 7rem;
+}
+
 /* ============================================================ trigger brakes == */
 
 /* Each row is its own grid, so `auto` columns would size to that row's own badge and button and
    the column edges would wander from row to row. Fixed tracks keep them one column down the panel. */
-.ap-trigger-row {
+.ap-trigger-row,
+.ui-rows-row.ap-trigger-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 6.5rem 7rem;
   align-items: center;
+  align-content: start;
   gap: var(--space-3);
+  padding-block: var(--space-2);
+}
+
+/* The panel body already pads the top: the first row's own padding stacked on it into a gap under
+   the heading, and the last one's into a gap above the panel's foot. */
+.ui-panel-body > .ui-rows > .ap-trigger-row:first-child {
+  padding-top: 0;
+}
+
+.ui-panel-body > .ui-rows > .ap-trigger-row:last-child {
+  padding-bottom: 0;
 }
 
 .ap-trigger-name {

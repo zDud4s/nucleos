@@ -27,6 +27,7 @@ import {
   Quiet,
   RefusalNote,
   RelativeTime,
+  Tip,
   Row,
   Rows,
   Select,
@@ -82,9 +83,6 @@ export function RemoteDevices() {
 
   return (
     <Panel title="Remote devices">
-      <p className="sy-note">
-        Pair a browser on another device. Create a code here, then enter it on that device.
-      </p>
       {setup.data !== undefined && <SetupWizard setup={setup.data} />}
       {setup.data === undefined && !setup.isError && (<div className="sy-note" aria-hidden="true">
           <p style={{ display: "flex", alignItems: "center", minHeight: "1lh" }}>
@@ -101,9 +99,14 @@ export function RemoteDevices() {
             onDismiss={() => setCreated(null)}
           />
           <p className="sy-note">
-            Valid 5 minutes, single use. On the device, open{" "}
-            {setup.data?.public_origin ? setup.data.public_origin : "this machine's remote address"}{" "}
-            in the browser and enter this code.
+            Expires in 5 minutes
+            <Tip
+              name="About this code"
+              persist
+              tip={`Valid 5 minutes, single use. On the device, open ${
+                setup.data?.public_origin ? setup.data.public_origin : "this machine's remote address"
+              } in the browser and enter this code.`}
+            />
           </p>
           {setup.data?.enabled === true && setup.data.public_origin !== "" && (
             <QrCode
@@ -148,10 +151,11 @@ export function RemoteDevices() {
         >
           Create code
         </Button>
+        <Tip
+          name="About pairing a device"
+          tip={`Pair a browser on another device. Create a code here, then enter it on that device. The ${level === "owner" ? "Owner" : level} level ${LEVEL_HINT[level]}`}
+        />
       </form>
-      <p className="sy-note">
-        The {level === "owner" ? "Owner" : level} level {LEVEL_HINT[level]}
-      </p>
       {createCode.isError && <CreateError error={createCode.error} />}
 
       {devices.isError && devices.data === undefined && (
@@ -227,13 +231,18 @@ function SetupWizard({ setup }: { setup: RemoteSetup }) {
         </>
       )}
       {ts.installed && !ts.signed_in && (
-        <p>Tailscale is installed but not signed in. Open Tailscale, sign in, then reopen this page.</p>
+        <p title="Tailscale is installed but not signed in. Open Tailscale, sign in, then reopen this page.">
+          Tailscale not signed in
+        </p>
       )}
       {ts.installed && ts.signed_in && !ts.https_ok && (
         <>
           <p>
-            Your tailnet has HTTPS certificates switched off. Turn on MagicDNS and HTTPS
-            certificates in the Tailscale admin console, then come back.
+            Tailnet HTTPS is off
+            <Tip
+              name="About tailnet HTTPS"
+              tip="Your tailnet has HTTPS certificates switched off. Turn on MagicDNS and HTTPS certificates in the Tailscale admin console, then come back."
+            />
           </p>
           <Button variant="ghost" onClick={() => void openUrl(TAILSCALE_ADMIN_DNS)}>
             Open the Tailscale admin console
@@ -243,14 +252,20 @@ function SetupWizard({ setup }: { setup: RemoteSetup }) {
       {exposed}
       {setup.port_taken && !setup.funnel && (
         <p>
-          Tailscale is already serving something else on this machine&apos;s HTTPS port. NucleOS
-          leaves it alone, so it cannot publish the page there. Free that port, or use an address you
-          already have.
+          Tailscale is serving on the HTTPS port
+          <Tip
+            name="About the HTTPS port"
+            persist
+            tip="Tailscale is already serving something else on this machine's HTTPS port. NucleOS leaves it alone, so it cannot publish the page there. Free that port, or use an address you already have."
+          />
         </p>
       )}
       {ready && (
         <>
-          <p>Ready: {ts.dns_name}. Remote access is published on your tailnet only, never the public internet.</p>
+          <p>
+            Ready: {ts.dns_name}
+            <Tip name="About publishing" tip="Remote access is published on your tailnet only, never the public internet." />
+          </p>
           <Button
             variant="ghost"
             disabled={enable.isPending || setup.funnel || setup.port_taken}
@@ -294,10 +309,11 @@ function EnableError({ error }: { error: unknown }) {
       const approval = error.detail;
       return (
         <>
-          <ErrorNote>
-            Tailscale needs you to approve Serve for your tailnet first. Open the page, approve it,
-            then press Turn on remote access again.
-          </ErrorNote>
+          <ErrorNote>Approve Serve in Tailscale</ErrorNote>
+          <Tip
+            name="About approving Serve"
+            tip="Tailscale needs you to approve Serve for your tailnet first. Open the page, approve it, then press Turn on remote access again."
+          />
           <Button variant="ghost" onClick={() => void openUrl(approval)}>
             Open the Tailscale approval page
           </Button>

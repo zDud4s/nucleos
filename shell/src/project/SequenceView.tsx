@@ -8,8 +8,9 @@ import { ErrorNote } from "../ui";
 
 const DANGER = "var(--tone-danger-fg)";
 const COLUMN = 170;
+const NO_FLOWS = "No flows declared. Add them to .nucleos/flows.yaml.";
 const HOW_TO_DECLARE =
-  "No flows are declared for this project. Declare them in .nucleos/flows.yaml as " +
+  "Declare them as " +
   `flows: [{ name, steps: [{ participant, path, fn }] }], and the ${DAEMON_NAME} verifies each step ` +
   "against the code.";
 
@@ -31,7 +32,11 @@ export function SequenceView({ projectId }: { projectId: string }) {
     return <ErrorNote>{`${data.file} could not be read: ${data.error}`}</ErrorNote>;
   }
   if (!data.declared || data.flows.length === 0) {
-    return <p className="m-0 text-sm text-text-muted">{HOW_TO_DECLARE}</p>;
+    return (
+      <p className="m-0 text-sm text-text-muted" title={HOW_TO_DECLARE}>
+        {NO_FLOWS}
+      </p>
+    );
   }
   return (
     <div className="flex flex-col gap-8">

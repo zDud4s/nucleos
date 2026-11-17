@@ -42,6 +42,7 @@ import {
   RefusalNote,
   Select,
   StateBadge,
+  Tip,
 } from "../ui";
 
 /**
@@ -205,9 +206,15 @@ export function NewProject() {
               {/* Ghost: reading a folder is a look, not a decision. The one solid button on this
                   dialog is "Add it, in shadow", the write. */}
             </form>
-            <p id={helpId} className="text-xs text-text-muted">
-              An absolute path on this machine. Nothing is written until the last step.
-            </p>
+            <Tip
+              name="About the folder"
+              tip={
+                <span id={helpId}>
+                  An absolute path on this machine. Nothing is written until the last step.
+                </span>
+              }
+              persist
+            />
             {browseNote !== null && <ErrorNote>{browseNote}</ErrorNote>}
             {found.isError ? <WhyNot error={found.error} /> : null}
           </Step>
@@ -679,10 +686,10 @@ function Found({
         <ConsentListing consent={consentAsk.consent} />
         <div className="flex flex-wrap items-center gap-3">
           <Button variant="primary" onClick={() => consentAsk.resolve(true)}>
-            agree and record the workflow
+            Agree and record the workflow
           </Button>
           <Button variant="quiet" onClick={() => consentAsk.resolve(false)}>
-            cancel
+            Cancel
           </Button>
         </div>
       </div>
@@ -726,7 +733,7 @@ function Found({
                     <>
                       {" "}
                       <Button variant="quiet" onClick={() => setProjectId(shapedId(projectId))}>
-                        use {shapedId(projectId)}
+                        Use {shapedId(projectId)}
                       </Button>
                     </>
                   )}
@@ -774,17 +781,18 @@ function Found({
             {found.commands.length === 0 ? null : <span className="np-group-n">{found.commands.length}</span>}
           </h3>
           {found.commands.length === 0 ? (
-            <p className="np-hint">
-              None found in a <span className="font-mono">package.json</span>, a{" "}
-              <span className="font-mono">Makefile</span> or a Cargo config. They can be declared on
-              the project's own page.
+            <p
+              className="np-hint"
+              title="Looked in package.json, a Makefile and a Cargo config. They can be declared on the project's own page."
+            >
+              None found
             </p>
           ) : (
             <>
-              <p className="np-hint">
-                Tick the ones worth a button on the project's page. Nothing unticked is saved, and none
-                of them becomes the gate: that is the field in step 3.
-              </p>
+              <Tip
+                name="About commands"
+                tip="Tick the ones worth a button on the project's page. Nothing unticked is saved, and none of them becomes the gate: that is the field in step 3."
+              />
               <div className="np-list">
                 {found.commands.map((suggestion) => (
                   <label key={suggestion.name} className="np-command">
@@ -807,9 +815,11 @@ function Found({
                 ))}
               </div>
               {found.commands_omitted > 0 ? (
-                <p className="np-hint">
-                  {found.commands_omitted} more were found and are not listed: the rest can be
-                  declared on the project's page.
+                <p
+                  className="np-hint"
+                  title="The rest can be declared on the project's page."
+                >
+                  {found.commands_omitted} more not listed
                 </p>
               ) : null}
             </>
@@ -830,11 +840,7 @@ function Found({
               as typed. Blank is a real answer — no gate — and can be set later with the rules. */}
           <Field
             label="Gate command"
-            helper={
-              found.gate === null
-                ? "Its exit code says the project is green. Nothing here suggests one; blank is none."
-                : `Its exit code says the project is green: proposed from ${found.gate.source}; blank is none.`
-            }
+            helper={found.gate === null ? undefined : `Proposed from ${found.gate.source}`}
           >
             <input
               value={gate}
@@ -877,10 +883,16 @@ function Found({
             <span id={ceilingLabelId} className="np-setting-label">
               Open-proposal ceiling
             </span>
-            <span id={ceilingHelpId} className="np-hint">
-              How many proposals may wait on your review before new work is held. Two keeps a new
-              project's first ones few enough to read.
-            </span>
+            <Tip
+              name="About the ceiling"
+              tip={
+                <span id={ceilingHelpId}>
+                  How many proposals may wait on your review before new work is held. Two keeps a new
+                  project's first ones few enough to read.
+                </span>
+              }
+              persist
+            />
           </div>
           <div className="np-stepper">
             <Button
@@ -898,7 +910,7 @@ function Found({
               +
             </Button>
             <Button variant="quiet" disabled={wip === null} onClick={() => setWip(null)}>
-              no ceiling
+              No ceiling
             </Button>
           </div>
         </div>
@@ -923,7 +935,7 @@ function Found({
                 setInstalling(null);
               }}
             >
-              leave the workflow for later
+              Leave the workflow for later
             </Button>
           </div>
         ) : null}
@@ -1113,10 +1125,10 @@ function Harnesses({
   return (
     <div className="np-group">
       <h3 className="np-group-title">Way of working</h3>
-      <p className="np-hint">
-        Adopting it records that it is here: the folder is not copied, not rewritten, and nothing is
-        added to it. It receives no updates, because there is no library it came from.
-      </p>
+      <Tip
+        name="About adopting"
+        tip="Adopting it records that it is here: the folder is not copied, not rewritten, and nothing is added to it. It receives no updates, because there is no library it came from."
+      />
       <div className="np-options">
         {harnesses.map((harness) => (
           <label key={harness.path} className="np-option">

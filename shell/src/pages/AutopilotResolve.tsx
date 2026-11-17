@@ -19,7 +19,7 @@ import {
   type ResolveOutcome,
 } from "../data/autopilot";
 import type { ProjectSummary } from "../data/system";
-import { Badge, Button, ConfirmButton, Count, ErrorNote, Inset, Panel, Quiet, RefusalNote, RelativeTime } from "../ui";
+import { Badge, Button, ConfirmButton, Count, ErrorNote, Inset, Panel, Quiet, RefusalNote, RelativeTime, Tip } from "../ui";
 import { DecisionDialog } from "./AutopilotJudge";
 
 /**
@@ -56,16 +56,12 @@ export function ResolvePanel({
   const rows = queue.data ?? [];
   return (
     <Panel title="Resolving blocks" aside={<span className="ap-project-name">{projectId}</span>}>
-      <p className="ap-note" id="resolve-data-warning">
-        {RESOLVE_DATA_WARNING}
-      </p>
       {readiness !== undefined && <p className="ap-note">{readReadiness(readiness)}</p>}
-      {mode !== "off" && (
-        <p className="ap-note" id="resolve-enforce-risk">
-          {RESOLVE_ENFORCE_RISK}
-        </p>
-      )}
       <div className="ap-actions">
+        <Tip persist name="About resolving blocks" tip={<span id="resolve-data-warning">{RESOLVE_DATA_WARNING}</span>} />
+        {mode !== "off" && (
+          <Tip persist name="Risk of letting the resolver decide" tip={<span id="resolve-enforce-risk">{RESOLVE_ENFORCE_RISK}</span>} />
+        )}
         {mode === "off" ? (
           // Turning it on sends data off the machine, so it asks in a dialog, like the judge's watching.
           <Button
@@ -99,7 +95,7 @@ export function ResolvePanel({
       {setMode.isError && <ResolveRefusal error={setMode.error} />}
       {/* An empty queue is one quiet line; the heading and its count appear with the first block. */}
       {queue.data !== undefined && rows.length === 0 && (
-        <Quiet says="No block the resolver saw is waiting for you." />
+        <Quiet says="Nothing waiting" />
       )}
       {rows.length > 0 && (
         <>

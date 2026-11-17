@@ -49,7 +49,7 @@ describe("PathPicker", () => {
 
     render(<PathPicker open onOpenChange={vi.fn()} onSelect={vi.fn()} />);
 
-    expect(await screen.findByText(/needs an owner device/)).toBeTruthy();
+    expect(await screen.findByText("Owner device needed")).toBeTruthy();
     expect(apiFetch).not.toHaveBeenCalled();
   });
 

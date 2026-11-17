@@ -17,8 +17,11 @@ export function ClassesView({ projectId, modules }: { projectId: string; modules
 
   if (path === null) {
     return (
-      <p className="m-0 text-sm text-text-muted">
-        This project has no Rust file to draw classes from.
+      <p
+        className="m-0 text-sm text-text-muted"
+        title="This project has no Rust file to draw classes from."
+      >
+        No Rust file
       </p>
     );
   }

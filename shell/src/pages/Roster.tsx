@@ -20,7 +20,6 @@ import { SectionTitle } from "../ui/SectionTitle";
 import { Tip, usePaletteGroup } from "../ui";
 import { usePageKeys } from "../project/pageKeys";
 import { StaleNote } from "../ui/StaleNote";
-import { Teach } from "../ui/Teach";
 import { readState } from "../ui/state-map";
 import type { Removed } from "./RemoveProject";
 import { plural } from "../lib/plural";
@@ -140,12 +139,12 @@ export function Roster() {
           <RosterSkeleton />
         )
       ) : rows.length === 0 ? (
-        <Teach
-          title={`No project has been registered with the ${DAEMON_NAME}`}
+        <Quiet
+          says={`No project has been registered with the ${DAEMON_NAME}`}
           action={<Link to="/projects/new">Add a project</Link>}
         >
           Adding one takes a folder and three questions.
-        </Teach>
+        </Quiet>
       ) : (
         <Filtered rows={rows} stale={stale} />
       )}
@@ -218,7 +217,7 @@ function Filtered({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
           action={
             <>
               <button type="button" className="ui-quiet-ask" onClick={() => setQ("")}>
-                clear the search
+                Clear the search
               </button>
               <Link to="/projects/new">add a project</Link>
             </>
@@ -265,7 +264,7 @@ function LeftTheRoster({ removed }: { removed: Removed }) {
           <>
             <Link to="/projects/new">add it back</Link>
             <button type="button" className="ui-quiet-ask" onClick={() => setDismissed(true)}>
-              dismiss
+              Dismiss
             </button>
           </>
         }

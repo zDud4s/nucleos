@@ -1,5 +1,5 @@
 import { useState, type ReactElement, type ReactNode } from "react";
-import { Button, ErrorNote, Field, Select, type FieldProps } from "../ui";
+import { Button, ErrorNote, Field, Select, Tip, type FieldProps } from "../ui";
 import {
   defaultFor,
   enumOptions,
@@ -52,7 +52,7 @@ function withKey(record: Record<string, unknown>, key: string, next: unknown): R
 
 function RawNode(props: {
   label: string;
-  helper: string | undefined;
+  helper: ReactNode;
   value: unknown;
   invalid: boolean | undefined;
   onChange: (value: unknown) => void;
@@ -120,6 +120,11 @@ function MapAdder(props: { label: string; exists: (key: string) => boolean; onAd
   );
 }
 
+/** A schema description is help, so it opens on demand; `persist` keeps its text in the document. */
+function aboutTip(description: string | undefined): ReactElement | undefined {
+  return description === undefined ? undefined : <Tip tip={description} name="About" persist />;
+}
+
 export function FieldNode(props: FieldNodeProps): ReactElement {
   const { node, root, value, onChange, path, label, errors, required = false, bare = false, depth = 0, hide } = props;
   const { node: inner, nullable } = unwrapNullable(node, root);
@@ -131,7 +136,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
 
   const leaf = (control: FieldProps["children"]): ReactElement => (
     <div data-field={path} className="flex flex-col gap-1">
-      <Field label={label} helper={inner.description}>
+      <Field label={label} helper={aboutTip(inner.description)}>
         {control}
       </Field>
       {failure}
@@ -141,8 +146,10 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
   const group = (children: ReactNode): ReactElement => (
     <div data-field={path}>
       <fieldset className="flex flex-col gap-3 rounded-lg border border-border-strong p-3">
-        <legend className="px-1 text-sm">{label}</legend>
-        {inner.description !== undefined ? <p className="sy-note">{inner.description}</p> : null}
+        <legend className="px-1 text-sm">
+          {label}
+          {aboutTip(inner.description)}
+        </legend>
         {children}
       </fieldset>
       {failure}
@@ -312,16 +319,18 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
     case "boolean": {
       return (
         <div data-field={path} className="flex flex-col gap-1">
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={value === undefined || value === null ? inner.default === true : value === true}
-              aria-invalid={invalid}
-              onChange={(event) => { onChange(event.target.checked); }}
-            />
-            <span>{label}</span>
-          </label>
-          {inner.description !== undefined ? <p className="sy-note">{inner.description}</p> : null}
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={value === undefined || value === null ? inner.default === true : value === true}
+                aria-invalid={invalid}
+                onChange={(event) => { onChange(event.target.checked); }}
+              />
+              <span>{label}</span>
+            </label>
+            {aboutTip(inner.description)}
+          </div>
           {failure}
         </div>
       );
@@ -353,7 +362,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
     case "raw":
       return (
         <div data-field={path} className="flex flex-col gap-1">
-          <RawNode label={label} helper={inner.description} value={value} invalid={invalid} onChange={onChange} />
+          <RawNode label={label} helper={aboutTip(inner.description)} value={value} invalid={invalid} onChange={onChange} />
           {failure}
         </div>
       );

@@ -6,7 +6,7 @@ import {
   useRejectLoadoutTool,
   type LoadoutTool,
 } from "../../data/loadout-tools";
-import { Button, Count, Panel, RelativeTime, Row, Rows, Select } from "../../ui";
+import { Button, Count, Panel, RelativeTime, Row, Rows, Select, Tip } from "../../ui";
 import { ToolRefusal } from "./ScopedTools";
 import "./knowledge.css";
 
@@ -34,10 +34,18 @@ export function ToolRequests() {
   return (
     <>
       {refusal !== null && <ToolRefusal error={refusal} />}
-      <Panel title="Tools to approve" aside={<Count n={rows.length} />}>
-        <p className="learned-lede">
-          None is callable until you approve it; a refusal stays on the record.
-        </p>
+      <Panel
+        title="Tools to approve"
+        aside={
+          <>
+            <Tip
+              name="About tool approval"
+              tip="None is callable until you approve it; a refusal stays on the record."
+            />
+            <Count n={rows.length} />
+          </>
+        }
+      >
         <Rows label="Tool requests">
           {rows.map((row) => (
             <RequestRow

@@ -282,7 +282,7 @@ describe("Chats - the list across machines", () => {
     rememberChatMachine(["c-9"], "tower");
     render(<ChangeProject chatId="c-9" picking onPicking={() => {}} />, { wrapper: wrapper(newClient()) });
     expect(
-      screen.getByText(/This chat runs on another machine, so its project can only be changed there\./),
+      screen.getByText(/Runs on another machine: change its project there\./),
     ).toBeTruthy();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
@@ -382,7 +382,7 @@ describe("Chats - the list across machines", () => {
       { wrapper: wrapper(newClient()) },
     );
     const target = await screen.findByRole("button", { name: "h-1 on This device" });
-    expect(screen.getByText(/sent as a message/i)).toBeTruthy();
+    expect(screen.getByTitle(/sent as a message/i)).toBeTruthy();
     fireEvent.click(target);
     await waitFor(() => expect(sent).toHaveBeenCalled());
 

@@ -256,7 +256,7 @@ export interface FanConfig {
 /** Sized by the stage, not the window: inside the app the rail takes 15rem of it. */
 export function fanConfig(width: number): FanConfig {
   if (width < 560) {
-    return { cardW: 184, cardH: 244, xStep: 108, y: 16, rot: 7, scaleRed: 0.07, reach: 1, compact: true };
+    return { cardW: 168, cardH: 244, xStep: 88, y: 16, rot: 6, scaleRed: 0.08, reach: 1, compact: true };
   }
   if (width < 1000) {
     return { cardW: 232, cardH: 316, xStep: 146, y: 28, rot: 9, scaleRed: 0.09, reach: 2, compact: false };

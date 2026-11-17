@@ -149,8 +149,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
       */}
       {slots.length > limit ? (
         <p className="text-xs text-tone-paused-fg">
-          {slots.length} in flight against a ceiling of {limit}: the ceiling was lowered under work
-          already running.
+          {slots.length} in flight against a ceiling of {limit}.
         </p>
       ) : null}
       {stale}

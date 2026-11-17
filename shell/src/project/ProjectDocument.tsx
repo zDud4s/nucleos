@@ -27,7 +27,7 @@ export function ProjectDocument({ projectId, name, onChanged, hide }: ProjectDoc
 
   const row = index.data?.find((candidate) => candidate.scope === scope && candidate.name === name);
   if (index.data !== undefined && row === undefined) {
-    return <p className="text-sm text-text-muted">This project has no {name} document to edit.</p>;
+    return <p className="text-sm text-text-muted" title={`This project has no ${name} document to edit.`}>Not set up</p>;
   }
 
   return (

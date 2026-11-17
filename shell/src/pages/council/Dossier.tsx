@@ -140,7 +140,7 @@ function SetupDossier({
       <section className="council-dossier-section" aria-labelledby="council-dossier-title">
         <h2 id="council-dossier-title" className="council-dossier-title">The case</h2>
         {question.trim() === "" ? (
-          <p className="council-dossier-hint">Write the question on the lectern.</p>
+          <p className="council-dossier-hint">No question</p>
         ) : (
           <p className="council-dossier-question">{question}</p>
         )}
@@ -336,7 +336,7 @@ function SessionDossier({
       <section className="council-dossier-section" aria-labelledby="council-dossier-title">
         <h2 id="council-dossier-title" className="council-dossier-title">The case</h2>
         <p className="council-dossier-question">{view.question}</p>
-        <p className="council-dossier-hint">Choose a seat to read what it said.</p>
+        <p className="council-dossier-hint">Choose a seat</p>
       </section>
     );
   }

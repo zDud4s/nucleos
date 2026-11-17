@@ -22,6 +22,7 @@ import {
   RelativeTime,
   Select,
   StateBadge,
+  Tip,
 } from "../ui";
 import { daemonProse } from "./prose";
 
@@ -116,10 +117,12 @@ export function Routines({ team, rules }: RoutinesProps) {
   return (
     <div className="teams-routines">
       <Panel title="Rules">
-        <p className="teams-note">
-          Rules can't be edited. Duplicate one to make a changed copy, then delete the original.
-        </p>
-        {rules.length === 0 && <Quiet says="No rules yet. Write one below, and it stays off until you arm it." />}
+        <Tip
+          persist
+          name="About editing rules"
+          tip="Rules can't be edited. Duplicate one to make a changed copy, then delete the original."
+        />
+        {rules.length === 0 && <Quiet says="No rules yet">Write one below, and it stays off until you arm it.</Quiet>}
         {rules.length > 0 && (
           <ul className="teams-rules" aria-label="Rules">
             {rules.map((rule) => (
@@ -307,7 +310,7 @@ function NewRuleForm({
         submit();
       }}
     >
-      <p className="teams-note">Writing never arms. Arm the rule once it is written.</p>
+      <Tip name="About arming" tip="Writing never arms. Arm the rule once it is written." />
       <label className="teams-field">
         <span className="teams-label" data-required="true">
           Name

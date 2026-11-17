@@ -40,6 +40,7 @@ import {
   Section,
   StaleNote,
   Teach,
+  Tip,
   Well,
 } from "../ui";
 import { WorkflowConsentPanel } from "./WorkflowConsent";
@@ -106,7 +107,7 @@ export function Workflows({ projectId }: WorkflowsProps) {
   const nothing = installed.data.length === 0;
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-6">
       {installed.isError ? <StaleNote dataUpdatedAt={installed.dataUpdatedAt} /> : null}
 
       {nothing ? (
@@ -167,16 +168,9 @@ function NothingInstalled({ library }: { library: Bundle[] | undefined }) {
   return (
     <div className="ws-teach">
       <Teach title="No workflow is installed here" action={action}>
-        {NO_WORKFLOW_MEANS}{" "}
-        {empty ? (
-          <>
-            Workflows come from bundles in your library: a folder under{" "}
-            <span className="font-mono">~/.nucleos/workflows/&lt;name&gt;/&lt;version&gt;/</span>{" "}
-            with a <span className="font-mono">bundle.yaml</span> in it. This machine has none yet.
-          </>
-        ) : (
-          "Pick one from this machine's library below."
-        )}
+        <Tip persist tip={NO_WORKFLOW_MEANS}>
+          {empty ? "The library is empty." : "Pick one below."}
+        </Tip>
       </Teach>
     </div>
   );
@@ -213,15 +207,14 @@ function ReadAt({ at, onReread }: { at: number; onReread: () => void }) {
   const when = new Date(at);
   return (
     <p className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-xs text-text-muted">
-      <span>
+      <span title="Read again after each change made here and when this window regains focus.">
         Read at{" "}
         <time className="font-mono tabular-nums" dateTime={when.toISOString()}>
           {clockText(at)}
         </time>
-        , and again after each change made here or when this window regains focus.
       </span>
       <Button variant="quiet" onClick={onReread}>
-        read again
+        Read again
       </Button>
     </p>
   );
@@ -265,7 +258,7 @@ function Unreadable({
   if (error.code === "no_library") {
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        This machine has no folder for a workflow library, so there is nothing to install from.
+        This machine has no folder for a workflow library.
       </p>
     );
   }
@@ -273,10 +266,7 @@ function Unreadable({
     return (
       <div className="flex flex-col gap-4">
         <div className="max-w-prose rounded-lg border border-tone-paused-border bg-tone-paused-bg p-4">
-          <p className="text-sm text-text">
-            This project&rsquo;s pins document does not read, so the {DAEMON_NAME} cannot say what
-            this project uses.
-          </p>
+          <p className="text-sm text-text">This project&rsquo;s pins document does not read.</p>
           <p className="mt-1 font-mono text-xs text-text-muted">{error.detail}</p>
         </div>
         <PinsDocument projectId={projectId} onChanged={onRetry} />
@@ -337,9 +327,11 @@ function InstalledRow({
   const overrides = row.overridden_nodes;
 
   return (
-    <section aria-label={`${row.name} workflow`} className="flex flex-col gap-3">
+    <section aria-label={`${row.name} workflow`} className="flex flex-col gap-2">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <h3 className="font-display text-lg text-text">{row.name}</h3>
+        <h3 className="font-display text-base text-text" title={row.description ?? undefined}>
+          {row.name}
+        </h3>
         <span className="font-mono text-xs text-text-muted">{row.version}</span>
         {/*
           The standing, in its tone and at body size — it is the answer to "is this all right?",
@@ -362,29 +354,26 @@ function InstalledRow({
         ) : null}
       </div>
 
-      <p className="text-sm text-text">{standingSentence(row, now)}</p>
-      {row.description !== null ? (
-        <p className="max-w-prose text-sm text-text-muted">{row.description}</p>
-      ) : null}
+      <p className="text-xs text-text-muted">{standingSentence(row, now)}</p>
 
       {/*
-        Both hashes, side by side, and only when they disagree. Serving them is what makes "this
+        Both hashes, inline, and only when they disagree. Serving them is what makes "this
         changed" a claim somebody can check instead of one they have to take on trust.
       */}
       {row.standing === "drifted" && row.origin_hash !== null ? (
-        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 font-mono text-xs text-text-muted">
-          <dt>pinned</dt>
-          <dd>{shortHash(row.hash)}</dd>
-          <dt>in the library</dt>
-          <dd>{shortHash(row.origin_hash)}</dd>
-        </dl>
+        <p className="flex flex-wrap gap-x-4 font-mono text-xs text-text-muted">
+          <span>
+            pinned <span>{shortHash(row.hash)}</span>
+          </span>
+          <span>
+            in the library <span>{shortHash(row.origin_hash)}</span>
+          </span>
+        </p>
       ) : null}
 
       {row.standing === "missing" ? (
-        <p className="max-w-prose text-sm text-text-muted">
-          The pin travelled with this repository and the bundle did not. It came from{" "}
-          <span className="font-mono">{row.origin}</span>, which is what the pin records so that a
-          new machine can be told what it is missing rather than quietly having no workflow.
+        <p className="text-xs text-text-muted">
+          Came from <span className="font-mono">{row.origin}</span>
         </p>
       ) : null}
 
@@ -396,8 +385,7 @@ function InstalledRow({
               {index > 0 ? ", " : null}
               <span className="font-mono">{path}</span>
             </span>
-          ))}{" "}
-          in this project.
+          ))}
         </p>
       ) : null}
 
@@ -407,7 +395,7 @@ function InstalledRow({
             disabled={update.isPending}
             onClick={() => setReview({ version: row.update_available ?? row.version, kind: "update" })}
           >
-            update to {row.update_available}
+            Update to {row.update_available}
           </Button>
         ) : null}
 
@@ -416,14 +404,14 @@ function InstalledRow({
             disabled={update.isPending}
             onClick={() => setReview({ version: row.version, kind: "follow" })}
           >
-            follow the library again
+            Follow the library again
           </Button>
         ) : null}
 
         {row.standing === "ejected" ? (
           <>
             <Button aria-expanded={diffOpen} onClick={onToggleDiff}>
-              {diffOpen ? "hide the diff" : "see the diff"}
+              {diffOpen ? "Hide the diff" : "See the diff"}
             </Button>
             {/*
               Update after the diff and never before it: for an ejected workflow this REPLACES the
@@ -436,12 +424,12 @@ function InstalledRow({
               disabled={update.isPending}
               onClick={() => setReview({ version: row.update_available ?? row.version, kind: "replace" })}
             >
-              replace with the library's
+              Replace with the library's
             </Button>
           </>
         ) : guard.open ? null : (
           <Button id={ejectId} disabled={eject.isPending} onClick={guard.show}>
-            eject
+            Eject
           </Button>
         )}
 
@@ -454,11 +442,11 @@ function InstalledRow({
         <span className="ml-auto">
           <ConfirmButton
             variant="quiet"
-            label="stop using it"
+            label="Stop using it"
             confirmLabel={
               overrides > 0
-                ? `stop: ${overrides} ${overrides === 1 ? "override goes" : "overrides go"} with the pin`
-                : "stop: remove the pin"
+                ? `Stop: ${overrides} ${overrides === 1 ? "override goes" : "overrides go"} with the pin`
+                : "Stop: remove the pin"
             }
             disabled={forget.isPending}
             onConfirm={() => forget.mutate({ projectId, name: row.name })}
@@ -473,12 +461,12 @@ function InstalledRow({
           version={review.version}
           confirmLabel={
             review.kind === "update"
-              ? `agree and update to ${review.version}`
+              ? `Agree and update to ${review.version}`
               : review.kind === "follow"
-                ? "agree and follow the library again"
-                : "replace: this copy's edits are lost"
+                ? "Agree and follow the library again"
+                : "Replace: this copy's edits are lost"
           }
-          holdLabel={review.kind === "replace" ? "replace: this copy's edits are lost" : undefined}
+          holdLabel={review.kind === "replace" ? "Replace: this copy's edits are lost" : undefined}
           pending={update.isPending}
           sentences={REFUSALS}
           onCancel={() => setReview(null)}
@@ -630,14 +618,13 @@ function EjectGuard({
       }}
       className="ui-well ui-well-reading flex max-w-prose flex-col gap-2"
     >
-      <p>
-        Ejecting gives this project its own copy, and that copy stops receiving anything the library
-        gets from then on. If the change is an improvement, the library is where it helps every
-        project that uses this bundle.
-      </p>
       <div className="flex flex-wrap items-center gap-3">
-        <Button disabled={pending} onClick={onEject}>
-          eject and edit
+        <Button
+          disabled={pending}
+          onClick={onEject}
+          title="Gives this project its own copy, which stops receiving library updates."
+        >
+          Eject and edit
         </Button>
         {/* Hidden on a remote device: VS Code opens on the main machine only. */}
         {editorAvailable() ? (
@@ -652,11 +639,11 @@ function EjectGuard({
               onEditOrigin();
             }}
           >
-            edit in the library
+            Edit in the library
           </Button>
         ) : null}
         <Button variant="quiet" onClick={onCancel}>
-          cancel
+          Cancel
         </Button>
       </div>
     </div>
@@ -679,9 +666,8 @@ function Diff({ projectId, name }: { projectId: string; name: string }) {
   }
   if (diff.data.changes.length === 0) {
     return (
-      <p className="max-w-prose text-sm text-text-muted">
-        Identical to {diff.data.origin_version} in the library, file for file, but still frozen: an
-        ejected copy receives nothing new whether or not it has been edited.
+      <p className="text-xs text-text-muted">
+        Identical to {diff.data.origin_version} in the library, but still frozen.
       </p>
     );
   }
@@ -700,8 +686,7 @@ function Diff({ projectId, name }: { projectId: string; name: string }) {
   return (
     <Well as="div" reads>
       <p className="text-xs text-text-muted">
-        Against {diff.data.origin_version} in the library. File by file: the line-by-line answer is
-        the editor, one click away.
+        Against {diff.data.origin_version} in the library.
       </p>
       <ul className="mt-2 flex flex-col gap-0.5">
         {diff.data.changes.map((change) => (
@@ -762,11 +747,7 @@ function Library({
     <Section label="On this machine" level={3}>
       {library.data.length === 0 ? (
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-2">
-          <p className="max-w-prose text-sm text-text-muted">
-            The library is empty. A bundle is a folder under{" "}
-            <span className="font-mono">~/.nucleos/workflows/&lt;name&gt;/&lt;version&gt;/</span>{" "}
-            with a <span className="font-mono">bundle.yaml</span> in it.
-          </p>
+          <p className="text-sm text-text-muted">The library is empty.</p>
           <LibraryPath />
         </div>
       ) : (
@@ -795,8 +776,8 @@ function Library({
           version={reviewing.version}
           confirmLabel={
             pinned.has(reviewing.name)
-              ? `agree and use ${reviewing.version} instead`
-              : "agree and use here"
+              ? `Agree and use ${reviewing.version} instead`
+              : "Agree and use here"
           }
           pending={install.isPending}
           sentences={REFUSALS}
@@ -859,7 +840,7 @@ function LibraryRow({
             something that is working is the click somebody regrets.
           */}
           <Button disabled={pending} onClick={onInstall}>
-            {pinnedVersion === null ? "use here" : `use ${bundle.version} instead`}
+            {pinnedVersion === null ? "Use here" : `Use ${bundle.version} instead`}
           </Button>
         </span>
       )}

@@ -236,7 +236,7 @@ describe("RunDetail — what it was told", () => {
 
     expect(
       await screen.findByText(
-        "This kind of run is briefed without a trace, so there is nothing to show here. That is not an empty briefing.",
+        "This kind of run is briefed without a trace.",
       ),
     ).toBeDefined();
     expect(screen.queryByRole("heading", { name: "Shown to the run" })).toBeNull();
@@ -257,7 +257,7 @@ describe("RunDetail — what it was told", () => {
 
     expect(
       await screen.findByText(
-        "The explanation of this briefing is past its retention window and has been deleted. What the run was told is not recoverable from here.",
+        "The briefing trace is past its retention window and was deleted.",
       ),
     ).toBeDefined();
   });
@@ -277,7 +277,7 @@ describe("RunDetail — what it was told", () => {
 
     expect(
       await screen.findByText(
-        "Nothing was on offer for this run: no approved knowledge was in its scope when it started.",
+        "Nothing was on offer: no approved knowledge in scope.",
       ),
     ).toBeDefined();
   });
@@ -360,7 +360,7 @@ describe("RunDetail — the gate", () => {
       ),
     );
     const first = await renderApp({ initialPath: "/runs/5" });
-    expect(await screen.findByText("The router gave no usable advice; the run launched as configured.")).toBeDefined();
+    expect(await screen.findByText("No usable advice; ran as configured.")).toBeDefined();
     expect(screen.getByText("Already failed on this item: sonnet@low, opus")).toBeDefined();
     expect(screen.queryByText("Router advised")).toBeNull();
     first.unmount?.();
@@ -397,7 +397,7 @@ describe("RunDetail — the gate", () => {
     expect(screen.queryByText(/gate failed/i)).toBeNull();
     // And it does not borrow the passing tone either: nothing measured this.
     expect(screen.queryByText(/gate passed/i)).toBeNull();
-    expect(screen.getByText(/no gate configured for it/)).toBeDefined();
+    expect(screen.getByText(/Nothing measured: no gate configured/)).toBeDefined();
   });
 
   it("draws the chain of a run that was continued and opens a leg on click", async () => {
@@ -583,8 +583,7 @@ describe("RunDetail — why it stopped", () => {
 
     await renderApp({ initialPath: "/runs/5" });
 
-    expect(await screen.findByText(/recorded no decisions/)).toBeDefined();
-    expect(screen.getByText(/Nothing is missing/)).toBeDefined();
+    expect(await screen.findByText(/no tool gate decisions recorded/)).toBeDefined();
   });
 
   /**
@@ -619,7 +618,7 @@ describe("RunDetail — why it stopped", () => {
 
     expect(await screen.findByText(/32 minutes against a 30 minutes silence ceiling/)).toBeDefined();
     expect(screen.getByText(/120 minutes wall clock/)).toBeDefined();
-    expect(screen.getByText(/stopped reporting/)).toBeDefined();
+    expect(screen.getByText(/It went quiet/)).toBeDefined();
   });
 
   /**

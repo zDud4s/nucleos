@@ -150,7 +150,7 @@ describe("MapCanvas", () => {
     // Up is the crumb trail now, and not a lone arrow inside the level: the
     // trail says where you are as well as where back is.
     const crumbs = screen.getByRole("navigation", { name: "Where you are" });
-    fireEvent.click(within(crumbs).getByRole("button", { name: "whole project" }));
+    fireEvent.click(within(crumbs).getByRole("button", { name: "Whole project" }));
     expect(screen.getByRole("table")).toBeTruthy();
   });
 
@@ -171,7 +171,7 @@ describe("MapCanvas", () => {
     // so does the neighbourhood offered instead — a clique's neighbourhood is the
     // clique. Promising a picture at the second step and drawing an unreadable
     // one would be this map's own failure, one level down.
-    expect(screen.getAllByText(/does not draw/).length).toBe(2);
+    expect(screen.getAllByText(/Not drawn$/).length).toBe(2);
     expect(screen.getAllByText(/links a box/).length).toBeGreaterThan(0);
     // And the way forward is offered whatever the second answer turns out to be.
     expect(screen.getByRole("group", { name: "Around" })).toBeTruthy();
@@ -267,7 +267,7 @@ describe("a matrix too small to be read whole", () => {
     // and points at the ways out.
     expect(screen.getByText(/Numbers hidden at this size/)).toBeTruthy();
     expect(screen.getByText(/8px/)).toBeTruthy();
-    expect(screen.getByText(/Point at a mark to read it, or zoom in/)).toBeTruthy();
+    expect(screen.getByTitle(/Point at a mark to read it, or zoom in/)).toBeTruthy();
 
     // And it does what it says: the marks are drawn without the digits nobody could read, and
     // the name of whatever is under the pointer is said above the window at a size that reads.
@@ -279,7 +279,7 @@ describe("a matrix too small to be read whole", () => {
     // And the old half untouched: this is not a refusal, the table is still on the page,
     // and the shape is still there to be read. Refusing the whole picture to protect the
     // half that broke would throw away the half that works.
-    expect(screen.queryByText(/does not draw/)).toBeNull();
+    expect(screen.queryByText(/Not drawn$/)).toBeNull();
     expect(screen.getAllByRole("table").length).toBeGreaterThan(0);
   });
 
@@ -414,7 +414,7 @@ describe("how far out the drawing stands", () => {
   it("comes back to the fit after a reader has moved it", () => {
     draw(wideProject.modules, wideProject.imports);
     fireEvent.click(screen.getByRole("button", { name: "Further out" }));
-    fireEvent.click(screen.getByText("fit"));
+    fireEvent.click(screen.getByText("Fit"));
     expect(screen.getByText("80%")).toBeTruthy();
   });
 
@@ -422,17 +422,17 @@ describe("how far out the drawing stands", () => {
     // The way out has to be the key everybody already presses. An overlay whose
     // only exit is a button somebody has to find is a trap with a nice border.
     draw(wideProject.modules, wideProject.imports);
-    fireEvent.click(screen.getByText("full screen"));
-    expect(screen.getByText("close")).toBeTruthy();
+    fireEvent.click(screen.getByText("Full screen"));
+    expect(screen.getByText("Close")).toBeTruthy();
     fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.getByText("full screen")).toBeTruthy();
+    expect(screen.getByText("Full screen")).toBeTruthy();
   });
 
   it("is a modal dialog that takes focus and hands it back to the button that opened it", () => {
     // It was a `fixed inset-0` div: Tab walked out into the page behind it, and closing it left
     // focus nowhere. The project switcher's standard is the one to meet.
     draw(wideProject.modules, wideProject.imports);
-    const opener = screen.getByText("full screen");
+    const opener = screen.getByText("Full screen");
     opener.focus();
     fireEvent.click(opener);
     const dialog = screen.getByRole("dialog", { name: /full screen/ });
@@ -440,7 +440,7 @@ describe("how far out the drawing stands", () => {
     expect(document.activeElement).toBe(dialog);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(document.activeElement?.textContent).toBe("full screen");
+    expect(document.activeElement?.textContent).toBe("Full screen");
   });
 
   it("keeps the rail and the trail in full screen, which is where there is most room for them", () => {
@@ -448,7 +448,7 @@ describe("how far out the drawing stands", () => {
     // you every way of going anywhere, which is the opposite of what more room
     // is for.
     draw(wideProject.modules, wideProject.imports);
-    fireEvent.click(screen.getByText("full screen"));
+    fireEvent.click(screen.getByText("Full screen"));
     expect(screen.getByRole("complementary", { name: "Every community" })).toBeTruthy();
     expect(screen.getByRole("navigation", { name: "Where you are" })).toBeTruthy();
   });
@@ -500,7 +500,7 @@ describe("every drawing under the matrix", () => {
     const doors = within(rail).getAllByRole("button");
     fireEvent.click(doors[doors.length - 1]);
     const crumbs = screen.getByRole("navigation", { name: "Where you are" });
-    expect(within(crumbs).getByRole("button", { name: "whole project" })).toBeTruthy();
+    expect(within(crumbs).getByRole("button", { name: "Whole project" })).toBeTruthy();
   });
 
 });
@@ -582,7 +582,7 @@ describe("MapCanvas — one file's own declarations", () => {
     draw(twoGroups.modules, twoGroups.imports);
     await openFirstFile();
 
-    await waitFor(() => expect(screen.getByText(/Nothing here reads this language yet/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/No reader for this language yet/)).toBeTruthy());
   });
 
   it("comes back up to the community it was opened from", async () => {

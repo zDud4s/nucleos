@@ -32,7 +32,6 @@ import {
   Row,
   Rows,
   StateBadge,
-  Teach,
   Term,
   type QueryLike,
 } from "../ui";
@@ -339,7 +338,7 @@ function MailFilterBar({
 
 function EmptyQueue({ filtered }: { filtered: boolean }) {
   return (
-    <Teach title={filtered ? "Nothing matches that search" : "The inbound queue is empty"}>
+    <Quiet says={filtered ? "Nothing matches that search" : "The inbound queue is empty"}>
       {filtered ? (
         <p>Clear the search above to see the whole queue: an empty match is not an empty inbox.</p>
       ) : (
@@ -348,7 +347,7 @@ function EmptyQueue({ filtered }: { filtered: boolean }) {
           Retention keeps a rolling window of mail, not a history: this list is what is here now.
         </p>
       )}
-    </Teach>
+    </Quiet>
   );
 }
 
@@ -371,7 +370,7 @@ function QueueList({
     <>
       <MailFilterBar rows={rows} filter={filter} onFilter={onFilter} />
       {shown.length === 0 ? (
-        <p className="mail-note">Nothing in this view. Choose All to see the whole queue.</p>
+        <p className="mail-note">Nothing in this view</p>
       ) : (
         <Rows label="Mail queue" className="mail-list">
           {shown.map((row) => (
@@ -562,7 +561,10 @@ function SkippedAbsence() {
           to show and here is why", which is the whole of what `Quiet` is for:
           the reasoning is worth keeping and is not worth the four lines it
           costs every reader who already knows it. */}
-      <Quiet says="a message the fetcher could not parse is never a row in this queue.">
+      <Quiet says="None unparsed">
+        <p>
+          A message the fetcher could not parse is never a row in this queue.
+        </p>
         <p>
           A message the fetcher could not parse does not appear above: it is written only as a line
           on the feed, kind <code className="mail-kind">email_fetch_skipped</code>, with the reason

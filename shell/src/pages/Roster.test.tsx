@@ -322,7 +322,7 @@ describe("the roster", () => {
   it("says so plainly when the núcleo knows of no project, with the way to add one", async () => {
     await openRoster([]);
 
-    const heading = await screen.findByRole("heading", { name: /no project has been registered/i });
+    const heading = await screen.findByText(/no project has been registered/i);
     expect(screen.queryByRole("region", { name: "Quiet" })).toBeNull();
     const teach = heading.parentElement as HTMLElement;
     expect(within(teach).getByRole("link", { name: "Add a project" }).getAttribute("href")).toBe(
@@ -350,7 +350,7 @@ describe("the roster", () => {
     await act(async () => {
       within(alert.closest(".ui-toast") as HTMLElement).getByRole("button", { name: "Retry" }).click();
     });
-    expect(await screen.findByRole("heading", { name: /no project has been registered/i })).toBeTruthy();
+    expect(await screen.findByText(/no project has been registered/i)).toBeTruthy();
   });
 
   it("filters the groups by name and opens the only match on Enter", async () => {
@@ -390,7 +390,7 @@ describe("the roster", () => {
     });
     expect(screen.getByRole("link", { name: "add a project" }).getAttribute("href")).toBe("/projects/new");
     await act(async () => {
-      screen.getByRole("button", { name: "clear the search" }).click();
+      screen.getByRole("button", { name: "Clear the search" }).click();
     });
     expect(box.value).toBe("");
     expect(names("Quiet")).toEqual(["alpha", "beta"]);

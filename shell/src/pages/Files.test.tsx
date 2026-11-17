@@ -140,6 +140,7 @@ describe("Files — no root configured", () => {
     renderWithQuery(<Files />);
 
     expect(await screen.findByText("The files folder could not be opened")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Why?" }));
     expect(screen.getByText(/%LOCALAPPDATA%\\nucleos\\NucleOS\\data\\files/)).toBeDefined();
     // Never an invitation to retry — there is nothing to retry towards.
     expect(screen.queryByText(/Service Unavailable/)).toBeNull();

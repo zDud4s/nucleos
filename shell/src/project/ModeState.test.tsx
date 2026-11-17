@@ -302,7 +302,7 @@ describe("the open-proposal ceiling", () => {
     const state = settingsState({ wip_limit: null, open_review_items: 2 });
     await openState(state, new Set(), AUTHORITY);
 
-    const clear = await screen.findByRole("button", { name: "no ceiling" });
+    const clear = await screen.findByRole("button", { name: "No ceiling" });
     expect((clear as HTMLButtonElement).disabled).toBe(false);
     expect(clear.getAttribute("aria-disabled")).toBe("true");
 
@@ -512,6 +512,25 @@ describe("occupancy", () => {
 });
 
 describe("branches", () => {
+  /** While the read is pending the list holds its place with skeleton rows, not a bare sentence. */
+  it("draws a skeleton while the branches load", async () => {
+    const state = daemonState({ projects: [project({ project_id: "nucleos", mode: "shadow" })] });
+    const answer = daemonFetch(state);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.startsWith("/projects/nucleos/branches")) return new Promise(() => {});
+      return answer(path, init);
+    });
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects/nucleos/state" });
+
+    const label = await screen.findByText("Reading branches…");
+    const skeleton = label.closest(".ui-skeleton");
+    expect(skeleton).not.toBeNull();
+    expect(skeleton?.getAttribute("aria-busy")).toBe("true");
+    expect(skeleton?.querySelectorAll(".ui-skeleton-row").length).toBe(5);
+  });
+
   /**
    * A poll that fails after a good one keeps the branches and dates them. Before, the whole panel
    * turned into "its folder may have moved", which is the wrong sentence for a missed poll.

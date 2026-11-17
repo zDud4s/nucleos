@@ -372,9 +372,12 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
 
       <div className="browser-content">
         {runtimeMissing ? (
-          <p className="browser-message" role="alert">
-            The Microsoft WebView2 Runtime is missing, so the browser cannot show pages. Install it
-            and restart the app.
+          <p
+            className="browser-message"
+            role="alert"
+            title="The browser cannot show pages without the Microsoft WebView2 Runtime. Install it and restart the app."
+          >
+            WebView2 Runtime missing
           </p>
         ) : (
           <>

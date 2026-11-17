@@ -121,7 +121,9 @@ export function PathPicker({ open, onOpenChange, onSelect, initialPath = "" }: P
       }
     >
       {owner === false ? (
-        <p>Browsing folders on the tower needs an owner device; you can still type the path by hand.</p>
+        <p title="Browsing folders on the tower needs an owner device; you can still type the path by hand.">
+          Owner device needed
+        </p>
       ) : (
         <div className="flex flex-col gap-3">
           <p className="font-mono text-sm text-text" aria-live="polite">

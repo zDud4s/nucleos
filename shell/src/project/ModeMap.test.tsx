@@ -200,9 +200,9 @@ describe("the architecture", () => {
     }
 
     fireEvent.click(screen.getByRole("button", { name: /^Specs/ }));
-    expect(screen.getByText(/Nothing decided yet/)).toBeTruthy();
+    expect(screen.getByText(/Nothing decided/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /^Architecture/ }));
-    expect(screen.queryByText(/Nothing decided yet/)).toBeNull();
+    expect(screen.queryByText(/Nothing decided/)).toBeNull();
   });
 });
 
@@ -285,7 +285,7 @@ describe("the answer before the detail", () => {
     const before = daemon.apiFetch.mock.calls.filter(([path]) =>
       String(path).endsWith("/map"),
     ).length;
-    fireEvent.click(screen.getByRole("button", { name: "read again" }));
+    fireEvent.click(screen.getByRole("button", { name: "Read again" }));
     await waitFor(() =>
       expect(
         daemon.apiFetch.mock.calls.filter(([path]) => String(path).endsWith("/map")).length,
@@ -296,7 +296,7 @@ describe("the answer before the detail", () => {
   it("offers to read a map again when it could not be read", async () => {
     open(new Error("no such folder"));
     expect(await screen.findByText(/could not read this project/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "read it again" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Read it again" })).toBeTruthy();
   });
 });
 

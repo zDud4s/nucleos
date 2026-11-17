@@ -28,6 +28,7 @@ import {
   ListFilter,
   PageHeader,
   Panel,
+  Quiet,
   RefusalNote,
   RelativeTime,
   Row,
@@ -37,6 +38,7 @@ import {
   StaleNote,
   useUndoToast,
   type UndoToastOptions,
+  Tip,
 } from "../ui";
 import "./contacts.css";
 
@@ -113,19 +115,9 @@ function RosterError({ error }: { error: unknown }) {
   return <ErrorNote>The {DAEMON_NAME} is not responding: nothing is known about the roster</ErrorNote>;
 }
 
-/**
- * An empty section's one line: the state, then its reason, both in view.
- * The reason used to sit in a hover tip; touch has no hover and keyboard
- * users found it by accident, so it is plain text now (critique #19).
- */
+/** An empty section's one line: the state in view, its reason behind "Why?". */
 function QuietLine({ says, children }: { says: string; children: ReactNode }) {
-  return (
-    <div className="ui-quiet">
-      <p>
-        {says}. {children}
-      </p>
-    </div>
-  );
+  return <Quiet says={says}>{children}</Quiet>;
 }
 
 /* -------------------------------------------------------- identity questions -- */
@@ -168,10 +160,7 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
 
   return (
     <Panel title="Identity questions" aside={<Count n={view.data?.length} />}>
-      <p className="contacts-note">
-        Two records that may be one person. Yes merges them (undo it per address in People below).
-        No is permanent: this pair is never suggested again.
-      </p>
+      <Tip name="About merges" tip="Two records that may be one person. Yes merges them (undo it per address in People below). No is permanent: this pair is never suggested again." />
       {view.isError && rows.length === 0 && <MergesError error={view.error} />}
       {rows.length > 0 && (
         <Rows label="Identity questions" className="contacts-questions">
@@ -231,10 +220,12 @@ function IdentityQuestion({
       </div>
       {conflict && (
         <div id={noteId} className="contacts-conflict">
-          <ConflictNote>
-            These two carry standing decisions that disagree, so approving will be refused. Settle one
-            of them and decide this again.
-          </ConflictNote>
+          <ConflictNote>Decisions disagree</ConflictNote>
+          <Tip
+            persist
+            name="About the conflict"
+            tip="These two carry standing decisions that disagree, so approving will be refused. Settle one of them and decide this again."
+          />
         </div>
       )}
       <div className="contacts-actions">

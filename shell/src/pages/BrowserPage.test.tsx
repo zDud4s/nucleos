@@ -295,7 +295,7 @@ describe("BrowserPage", () => {
     render(<BrowserPage />);
     await waitFor(() => expect(mocks.listeners.size).toBe(6));
     emit("runtime-missing", {});
-    expect(screen.getByText(/WebView2 Runtime is missing/)).toBeTruthy();
+    expect(screen.getByText("WebView2 Runtime missing")).toBeTruthy();
   });
 
   it("hides the old project's tab when switching project", async () => {

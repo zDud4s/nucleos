@@ -4,6 +4,7 @@ import type { StepUpOutcome } from "../data/transport";
 import { Button } from "../ui/Button";
 import { ErrorNote } from "../ui/ErrorNote";
 import { Modal } from "../ui/Modal";
+import { Tip } from "../ui/Tip";
 
 /**
  * Passkeys for the remote shell: the first one after an owner pairs, and the confirmation a grave
@@ -428,15 +429,19 @@ export function PasskeyEnrol({ onDone }: { onDone: () => void }) {
   return (
     <main className="remote-pairing">
       <section className="remote-pairing-form" aria-label="Register a passkey">
-        <h1>Register a passkey</h1>
-        <p>
-          Grave actions from this browser ask for a passkey. Use this device, or choose your phone if this one has
-          no authenticator.
-        </p>
-        <p>
-          If you skip, this browser works but those actions stay refused; do them on the main machine. A passkey can
-          only be registered within 15 minutes of pairing.
-        </p>
+<h1>
+          Register a passkey{" "}
+          <Tip
+            name="About passkeys"
+            tip={
+              <>
+                Grave actions from this browser ask for a passkey. Use this device, or choose your phone if this one
+                has no authenticator. If you skip, this browser works but those actions stay refused; do them on the
+                main machine. A passkey can only be registered within 15 minutes of pairing.
+              </>
+            }
+          />
+        </h1>
         {shown === null ? null : <ErrorNote>{shown}</ErrorNote>}
         <Button type="button" variant="primary" disabled={busy || state.status === "loading"} onClick={register}>
           {label}

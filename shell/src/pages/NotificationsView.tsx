@@ -22,7 +22,7 @@ import {
   useSetChannelNotifyPolicy,
   useSetNotifyPolicy,
 } from "../data/system";
-import { Button, Callout, ErrorNote, Panel, Quiet, RefusalNote, Section, Select, Skeleton, Switch } from "../ui";
+import { Button, Callout, ErrorNote, Panel, Quiet, RefusalNote, Section, Select, Skeleton, Switch, Tip } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 
@@ -278,11 +278,7 @@ function PolicyEditor({
             whatever you set here.
           </Callout>
         </div>
-        <p className="sy-note">
-          A family is a prefix, and a kind can override its family. Anything no rule claims is sent,
-          so a machine nobody has configured behaves exactly as it did before this screen existed.
-          The adapter picks this up on its next round: nothing needs restarting.
-        </p>
+        <Tip name="About families" tip="A family is a prefix, and a kind can override its family. Anything no rule claims is sent, so a machine nobody has configured behaves exactly as it did before this screen existed. The adapter picks this up on its next round: nothing needs restarting." />
         {base && primary === false && (
           <div className="sy-notify-never">
             <Callout tone="pending">
@@ -320,10 +316,7 @@ function PolicyEditor({
 
         {loose.length > 0 && (
           <Section label="On their own" level={3}>
-            <p className="sy-note">
-              Kinds no family prefix claims. Each is silenced on its own; there is no group switch
-              because there is no group: the grouping here is presentation, not a rule.
-            </p>
+            <Tip name="About loose kinds" tip="Kinds no family prefix claims. Each is silenced on its own; there is no group switch because there is no group: the grouping here is presentation, not a rule." />
             <ul className="sy-notify-kinds sy-notify-loose">
               {loose.map((row) => (
                 <KindItem
@@ -412,18 +405,23 @@ function DesktopSwitch() {
       )}
       {browser === "denied" && (
         <p className="sy-note">
-          This browser blocks notifications for this site. The prompt on screen and your channels
-          still tell you; allow them in the browser&rsquo;s site settings to get these too.
-        </p>
-      )}
-      {browser !== "unsupported" && (
-        <p className="sy-note">
-          They appear only while this tab is open. With no tab open, your channels carry the notice.
+          Blocked in this browser
+          <Tip
+            name="About blocked notifications"
+            tip="This browser blocks notifications for this site. The prompt on screen and your channels still tell you; allow them in the browser's site settings to get these too."
+          />
         </p>
       )}
       <p className="sy-note sy-notify-lead">
-        Waiting approvals, conversations that answered, and the feed lines the choices below allow
-        (the same ones your channels get).
+        Desktop notices
+        <Tip
+          name="About desktop notices"
+          tip={`Waiting approvals, conversations that answered, and the feed lines the choices below allow (the same ones your channels get).${
+            browser === "unsupported"
+              ? ""
+              : " They appear only while this tab is open. With no tab open, your channels carry the notice."
+          }`}
+        />
       </p>
     </Panel>
   );
@@ -577,8 +575,11 @@ function FamilyItem({
       )}
       {open && family.kinds.length === 0 && (
         <p id={popId} className="sy-note sy-notify-pop">
-          This machine has written none of these in the last 90 days. The switch still covers the
-          ones it writes next.
+          None in 90 days
+          <Tip
+            name="About this switch"
+            tip="This machine has written none of these in the last 90 days. The switch still covers the ones it writes next."
+          />
         </p>
       )}
     </li>

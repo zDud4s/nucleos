@@ -19,7 +19,7 @@ describe("Quiet", () => {
   it("the question names its section and its answer", () => {
     render(<Quiet says="none declared">Declaration rather than detection.</Quiet>);
 
-    const ask = screen.getByRole("button", { name: "why?" });
+    const ask = screen.getByRole("button", { name: "Why?" });
     const said = ask.getAttribute("aria-describedby");
     const why = ask.getAttribute("aria-controls");
     expect(said).toBeTruthy();
@@ -39,14 +39,14 @@ describe("Quiet", () => {
       </Quiet>,
     );
 
-    const ask = screen.getByRole("button", { name: "why?" });
+    const ask = screen.getByRole("button", { name: "Why?" });
     expect(ask.getAttribute("aria-expanded")).toBe("false");
 
     fireEvent.click(ask);
     expect(screen.getByText(/a real answer and not a gap/)).toBeTruthy();
     // The same control closes it, and says so — a "why?" that stayed "why?" while
     // the answer was open would be the only affordance for closing it again.
-    expect(screen.getByRole("button", { name: "less" }).getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("button", { name: "Less" }).getAttribute("aria-expanded")).toBe("true");
   });
 
   it("offers no question at all when there is nothing behind it", () => {

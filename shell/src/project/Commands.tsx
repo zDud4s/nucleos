@@ -101,7 +101,7 @@ export function Commands({ projectId }: CommandsProps) {
   */
   const declare = (
     <Button variant="ghost" onClick={() => setManaging(true)}>
-      declare a command
+      Declare a command
     </Button>
   );
   const manage = (
@@ -141,9 +141,12 @@ export function Commands({ projectId }: CommandsProps) {
                 marked a verdict has nothing to say about being green, and saying nothing is more
                 honest than drawing a bar of verbs that were never claimed to mean anything.
               */
-              <Quiet
-                says={`No command here is marked a gate, so nothing on this page claims to say whether ${projectId} is green.`}
-              />
+              <span
+                className="text-sm text-text-muted"
+                title={`No command here is marked a gate, so nothing on this page claims to say whether ${projectId} is green.`}
+              >
+                No gate marked
+              </span>
             ) : (
               gates.map((row) => (
                 <GateButton
@@ -155,8 +158,10 @@ export function Commands({ projectId }: CommandsProps) {
               ))
             )}
             <Button onClick={openPalette}>
-              all {rows.length} · {SHORTCUT_HINT}
+              All {rows.length} · {SHORTCUT_HINT}
             </Button>
+            {/* The row's one action, on the same line as the gates rather than a line of its own. */}
+            <span className="ml-auto">{declare}</span>
           </div>
 
           {refused !== null ? (
@@ -167,7 +172,6 @@ export function Commands({ projectId }: CommandsProps) {
         </>
       )}
 
-      <div>{declare}</div>
       {manage}
     </div>
   );
@@ -219,7 +223,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
               {row.source === "project" ? (
                 <span className="ml-auto">
                   <ConfirmButton
-                    label="forget"
+                    label="Forget"
                     confirmLabel={`Forget ${row.name}`}
                     variant="danger"
                     disabled={forget.isPending}
@@ -290,11 +294,9 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
         </div>
 
         <div className="ws-dialog-actions items-center">
-          <span className="mr-auto text-xs text-text-faint">
-            A name already declared is replaced rather than duplicated.
-          </span>
           <Button
             variant="primary"
+            title="A name already declared is replaced rather than duplicated."
             disabled={!ready || declare.isPending}
             onClick={() =>
               declare.mutate(
@@ -320,7 +322,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
               )
             }
           >
-            {declare.isPending ? "declaring…" : "declare"}
+            {declare.isPending ? "Declaring…" : "Declare"}
           </Button>
         </div>
 

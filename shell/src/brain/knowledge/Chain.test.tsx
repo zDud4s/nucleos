@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { screen } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import { Chain } from "./Chain";
 import { daemonWith, known } from "./test-helpers";
 import { renderWithRouter } from "../../test/harness";
@@ -22,9 +22,9 @@ describe("Chain", () => {
 
     await renderWithRouter(<Chain id={4} />);
 
-    expect(
-      await screen.findByText("This one replaced nothing and nothing has replaced it."),
-    ).toBeDefined();
+    expect(await screen.findByText("No chain")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Why?" }));
+    expect(screen.getByText("This one replaced nothing and nothing has replaced it.")).toBeDefined();
   });
 
   it("lists what the row replaced", async () => {

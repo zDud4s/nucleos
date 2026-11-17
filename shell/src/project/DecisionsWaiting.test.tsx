@@ -184,7 +184,7 @@ describe("the pile nobody has read", () => {
     await screen.findByText(THREE[0].text);
 
     fireEvent.click(screen.getByRole("button", { name: "approve line 1" }));
-    expect(await screen.findByText(/not yours to answer now/)).toBeTruthy();
+    expect(await screen.findByText(/already answered, or is gone/)).toBeTruthy();
     expect(screen.getByText(THREE[0].text)).toBeTruthy();
   });
 });

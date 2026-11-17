@@ -32,6 +32,7 @@ import {
   Modal,
   Panel,
   Quiet,
+  Tip,
   RefusalNote,
   RelativeTime,
   Section,
@@ -53,9 +54,9 @@ const MODE_LABEL: Record<JudgeMode, string> = {
 
 /** How the current mode reads in a sentence. The daemon's values (`off/observe/enforce`) are unchanged. */
 const MODE_NOW: Record<JudgeMode, string> = {
-  off: "off",
-  observe: "watching in shadow",
-  enforce: "acting",
+  off: "Off",
+  observe: "Watching in shadow",
+  enforce: "Acting",
 };
 
 /**
@@ -107,6 +108,11 @@ export function DecisionDialog({
   );
 }
 
+/** Whole percent of reviewed actions that agreed; 0 when nothing is reviewed. */
+function agreedPercent(reviewed: number, agree: number): number {
+  return reviewed === 0 ? 0 : Math.round((agree / reviewed) * 100);
+}
+
 export function JudgePanel({
   projectId,
   project,
@@ -132,31 +138,41 @@ export function JudgePanel({
   const enforceShut = !active || readiness?.ready !== true;
   const busy = setJudge.isPending;
   // What stands between the owner and the third segment, said under the control it locks.
+  // Values, not sentences: the rule behind them rides in the line's title.
   const needs: string[] = [];
-  if (!active) needs.push("an active project");
+  if (!active) needs.push("Needs an active project");
   if (readiness?.ready !== true) {
     needs.push(
-      `${READINESS_MIN_REVIEWED} reviewed at ${READINESS_MIN_AGREE_PERCENT}% agreement` +
-        (readiness === undefined ? "" : ` (${readiness.reviewed} reviewed so far, ${readiness.agree} agreed)`),
+      readiness === undefined
+        ? `0/${READINESS_MIN_REVIEWED} reviewed`
+        : `${readiness.reviewed}/${READINESS_MIN_REVIEWED} reviewed · ${agreedPercent(readiness.reviewed, readiness.agree)}% agreed`,
     );
   }
+  const rule = `Letting the judge act needs an active project and ${READINESS_MIN_REVIEWED} reviewed at ${READINESS_MIN_AGREE_PERCENT}% agreement`;
   const apply = (mode: JudgeMode) => setJudge.mutate({ project_id: projectId, judge: mode });
   return (
     <Panel title="Judge" aside={<span className="ap-project-name">{projectId}</span>}>
-      <p className="ap-note">
-        A model asked about each tool call the classifier left open. Watching in shadow sends each
-        such call to TypeSafe ({TYPESAFE_LEAVES}) and changes nothing; letting it act lets its
-        answer stand, except for the classes and guards it may refuse but never approve.{" "}
-        {TYPESAFE_DEFINITION}
-      </p>
       {status.isError && status.data === undefined && (
         <ErrorNote>Could not reach the {DAEMON_NAME}: nothing is known about the judge.</ErrorNote>
       )}
-      {current !== undefined && (
-        <p className="ap-reason">
-          The judge is <strong>{MODE_NOW[current]}</strong> for {projectId}.
-        </p>
-      )}
+      <p className="ap-reason">
+        Mode{current === undefined ? null : <> <strong>{MODE_NOW[current]}</strong></>}{" "}
+        <Tip
+          persist
+          name="About the judge"
+          tip={
+            <>
+              A model asked about each tool call the classifier left open. Watching in shadow sends each
+              such call to TypeSafe ({TYPESAFE_LEAVES}) and changes nothing; letting it act lets its
+              answer stand, except for the classes and guards it may refuse but never approve.{" "}
+              {TYPESAFE_DEFINITION}{" "}
+              {/* Review item E(i): the setting is photographed onto each run at launch (D2). */}
+              A change here reaches this project&rsquo;s next runs; runs already working keep the
+              setting they started with. <span id="judge-residual-risk">{JUDGE_RESIDUAL_RISK}</span>
+            </>
+          }
+        />
+      </p>
       <div className="ap-judge-control">
         {/* One switch, the project switch's shape: the current mode is pressed, never disabled, and
             a mode that is not open says why right under the control. */}
@@ -203,17 +219,12 @@ export function JudgePanel({
           </button>
         </div>
         {enforceShut && (
-          <p id={prereqId} className="ap-reason">
-            Letting the judge act needs {needs.join(" and ")}.
+          <p id={prereqId} className="ap-reason" title={rule}>
+            {needs.join(" · ")}
           </p>
         )}
       </div>
       {setJudge.isError && <JudgeRefusal error={setJudge.error} />}
-      {/* Review item E(i): the setting is photographed onto each run at launch (D2). */}
-      <p className="ap-note">
-        A change here reaches this project's next runs; runs already working keep the setting they
-        started with.
-      </p>
       {/* Review item G: fails closed (the classifier decides alone), and would otherwise be silent. */}
       {status.data?.rules_error != null && (
         <ErrorNote>
@@ -222,10 +233,11 @@ export function JudgePanel({
       )}
       {readiness !== undefined && (
         <>
-          <p className="ap-note">
-            {readiness.reviewed} distinct actions reviewed, {readiness.agree} agreed. Letting it act
-            needs {READINESS_MIN_REVIEWED} at {READINESS_MIN_AGREE_PERCENT}%, on an active project.
-          </p>
+          {readiness.ready && (
+            <p className="ap-note" title={rule}>
+              {readiness.reviewed}/{READINESS_MIN_REVIEWED} reviewed · {agreedPercent(readiness.reviewed, readiness.agree)}% agreed
+            </p>
+          )}
           {readiness.by_class.length > 0 && (
             <dl className="ap-decision-facts" aria-label="Agreement by class">
               {readiness.by_class.map((row) => (
@@ -240,9 +252,6 @@ export function JudgePanel({
           )}
         </>
       )}
-      <p className="ap-note" id="judge-residual-risk">
-        {JUDGE_RESIDUAL_RISK}
-      </p>
       <DecisionDialog
         open={asking === "observe"}
         onOpenChange={(open) => !open && setAsking(null)}

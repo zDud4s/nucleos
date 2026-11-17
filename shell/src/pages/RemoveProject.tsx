@@ -213,13 +213,13 @@ export function RemoveProject({
       {/* Drawn inside a modal: the answer row on its bottom edge, right-aligned, the act last. */}
       <div className="ws-dialog-actions">
         <Button variant="ghost" onClick={onCancel}>
-          cancel
+          Cancel
         </Button>
         {forgetting ? (
           <ConfirmButton
             variant="danger-solid"
-            label={removal.isPending ? "removing…" : "remove and forget"}
-            confirmLabel={`delete ${has} for good`}
+            label={removal.isPending ? "Removing…" : "Remove and forget"}
+            confirmLabel={`Delete ${has} for good`}
             subject={projectId}
             describedBy={consequenceId}
             disabled={disabled}
@@ -227,7 +227,7 @@ export function RemoveProject({
           />
         ) : (
           <Button variant="danger-solid" disabled={disabled} onClick={remove}>
-            {removal.isPending ? "removing…" : "remove"}
+            {removal.isPending ? "Removing…" : "Remove"}
           </Button>
         )}
       </div>

@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { File as FileIcon, Folder as FolderIcon } from "lucide-react";
 import { formatBytes, joinPath, middleEllipsis, useFolder, type Entry, type SortColumn, type SortDirection } from "../../data/files";
-import { Button, Panel, Quiet, RelativeTime, Skeleton, StaleNote, Teach } from "../../ui";
+import { Button, Panel, Quiet, RelativeTime, Skeleton, StaleNote } from "../../ui";
 import { LIST_SENTENCES, MOVE_SENTENCES, RefusalOrError, remPx } from "./shared";
 import type { FocusAfter } from "./pageParts";
 
@@ -255,15 +255,15 @@ export function FileTable(props: FileTableProps) {
         {/* `Teach` is for a place nothing has ever been — the root, empty. A
             subfolder that is empty is an ordinary answer, and says so in one line. */}
         {entries !== undefined && entries.length === 0 && path === "" && (
-          <Teach title="Nothing has been filed yet">
+          <Quiet says="Nothing has been filed yet">
             <p>
               Upload a file, make a folder, or drag something in from your file manager. A drop lands under the folder you
               are looking at.
             </p>
-          </Teach>
+          </Quiet>
         )}
         {entries !== undefined && entries.length === 0 && path !== "" && (
-          <Quiet says="Nothing in this folder yet. Upload, drop or make a folder here." />
+          <Quiet says="Folder is empty">Upload, drop or make a folder here.</Quiet>
         )}
 
         {/* `fi-table-picking` once anything is picked: until then the row boxes

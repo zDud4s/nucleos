@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { classifyWriteFailure, useSettingDoc, useSettingsIndex, useWriteSetting } from "../data/settings";
-import { Button, ConflictNote, Segmented, Table, Td, Th } from "../ui";
+import { Button, ConflictNote, Segmented, Table, Td, Th, Tip } from "../ui";
 
 const NAME = "autopilot";
 
@@ -33,7 +33,7 @@ export function GateTargets({ projectId }: { projectId: string }) {
 
   const listed = index.data?.some((row) => row.scope === scope && row.name === NAME);
   if (index.data !== undefined && listed !== true) {
-    return <p className="text-sm text-text-muted">This project has no {NAME} document to edit.</p>;
+    return <p className="text-sm text-text-muted" title={`This project has no ${NAME} document to edit.`}>Not set up</p>;
   }
   return <Editor scope={scope} />;
 }
@@ -60,7 +60,7 @@ function Editor({ scope }: { scope: string }) {
 
   if (doc.isPending) return <p className="text-sm text-text-faint">Reading this document…</p>;
   if (doc.data === undefined) {
-    return <p className="text-sm text-text-muted">The autopilot rules could not be read. Reopening the page asks again.</p>;
+    return <p className="text-sm text-text-muted">Could not read the autopilot rules.</p>;
   }
 
   const stored = storedTargets(doc.data.body);
@@ -95,11 +95,7 @@ function Editor({ scope }: { scope: string }) {
   }
 
   return (
-    <div className="flex flex-col gap-3">
-      <p className="text-sm text-text-muted">
-        Where each gate target runs. Until you choose, nothing publishes automatically.
-      </p>
-
+    <div className="flex flex-col gap-2">
       {notice?.kind === "stale" ? (
         <ConflictNote>Someone else changed the autopilot rules. Showing the latest version — try again.</ConflictNote>
       ) : null}
@@ -108,7 +104,11 @@ function Editor({ scope }: { scope: string }) {
         <thead>
           <tr>
             <Th>Target</Th>
-            <Th>Runs</Th>
+            <Th>
+              <Tip tip="Where each gate target runs. Until you choose, nothing publishes automatically.">
+                Runs
+              </Tip>
+            </Th>
             <Th>State</Th>
           </tr>
         </thead>

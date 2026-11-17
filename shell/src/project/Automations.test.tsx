@@ -288,6 +288,6 @@ describe("Automations", () => {
   it("says the project has no automations document when the index does not list it", async () => {
     world({ rules: [] }, 3, false);
     open();
-    expect(await screen.findByText("This project has no automations document to edit.")).toBeTruthy();
+    expect(await screen.findByTitle("This project has no automations document to edit.")).toBeTruthy();
   });
 });

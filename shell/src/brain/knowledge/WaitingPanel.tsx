@@ -20,6 +20,7 @@ import {
   RefusalNote,
   Rows,
   Select,
+  Tip,
 } from "../../ui";
 import { KnownRow } from "./KnownRow";
 import "./knowledge.css";
@@ -50,10 +51,18 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
   return (
     <>
       {refusal !== null && <DecisionRefusal error={refusal} />}
-      <Panel title="Lessons to approve" aside={<Count n={rows.length} />}>
-        <p className="learned-lede">
-          None reaches a prompt until you approve it; a refusal stays on the record.
-        </p>
+      <Panel
+        title="Lessons to approve"
+        aside={
+          <>
+            <Tip
+              name="About lesson approval"
+              tip="None reaches a prompt until you approve it; a refusal stays on the record."
+            />
+            <Count n={rows.length} />
+          </>
+        }
+      >
         {groups.map((group) => {
           const resultBelongsHere = sameProposalIds(
             batch.variables?.proposalIds,
@@ -123,7 +132,7 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
                         // is the one-line absence that component is for. It was set faint, which is
                         // the rung for metadata standing beside content — here the sentence is all
                         // the row has to say in place of its two buttons.
-                        <Quiet says="no question to answer: decide in the daemon" />
+                        <Quiet says="No question">Decide in the daemon.</Quiet>
                       ) : (
                         <RowDecisions
                           proposalId={row.proposal_id}

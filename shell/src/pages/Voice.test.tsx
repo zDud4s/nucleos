@@ -357,7 +357,7 @@ describe("Voice — the spoken conversation", () => {
 
     await renderVoice();
 
-    expect(await screen.findByText("no transcriber is set up: spoken turns cannot be understood yet")).toBeDefined();
+    expect(await screen.findByText("Voice needs a transcriber")).toBeDefined();
     expect(screen.queryByRole("button", { name: "Start talking" })).toBeNull();
   });
 

@@ -13,7 +13,7 @@ import {
   type PoolAccount,
 } from "../../data/accounts";
 import { isApiRefusal } from "../../data/client";
-import { Button, Field, Modal } from "../../ui";
+import { Button, Field, Modal, Tip } from "../../ui";
 import { engineName, suggestLabel } from "./engines";
 
 /** Used only when the daemon does not name its engines (an older daemon, or not loaded yet). */
@@ -148,15 +148,18 @@ function AddAccountStep({
           type="button"
           aria-pressed={pasting}
           disabled={!tokenOk}
+          title={tokenOk ? undefined : "Only Claude accounts can use a token."}
           className={`ac-engine${pasting ? " ac-engine-on" : ""}`}
           onClick={() => setMethod("token")}
         >
           <strong>Paste token</strong>
         </button>
       </div>
-      {!tokenOk ? <p className="ac-hint">Only Claude accounts can use a token.</p> : null}
       {pasting ? (
-        <Field label="Token" helper="Run `claude setup-token` in a terminal and paste the token it prints.">
+        <Field
+          label="Token"
+          helper={<Tip name="About the token" persist tip="Run `claude setup-token` in a terminal and paste the token it prints." />}
+        >
           <input type="password" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" />
         </Field>
       ) : null}
@@ -171,7 +174,11 @@ function AddAccountStep({
           {pasting ? "Add account" : "Start login"}
         </Button>
       </div>
-      {hint !== null ? <p id="ac-add-hint" className="ac-hint">{hint}</p> : null}
+      {hint !== null ? (
+        <span id="ac-add-hint">
+          <Tip name="Why it cannot start" persist tip={hint} />
+        </span>
+      ) : null}
       {failed.isError ? (
         <div role="alert" className="ac-error">
           {isApiRefusal(failed.error) ? (failed.error.detail || failed.error.code) : "the background service is not responding"}

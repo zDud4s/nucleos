@@ -6,7 +6,18 @@ import {
   type BranchRow,
   type BranchStanding,
 } from "../data/project-git";
-import { ErrorNote, Quiet, RelativeTime, Row, Rows, StaleNote } from "../ui";
+import { useState } from "react";
+import {
+  Button,
+  ErrorNote,
+  Quiet,
+  RelativeTime,
+  Row,
+  Rows,
+  SectionTitle,
+  Skeleton,
+  StaleNote,
+} from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -35,7 +46,11 @@ const STANDING_TEXT: Record<BranchStanding, string> = {
   diverged: "diverged",
 };
 
+/** How many branch lines show before the "Show all" toggle. */
+const VISIBLE_BRANCHES = 5;
+
 export function Branches({ projectId }: BranchesProps) {
+  const [expanded, setExpanded] = useState(false);
   const branches = useProjectBranches(projectId);
   const recent = useProjectLog(projectId, "", 5);
 
@@ -52,13 +67,22 @@ export function Branches({ projectId }: BranchesProps) {
     );
   }
   if (branches.data === undefined) {
-    return <p className="text-sm text-text-faint">Reading branches…</p>;
+    /*
+      Rows of the final height, so the list does not jump when the branches arrive. The same count
+      as the collapsed list shows, which is what most projects will end up drawing.
+    */
+    return (
+      <div className="ws-branch-skeleton">
+        <Skeleton label="Reading branches…" variant="row" count={VISIBLE_BRANCHES} height="1.75rem" />
+      </div>
+    );
   }
 
   const { integration, branches: rows, omitted } = branches.data;
+  const shown = expanded ? rows : rows.slice(0, VISIBLE_BRANCHES);
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="ws-fade-in flex flex-col gap-3">
       {branches.isError ? <StaleNote dataUpdatedAt={branches.dataUpdatedAt} /> : null}
       {integration === null ? (
         /*
@@ -66,9 +90,11 @@ export function Branches({ projectId }: BranchesProps) {
           and it is stated rather than papered over, because every distance on this panel depends on
           there being a target and there is not one.
         */
-        <p className="text-sm text-tone-paused-fg">
-          The project root is on a detached HEAD, so there is no branch for these to be measured
-          against.
+        <p
+          className="text-sm text-tone-paused-fg"
+          title="The project root is on a detached HEAD, so there is no branch to measure against."
+        >
+          Detached HEAD
         </p>
       ) : null}
 
@@ -84,11 +110,19 @@ export function Branches({ projectId }: BranchesProps) {
           row paints its own fill over it.
         */
         <Rows label="Local branches">
-          {rows.map((row) => (
+          {shown.map((row) => (
             <Line key={row.name} row={row} integration={integration} />
           ))}
         </Rows>
       )}
+
+      {rows.length > VISIBLE_BRANCHES ? (
+        <div className="px-4">
+          <Button variant="quiet" onClick={() => setExpanded(!expanded)} aria-expanded={expanded}>
+            {expanded ? "Show fewer" : `Show all (${rows.length})`}
+          </Button>
+        </div>
+      ) : null}
 
       {/*
         A ceiling that hid what it dropped would read as "these are all your branches". Said out
@@ -96,13 +130,13 @@ export function Branches({ projectId }: BranchesProps) {
       */}
       {omitted > 0 ? (
         <p className="text-xs text-text-faint">
-          {omitted} older {omitted === 1 ? "branch" : "branches"} not measured.
+          +{omitted} older, not measured
         </p>
       ) : null}
 
       {recent.data !== undefined && recent.data.length > 0 ? (
         <div className="flex flex-col gap-1">
-          <p className="text-xs uppercase tracking-wide text-text-faint">Latest commits</p>
+          <SectionTitle>Latest commits</SectionTitle>
           {recent.data.map((commit) => (
             <p key={commit.sha} className="flex items-baseline gap-2 text-sm">
               <span className="font-mono text-xs text-text-faint">{commit.short_sha}</span>
@@ -129,7 +163,7 @@ function Line({ row, integration }: { row: BranchRow; integration: string | null
   const tone = STANDING_TONE[standing];
 
   return (
-    <Row layout="line" className="ws-branch-line">
+    <Row layout="line" dense className="ws-branch-line">
       <span
         className="h-1.5 w-1.5 shrink-0 rounded-pill"
         style={{ background: `var(--tone-${tone}-fg)` }}

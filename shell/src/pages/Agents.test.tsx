@@ -497,6 +497,7 @@ describe("Agents - editing a row", () => {
     renderWithQuery(<Agents />);
 
     const editor = await openEditor("copywriter");
+    fireEvent.click(within(editor).getByRole("button", { name: "About saving" }));
     expect(within(editor).getByText(/reaches work that is already queued/i)).toBeDefined();
   });
 
@@ -601,9 +602,10 @@ describe("Agents - an empty catalogue", () => {
     daemon.apiFetch.mockImplementation(agentsFetch([]));
     renderWithQuery(<Agents />);
 
-    expect(await screen.findByRole("heading", { name: "No agent has been hired yet" })).toBeDefined();
+    expect(await screen.findByText("No agent has been hired yet")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Why?" }));
     expect(screen.getByText(/a name, a speciality/i)).toBeDefined();
-    // The call to action sits inside the lesson as well as in the header.
+    // The call to action sits beside the line as well as in the header.
     expect(screen.getAllByRole("button", { name: "New agent" })).toHaveLength(2);
     expect(screen.queryByRole("table")).toBeNull();
   });

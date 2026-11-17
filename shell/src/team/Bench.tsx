@@ -222,7 +222,7 @@ function BenchHead({
         )}
       </div>
       {team.mission.trim() === "" ? (
-        <Quiet says="No description yet. The Charter tab holds the mission." />
+        <Quiet says="No description yet">The Charter tab holds the mission.</Quiet>
       ) : (
         <p className="teams-bench-remit">{team.mission}</p>
       )}

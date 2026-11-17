@@ -287,7 +287,7 @@ describe("Brain", () => {
 
     daemon.apiFetch.mockImplementation(daemonWith());
     await renderWithRouter(<Brain />, { initialPath: "/brain?view=graph&item=knowledge:abc" });
-    expect(await screen.findByText("Select a node to see what it is linked to.")).toBeTruthy();
+    expect(await screen.findByText("Select a node")).toBeTruthy();
   });
 
   it("knowledge failing draws the notes anyway and says what is missing", async () => {

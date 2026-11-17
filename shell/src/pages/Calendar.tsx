@@ -37,6 +37,7 @@ import {
   StaleNote,
   usePaletteGroup,
   type PaletteGroup,
+  Tip,
 } from "../ui";
 import "./calendar.css";
 
@@ -605,10 +606,7 @@ export function HeldNotifications() {
 
   return (
     <Panel title="Held notifications" variant="dim">
-      <p className="calendar-note">
-        If the calendar cannot be read, you count as free, so a notification is never held back by
-        mistake.
-      </p>
+      <Tip name="About the calendar" tip="If the calendar cannot be read, you count as free, so a notification is never held back by mistake." />
       {pending.isError && rows.length === 0 && <NotificationsError error={pending.error} />}
       {pending.data !== undefined && rows.length === 0 && <Quiet says="nothing has been held." />}
       {pending.data === undefined && !pending.isError && <NotificationsSkeleton />}

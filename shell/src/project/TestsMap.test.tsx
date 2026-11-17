@@ -33,9 +33,8 @@ describe("the test map section", () => {
     renderWithQuery(<TestsMap projectId="p1" />);
 
     await screen.findByText(/Proposed map/);
-    expect(document.body.textContent).toContain(
-      "No nucleos.tests.yaml yet. Every change runs the whole gate.",
-    );
+    expect(document.body.textContent).toContain("No nucleos.tests.yaml");
+    expect(document.body.textContent).not.toContain("Every change runs the whole gate.");
     const details = document.querySelector("details");
     expect(details?.open).toBe(true);
     expect(document.querySelector("pre")?.textContent).toContain("core/**");

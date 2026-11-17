@@ -46,6 +46,7 @@ import {
   Skeleton,
   StateBadge,
   toastManager,
+  Tip,
 } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
@@ -180,7 +181,7 @@ function LiveSessions({
       {/* The empty line says where a session comes from, which is the next step; "nothing is open"
           alone read as a list that failed to load. */}
       {view.data !== undefined && rows.length === 0 && (
-        <Quiet says="no windows are open. Open one above, or an agent will when it needs a browser." />
+        <Quiet says="No windows open">Open one above, or an agent will when it needs a browser.</Quiet>
       )}
       {rows.length > 0 && (
         <p className="browser-note">
@@ -379,7 +380,6 @@ function ChainDialogue({
   // that has to be chosen; a box that arrived ticked would make writing something granted by not
   // reading the screen.
   const [writable, setWritable] = useState(false);
-  const consequenceId = useId();
   // The question outranks the list and arrives when the window closes, so a keyboard or
   // screen-reader user who just held "Give the wheel back" is taken to it rather than left behind.
   const dialogueRef = useRef<HTMLDivElement>(null);
@@ -394,10 +394,7 @@ function ChainDialogue({
   return (
     <div ref={dialogueRef} className="browser-chain-dialogue" tabIndex={-1} role="group" aria-label="Keep these?">
     <Panel title="Keep these?">
-      <p className="browser-note">
-        The window closed, and this is where it went. Nothing is granted yet: say yes to the whole
-        set or no to all of it. There is no picking a few origins out of the chain.
-      </p>
+      <Tip name="About this chain" tip="The window closed, and this is where it went. Nothing is granted yet: say yes to the whole set or no to all of it. There is no picking a few origins out of the chain." />
       <ol className="browser-chain" aria-label="Navigation chain">
         {chain.map((url, index) => (
           <li key={index} className="browser-url">
@@ -410,20 +407,25 @@ function ChainDialogue({
           type="checkbox"
           checked={writable}
           disabled={keepChain.isPending}
-          aria-describedby={consequenceId}
           onChange={(event) => setWritable(event.target.checked)}
         />
         <span>Let agents submit forms here, as you</span>
       </label>
-      {/* The consequence sits right under the box that causes it, and says what the answer covers:
-          reading reaches every origin above, identity providers included. */}
-      <p className="browser-note" id={consequenceId}>
-        Agents will read all {chain.length} {origins} above, identity providers included.{" "}
-        {writable
-          ? "They may also submit forms on the site you ended on, never on the identity providers, without asking you again."
-          : "They will not submit any form."}{" "}
-        Every submission is listed under Site grants, by field names and never contents.
-      </p>
+      {/* The consequence sits right next to the box that causes it, behind the tip, and says what
+          the answer covers: reading reaches every origin above, identity providers included. */}
+      <Tip
+        persist
+        name="What agents may do here"
+        tip={
+          <>
+            Agents will read all {chain.length} {origins} above, identity providers included.{" "}
+            {writable
+              ? "They may also submit forms on the site you ended on, never on the identity providers, without asking you again."
+              : "They will not submit any form."}{" "}
+            Every submission is listed under Site grants, by field names and never contents.
+          </>
+        }
+      />
       <div className="browser-actions">
         <ConfirmButton
           label="Keep them"
@@ -499,7 +501,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
   if (projects.data !== undefined && options.length === 0) {
     return (
       <div className="browser-bar-block">
-        <Quiet says="no project is registered yet. A window opens on a project's profile." />
+        <Quiet says="No project registered">A window opens on a project's profile.</Quiet>
         {unavailable && <SidecarTrouble health={health} />}
       </div>
     );
@@ -587,11 +589,24 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
         </Button>
         </span>
       </form>
-      <p id={hintId} className="browser-bar-hint">
+      {/* Available: the usage text stays in the DOM, hidden, as the inputs' description. Unavailable:
+          a short state label, with the consequence on hover. */}
+      <p
+        id={hintId}
+        className="browser-bar-hint"
+        hidden={!unavailable}
+        title={
+          unavailable
+            ? subsystem.status === "disabled"
+              ? "The browser is not configured on this machine, so no window can open."
+              : "The browser is not running, so no window can open until it restarts."
+            : undefined
+        }
+      >
         {unavailable
           ? subsystem.status === "disabled"
-            ? "The browser is not configured on this machine, so no window can open."
-            : "The browser is not running, so no window can open until it restarts."
+            ? "Browser not configured"
+            : "Browser not running"
           : "Open a window: you drive, on the project's profile; the address is optional. Open with agent: the agent drives and you can take over; it needs an address."}
       </p>
       {unavailable && <SidecarTrouble health={health} />}
@@ -679,10 +694,7 @@ function SiteGrants() {
     <Panel title="Site grants" aside={picker}>
       {/* Origins are shown exactly as recorded: a punycode host is never prettified back to the
           glyphs it encodes. */}
-      <p className="browser-note">
-        Sites this project&apos;s profile has logged into. Agents may read them; only the ones
-        marked &ldquo;submits forms&rdquo; may send anything.
-      </p>
+      <Tip name="About these sites" tip="Sites this project&apos;s profile has logged into. Agents may read them; only the ones marked &ldquo;submits forms&rdquo; may send anything." />
 
       {projects.data !== undefined && options.length === 0 && <Quiet says="no project is registered yet." />}
 

@@ -246,7 +246,7 @@ describe("the nodes that do not match", () => {
   it("answers a project with no approved decisions in words, and shows no zeros", () => {
     open({ unclaimed: [], decisions: [] });
 
-    expect(screen.getByText(/No decision has been approved for this project yet/)).toBeTruthy();
+    expect(screen.getByText(/No decision approved yet/)).toBeTruthy();
     expect(screen.getByText(/extract a spec/i)).toBeTruthy();
     expect(screen.queryAllByText("0")).toHaveLength(0);
   });
@@ -374,7 +374,8 @@ describe("the nodes that do not match", () => {
 
     expect(document.body.textContent ?? "").not.toMatch(/stamp|carimb/i);
     // One silent row in the fixture, one button, and it is §14's question.
-    const controls = screen.queryAllByRole("button");
+    // The ⓘ marks are explanations, not controls.
+    const controls = screen.queryAllByRole("button").filter((b) => !b.classList.contains("ui-tip-mark"));
     expect(controls).toHaveLength(1);
     expect(controls[0].textContent ?? "").toMatch(/was this ever named/i);
     // And it hangs off the silent pile, never off the row whose heading carried no number — where
@@ -382,7 +383,11 @@ describe("the nodes that do not match", () => {
     const unnumbered = screen.getByRole("list", {
       name: /decisions whose heading carried no number/i,
     });
-    expect(within(unnumbered).queryAllByRole("button")).toHaveLength(0);
+    expect(
+      within(unnumbered)
+        .queryAllByRole("button")
+        .filter((b) => !b.classList.contains("ui-tip-mark")),
+    ).toHaveLength(0);
   });
 
   /**

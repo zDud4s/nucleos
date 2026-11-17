@@ -64,7 +64,6 @@ import {
   StaleNote,
   Select,
   StateBadge,
-  Teach,
   feedGravityOf,
   feedGravityTone,
   type FeedGravity,
@@ -833,7 +832,7 @@ function SearchResults({
       )}
       {rows === undefined && !query.isError && <Skeleton label="Searching the feed…" lines={3} />}
       {rows !== undefined && rows.length === 0 && (
-        <Quiet says={`Nothing matches this search. The ${DAEMON_NAME} has lines, but none of them match. Clear a filter to widen it.`} />
+        <Quiet says="Nothing matches this search" />
       )}
       {rows !== undefined && rows.length > 0 && (
         <>
@@ -902,8 +901,8 @@ function LiveView(props: LiveViewProps) {
 
   if (empty && !ownerFiltered && history.data !== undefined && history.data.length === 0) {
     return (
-      <Teach
-        title="Nothing has happened yet"
+      <Quiet
+        says="Nothing has happened yet"
         action={
           <span className="feed-teach-actions">
             <Link to="/runs" className="feed-link">
@@ -920,7 +919,7 @@ function LiveView(props: LiveViewProps) {
           worktree released, an urgent e-mail. A feed line <em>is</em> the notification (nothing pops
           up anywhere else), and this page replays them on the time they happened.
         </p>
-      </Teach>
+      </Quiet>
     );
   }
 

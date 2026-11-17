@@ -31,7 +31,11 @@ export function ExclusionsPanel() {
       {rules.isError && rules.data === undefined && (
         <ErrorNote>Could not reach the {DAEMON_NAME}: nothing is known about the exclusions.</ErrorNote>
       )}
-      {rules.data !== undefined && active.length === 0 && <Quiet says="No two jobs are kept apart." />}
+      {rules.data !== undefined && active.length === 0 && (
+        <div title="No two jobs are kept apart. A rule needs two live jobs in one project.">
+          <Quiet says="None" />
+        </div>
+      )}
       {active.length > 0 && (
         <ul className="ap-list" aria-label="Exclusions in force">
           {active.map((rule) => (
@@ -95,7 +99,7 @@ function KeepApart({ jobs, rules }: { jobs: Job[]; rules: FleetExclusion[] }) {
   const second = partners.find((job) => job.id === chosenSecond) ?? partners[0];
 
   if (first === undefined || second === undefined) {
-    return <p className="ap-meta">Asking needs two live jobs in the same project that are not already kept apart.</p>;
+    return null;
   }
   return (
     <form
@@ -128,7 +132,7 @@ function KeepApart({ jobs, rules }: { jobs: Job[]; rules: FleetExclusion[] }) {
       </Button>
       {propose.isSuccess && (
         <p className="ap-meta">
-          Asked. Nothing changes until it is answered in{" "}
+          Asked. Answer it in{" "}
           <Link className="ap-link" to="/waiting">
             Waiting
           </Link>

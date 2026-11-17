@@ -22,7 +22,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Button, ConfirmButton, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote, Select } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote, Select, Tip } from "../ui";
 import { detectDrift, snapshotFromView, type Drift, type DriftField } from "./drift";
 import { daemonProse } from "./prose";
 
@@ -535,7 +535,7 @@ function TeamForm({
         <fieldset className="teams-members">
           <legend className="teams-label">Members</legend>
           {members.length === 0 ? (
-            <p className="teams-note">No specialists exist yet. Hire one on the Agents page first.</p>
+            <Quiet says="No specialists">Hire one on the Agents page first.</Quiet>
           ) : (
             <ul className="teams-check-list">
               {members.map((agent) => {
@@ -890,9 +890,11 @@ function StepperRow({
         <label className="teams-limit-label" htmlFor={inputId}>
           {label}
         </label>
-        <span className="teams-limit-explain" id={explainId}>
+        {/* Hidden, not removed: the input is described by it. Sighted users get it as a tip. */}
+        <span className="teams-limit-explain" id={explainId} hidden>
           {explain} {rangeShort(spec)}.
         </span>
+        <Tip name={`About ${label}`} tip={`${explain} ${rangeShort(spec)}.`} />
         {problem !== null && (
           <span className="teams-limit-error" id={problemId}>
             {problem}
@@ -982,9 +984,10 @@ function CeilingRow({ value, onChange }: { value: string; onChange: (value: stri
         <label className="teams-limit-label" htmlFor={inputId}>
           Spending ceiling per task
         </label>
-        <span className="teams-limit-explain" id={explainId}>
+        <span className="teams-limit-explain" id={explainId} hidden>
           What one task may spend, in US dollars, before it stops.
         </span>
+        <Tip name="About the spending ceiling" tip="What one task may spend, in US dollars, before it stops." />
         {problem !== null && (
           <span className="teams-limit-error" id={problemId}>
             {problem}

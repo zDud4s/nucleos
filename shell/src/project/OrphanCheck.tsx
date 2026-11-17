@@ -5,7 +5,7 @@ import type { Anchored, Loss, Orphan } from "../data/project-map";
 import { useOrphanCheck, useRecordAnchor } from "../data/project-map";
 import { UI_LOCALE } from "../lib/locale";
 import { pluralWord } from "../lib/plural";
-import { Button, ErrorNote } from "../ui";
+import { Button, ErrorNote, Tip } from "../ui";
 
 /**
  * §14's guard, on one row of *declared, with no code*.
@@ -113,17 +113,16 @@ function Answer({ answer }: { answer: Orphan }) {
     case "never_named":
       return (
         <p className="max-w-prose text-xs text-text-muted">
-          Nothing in this repository's history ever named this section. It has no code, and that
-          is the whole of it: the comment was not deleted, it was never written.
+          Nothing in this repository's history ever named this section: the comment was never
+          written.
         </p>
       );
 
     case "still_named":
       return (
         <p className="max-w-prose text-xs text-text-muted">
-          Something names it right now: {answer.paths.join(" · ")}, so this line is not what it
-          looks like. Worth saying out loud rather than hiding the row: the panel and the history
-          disagree, and one of them is stale.
+          Something names it right now: {answer.paths.join(" · ")}. The panel and the history
+          disagree.
         </p>
       );
 
@@ -135,36 +134,33 @@ function Answer({ answer }: { answer: Orphan }) {
               <Went key={`${loss.path}@${loss.commit}`} loss={loss} />
             ))}
           </ul>
-          <p className="max-w-prose text-xs text-text-faint">
-            That is a fact about git and not a verdict: it says the text left the file, not whether
-            the decision was ever implemented. Reading the commit is the only way to tell whether
-            the comment went on purpose.
-          </p>
+          <Tip
+            name="About this finding"
+            persist
+            tip="That is a fact about git and not a verdict: it says the text left the file, not whether the decision was ever implemented. Reading the commit is the only way to tell whether the comment went on purpose."
+          />
         </div>
       );
 
     case "not_in_window":
       return (
         <p className="max-w-prose text-xs text-text-muted">
-          Nothing in the last {answer.window} commits named it. There is older history this did not
-          read, so this is <em>not found</em> and not <em>never named</em>: the two are different
-          facts and only one of them is a claim about your code.
+          Nothing in the last {answer.window} commits named it. Older history was not read, so this
+          is <em>not found</em>, not <em>never named</em>.
         </p>
       );
 
     case "unreadable":
       return (
         <p className="max-w-prose text-xs text-text-muted">
-          Git is there and would not answer, so nothing was read. Worth trying again; nothing here
-          says anything about the decision either way.
+          Git would not answer, so nothing was read. Worth trying again.
         </p>
       );
 
     case "no_repository":
       return (
         <p className="max-w-prose text-xs text-text-muted">
-          This project has no repository, so there is no history to ask. Nothing to retry, and
-          nothing here is a finding about the decision.
+          This project has no repository, so there is no history to ask.
         </p>
       );
   }
@@ -202,7 +198,7 @@ function Remember({
     return (
       <p className="max-w-prose text-xs text-text-muted">
         Written down. {paths.join(" · ")} {pluralWord(paths.length, "is", "are")} this decision’s code
-        now, and deleting the comment again will not take that away. It will say so instead.
+        now.
       </p>
     );
   }
@@ -251,8 +247,7 @@ function Went({ loss }: { loss: Loss }) {
       {loss.declared ? null : (
         <>
 :
-          the citation named a section and no document, so which spec it meant is a guess, the
-          same guess the rest of this panel makes about the present.
+          the citation named no document, so which spec it meant is a guess.
         </>
       )}
     </li>
