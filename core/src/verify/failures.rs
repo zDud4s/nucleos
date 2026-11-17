@@ -12,6 +12,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::knowledge::strip_ansi;
+
 /// What `gate::TailBuffer::render` prepends when the output exceeded the cap.
 pub const TRUNCATION_MARK: &str = "…[output truncated; showing tail]";
 
@@ -72,25 +74,6 @@ pub fn extract(output: &str) -> Option<Failures> {
         }
     }
     (!found.tests.is_empty()).then_some(found)
-}
-
-/// Drops ANSI CSI escape sequences (`ESC [ ... <final byte>`), e.g. colour codes.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if ('\u{40}'..='\u{7e}').contains(&next) {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// libtest: `test <path> ... FAILED` lines, confirmed by the sum of `N failed` over the

@@ -13,6 +13,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::accounts::pool::PoolState;
 use crate::conductor::continuation::with_handoff;
 use crate::conductor::sweep::CONTINUATION_STOPPED;
 use crate::execution::runs::finalize_termination;
@@ -278,7 +279,17 @@ async fn wrap_node(
             relaunch_or_stop(state, &job.id, node_id, &run_id, &WATCHDOG, None).await
         }
         (false, None) => {
-            // The weekly quota (spec B10) comes first: it also reads as a 429, but it lifts at the
+            // A death on the ACCOUNT's limit (usage limit or 429) is judged before anything else:
+            // the account is marked out and another is tried at once; only when none has room does
+            // the node wait, until the earliest reset. It spends no allowance, like the quota.
+            match account_limit::judge(pool, &PoolState::global(), node_id, &run_id).await? {
+                account_limit::Verdict::Relaunch => {
+                    return relaunch_or_stop(state, &job.id, node_id, &run_id, &QUOTA, None).await;
+                }
+                account_limit::Verdict::Wait { .. } => return Ok(false),
+                account_limit::Verdict::NotAccountLimit => {}
+            }
+            // The weekly quota (spec B10) comes next: it also reads as a 429, but it lifts at the
             // reset it names, not after a backoff, and it spends no allowance.
             if let Some(resume) = quota_resume_at(pool, &run_id).await? {
                 if Utc::now() < resume {
@@ -631,7 +642,10 @@ async fn relaunch_or_stop(
     Ok(true)
 }
 
-// `mod.rs` is a shared file this node does not own, so the new test file is wired in from here.
+// `mod.rs` is a shared file this node does not own, so the new modules are wired in from here.
+#[path = "account_limit.rs"]
+mod account_limit;
+
 #[cfg(test)]
 #[path = "wrap_auto_tests.rs"]
 mod wrap_auto_tests;

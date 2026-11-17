@@ -56,7 +56,7 @@ Filled packets flow via stdin/temp files (see `dispatch.md`); never Edit/Write `
 | `pipelines/` | Saved agent-pipeline YAML definitions, structure-only DAGs, authored by `orchestrate-agents`. | A definition, not a run: it holds no outputs. |
 | `agent-runs/` | Filled run records persisted by `run-pipeline`. | The result of one run; `pipelines/` is what it ran. |
 
-Metrics, rework, intent and event rows are not files you write: the controller records them with the MCP tool `mcp__nucleos__record` (`{kind: metric|rework|intent|event, task_id, phase?, caught_by?, payload}`), and the daemon owns the ledgers.
+Metrics, rework, intent and event rows are not files you write: the controller records them with the MCP tool `mcp__nucleos__record` (`{kind: metric|rework|intent|event, task_id, phase?, caught_by?, payload}`), and the daemon owns the ledgers. A `rework` record should carry `payload.root_cause` (why the work had to be redone), `fix` (what corrected it) and `lesson` (what to do next time): the daemon turns them into a memory lesson without a model.
 
 ## Rules
 

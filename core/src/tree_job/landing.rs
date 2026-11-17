@@ -766,7 +766,17 @@ pub async fn settle_merge(
             held.extra.insert("merged_at".to_owned(), json!(now_iso()));
             held.extra.remove("merge_request_id");
             held.extra.remove("merge_failure");
+            let recovered_node = held.node_id.clone();
+            let recovered_worktree = held.worktree.clone();
             persist(pool, job).await?;
+            // A branch that failed a verification and then passed one is a lesson; fail open.
+            if let (Some(node_id), Some(worktree)) = (recovered_node, recovered_worktree)
+                && let Err(error) =
+                    crate::distill::enqueue_branch_recovered_in(pool, &job.id, &node_id, &worktree)
+                        .await
+            {
+                tracing::warn!(tree_id = %job.id, %error, "distill: could not queue a recovered branch");
+            }
             Ok(MergeSettlement::Merged { sha })
         }
         RequestEnd::Failed { reason, .. } => {
@@ -2006,6 +2016,133 @@ mod tests {
             1,
             "the replay enqueued nothing"
         );
+    }
+
+    /// Seeds one `verify_runs` row of `worktree` in `status`, started at `started`.
+    async fn seed_verify_run(pool: &SqlitePool, worktree: &str, status: &str, started: &str) {
+        sqlx::query(
+            "INSERT INTO verify_runs (project_id, worktree, scope, origin, requested_by, argv,
+                                      status, duration_ms, started_at, finished_at)
+             VALUES ('alpha', ?, 'full', 'gate', 'gate', '[]', ?, 10, ?, ?)",
+        )
+        .bind(worktree)
+        .bind(status)
+        .bind(started)
+        .bind(started)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// `(cause, tree_id, node_id, request_id, decision_id)` of a `distill_queue` row.
+    type QueuedRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+
+    /// The distillation queue.
+    async fn queued_for_distillation(pool: &SqlitePool) -> Vec<QueuedRow> {
+        sqlx::query_as(
+            "SELECT cause, tree_id, node_id, request_id, decision_id FROM distill_queue ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Merges the branch `api` (checked out in its own worktree, behind the node `node-api`)
+    /// through the queue, and returns the settlement.
+    async fn merge_api_through_the_queue(
+        h: &Harness,
+        container: &tempfile::TempDir,
+        repo: &Path,
+        verify_runs: &[(&str, &str)],
+    ) -> MergeSettlement {
+        let worktree = container.path().join("api-tree");
+        assert!(git_in(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "tree/api"
+            ]
+        ));
+        let worktree = worktree.to_string_lossy().into_owned();
+        for (status, started) in verify_runs {
+            seed_verify_run(&h.pool, &worktree, status, started).await;
+        }
+        let mut branch = branch_at("api", "green");
+        branch.worktree = Some(worktree);
+        branch.node_id = Some("node-api".to_owned());
+        let mut job = saved_job(&h.pool, manifest_for_repo(repo, vec![branch])).await;
+
+        submit_merge(&h.pool, &h.resolved, &mut job, "api", Origin::Daemon)
+            .await
+            .unwrap();
+        drain(&h.pool).await;
+        settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT, true)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn settle_merge_after_a_failed_gate_queues_branch_recovered() {
+        let _lock = test_env_lock();
+        let (container, repo) = repo_with_a_tree_branch("nucleos-landing-recovered-");
+        let h = harness(&repo).await;
+
+        let settled = merge_api_through_the_queue(
+            &h,
+            &container,
+            &repo,
+            &[
+                ("failed", "2026-10-30T10:01:00+00:00"),
+                ("passed", "2026-10-30T10:02:00+00:00"),
+            ],
+        )
+        .await;
+
+        assert!(
+            matches!(settled, MergeSettlement::Merged { .. }),
+            "{settled:?}"
+        );
+        assert_eq!(
+            queued_for_distillation(&h.pool).await,
+            vec![(
+                "branch_recovered".to_owned(),
+                Some("job-1".to_owned()),
+                Some("node-api".to_owned()),
+                None,
+                None,
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_merge_of_a_clean_branch_queues_nothing() {
+        let _lock = test_env_lock();
+        let (container, repo) = repo_with_a_tree_branch("nucleos-landing-clean-");
+        let h = harness(&repo).await;
+
+        let settled = merge_api_through_the_queue(
+            &h,
+            &container,
+            &repo,
+            &[("passed", "2026-10-30T10:02:00+00:00")],
+        )
+        .await;
+
+        assert!(
+            matches!(settled, MergeSettlement::Merged { .. }),
+            "{settled:?}"
+        );
+        let rows = queued_for_distillation(&h.pool).await;
+        assert!(rows.is_empty(), "a clean merge teaches nothing: {rows:?}");
     }
 
     /// The pattern of `merge_item`: an implement node leaves its tree uncommitted, and a merge of

@@ -557,6 +557,11 @@ pub async fn answer_widening(
         write_manifest(&mut tx, tree_id, manifest, &at).await?;
     }
     tx.commit().await?;
+    if decision.tree_id.is_some()
+        && let Err(error) = crate::distill::enqueue_tree_parked_in(pool, decision_id).await
+    {
+        tracing::warn!(decision_id, %error, "distill: could not queue a parked tree decision");
+    }
     // The branch this answer resumes is ready to move: wake the driver instead of leaving it to the
     // next tick.
     crate::conductor::sweep::wake();
@@ -639,6 +644,9 @@ pub async fn answer_dropping(
     tx.commit().await?;
     // An earlier park of the same node may still be open: a dropped branch leaves none.
     super::obsolete::close_node_decisions_logged(pool, &tree_id, &node_id, "branch dropped").await;
+    if let Err(error) = crate::distill::enqueue_tree_parked_in(pool, decision_id).await {
+        tracing::warn!(decision_id, %error, "distill: could not queue a parked tree decision");
+    }
     crate::conductor::sweep::wake();
 
     decision.answer = Some(text.to_owned());
@@ -1185,6 +1193,83 @@ mod tests {
         assert!(
             matches!(again, Err(DecisionError::NotFound(_))),
             "{again:?}"
+        );
+    }
+
+    /// Gives the seeded tree a project, so the distillation hooks can scope what they queue.
+    async fn give_the_tree_a_project(pool: &SqlitePool) {
+        sqlx::query("UPDATE tree_jobs SET project_id = 'alpha' WHERE id = ?")
+            .bind(TREE)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// `(cause, tree_id, node_id, request_id, decision_id)` of a `distill_queue` row.
+    type QueuedRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+
+    /// The distillation queue.
+    async fn queued(pool: &SqlitePool) -> Vec<QueuedRow> {
+        sqlx::query_as(
+            "SELECT cause, tree_id, node_id, request_id, decision_id FROM distill_queue ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn answering_a_tree_decision_queues_tree_parked_with_its_decision_id() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        give_the_tree_a_project(&pool).await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+        assert!(
+            queued(&pool).await.is_empty(),
+            "parking alone queues nothing"
+        );
+
+        answer(&pool, &parked.id, ANSWER, CHANNEL).await.unwrap();
+
+        assert_eq!(
+            queued(&pool).await,
+            vec![(
+                "tree_parked".to_owned(),
+                Some(TREE.to_owned()),
+                Some(NODE.to_owned()),
+                None,
+                Some(parked.id.clone()),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_dropping_a_branch_queues_tree_parked() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+        give_the_tree_a_project(&pool).await;
+        let parked = park(&pool, TREE, NODE, QUESTION).await.unwrap();
+
+        answer_dropping(&pool, &parked.id, "drop it", ORIGIN_CONDUCTOR)
+            .await
+            .unwrap();
+
+        assert_eq!(branch_of(&pool, BRANCH).await.state, "dropped");
+        assert_eq!(
+            queued(&pool).await,
+            vec![(
+                "tree_parked".to_owned(),
+                Some(TREE.to_owned()),
+                Some(NODE.to_owned()),
+                None,
+                Some(parked.id.clone()),
+            )]
         );
     }
 
