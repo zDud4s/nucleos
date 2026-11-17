@@ -692,7 +692,7 @@ pub async fn promote_layer_in(
 /// Move an active, already confirmed (`trial = 0`) row to another layer, with an event. Unlike
 /// `promote_layer_in` it never puts the row back on trial. `false` when the row is not an active
 /// confirmed row or is already in that layer. Nothing is committed here.
-pub(super) async fn promote_confirmed_layer_in(
+pub async fn promote_confirmed_layer_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: i64,
     to: Layer,
@@ -751,9 +751,9 @@ pub(super) async fn reconfirm_row_in(
     let mut merged = elements(stored.as_deref());
     for element in elements(Some(evidence)) {
         let key = |value: &serde_json::Value| (value.get("t").cloned(), value.get("id").cloned());
-        if !merged.iter().any(|kept| key(kept) == key(&element)) {
-            merged.push(element);
-        }
+        // A re-seen item moves to the end (newest) so the cap never drains it.
+        merged.retain(|kept| key(kept) != key(&element));
+        merged.push(element);
     }
     cap_evidence(&mut merged);
     let merged = tagged_evidence(&serde_json::Value::Array(merged));
@@ -957,6 +957,41 @@ mod rework_core_tests {
         assert!(kept.len() <= EVIDENCE_CAP, "bounded: {}", kept.len());
         assert!(kept.iter().any(|e| e["id"] == 60), "the newest is kept");
         assert!(!kept.iter().any(|e| e["id"] == 1), "the oldest is dropped");
+    }
+
+    /// Reconfirming with the oldest stored item plus a new one keeps the re-seen item.
+    #[tokio::test]
+    async fn reconfirm_row_in_moves_a_reseen_item_to_the_end_so_the_cap_keeps_it() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = trial_row(&pool, "A re-seen lesson").await;
+        let full: Vec<serde_json::Value> = (1..=EVIDENCE_CAP as i64)
+            .map(|n| serde_json::json!({"t": "record", "id": n}))
+            .collect();
+        let stored = serde_json::Value::Array(full).to_string();
+        let incoming =
+            serde_json::json!([{"t": "record", "id": 1}, {"t": "record", "id": 999}]).to_string();
+        let mut tx = pool.begin().await.unwrap();
+        reconfirm_row_in(&mut tx, id, "episodic", "active", Some(stored), &incoming)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT evidence FROM knowledge WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let kept: Vec<serde_json::Value> = serde_json::from_str(&after.unwrap()).unwrap();
+        assert_eq!(kept.len(), EVIDENCE_CAP);
+        assert!(
+            kept.iter().any(|e| e["id"] == 1),
+            "the re-seen item survives"
+        );
+        assert!(kept.iter().any(|e| e["id"] == 999));
+        assert!(
+            !kept.iter().any(|e| e["id"] == 2),
+            "the oldest unseen item is dropped"
+        );
     }
 
     async fn promote(pool: &sqlx::SqlitePool, id: i64) -> bool {

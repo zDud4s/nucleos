@@ -268,12 +268,19 @@ async fn reinforce_gate_signatures(
                 .fetch_optional(&mut *transaction)
                 .await?;
                 if promotable.is_some() {
-                    crate::knowledge::promote_layer_in(
+                    // A trial row goes on trial in the new layer; a confirmed one just moves.
+                    let _ = crate::knowledge::promote_layer_in(
                         &mut transaction,
                         id,
                         crate::knowledge::Layer::Procedural,
                     )
-                    .await?;
+                    .await?
+                        || crate::knowledge::promote_confirmed_layer_in(
+                            &mut transaction,
+                            id,
+                            crate::knowledge::Layer::Procedural,
+                        )
+                        .await?;
                 }
             }
         }
@@ -1373,6 +1380,45 @@ Finished in 3.2s\n";
         assert_eq!(knowledge_count(&pool).await, 1);
     }
 
+    #[tokio::test]
+    async fn a_gate_signature_recurrence_promotes_a_confirmed_lesson_without_touching_its_trial() {
+        let pool = test_pool().await;
+        let lesson = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:confirmed lesson",
+            "active",
+            Some(1),
+        )
+        .await;
+        sqlx::query("UPDATE knowledge SET trial = 0, trial_started_at = NULL WHERE id = ?")
+            .bind(lesson)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_gate_signature(&pool, lesson, &raw_fingerprint(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+
+        run_pass(&pool, at(1)).await.unwrap();
+
+        let row = known(&pool, lesson).await;
+        assert_eq!(row["layer"], "procedural");
+        assert_eq!(row["status"], "active");
+        let (trial, started): (i64, Option<String>) =
+            sqlx::query_as("SELECT trial, trial_started_at FROM knowledge WHERE id = ?")
+                .bind(lesson)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(trial, 0);
+        assert!(started.is_none());
+    }
+
     /// Finding m1 end to end: a lesson written by the rework capture (no hand-planted key) is
     /// reinforced by a repeated gate failure.
     #[tokio::test]
@@ -1414,13 +1460,28 @@ Finished in 3.2s\n";
         .await
         .unwrap();
         let crate::knowledge::Captured::Written(lesson) =
-            crate::knowledge::capture_rework(&pool, record).await.unwrap()
+            crate::knowledge::capture_rework(&pool, record)
+                .await
+                .unwrap()
         else {
             panic!("a rework with a cause and a fix is written");
         };
-        let first_run =
-            seed_run(&pool, PROJECT, "completed", Some("failed"), Some(CARGO_FAILURE_GATE)).await;
-        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(CARGO_FAILURE_GATE)).await;
+        let first_run = seed_run(
+            &pool,
+            PROJECT,
+            "completed",
+            Some("failed"),
+            Some(CARGO_FAILURE_GATE),
+        )
+        .await;
+        seed_run(
+            &pool,
+            PROJECT,
+            "completed",
+            Some("failed"),
+            Some(CARGO_FAILURE_GATE),
+        )
+        .await;
 
         let report = run_pass(&pool, at(1)).await.unwrap();
 

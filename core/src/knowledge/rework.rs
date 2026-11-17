@@ -219,10 +219,18 @@ async fn gate_signature_for_record(
     let tail: sqlx::Result<Option<Option<String>>> = sqlx::query_scalar(
         "SELECT output_tail FROM verify_runs
           WHERE project_id = ? AND worktree IS ? AND status <> 'passed' AND started_at <= ?
+            AND NOT EXISTS (
+                SELECT 1 FROM verify_runs later
+                 WHERE later.project_id = verify_runs.project_id
+                   AND later.worktree IS verify_runs.worktree
+                   AND later.status = 'passed'
+                   AND later.started_at > verify_runs.started_at
+                   AND later.started_at <= ?)
           ORDER BY started_at DESC, id DESC LIMIT 1",
     )
     .bind(&record.project_id)
     .bind(record.worktree.as_deref())
+    .bind(&record.created_at)
     .bind(&record.created_at)
     .fetch_optional(&mut **tx)
     .await;
@@ -871,8 +879,15 @@ mod tests {
         let mut last = 0;
         let mut id = 0;
         for n in 0..60 {
-            let record =
-                seed_rework(&pool, PROJECT, &format!("t{n}"), "a hot cause", "a fix", &[]).await;
+            let record = seed_rework(
+                &pool,
+                PROJECT,
+                &format!("t{n}"),
+                "a hot cause",
+                "a fix",
+                &[],
+            )
+            .await;
             if n == 0 {
                 first = record;
             }
@@ -885,7 +900,11 @@ mod tests {
         let (_, _, _, _, _, _, _, observations, _, evidence) = row(&pool, id).await;
         assert_eq!(observations, Some(60), "every recurrence counts");
         let evidence: Vec<Value> = serde_json::from_str(&evidence.unwrap()).unwrap();
-        assert!(evidence.len() <= cap, "bounded at {cap}: {}", evidence.len());
+        assert!(
+            evidence.len() <= cap,
+            "bounded at {cap}: {}",
+            evidence.len()
+        );
         assert!(
             evidence.iter().any(|e| e["id"] == json!(last)),
             "the newest evidence is kept"
@@ -1227,7 +1246,8 @@ error: could not compile `nucleos-core` (lib) due to 1 previous error\n";
     #[tokio::test]
     async fn rework_capture_stores_the_gate_signature_of_the_last_failed_verify_run() {
         let pool = pool().await;
-        // An older failure with another signature, then the latest failure, then a pass.
+        // An older failure with another signature, then the latest failure; the pass comes only
+        // after the record, so the failure was still current when the rework was written.
         seed_verify_run(
             &pool,
             PROJECT,
@@ -1252,7 +1272,7 @@ error: could not compile `nucleos-core` (lib) due to 1 previous error\n";
             WORKTREE,
             "passed",
             "all green",
-            "2026-01-03T00:00:00+00:00",
+            "2099-01-03T00:00:00+00:00",
         )
         .await;
         let record = seed_rework_in_worktree(&pool, "the import was missing").await;
@@ -1261,7 +1281,9 @@ error: could not compile `nucleos-core` (lib) due to 1 previous error\n";
             panic!("a rework with a cause and a fix is written");
         };
 
-        let expected = crate::knowledge::failure_signature(CARGO_FAILURE).unwrap().fingerprint;
+        let expected = crate::knowledge::failure_signature(CARGO_FAILURE)
+            .unwrap()
+            .fingerprint;
         assert_eq!(gate_signature_of(&pool, id).await, Some(expected));
         let (_, _, _, _, _, _, _, _, key, _) = row(&pool, id).await;
         assert_eq!(
@@ -1303,6 +1325,36 @@ error: could not compile `nucleos-core` (lib) due to 1 previous error\n";
         )
         .await;
         let record = seed_rework_in_worktree(&pool, "a cause with no gate behind it").await;
+
+        let Captured::Written(id) = capture_rework(&pool, record).await.unwrap() else {
+            panic!("a rework with a cause and a fix is written");
+        };
+
+        assert_eq!(gate_signature_of(&pool, id).await, None);
+    }
+
+    #[tokio::test]
+    async fn rework_capture_ignores_a_failure_that_a_later_pass_had_already_cleared() {
+        let pool = pool().await;
+        seed_verify_run(
+            &pool,
+            PROJECT,
+            WORKTREE,
+            "failed",
+            CARGO_FAILURE,
+            "2026-01-01T00:00:00+00:00",
+        )
+        .await;
+        seed_verify_run(
+            &pool,
+            PROJECT,
+            WORKTREE,
+            "passed",
+            "all green",
+            "2026-01-02T00:00:00+00:00",
+        )
+        .await;
+        let record = seed_rework_in_worktree(&pool, "fixed before the rework was recorded").await;
 
         let Captured::Written(id) = capture_rework(&pool, record).await.unwrap() else {
             panic!("a rework with a cause and a fix is written");
