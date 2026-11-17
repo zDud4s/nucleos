@@ -2,11 +2,15 @@ import {
   useCallback,
   useEffect,
   useId,
+  useRef,
   useState,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
 import { Kbd } from "./Kbd";
+
+/** How long the pointer must rest on a trigger before a hover tip opens. */
+const HOVER_OPEN_DELAY_MS = 700;
 
 /** What a render-prop trigger is handed, so it can wire its own control to the tip. */
 export interface TipState {
@@ -59,7 +63,17 @@ export function Tip({ tip, children, name, shortcut, persist, className }: TipPr
   const [pinned, setPinned] = useState(false);
   const open = hover || focus || pinned;
 
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pressed = useRef(false);
+  const clearHoverTimer = () => {
+    if (hoverTimer.current !== null) clearTimeout(hoverTimer.current);
+    hoverTimer.current = null;
+  };
+  useEffect(() => clearHoverTimer, []);
+
   const close = useCallback(() => {
+    if (hoverTimer.current !== null) clearTimeout(hoverTimer.current);
+    hoverTimer.current = null;
     setHover(false);
     setFocus(false);
     setPinned(false);
@@ -131,11 +145,38 @@ export function Tip({ tip, children, name, shortcut, persist, className }: TipPr
     <span
       className={className === undefined ? "ui-tip" : `ui-tip ${className}`}
       ref={setRoot}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onFocus={() => setFocus(true)}
-      onBlur={() => setFocus(false)}
-      onKeyDown={onKeyDown}
+      onMouseEnter={() => {
+        clearHoverTimer();
+        hoverTimer.current = setTimeout(() => {
+          hoverTimer.current = null;
+          setHover(true);
+        }, HOVER_OPEN_DELAY_MS);
+      }}
+      onMouseLeave={() => {
+        // Leaving cancels a pending open and closes an open one at once, with no linger.
+        clearHoverTimer();
+        setHover(false);
+      }}
+      onPointerDown={(event) => {
+        // A mouse press focuses the trigger; that focus must not keep the tip up after the
+        // pointer leaves. Keyboard focus (no press first) still opens it.
+        if (event.pointerType !== "touch") pressed.current = true;
+      }}
+      onFocus={() => {
+        if (pressed.current) {
+          pressed.current = false;
+          return;
+        }
+        setFocus(true);
+      }}
+      onBlur={() => {
+        pressed.current = false;
+        setFocus(false);
+      }}
+      onKeyDown={(event) => {
+        pressed.current = false;
+        onKeyDown(event);
+      }}
     >
       {trigger}
       <span className="ui-tip-pop" id={tipId} role="tooltip" hidden={!open}>

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { Tip } from "./Tip";
 
 describe("Tip", () => {
@@ -9,13 +9,38 @@ describe("Tip", () => {
     expect(screen.getByText("the line")).toBeTruthy();
   });
 
-  it("opens on hover and closes when the pointer leaves", () => {
-    const { container } = render(<Tip tip="the reason">the line</Tip>);
-    const root = container.querySelector(".ui-tip") as HTMLElement;
-    fireEvent.mouseEnter(root);
-    expect(screen.getByText("the reason")).toBeTruthy();
-    fireEvent.mouseLeave(root);
-    expect(screen.queryByText("the reason")).toBeNull();
+  it("opens on hover after a delay and closes at once when the pointer leaves", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<Tip tip="the reason">the line</Tip>);
+      const root = container.querySelector(".ui-tip") as HTMLElement;
+      fireEvent.mouseEnter(root);
+      expect(screen.queryByText("the reason")).toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(700);
+      });
+      expect(screen.getByText("the reason")).toBeTruthy();
+      fireEvent.mouseLeave(root);
+      expect(screen.queryByText("the reason")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not open when the pointer leaves before the delay", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<Tip tip="the reason">the line</Tip>);
+      const root = container.querySelector(".ui-tip") as HTMLElement;
+      fireEvent.mouseEnter(root);
+      fireEvent.mouseLeave(root);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(screen.queryByText("the reason")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("opens on keyboard focus without moving it", () => {
@@ -61,8 +86,17 @@ describe("Tip", () => {
 
   it("closes on Escape even when only the pointer opened it", () => {
     const { container } = render(<Tip tip="the reason">the line</Tip>);
-    fireEvent.mouseEnter(container.querySelector(".ui-tip") as HTMLElement);
-    fireEvent.keyDown(document, { key: "Escape" });
+    vi.useFakeTimers();
+    try {
+      fireEvent.mouseEnter(container.querySelector(".ui-tip") as HTMLElement);
+      act(() => {
+        vi.advanceTimersByTime(700);
+      });
+      expect(screen.getByText("the reason")).toBeTruthy();
+      fireEvent.keyDown(document, { key: "Escape" });
+    } finally {
+      vi.useRealTimers();
+    }
     expect(screen.queryByText("the reason")).toBeNull();
   });
 

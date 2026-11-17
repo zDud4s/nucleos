@@ -255,10 +255,15 @@ function rowOf(roster: readonly ProjectSummary[], id: string): ProjectSummary {
   return found;
 }
 
-/** The roster list's options, in the order they are drawn. */
+/** The fan's cards (the listbox's options), in the order they are drawn. Far cards are visibility:hidden. */
 function options(): HTMLElement[] {
   const roster = screen.getByRole("listbox", { name: "All projects by urgency" });
-  return within(roster).getAllByRole("option");
+  return within(roster).getAllByRole("option", { hidden: true });
+}
+
+/** The fan stage itself: the one tab stop, which the keys are pressed on. */
+function stage(): HTMLElement {
+  return screen.getByRole("listbox", { name: "All projects by urgency" });
 }
 
 /**
@@ -319,11 +324,9 @@ function press(key: string): void {
 async function landsOn(index: number): Promise<void> {
   await waitFor(() => {
     const all = options();
-    expect(document.activeElement).toBe(all[index]);
+    expect(document.activeElement).toBe(stage());
+    expect(stage().getAttribute("aria-activedescendant")).toBe(all[index].id);
     expect(all[index].getAttribute("aria-selected")).toBe("true");
-    expect(all.map((option) => option.getAttribute("tabindex"))).toEqual(
-      all.map((_, at) => (at === index ? "0" : "-1")),
-    );
   });
 }
 
@@ -342,8 +345,8 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     await renderCockpit();
 
     const roster = await screen.findByRole("listbox", { name: "All projects by urgency" });
-    expect(within(roster).getAllByRole("option")).toHaveLength(4);
-    expect(options().map((option) => option.getAttribute("tabindex"))).toEqual(["0", "-1", "-1", "-1"]);
+    expect(within(roster).getAllByRole("option", { hidden: true })).toHaveLength(4);
+    expect(roster.getAttribute("tabindex")).toBe("0");
     expect(selectedOption()).toBe(options()[0]);
 
     // The list controls the one panel, and the panel is named for the selected project.
@@ -351,7 +354,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     expect(roster.getAttribute("aria-controls")).toBe(panel().id);
     expect(panel().getAttribute("aria-label")).toBe("Setting for bravo");
 
-    options()[0].focus();
+    stage().focus();
     press("ArrowDown");
     await landsOn(1);
     expect(panel().getAttribute("aria-label")).toBe("Setting for alpha");
@@ -407,11 +410,8 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     expect(selectedOption().textContent?.startsWith("bravo")).toBe(true);
     expect(panel().querySelector(".ap-fan-focus-title strong")?.textContent).toBe("bravo");
 
-    // The stage is drawing, not controls: hidden from assistive technology as a whole, so the
-    // focused card is read off the page by its class and not by any role.
     const card = document.querySelector(".ap-fan-card-focus");
     expect(card).not.toBeNull();
-    expect(card?.closest('[aria-hidden="true"]')).not.toBeNull();
     expect(card?.textContent).toContain("bravo");
     const cardWords = Array.from(card?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
     expect(cardWords).toContain("active");
@@ -443,7 +443,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     await renderCockpit();
 
     await screen.findByRole("listbox", { name: "All projects by urgency" });
-    options()[0].focus();
+    stage().focus();
     press("ArrowRight");
     await landsOn(1);
     expect(selectedOption().textContent?.startsWith("alpha")).toBe(true);
@@ -495,7 +495,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
           "",
       );
 
-    options()[0].focus();
+    stage().focus();
     press("ArrowRight");
     await landsOn(1);
     expect(gate().textContent).toBe(PROMOTION_EARNED);
@@ -1536,7 +1536,7 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
     expect(within(list).queryByText("Allow #301")).toBeNull();
   });
 
-  it("keeps the project in focus in a bar, and puts the trigger brakes before the evidence", async () => {
+  it("puts the trigger brakes before the evidence, with no 'acting on' strip", async () => {
     const world = cockpitWorld({
       projects: [project({ project_id: "alpha", mode: "shadow" })],
       decisions: [decision()],
@@ -1545,13 +1545,11 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
 
     await renderCockpit();
 
-    const bar = await screen.findByRole("group", { name: "Project in focus" });
-    expect(within(bar).getByText("alpha")).toBeDefined();
-
     const brakes = await screen.findByRole("list", { name: "Trigger brakes" });
     const evidence = await screen.findByRole("list", { name: "Shadow decisions" });
     // The brakes come first in the document, as the page's own doc-comment promises.
     expect(brakes.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Project in focus" })).toBeNull();
   });
 
   it("draws no project-dependent panel, and no 'choose a project above', when the roster is empty", async () => {
@@ -1564,7 +1562,7 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
     expect(screen.queryByRole("group", { name: "Project in focus" })).toBeNull();
   });
 
-  it("lists every project by urgency as options, and can hide the fan", async () => {
+  it("walks the projects on the fan itself, with no roster list and no way to hide the fan", async () => {
     const world = cockpitWorld({
       projects: [
         project({ project_id: "alpha", mode: "shadow" }),
@@ -1576,64 +1574,35 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
     await renderCockpit();
 
     const roster = await screen.findByRole("listbox", { name: "All projects by urgency" });
-    expect(within(roster).getAllByRole("option")).toHaveLength(2);
-
-    // The fan shows by default, with one line under it naming both ways to walk it and the way to
-    // put it away. No strip of markers and no "1 of N" readout: the list is the index.
-    expect(document.querySelector(".ap-fan-stage")).not.toBeNull();
-    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
-    expect(screen.queryByRole("tablist")).toBeNull();
-    const hint = document.querySelector<HTMLElement>(".ap-fan-pane .ap-fan-hint");
-    expect(hint?.getAttribute("title")).toContain("drag the cards");
-    expect(document.querySelector(".ap-context")).toBeNull();
-    expect(within(hint!).getByRole("button", { name: "Hide the fan" })).toBeDefined();
-
-    // Hidden, the hint goes with the fan: one line heads the list with the way back, and the list
-    // itself stays.
-    fireEvent.click(screen.getByRole("button", { name: "Hide the fan" }));
-    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
-    expect(document.querySelector(".ap-fan-hint")).toBeNull();
-    expect(document.querySelector(".ap-roster-head")?.textContent).toContain("2 projects, most urgent first");
-    expect(
-      within(screen.getByRole("listbox", { name: "All projects by urgency" })).getAllByRole("option"),
-    ).toHaveLength(2);
-
-    fireEvent.click(screen.getByRole("button", { name: "Show the fan" }));
-    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
+    expect(within(roster).getAllByRole("option", { hidden: true })).toHaveLength(2);
+    expect(roster.classList.contains("ap-fan-stage")).toBe(true);
+    expect(document.querySelector(".ap-roster")).toBeNull();
     expect(document.querySelector(".ap-roster-head")).toBeNull();
-    expect(screen.getByRole("button", { name: "Hide the fan" })).toBeDefined();
+    expect(screen.queryByRole("tablist")).toBeNull();
+    expect(screen.queryByRole("button", { name: /the fan/ })).toBeNull();
   });
 
-  it("remembers a hidden fan on the next visit", async () => {
-    const world = cockpitWorld({
-      projects: [
-        project({ project_id: "alpha", mode: "shadow" }),
-        project({ project_id: "bravo", mode: "active" }),
-      ],
-    });
-    daemon.apiFetch.mockImplementation(cockpitFetch(world));
-    localStorage.setItem("nucleos.autopilot.fan", "hidden");
+  it("puts the section nav under the project cards", async () => {
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
 
     await renderCockpit();
 
-    expect(await screen.findByRole("button", { name: "Show the fan" })).toBeDefined();
-    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Show the fan" }));
-    expect(localStorage.getItem("nucleos.autopilot.fan")).toBeNull();
+    const nav = await screen.findByRole("navigation", { name: "Autopilot sections" });
+    const fan = screen.getByRole("region", { name: "Projects" });
+    expect(fan.compareDocumentPosition(nav) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("shows a single project's card even when the fan was hidden, since there is no toggle to undo it", async () => {
+  it("shows a single project's card with no list", async () => {
     const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
-    localStorage.setItem("nucleos.autopilot.fan", "hidden");
 
     await renderCockpit();
 
     await screen.findByText("alpha", { selector: ".ap-fan-focus-title strong" });
-    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
     expect(document.querySelector(".ap-fan-card-focus")?.textContent).toContain("alpha");
-    expect(screen.queryByRole("button", { name: /the fan/ })).toBeNull();
+    expect(screen.queryByRole("listbox")).toBeNull();
   });
 });
 

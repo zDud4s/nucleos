@@ -771,13 +771,13 @@ a.ws-lead-door:hover {
 /* ------------------------------------------------------------- autonomy block -- */
 
 /*
-  Mode and the proposal ceiling are two short blocks and each takes the height its content needs:
-  stretched to share a row, the shorter one was a card half empty. The switch sizes to its three
-  words (the generic \`.ws-page .ui-switch\` above spans its card, which is for the cards that
-  hold nothing else).
+  Mode and the proposal ceiling share one row of a two-column grid and stretch to the same height,
+  with the same padding and heading, so their first lines of content sit on one baseline. The
+  switch sizes to its three words (the generic \`.ws-page .ui-switch\` above spans its card, which
+  is for the cards that hold nothing else).
 */
 .ws-authority .ws-autonomy {
-  align-items: start;
+  align-items: stretch;
   /* A small gap between the "Autonomy" heading and the cards under it. */
   margin-top: var(--space-1);
 }
