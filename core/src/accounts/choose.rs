@@ -95,6 +95,12 @@ pub enum Decision {
     NoCandidate {
         why: String,
     },
+    /// Auto mode only: every eligible account has a live exhaustion mark (or a trusted reading at
+    /// `exhausted_at`), so none is picked. `earliest_resets_at` is when the first of them is usable
+    /// again; `None` when no account's reset is known. Callers park the work until then.
+    AllExhausted {
+        earliest_resets_at: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -313,17 +319,71 @@ fn choose_pinned(input: &ChooseInput<'_>, pinned: &Candidate, scored: &[Scored<'
     }
 }
 
+/// When an exhausted account can run again: the latest reset among its live marks and its trusted
+/// windows at `exhausted_at`. `None` when any of those has no known reset (it holds until told
+/// otherwise), or when the account is not exhausted at all.
+fn usable_again_at(
+    candidate: &Candidate,
+    weights: &Weights,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut latest: Option<DateTime<Utc>> = None;
+    let mut any = false;
+    for (_, resets) in candidate
+        .exhausted
+        .iter()
+        .filter(|(_, resets)| resets.is_none_or(|at| at > now))
+    {
+        any = true;
+        let at = (*resets)?;
+        latest = Some(latest.map_or(at, |l| l.max(at)));
+    }
+    if let Some(windows) = trusted_windows(candidate, now) {
+        for window in windows
+            .iter()
+            .filter(|w| w.used_fraction >= weights.exhausted_at)
+        {
+            any = true;
+            let at = window.resets_at?;
+            latest = Some(latest.map_or(at, |l| l.max(at)));
+        }
+    }
+    if any { latest } else { None }
+}
+
+/// Auto mode: accounts with a live exhaustion mark, or a trusted reading at `exhausted_at`, are
+/// never picked. With none left, the answer is `AllExhausted` (also for a single account), or
+/// `SessionStuck` for a not-movable chat session so it keeps its own "new session?" path.
 fn choose_auto(input: &ChooseInput<'_>, scored: &[Scored<'_>]) -> Decision {
-    let Some(top) = best(scored) else {
+    let weights = input.weights;
+    let movable = input.mid_switch_enabled && input.portability != SessionPortability::NotPortable;
+    if scored.is_empty() {
         return Decision::NoCandidate {
             why: "no active account for this provider".into(),
         };
+    }
+    let eligible: Vec<Scored<'_>> = scored
+        .iter()
+        .copied()
+        .filter(|(c, _)| exhausted_window(c, weights, input.now).is_none())
+        .collect();
+    let Some(top) = best(&eligible) else {
+        if let Some(current) = input.session.current.as_ref().filter(|_| !movable) {
+            return Decision::SessionStuck {
+                current: current.clone(),
+                alternative: None,
+            };
+        }
+        return Decision::AllExhausted {
+            earliest_resets_at: scored
+                .iter()
+                .filter_map(|(c, _)| usable_again_at(c, weights, input.now))
+                .min(),
+        };
     };
     let Some(current) = input.session.current.as_ref() else {
-        return use_new(top, scored.len());
+        return use_new(top, eligible.len());
     };
-    let weights = input.weights;
-    let movable = input.mid_switch_enabled && input.portability != SessionPortability::NotPortable;
     let alternative = || {
         let others: Vec<Scored<'_>> = scored
             .iter()
@@ -379,6 +439,10 @@ fn choose_auto(input: &ChooseInput<'_>, scored: &[Scored<'_>]) -> Decision {
         reason: reason_for(&top.1),
         switched_from: Some(current.clone()),
     };
+    if cur_limit {
+        // The provider said the current account is out: leave it for the best eligible one.
+        return go;
+    }
     if top.0.account.id == cur.0.account.id || rank_cmp(&top, &cur) != Ordering::Greater {
         return stay(reason_for(&cur.1));
     }
@@ -617,8 +681,13 @@ mod tests {
     #[test]
     fn all_at_risk_picks_the_least_loaded() {
         let now = Utc::now();
-        let a = candidate("fake:a", &[("1h", 0.99, 600)], now);
-        let b = candidate("fake:b", &[("1h", 0.96, 600)], now);
+        // At risk through projected load (live sessions), not yet exhausted by a reading.
+        let mut a = candidate("fake:a", &[("1h", 0.90, 600)], now);
+        let mut b = candidate("fake:b", &[("1h", 0.80, 600)], now);
+        a.live_sessions = 50;
+        b.live_sessions = 50;
+        assert!(score(&a, &Weights::default(), now).at_risk);
+        assert!(score(&b, &Weights::default(), now).at_risk);
         let decision = new_session(&[a, b], now);
         assert_eq!(account_of(&decision), "fake:b");
         assert!(matches!(
@@ -669,7 +738,9 @@ mod tests {
     #[test]
     fn p7_a_single_account_is_used_whatever_its_state_of_usage() {
         let now = Utc::now();
-        let only = candidate("fake:a", &[("1h", 0.99, 600)], now);
+        // Heavily loaded by live sessions, but not exhausted: still the only account.
+        let mut only = candidate("fake:a", &[("1h", 0.90, 600)], now);
+        only.live_sessions = 50;
         assert!(matches!(
             new_session(&[only], now),
             Decision::Use {
@@ -930,6 +1001,127 @@ mod tests {
             choose_account(&input),
             Decision::Use {
                 reason: Reason::StayedNotPortable,
+                ..
+            }
+        ));
+    }
+
+    fn marked(id: &str, resets_in: Option<i64>, now: DateTime<Utc>) -> Candidate {
+        let mut c = candidate(id, &[], now);
+        c.exhausted.push((
+            "5h".into(),
+            resets_in.map(|s| now + chrono::Duration::seconds(s)),
+        ));
+        c
+    }
+
+    #[test]
+    fn a_single_exhausted_account_is_all_exhausted_not_picked() {
+        let now = Utc::now();
+        let only = marked("fake:a", Some(3600), now);
+        assert_eq!(
+            new_session(&[only], now),
+            Decision::AllExhausted {
+                earliest_resets_at: Some(now + chrono::Duration::seconds(3600)),
+            }
+        );
+        // A trusted reading at the threshold counts the same as a mark.
+        let read = candidate("fake:a", &[("1h", 0.99, 600)], now);
+        assert_eq!(
+            new_session(&[read], now),
+            Decision::AllExhausted {
+                earliest_resets_at: Some(now + chrono::Duration::seconds(600)),
+            }
+        );
+    }
+
+    #[test]
+    fn all_exhausted_reports_the_earliest_known_reset() {
+        let now = Utc::now();
+        let a = marked("fake:a", Some(7200), now);
+        let b = marked("fake:b", Some(1800), now);
+        let unknown = marked("fake:c", None, now);
+        assert_eq!(
+            new_session(&[a.clone(), b, unknown.clone()], now),
+            Decision::AllExhausted {
+                earliest_resets_at: Some(now + chrono::Duration::seconds(1800)),
+            }
+        );
+        // No reset known anywhere: none to report.
+        assert_eq!(
+            new_session(&[unknown], now),
+            Decision::AllExhausted {
+                earliest_resets_at: None
+            }
+        );
+        // A mark whose reset has passed no longer holds.
+        let later = now + chrono::Duration::seconds(7300);
+        assert_eq!(account_of(&new_session(&[a], later)), "fake:a");
+    }
+
+    #[test]
+    fn an_exhausted_account_is_never_picked_while_another_has_room() {
+        let now = Utc::now();
+        // The exhausted one would win on every score; it must still lose.
+        let out = marked("fake:a", Some(3600), now);
+        let busy = candidate("fake:b", &[("30d", 0.94, 29 * DAY)], now);
+        assert_eq!(account_of(&new_session(&[out, busy], now)), "fake:b");
+    }
+
+    #[test]
+    fn a_portable_session_on_an_exhausted_account_moves_to_the_eligible_one() {
+        let now = Utc::now();
+        let out = marked("fake:a", Some(3600), now);
+        let b = candidate("fake:b", &[("30d", 0.5, 20 * DAY)], now);
+        let warm_big = warm(on("fake:a"), now, 10, 2_000_000);
+        let decision = pick(
+            &[out.clone(), b],
+            &warm_big,
+            SessionPortability::Portable,
+            now,
+        );
+        assert!(matches!(
+            decision,
+            Decision::Use { ref account, switched_from: Some(_), .. } if account.as_str() == "fake:b"
+        ));
+        let other_out = marked("fake:b", Some(60), now);
+        assert!(matches!(
+            pick(
+                &[out, other_out],
+                &on("fake:a"),
+                SessionPortability::Portable,
+                now
+            ),
+            Decision::AllExhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn a_not_portable_chat_with_every_account_exhausted_stays_session_stuck() {
+        let now = Utc::now();
+        let a = marked("fake:a", Some(3600), now);
+        let b = marked("fake:b", Some(60), now);
+        assert_eq!(
+            pick(&[a, b], &on("fake:a"), SessionPortability::NotPortable, now),
+            Decision::SessionStuck {
+                current: AccountId("fake:a".into()),
+                alternative: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_pinned_account_that_is_out_still_blocks_rather_than_all_exhausted() {
+        let now = Utc::now();
+        let a = marked("fake:a", Some(3600), now);
+        let b = marked("fake:b", Some(60), now);
+        let mut session = on("fake:a");
+        session.choice = AccountChoice::Account(AccountId("fake:a".into()));
+        assert!(matches!(
+            pick(&[a, b], &session, SessionPortability::Portable, now),
+            Decision::PinnedBlocked {
+                why: BlockReason::AtLimit,
+                alternative: None,
                 ..
             }
         ));

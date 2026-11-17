@@ -38,6 +38,12 @@ pub enum AuthSignal {
     Source(String),
     /// A turn ended; `rate_limited` when it ended on a 429.
     TurnEnded { rate_limited: bool },
+    /// A pooled account's turn ended on a limit: the account to mark exhausted, and when the CLI
+    /// said it resets. Handled by the watch task, not by [`AuthWatch::on`].
+    AccountLimited {
+        account: String,
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// The watch's memory. `on_key` is `None` until the first `init` since the daemon started.
@@ -72,6 +78,7 @@ impl AuthWatch {
                     )),
                 }
             }
+            AuthSignal::AccountLimited { .. } => None,
             AuthSignal::TurnEnded {
                 rate_limited: false,
             } => {
@@ -175,6 +182,10 @@ pub fn watch_claude_auth(pool: SqlitePool) {
     tokio::spawn(async move {
         let mut watch = AuthWatch::default();
         while let Some(signal) = rx.recv().await {
+            if let AuthSignal::AccountLimited { account, resets_at } = &signal {
+                mark_account_limited(&pool, account, *resets_at).await;
+                continue;
+            }
             if let Some((kind, summary)) = watch.on(&signal) {
                 let settings_sets_key =
                     read_user_settings().is_some_and(|text| settings_env_sets_api_key(&text));
@@ -187,6 +198,27 @@ pub fn watch_claude_auth(pool: SqlitePool) {
             }
         }
     });
+}
+
+/// Marks a pooled Claude account exhausted after a mid-session limit, persisted like
+/// `note_limit_and_announce` (pool mark, once-per-window feed row, `account_exhaustions` row).
+/// With no known reset the mark is short, so a bare 429 does not park the account for a window.
+pub(super) async fn mark_account_limited(
+    pool: &SqlitePool,
+    account: &str,
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let now = chrono::Utc::now();
+    let hit = crate::accounts::launch_chat::mid_session_hit(resets_at, now);
+    crate::accounts::launch_chat::mark_hit_and_announce(
+        pool,
+        None,
+        "claude",
+        &crate::accounts::AccountId(account.to_owned()),
+        &hit,
+        now,
+    )
+    .await;
 }
 
 /// Reports a signal. A no-op until [`watch_claude_auth`] ran, which is every test.
@@ -300,6 +332,42 @@ mod tests {
             .on(&AuthSignal::TurnEnded { rate_limited: true })
             .unwrap();
         assert!(summary.contains("the API key"), "{summary}");
+    }
+
+    #[test]
+    fn an_account_limit_signal_is_not_a_feed_row_of_the_watch() {
+        let mut watch = AuthWatch::default();
+        let signal = AuthSignal::AccountLimited {
+            account: "claude:a".into(),
+            resets_at: None,
+        };
+        assert_eq!(watch.on(&signal), None);
+    }
+
+    #[tokio::test]
+    async fn a_mid_session_limit_marks_the_account_and_persists_it() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        crate::storage::MIGRATOR.run(&db).await.unwrap();
+        let id = crate::accounts::AccountId("claude:authwatch".into());
+        let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+        mark_account_limited(&db, id.as_str(), Some(reset)).await;
+        let stored = crate::accounts::store::live_exhaustions(&db, chrono::Utc::now())
+            .await
+            .unwrap();
+        let mark = stored.iter().find(|m| m.account_id == id).expect("stored");
+        // Storage keeps whole seconds.
+        assert_eq!(
+            mark.resets_at.map(|t| t.timestamp()),
+            Some(reset.timestamp())
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ macro_rules! live_statuses_sql {
     };
 }
 
+mod account_limit;
 mod agent_launcher;
 mod brakes;
 mod bridge;
@@ -47,6 +48,8 @@ mod prompts;
 mod spawn;
 mod start;
 mod store;
+#[cfg(test)]
+mod tests_account_limit;
 #[cfg(test)]
 mod tests_agent_launcher;
 #[cfg(test)]
@@ -67,6 +70,7 @@ mod tests_ungated_checkpoint;
 mod tests_walk_state_parity;
 mod views;
 
+use self::account_limit::*;
 pub use self::agent_launcher::CatalogAgentLauncher;
 use self::brakes::*;
 pub use self::decide::*;

@@ -97,6 +97,7 @@ the contract, not a snapshot.
 | `execution/job/bridge.rs` | The legacy bridge between the job's `JobView` and the pure graph walker: builds a `WalkState` and `Facts` from a view and reads a walker `Step` back as the old `Next`, so the old decision tables can be run against the seeded autopilot graph. |
 | `execution/job/command_node.rs` | Running a command node: the workflow's own shell command in the job's worktree, its exit code and captured output read back as a `CommandResult`, and what follows (continue, fail or park). |
 | `execution/job/decide.rs` | The pure half: item and review states, `next_step`, and how a round closes. No database, no worktree, no subprocess. |
+| `execution/job/account_limit.rs` | A job node that died on an account's usage limit: switch to another account now (cold), or park the job until the earliest reset plus a margin; never a blind retry on the exhausted account. |
 | `execution/job/agent_launcher.rs` | The launcher for graph nodes that name an `agent:`: asks the shared `resolve_agent_launch`, maps its engines, pin and output shape into the dispatcher's node launch; nodes without `agent:` keep the default protocol-and-body prompt. |
 | `execution/job/dispatch.rs` | Choosing what runs a node: the node's agent, model and effective timeout resolved into one dispatch decision before a run is spawned. |
 | `execution/job/drive.rs` | The loop that drives jobs: `advance`, the council before review, starting items and the tick. |
@@ -109,6 +110,7 @@ the contract, not a snapshot.
 | `execution/job/spawn.rs` | Spawning a node: the worktree, the item claim and provisioning, the loadout, and parking or releasing an item. |
 | `execution/job/start.rs` | Starting a job: `resolve_start` (pure) and `start` (writes the row, provisions the worktree). |
 | `execution/job/store.rs` | The job rows: loading a view, status writes guarded by compare-and-set, inserting, cancelling, and recovering orphans at startup. |
+| `execution/job/tests_account_limit.rs` | Database-level tests of account-aware job retry: switching to another account and parking until the earliest reset. |
 | `execution/job/tests_agent_launcher.rs` | Database-level tests of the default agent launcher through a real context. |
 | `execution/job/tests_command_nodes.rs` | Database-level tests of command nodes in the job engine. |
 | `execution/job/tests_plan_landing.rs` | Database-level tests of plan landing and replan in the job engine. |
@@ -392,6 +394,7 @@ the contract, not a snapshot.
 | `tree_job/root_disk.rs` | What the root start does with a refusal the disk alone caused: parse the figures out of the error, retry, and after `DISK_START_CAP` refusals ask the owner once with the GB needed. No database. |
 | `tree_job/root_orphan.rs` | The worktree a failed root start left behind: `clear` takes its links off without following them, then removes it before the retry. |
 | `tree_job/run_end.rs` | Settles a tree node on the end of its run: a listener on the `Topic::Runs` wake runs `reconcile_running` a moment after any run ends, so the node closes with its run. The sweep keeps calling `reconcile_running` as the backstop. |
+| `tree_job/account_limit.rs` | Judges a node run that died on its account's limit (usage limit or 429): marks the account exhausted and re-picks; relaunch now when another account has room, else wait until the earliest reset plus a margin, with one feed row. |
 | `tree_job/wrap.rs` | Wrapping up a node run that already reported, and starting a branch node again when its run ended with a handoff or died without a report; a run the watchdog ended is relaunched under its own `watchdog-` chain, not the died cap. |
 | `tree_job/watchdog.rs` | Keeps a running node (the root included) from being left without a session: starts a branch node that has no run from its stored launch, ends a live run whose lease (last sign of life) expired so `wrap` relaunches it, backs off failed relaunches (60 s doubling to 30 min, table `node_watchdog`), and after 4 failures in a row (ladder) parks the branch with an owner decision. A leaf (a node topping no branch) is covered too: a leaf with no run for 5 minutes is relaunched, and after 4 failures it fails instead of parking. Also gates the root start retry after an admission refusal. |
 | `tree_job/decision_tools.rs` | The daemon routes behind the `decision_list` and `decision_answer` MCP tools: `GET /tree-decisions` (open by default, filter by tree/status) and `POST /tree-decisions/{id}/answer`, which goes through `open::answer_and_relaunch` with the `conductor` origin. Mounted by `http/nodes.rs`; tree-run keys never reach them (`auth::grants`, plus `mcp_tools::boxes::tree_run_decision_refusal`). |
