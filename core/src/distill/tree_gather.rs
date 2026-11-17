@@ -43,18 +43,22 @@ pub(super) async fn gather_blocks(
     let mut blocks = TreeBlocks::default();
 
     // Node reports: counts run over every node, the report list over the focused ones, capped.
-    let nodes: Vec<NodeRow> = sqlx::query_as(
+    // The newest NODE_CAP nodes, read back in creation order.
+    let mut nodes: Vec<NodeRow> = sqlx::query_as(
         "SELECT id, status, summary, handoff_path, run_id FROM work_nodes
-             WHERE tree_job_id = ? ORDER BY created_at, id",
+             WHERE tree_job_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
     )
     .bind(&job.id)
+    .bind(NODE_CAP as i64)
     .fetch_all(pool)
     .await?;
+    nodes.reverse();
     for (id, status, summary, handoff_path, run_id) in &nodes {
-        let report = handoff_path
-            .as_deref()
-            .filter(|path| !path.is_empty())
-            .and_then(|path| std::fs::read_to_string(path).ok())
+        let handoff_text = match handoff_path.as_deref().filter(|path| !path.is_empty()) {
+            Some(path) => tokio::fs::read_to_string(path).await.ok(),
+            None => None,
+        };
+        let report = handoff_text
             .map(|text| crate::tree_job::report::parse_report(&text));
         let has_open_items = report
             .as_ref()

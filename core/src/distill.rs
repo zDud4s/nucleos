@@ -696,26 +696,32 @@ async fn tombstoned_in(
             && similarity >= SIM_SAME
         {
             hit = Some(id);
-        } else if let Some((id, similarity)) = crate::embed::nearest_in_scope(
-            tx,
-            "project",
-            Some(project_id),
-            &["expired"],
-            model,
-            vector,
-            &[],
-        )
-        .await?
-            && similarity >= SIM_SAME
-        {
-            // Only the nearest expired row is checked, so an older neighbour hides a newer one.
-            let recent: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM knowledge WHERE id = ? AND ended_at > ?")
-                    .bind(id)
-                    .bind(&cutoff)
-                    .fetch_optional(&mut **tx)
-                    .await?;
-            hit = recent;
+        } else {
+            // Expired rows past the cool-off must not compete: an older neighbour would hide a
+            // newer one if only the single nearest expired row were checked.
+            let stale: Vec<i64> = sqlx::query_scalar(
+                "SELECT id FROM knowledge
+                  WHERE scope_kind = 'project' AND scope_id = ? AND status = 'expired'
+                    AND (ended_at IS NULL OR ended_at <= ?)",
+            )
+            .bind(project_id)
+            .bind(&cutoff)
+            .fetch_all(&mut **tx)
+            .await?;
+            if let Some((id, similarity)) = crate::embed::nearest_in_scope(
+                tx,
+                "project",
+                Some(project_id),
+                &["expired"],
+                model,
+                vector,
+                &stale,
+            )
+            .await?
+                && similarity >= SIM_SAME
+            {
+                hit = Some(id);
+            }
         }
     }
     let Some(id) = hit else {

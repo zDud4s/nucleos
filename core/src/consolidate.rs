@@ -110,6 +110,9 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
     for project in projects {
         if project_is_busy(pool, &project).await? {
             report.skipped_busy += 1;
+            // Trial expiry is wall-clock and counter based: a project that is always busy must
+            // not keep its overdue trials alive.
+            report.expired += expire_trials(pool, &project, now).await?;
             continue;
         }
         let window = gate_window(pool, &project).await?;
@@ -205,9 +208,9 @@ fn repeated_signatures(window: &[GateRun]) -> BTreeMap<String, Vec<i64>> {
     groups
 }
 
-/// A repeated gate signature raises a row somebody already explained (its `cause_key` is the raw
-/// fingerprint) and never creates one: observations go up, the runs become evidence, the row is
-/// reconfirmed.
+/// A repeated gate signature raises a row somebody already explained (its `gate_signature` is the
+/// raw fingerprint) and never creates one: observations go up, the runs become evidence, the row
+/// is reconfirmed, and an episodic row with two observations is promoted to procedural.
 async fn reinforce_gate_signatures(
     pool: &SqlitePool,
     project: &str,
@@ -220,7 +223,7 @@ async fn reinforce_gate_signatures(
         let mut transaction = pool.begin().await?;
         let rows: Vec<(i64, Option<i64>, Option<String>)> = sqlx::query_as(
             "SELECT id, observations, evidence FROM knowledge
-              WHERE scope_kind = 'project' AND scope_id = ? AND cause_key = ?
+              WHERE scope_kind = 'project' AND scope_id = ? AND gate_signature = ?
                 AND source IN ('consolidator', 'distiller')
                 AND status IN ('active', 'proposed')
               ORDER BY id",
@@ -244,7 +247,7 @@ async fn reinforce_gate_signatures(
             let updated = sqlx::query(
                 "UPDATE knowledge
                     SET observations = ?, evidence = ?, last_confirmed_at = ?
-                  WHERE id = ? AND cause_key = ?
+                  WHERE id = ? AND gate_signature = ?
                     AND source IN ('consolidator', 'distiller')
                     AND status IN ('active', 'proposed')",
             )
@@ -256,6 +259,23 @@ async fn reinforce_gate_signatures(
             .execute(&mut *transaction)
             .await?;
             reinforced += updated.rows_affected() as usize;
+            if updated.rows_affected() > 0 && observed >= 2 {
+                let promotable: Option<i64> = sqlx::query_scalar(
+                    "SELECT id FROM knowledge
+                      WHERE id = ? AND layer = 'episodic' AND status = 'active'",
+                )
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                if promotable.is_some() {
+                    crate::knowledge::promote_layer_in(
+                        &mut transaction,
+                        id,
+                        crate::knowledge::Layer::Procedural,
+                    )
+                    .await?;
+                }
+            }
         }
         transaction.commit().await?;
     }
@@ -846,7 +866,7 @@ mod tests {
         format!("gate:{}", failure_signature(output).unwrap().fingerprint)
     }
 
-    /// The raw signature fingerprint: slice 1 matches `cause_key` against it (plan assumption).
+    /// The raw signature fingerprint: the reinforcer matches `gate_signature` against it.
     fn raw_fingerprint(output: &str) -> String {
         failure_signature(output).unwrap().fingerprint
     }
@@ -1687,9 +1707,7 @@ Finished in 3.2s\n";
             Some(1),
         )
         .await;
-        set_cause_key(&pool, cause, &raw_fingerprint(plain))
-            .await
-            .unwrap();
+        set_gate_signature(&pool, cause, &raw_fingerprint(plain)).await;
         for _ in 0..3 {
             seed_run(&pool, PROJECT, "completed", Some("failed"), Some(coloured)).await;
         }
@@ -1797,7 +1815,7 @@ Finished in 3.2s\n";
         assert!(!updates.is_empty());
         for update in updates {
             let flat = update.split_whitespace().collect::<String>();
-            if update.contains("cause_key = ?") {
+            if update.contains("gate_signature = ?") {
                 // The one reinforcement statement: it may only raise a row that has a cause and
                 // is the consolidator's or the distiller's, never an owner's.
                 assert!(
@@ -2066,9 +2084,7 @@ Finished in 3.2s\n";
             Some(1),
         )
         .await;
-        set_cause_key(&pool, cause, &raw_fingerprint(legacy))
-            .await
-            .unwrap();
+        set_gate_signature(&pool, cause, &raw_fingerprint(legacy)).await;
         for output in [legacy, nested, legacy, nested] {
             seed_run(&pool, PROJECT, "completed", Some("failed"), Some(output)).await;
         }
@@ -2108,9 +2124,7 @@ Finished in 3.2s\n";
             Some(1),
         )
         .await;
-        set_cause_key(&pool, cause, &raw_fingerprint(FAILURE))
-            .await
-            .unwrap();
+        set_gate_signature(&pool, cause, &raw_fingerprint(FAILURE)).await;
         seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
         seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
         let job = sqlx::query(
@@ -2249,10 +2263,8 @@ Finished in 3.2s\n";
         .execute(&pool)
         .await
         .unwrap();
-        // Only a row that has a cause is reinforced (and so reconfirmed) by the gate now.
-        set_cause_key(&pool, id, &raw_fingerprint(FAILURE))
-            .await
-            .unwrap();
+        // Only a row that carries the gate signature is reinforced (and so reconfirmed) by the gate.
+        set_gate_signature(&pool, id, &raw_fingerprint(FAILURE)).await;
         for hour in 2..=4 {
             seed_run_at(&pool, PROJECT, Some("failed"), Some(FAILURE), at(hour)).await;
         }

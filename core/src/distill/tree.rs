@@ -227,11 +227,18 @@ pub async fn enqueue_branch_recovered_in(
     let Some(project) = tree_project(pool, tree_id).await? else {
         return Ok(false);
     };
-    let statuses: Vec<String> =
-        sqlx::query_scalar("SELECT status FROM verify_runs WHERE worktree = ? ORDER BY id")
-            .bind(worktree)
-            .fetch_all(pool)
-            .await?;
+    // Only runs from the tree's own lifetime: a reused worktree path carries older history.
+    let statuses: Vec<String> = sqlx::query_scalar(
+        "SELECT status FROM verify_runs
+         WHERE worktree = ?
+           AND julianday(started_at) >=
+               (SELECT julianday(created_at) FROM tree_jobs WHERE id = ?)
+         ORDER BY id",
+    )
+    .bind(worktree)
+    .bind(tree_id)
+    .fetch_all(pool)
+    .await?;
     let mut failed = false;
     let mut recovered = false;
     for status in &statuses {

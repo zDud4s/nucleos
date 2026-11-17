@@ -69,8 +69,6 @@ impl From<sqlx::Error> for ProposeError {
 /// from the project id, and the source from whether a run is behind the request. It is what keeps
 /// this phase a move rather than a change — the door writes what it wrote. Deriving the scope from
 /// the run instead of from the caller is a later decision, with its own reasons.
-/// The fingerprint is derived from the body with the consolidator's own function, so
-/// `consolidate::blocked_outcome` sees a pending, rejected, or reverted proposal.
 pub async fn propose(
     pool: &SqlitePool,
     declaration: Declaration<'_>,
@@ -119,6 +117,10 @@ pub struct Provenance<'a> {
 
 /// `propose_in` with the provenance a caller other than a run or the owner brings. Nothing is
 /// committed here.
+///
+/// The stored fingerprint is the caller's `provenance.fingerprint` when given, else it falls back
+/// to `gate:<failure_signature(body)>`, so `consolidate::blocked_outcome` sees a pending,
+/// rejected or reverted proposal.
 pub async fn propose_in_with(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     declaration: Declaration<'_>,
@@ -687,6 +689,48 @@ pub async fn promote_layer_in(
     Ok(moved)
 }
 
+/// Move an active, already confirmed (`trial = 0`) row to another layer, with an event. Unlike
+/// `promote_layer_in` it never puts the row back on trial. `false` when the row is not an active
+/// confirmed row or is already in that layer. Nothing is committed here.
+pub(super) async fn promote_confirmed_layer_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    to: Layer,
+) -> sqlx::Result<bool> {
+    let from: Option<String> = sqlx::query_scalar(
+        "SELECT layer FROM knowledge WHERE id = ? AND status = 'active' AND trial = 0",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(from) = from else {
+        return Ok(false);
+    };
+    let moved = sqlx::query(
+        "UPDATE knowledge SET layer = ?
+          WHERE id = ? AND status = 'active' AND trial = 0 AND layer <> ?",
+    )
+    .bind(to.as_str())
+    .bind(id)
+    .bind(to.as_str())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if moved {
+        let note = format!("layer {from}->{}", to.as_str());
+        same_status_event_in(tx, id, note).await?;
+    }
+    Ok(moved)
+}
+
+/// Keep only the newest `EVIDENCE_CAP` items of an evidence array (items are appended oldest first).
+pub(super) fn cap_evidence(items: &mut Vec<serde_json::Value>) {
+    if items.len() > EVIDENCE_CAP {
+        items.drain(..items.len() - EVIDENCE_CAP);
+    }
+}
+
 /// Merge evidence into a live row, renew it when it is an active episode, and log the event.
 pub(super) async fn reconfirm_row_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -711,6 +755,7 @@ pub(super) async fn reconfirm_row_in(
             merged.push(element);
         }
     }
+    cap_evidence(&mut merged);
     let merged = tagged_evidence(&serde_json::Value::Array(merged));
 
     let now = chrono::Utc::now().to_rfc3339();

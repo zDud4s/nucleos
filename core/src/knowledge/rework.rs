@@ -167,7 +167,9 @@ pub async fn capture_rework(pool: &SqlitePool, record_id: i64) -> sqlx::Result<C
 
     let now = Utc::now();
     let evidence = serde_json::json!([{"t": "record", "id": record.id}]).to_string();
-    let mut tx = pool.begin().await?;
+    // IMMEDIATE takes the write lock up front, so two concurrent captures serialise instead of
+    // one failing with SQLITE_BUSY when it upgrades a read lock.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let outcome = capture_in(&mut tx, &record, &candidate, &evidence, now).await?;
     tx.commit().await?;
     Ok(outcome)
@@ -181,20 +183,55 @@ async fn capture_in(
     now: DateTime<Utc>,
 ) -> sqlx::Result<Captured> {
     let project = record.project_id.as_str();
+    let signature = gate_signature_for_record(tx, record).await;
+    // A live row wins over any older tombstone of the same cause.
+    if let Some(live) = live_row_in(tx, project, &candidate.cause_key).await? {
+        return reinforce_in(tx, record, live, evidence, signature.as_deref()).await;
+    }
     if let Some(dead) = tombstoned_cause_in(tx, project, &candidate.cause_key, now).await? {
         super::note_tombstone_skip_in(tx, dead).await?;
         return Ok(Captured::Skipped);
     }
-    if let Some(live) = live_row_in(tx, project, &candidate.cause_key).await? {
-        return reinforce_in(tx, record, live, evidence).await;
-    }
     if let Some(id) = insert_row_in(tx, project, candidate, evidence, now).await? {
+        // Kept out of `insert_row_in` so its signature stays as the callers know it.
+        if let Some(signature) = signature.as_deref() {
+            sqlx::query("UPDATE knowledge SET gate_signature = ? WHERE id = ?")
+                .bind(signature)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+        }
         return Ok(Captured::Written(id));
     }
     // Lost the race to a live row of the same cause: reinforce it instead.
     match live_row_in(tx, project, &candidate.cause_key).await? {
-        Some(live) => reinforce_in(tx, record, live, evidence).await,
+        Some(live) => reinforce_in(tx, record, live, evidence, signature.as_deref()).await,
         None => Ok(Captured::Skipped),
+    }
+}
+
+/// The fingerprint of the last failed verify run of the record's project and worktree that
+/// started no later than the record. Fails open: a lookup error is `None`.
+async fn gate_signature_for_record(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &crate::workflow_records::Record,
+) -> Option<String> {
+    let tail: sqlx::Result<Option<Option<String>>> = sqlx::query_scalar(
+        "SELECT output_tail FROM verify_runs
+          WHERE project_id = ? AND worktree IS ? AND status <> 'passed' AND started_at <= ?
+          ORDER BY started_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&record.project_id)
+    .bind(record.worktree.as_deref())
+    .bind(&record.created_at)
+    .fetch_optional(&mut **tx)
+    .await;
+    match tail {
+        Ok(tail) => super::signature::failure_signature(&tail??).map(|s| s.fingerprint),
+        Err(error) => {
+            tracing::warn!(%error, record = record.id, "could not look up the gate signature");
+            None
+        }
     }
 }
 
@@ -204,6 +241,7 @@ async fn reinforce_in(
     record: &crate::workflow_records::Record,
     live: LiveRow,
     evidence: &str,
+    signature: Option<&str>,
 ) -> sqlx::Result<Captured> {
     let (id, layer, status, stored) = live;
     let seen = stored.clone().unwrap_or_else(|| "[]".to_owned());
@@ -231,7 +269,14 @@ async fn reinforce_in(
     .fetch_one(&mut **tx)
     .await?;
 
+    // `reconfirm_row_in` keeps only the newest `EVIDENCE_CAP` items; `observations` below still
+    // counts every recurrence.
     super::propose::reconfirm_row_in(tx, id, &layer, &status, stored, evidence).await?;
+    sqlx::query("UPDATE knowledge SET gate_signature = COALESCE(gate_signature, ?) WHERE id = ?")
+        .bind(signature)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
     if same_task > 0 {
         return Ok(Captured::Reinforced(id));
     }
@@ -244,8 +289,13 @@ async fn reinforce_in(
             .bind(id)
             .fetch_one(&mut **tx)
             .await?;
-    if observations >= 2 && super::promote_layer_in(tx, id, super::Layer::Procedural).await? {
-        return Ok(Captured::Promoted(id));
+    if observations >= 2 {
+        // A lesson still on trial moves and restarts its trial; a confirmed one just moves.
+        let moved = super::promote_layer_in(tx, id, super::Layer::Procedural).await?
+            || super::propose::promote_confirmed_layer_in(tx, id, super::Layer::Procedural).await?;
+        if moved {
+            return Ok(Captured::Promoted(id));
+        }
     }
     Ok(Captured::Reinforced(id))
 }

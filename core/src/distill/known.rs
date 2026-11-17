@@ -9,7 +9,6 @@ use super::{MAX_REFUSED, REFUSED_DAYS};
 
 /// Titles of the live lessons of a project (`active` or `proposed`), without the rows the
 /// consolidator wrote.
-#[allow(dead_code)]
 pub(super) async fn titles(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar(
         "SELECT title FROM knowledge
