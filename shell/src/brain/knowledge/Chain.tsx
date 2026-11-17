@@ -72,7 +72,9 @@ export function Chain({ id }: ChainProps) {
           line, nothing to teach, and `Quiet`'s muted rung rather than the faint
           one — in an empty region the sentence is the content. */}
       {replaced.length === 0 && replacedBy === null && (
-        <Quiet says="This one replaced nothing and nothing has replaced it." />
+        <Quiet says="No chain">
+          <p>This one replaced nothing and nothing has replaced it.</p>
+        </Quiet>
       )}
       {events.length > 0 && (
         <ul className="learned-events">

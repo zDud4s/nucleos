@@ -1052,6 +1052,7 @@ describe("System - quota brake", () => {
     expect(enabled.checked).toBe(false);
     expect(fiveHour.value).toBe("85");
     expect(sevenDay.value).toBe("90");
+    fireEvent.click(within(block).getByRole("button", { name: "About the quota brake" }));
     expect(within(block).getByText(/Only claude's windows count\./)).toBeDefined();
 
     fireEvent.click(enabled);

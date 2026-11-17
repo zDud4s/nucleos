@@ -105,7 +105,7 @@ describe("PairingDialog", () => {
     expect(calls("POST")[0][0]).toBe("/channels/telegram/pairing");
     expect(screen.getByText("/pair 482913")).toBeTruthy();
     expect(screen.getByText("482913")).toBeTruthy();
-    expect(screen.getByText(/send this to the bot in the conversation you want to pair/i)).toBeTruthy();
+    expect(screen.getByTitle(/send this to the bot in the conversation you want to pair/i)).toBeTruthy();
   });
 
   it("does not post again on a re-render", async () => {

@@ -73,8 +73,8 @@ describe("the sides of the product", () => {
     // imports inside one folder. Drawn without the sentence it reads as a clean bill of health.
     draw([mod("core/src/a.rs"), mod("shell/src/x.ts")], []);
     // The line says it; the reasoning is one click away rather than on every open.
-    expect(screen.getByText(/These sides share no source/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "why?" }));
+    expect(screen.getByText("No shared source")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Why?" }));
     expect(screen.getByText(/No import crosses between them, and none could/)).toBeTruthy();
     expect(screen.getByText(/it does not say they are independent/)).toBeTruthy();
   });
@@ -112,8 +112,9 @@ describe("the boundary between the two sides", () => {
     draw([mod("core/src/a.rs"), mod("shell/src/x.ts")], [], {
       seam: { served: ["/things", "/quiet"], calls: 1, matched: 1, uncalled: ["/quiet"] },
     });
-    expect(screen.getByText(/What passes between them is HTTP: 2 routes/)).toBeTruthy();
-    // The verified answer stays on the line, visible, rather than behind the disclosure.
+    expect(screen.getByText(/HTTP: 2 routes/)).toBeTruthy();
+    // The verified answer is one click away, behind the disclosure.
+    fireEvent.click(screen.getByRole("button", { name: "Why?" }));
     expect(screen.getByText(/Nothing asks for a route that does not exist/)).toBeTruthy();
   });
 
@@ -162,7 +163,7 @@ describe("the boundary between the two sides", () => {
         uncalled: ["/b"],
       },
     });
-    fireEvent.click(screen.getByRole("button", { name: "why?" }));
+    fireEvent.click(screen.getByRole("button", { name: "Why?" }));
     expect(screen.getByText(/hand the path in from elsewhere/)).toBeTruthy();
     // As a list and not a tooltip: a hover is not something a keyboard can do.
     expect(screen.getByText("shell/src/data/runs.ts:210")).toBeTruthy();
@@ -212,7 +213,7 @@ describe("an alarm with its proof", () => {
     );
     expect(screen.getByText(/dependencies between communities point backwards/)).toBeTruthy();
     expect(screen.getByText("25%")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "show them" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show them" }));
     expect(opened).toBe(1);
   });
 });
@@ -225,7 +226,7 @@ describe("a project this map can only read one side of", () => {
     draw([mod("shell/src/x.ts")], [], {
       seam: { served: [], calls: 7, matched: 0 },
     });
-    expect(screen.getByText(/the boundary could not be read/)).toBeTruthy();
+    expect(screen.getByText("No route found")).toBeTruthy();
     expect(screen.getByText(/7 calls the shell makes are left uncompared/)).toBeTruthy();
     expect(screen.queryByText(/Nothing asks for a route that does not exist/)).toBeNull();
   });
@@ -237,7 +238,7 @@ describe("a daemon too old to have read the boundary", () => {
     // over as though there were one. Read as a real seam, that is a claim that this product has no
     // routes; read as a crash, it takes the whole map screen down, which is what it first did.
     draw([mod("core/src/a.rs")], [], { seam: null });
-    expect(screen.getByText(/does not report the boundary/)).toBeTruthy();
+    expect(screen.getByText("Boundary not reported")).toBeTruthy();
     expect(screen.queryByText(/the boundary is/)).toBeNull();
     // The rest of the picture is unaffected — the sides are counted here, not by the daemon.
     expect(screen.getByText("core")).toBeTruthy();

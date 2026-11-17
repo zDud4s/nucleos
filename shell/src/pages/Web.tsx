@@ -27,7 +27,6 @@ import {
   Section,
   Skeleton,
   StateBadge,
-  Teach,
 } from "../ui";
 import "./web.css";
 import { keys } from "../data/keys";
@@ -82,9 +81,9 @@ export function Web({ embedded = false }: { embedded?: boolean } = {}) {
       <WebBar onFilter={setQ} />
 
       {untouched ? (
-        <Teach title="Nothing has been read yet">
+        <Quiet says="Nothing has been read yet">
           <p>Paste an address above to read it now. Every page read stays here, indexed and searchable.</p>
-        </Teach>
+        </Quiet>
       ) : (
         // Below 60rem the layout is one column, and with a page open only the reader shows: a list
         // stacked above it made a click on a row look as if nothing had happened.
@@ -100,13 +99,13 @@ export function Web({ embedded = false }: { embedded?: boolean } = {}) {
               </Link>
             )}
             {pageId === null && (
-              <Teach title={rawId === undefined ? "Nothing is open" : "No such page"}>
+              <Quiet says={rawId === undefined ? "Nothing is open" : "No such page"}>
                 <p>
                   {rawId === undefined
                     ? "Pick a page from the archive to read it here."
                     : "There is no page with that number. Pick one from the archive."}
                 </p>
-              </Teach>
+              </Quiet>
             )}
             {pageId !== null && <ReaderView key={pageId} id={pageId} />}
           </div>
@@ -175,6 +174,10 @@ function WebBar({ onFilter }: { onFilter: (q: string | undefined) => void }) {
   const trimmed = text.trim();
   const isUrl = looksLikeUrl(text);
   const hintId = useId();
+  const hintText =
+    isUrl || trimmed === ""
+      ? "Paste an address to read it. Type words to filter the archive; Enter also searches the web."
+      : "Filtering the archive as you type. Press Enter to search the web as well.";
   barDraft = text;
 
   useEffect(() => {
@@ -215,7 +218,8 @@ function WebBar({ onFilter }: { onFilter: (q: string | undefined) => void }) {
             value={text}
             aria-label="Read an address or filter the archive"
             aria-describedby={hintId}
-            placeholder="Address to read, or words to filter"
+            title={hintText}
+            placeholder="Address or filter"
             autoComplete="off"
             spellCheck={false}
             onChange={(event) => setText(event.target.value)}
@@ -231,10 +235,9 @@ function WebBar({ onFilter }: { onFilter: (q: string | undefined) => void }) {
           </Button>
         )}
       </form>
-      <p id={hintId} className="web-bar-hint">
-        {isUrl || trimmed === ""
-          ? "Paste an address to read it. Type words to filter the archive; Enter also searches the web."
-          : "Filtering the archive as you type. Press Enter to search the web as well."}
+      {/* The usage text stays in the DOM, hidden, as the input's description; it shows as its title. */}
+      <p id={hintId} hidden>
+        {hintText}
       </p>
 
       {read.data !== undefined && <ReadOutcome view={read.data} />}
@@ -285,7 +288,9 @@ function SearchOutcome({ query, view }: { query: string; view: SearchView }) {
             not an announcement, and this one arrives after a mutation lands. */}
         {view.provider === "unavailable" && (
           <div role="status">
-            <Quiet says="no search provider is configured on this machine: showing only what is already in the archive" />
+            <Quiet says="No search provider">
+              None is configured on this machine: showing only what is already in the archive.
+            </Quiet>
           </div>
         )}
 
@@ -349,13 +354,13 @@ function ArchiveList({
     <Panel title="Archive">
       {loading && <Skeleton label="Reading the archive…" variant="row" count={4} />}
       {!loading && rows !== undefined && rows.length === 0 && (
-        <Teach title={q === undefined ? "Nothing has been read yet" : "Nothing here matches"}>
+        <Quiet says={q === undefined ? "Nothing has been read yet" : "Nothing here matches"}>
           <p>
             {q === undefined
               ? "Paste an address above to read it now."
               : "Press Enter to search the web for it, or clear the field to see the whole archive."}
           </p>
-        </Teach>
+        </Quiet>
       )}
       {rows !== undefined && rows.length > 0 && (
         <Rows label="Archive">

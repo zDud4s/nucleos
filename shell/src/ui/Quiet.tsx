@@ -81,7 +81,7 @@ export function Quiet({ says, children, action, announce, compact }: QuietProps)
         aria-describedby={saidId}
         onClick={() => setWhy(!why)}
       >
-        {why ? "less" : "why?"}
+        {why ? "Less" : "Why?"}
       </button>
     );
 
@@ -110,7 +110,7 @@ export function Quiet({ says, children, action, announce, compact }: QuietProps)
               aria-describedby={saidId}
               onClick={toggle}
             >
-              {pinned ? "less" : "why?"}
+              {pinned ? "Less" : "Why?"}
             </button>
           )}
         </Tip>

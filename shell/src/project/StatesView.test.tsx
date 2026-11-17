@@ -73,7 +73,7 @@ describe("the States view", () => {
   it("says so when the project has no state machine", async () => {
     daemon.apiFetch.mockResolvedValue({ root: "C:/p", files_read: 3, machines: [] });
     withClient(<StatesView projectId="alpha" />);
-    expect(await screen.findByText(/No state machine found/)).toBeTruthy();
+    expect(await screen.findByText(/No state machines/)).toBeTruthy();
   });
 
   it("opens from the map's States door even while the map is unanswered", async () => {

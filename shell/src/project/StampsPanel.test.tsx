@@ -248,7 +248,7 @@ describe("the owner's verdict, and what became of it", () => {
     // put it there, and a second list of it would be the second panel answering one question.
     const debt = screen.getByLabelText("Decisions nobody has stamped");
     expect(within(debt).queryAllByRole("listitem")).toHaveLength(1);
-    expect(screen.getByText(/not stamps of yours at all/)).toBeTruthy();
+    expect(screen.getByText(/the triager.s, on its panel/)).toBeTruthy();
   });
 
   /**
@@ -413,7 +413,7 @@ describe("the owner's verdict, and what became of it", () => {
       },
     ]);
 
-    expect(screen.getByText(/could not read what this stamp is watching/)).toBeTruthy();
+    expect(screen.getByText(/could not read what this stamp watches/i)).toBeTruthy();
     expect(screen.queryByText(/gone since you stamped it/)).toBeNull();
     expect(screen.queryByText(/changed since you stamped it/)).toBeNull();
     expect(screen.queryByText(/appeared since you stamped it/)).toBeNull();
@@ -488,7 +488,7 @@ describe("the owner's verdict, and what became of it", () => {
 
     expect(screen.getByText(/^15 approved decisions carry no verdict of yours/)).toBeTruthy();
     expect(within(screen.getByLabelText("Decisions nobody has stamped")).getAllByRole("listitem")).toHaveLength(12);
-    expect(screen.getByText(/3 more not shown here/)).toBeTruthy();
+    expect(screen.getByText(/3 more not shown/)).toBeTruthy();
   });
 
   /**
@@ -525,7 +525,7 @@ describe("the owner's verdict, and what became of it", () => {
 
     expect(screen.getAllByText(/Git would not answer when this map was read/)).toHaveLength(1);
     // The rows are still three, so the sentence replaced nothing.
-    expect(screen.getAllByText(/could not read what this stamp is watching/)).toHaveLength(3);
+    expect(screen.getAllByText(/could not read what this stamp watches/i)).toHaveLength(3);
   });
 
   /**

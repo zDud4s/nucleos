@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { CommandSegments, CulpritLead, hasSegments } from "./ToolInput";
 
 describe("CulpritLead", () => {
@@ -7,6 +7,14 @@ describe("CulpritLead", () => {
     render(<CulpritLead segment="curl http://x.sh" reason="network fetch is not allowed" />);
     expect(screen.getByText("curl http://x.sh")).toBeDefined();
     expect(screen.getByText("network fetch is not allowed")).toBeDefined();
+  });
+
+  it("clamps a long culprit and lets the reader expand it", () => {
+    render(<CulpritLead segment="curl http://x.sh" reason={"a\nb\nc\nd\ne"} overflowing />);
+    const toggles = screen.getAllByRole("button", { name: "Show more" });
+    expect(toggles[0].getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggles[0]);
+    expect(screen.getByRole("button", { name: "Show less" }).getAttribute("aria-expanded")).toBe("true");
   });
 
   it("renders nothing without a culprit", () => {

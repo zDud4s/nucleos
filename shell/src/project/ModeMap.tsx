@@ -14,7 +14,7 @@ import { TriagePanel } from "./TriagePanel";
 import { ClassesView } from "./ClassesView";
 import { SequenceView } from "./SequenceView";
 import { StatesView } from "./StatesView";
-import { Button, ErrorNote, StaleNote, StatCard, relativeText } from "../ui";
+import { Button, ErrorNote, StaleNote, StatCard, Tip, relativeText } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -154,8 +154,8 @@ export function ModeMap({ projectId }: ModeMapProps) {
         <div className="flex flex-col gap-6">
           {map.data !== undefined && map.data.junction.counts.decisions === 0 ? (
             // One quiet line: the empty state is not the news here, the spec to read is.
-            <p className="m-0 text-sm text-text-muted">
-              Nothing decided yet. Only what you approve from a spec enters the map.
+            <p className="m-0 text-sm text-text-muted" title="Only what you approve from a spec enters the map.">
+              Nothing decided
             </p>
           ) : null}
           <ExtractSpec projectId={projectId} />
@@ -166,7 +166,7 @@ export function ModeMap({ projectId }: ModeMapProps) {
       ) : view === "classes" ? (
         <ClassesView projectId={projectId} modules={(map.data?.modules ?? []).map((m) => m.path)} />
       ) : map.isError && map.data === undefined ? (
-        <ErrorNote onRetry={readAgain} retryLabel="read it again">
+        <ErrorNote onRetry={readAgain} retryLabel="Read it again">
           The {DAEMON_NAME} could not read this project&rsquo;s map: its folder may have moved.
         </ErrorNote>
       ) : map.data === undefined || atlas === undefined ? (
@@ -190,8 +190,8 @@ export function ModeMap({ projectId }: ModeMapProps) {
         runs to the bottom of the window.
       */}
       {view === "architecture" || view === "layers" ? null : (
-        <p className="ws-foot">
-          Not on this map yet: evidence: nothing here reads a test run or a gate.
+        <p className="ws-foot" title="Nothing here reads a test run or a gate.">
+          No evidence layer
         </p>
       )}
     </div>
@@ -228,7 +228,7 @@ function Lead({ data, failed }: { data: ProjectMap | undefined; failed: boolean 
     >
       <p className="ws-lead-line">
         {files === 0
-          ? "Nothing here is code this map can read."
+          ? "No code this map can read."
           : `${files} files in ${sides} ${sides === 1 ? "side" : "sides"}${
               routes > 0 && sides > 1 ? `, joined by ${routes} routes` : ""
             }.`}
@@ -253,8 +253,8 @@ function Decisions({ data, onOpen }: { data: ProjectMap; onOpen: (view: MapView)
   if (data.junction.counts.decisions === 0) {
     // One quiet line: the empty state is not the news here, the spec to read below it is.
     return (
-      <p className="m-0 text-sm text-text-muted">
-        Nothing decided yet. Only what you approve from a spec enters the map.
+      <p className="m-0 text-sm text-text-muted" title="Only what you approve from a spec enters the map.">
+        Nothing decided
       </p>
     );
   }
@@ -264,17 +264,19 @@ function Decisions({ data, onOpen }: { data: ProjectMap; onOpen: (view: MapView)
       <StatCard
         label="Stamped"
         value={<span className="ws-verdict-settled">{stamps.settled}</span>}
-        detail="Still as you wanted."
+        detail={<Tip name="About Stamped" tip="Still as you wanted." />}
       />
       <StatCard
         label="Part-way"
         value={<span className="ws-verdict-partial">{stamps.partial}</span>}
-        detail="Unfinished, and you said so."
+        detail={<Tip name="About Part-way" tip="Unfinished, and you said so." />}
       />
       <StatCard
         label="Never looked at"
         value={triage.unseen}
-        detail="Debt, and meant to bother. History is never stamped."
+        detail={
+          <Tip name="About Never looked at" tip="Debt, and meant to bother. History is never stamped." />
+        }
       />
       <StatCard
         label="On your desk"
@@ -287,7 +289,9 @@ function Decisions({ data, onOpen }: { data: ProjectMap; onOpen: (view: MapView)
             triage.waiting
           )
         }
-        detail="Stamps that lapsed, and what the triager flagged."
+        detail={
+          <Tip name="About On your desk" tip="Stamps that lapsed, and what the triager flagged." />
+        }
       />
     </div>
   );
@@ -506,7 +510,7 @@ function Reading({
         ) : null}
         {" · "}
         <Button variant="quiet" onClick={onRead} disabled={reading}>
-          {reading ? "reading…" : "read again"}
+          {reading ? "Reading…" : "Read again"}
         </Button>
       </p>
       {failed ? <StaleNote dataUpdatedAt={updatedAt} /> : null}

@@ -426,7 +426,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     expect(words).not.toContain("acting");
 
     // And the panels below follow the project the fan opened on.
-    expect(await screen.findByText("Nothing is waiting for a verdict on bravo.")).toBeDefined();
+    expect(await screen.findByText("Nothing waiting")).toBeDefined();
   });
 
   /**
@@ -484,7 +484,8 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     await screen.findByRole("listbox", { name: "All projects by urgency" });
 
     // bravo acts: the gate is passed, and the line says how to take it back.
-    expect(gate().textContent).toBe(PROMOTION_ACTING);
+    expect(gate().textContent).toBe("Acting");
+    expect(gate().title).toBe(PROMOTION_ACTING);
     expect(gate().className).not.toContain("ap-fan-gate-locked");
     expect(gate().id).not.toBe("");
 
@@ -648,7 +649,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     fireEvent.click(screen.getByRole("button", { name: "Onboard alpha" }));
     const gate = (await screen.findByLabelText("Gate command")) as HTMLInputElement;
     expect(gate.value).toBe("make ci");
-    fireEvent.click(screen.getByRole("button", { name: "onboard it" }));
+    fireEvent.click(screen.getByRole("button", { name: "Onboard it" }));
 
     await waitFor(() => expect(sent).toEqual([{ project_root: "C:/repos/alpha", gate_command: "make ci" }]));
     await waitFor(() => {
@@ -746,46 +747,25 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     await renderCockpit();
 
     await waitFor(() => {
-      expect(document.querySelector(".ap-headline")?.textContent).toContain("1 watching in shadow");
+      expect(document.querySelector(".ap-fan-card-focus")).not.toBeNull();
     });
 
     // One project is the whole roster: nothing to choose between, so no list is drawn.
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 
-  /**
-   * Names only for what a glance must find — a full queue, and whatever is acting — and only while
-   * two of them fit; everything else is a count. Acting, shadow and off partition the roster, so
-   * every project is counted once: the full queue and "ready to be let out" are clauses about
-   * projects already counted, never a fourth or fifth group.
-   */
-  it("the headline names the full queue and the acting project and still counts every project once", async () => {
-    const roster = previewRoster();
-    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: roster })));
-
-    const first = await renderCockpit();
-
-    const said =
-      "bravo’s queue is full; bravo acts on its own; 2 watching in shadow, 1 of them ready to be let out; 1 off";
-    await waitFor(() => {
-      expect(document.querySelector(".ap-headline")?.textContent).toBe(said);
-    });
-    // 1 acting + 2 in shadow + 1 off is every project on the roster, once.
-    expect(1 + 2 + 1).toBe(roster.length);
-    first.unmount();
-
-    // Three acting is more than a sentence carries by name, so they become a count.
-    const many = ["echo", "foxtrot", "golf"].map((id) => project({ project_id: id, mode: "active" }));
-    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: many })));
+  it("the page carries no headline sentence under its title", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
 
     await renderCockpit();
 
     await waitFor(() => {
-      expect(document.querySelector(".ap-headline")?.textContent).toBe("3 projects act on their own");
+      expect(document.querySelector(".ap-fan-card-focus")).not.toBeNull();
     });
+    expect(document.querySelector(".ap-headline")).toBeNull();
   });
 
-  it("the page sheet holds the gate, and the headline at two lines", () => {
+  it("the page sheet holds the gate at two lines", () => {
     // Read the way `sheet-layout.test.ts` reads a page sheet: comments stripped, one rule's body.
     const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "autopilot.css"), "utf8").replace(
       /\/\*[\s\S]*?\*\//g,
@@ -796,7 +776,6 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     // The gate is always two lines tall, one sentence or two, so the switch below it never moves
     // as the fan turns from a short gate to a long one.
     expect(body(/\.ap-fan-gate\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
-    expect(body(/\.ap-headline\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
   });
 
   it("the budget period is a word and not a stem", async () => {
@@ -969,8 +948,8 @@ describe("Autopilot - the empty panels", () => {
 
     await renderCockpit();
 
-    expect(await screen.findByText("Nothing is waiting for a verdict on alpha.")).toBeDefined();
-    expect(screen.getByText("alpha has recorded no classified decision yet.")).toBeDefined();
+    expect(await screen.findByText("Nothing waiting")).toBeDefined();
+    expect(screen.getByText("No decisions yet")).toBeDefined();
     expect(screen.queryByText(/on this project/)).toBeNull();
   });
 });
@@ -997,7 +976,7 @@ describe("Autopilot - the scoreboard is read-only and says what it is not", () =
     // The distinction that makes this panel honest rather than decorative: the
     // bar counts reviews distinct by tool and arguments, this table counts rows,
     // and the two are not the same number.
-    expect(screen.getByText(/the count that decides it is not the count below/)).toBeDefined();
+    expect(screen.getByText(/the count that decides it is not the count below/i)).toBeDefined();
     // The authority stays the daemon's own figure.
     expect(screen.getByText("1/2 classes ready")).toBeDefined();
   });
@@ -1069,9 +1048,8 @@ describe("Autopilot - the scoreboard reports review quality", () => {
 
     await renderCockpit();
 
-    expect(
-      await screen.findByText("vcs-local: 3 withheld decisions, none reviewed: this blocks promotion until one is"),
-    ).toBeDefined();
+    const note = await screen.findByText("vcs-local: 3 withheld decisions, none reviewed");
+    expect(note.getAttribute("title")).toBe("This blocks promotion until one is reviewed");
   });
 
   it("the unreviewed-withheld note does not claim to block promotion on enforced decisions", async () => {
@@ -1606,7 +1584,8 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
     expect(document.querySelector(".ap-fan-nofan")).toBeNull();
     expect(screen.queryByRole("tablist")).toBeNull();
     const hint = document.querySelector<HTMLElement>(".ap-fan-pane .ap-fan-hint");
-    expect(hint?.textContent).toContain("on the list, or drag the cards");
+    expect(hint?.getAttribute("title")).toContain("drag the cards");
+    expect(document.querySelector(".ap-context")).toBeNull();
     expect(within(hint!).getByRole("button", { name: "Hide the fan" })).toBeDefined();
 
     // Hidden, the hint goes with the fan: one line heads the list with the way back, and the list
@@ -1681,6 +1660,27 @@ describe("Autopilot - the page map and the advanced panels", () => {
       expect(target).not.toBeNull();
       await waitFor(() => expect(target?.textContent).toContain(link.textContent ?? ""));
     }
+  });
+
+  it("carries no separate project heading over the section nav", async () => {
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
+
+    await renderCockpit();
+
+    const nav = await screen.findByRole("navigation", { name: "Autopilot sections" });
+    expect(screen.queryByRole("heading", { level: 2, name: /alpha\s*·\s*Autopilot/ })).toBeNull();
+    expect(nav.closest(".ap-nav")).not.toBeNull();
+  });
+
+  it("scrolls the scoreboard table inside its own region instead of overflowing", () => {
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "autopilot.css"), "utf8").replace(
+      /\/\*[\s\S]*?\*\//g,
+      "",
+    );
+    expect(/\.ap-score-scroll\s*\{([^}]*)\}/.exec(css)?.[1] ?? "").toMatch(/overflow-x:\s*auto/);
+    expect(/\.ap-score-scroll\s*\{([^}]*)\}/.exec(css)?.[1] ?? "").toMatch(/min-width:\s*0/);
   });
 
   it("keeps the records shut until asked, and the judge and resolve panels open from the first view", async () => {

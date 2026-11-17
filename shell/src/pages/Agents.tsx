@@ -40,7 +40,6 @@ import {
   TabsList,
   TabsTrigger,
   Td,
-  Teach,
   Th,
   Tip,
   toastManager,
@@ -177,17 +176,17 @@ export function Agents() {
       {!answered && !agents.isError && <Skeleton label="Reading the catalogue" variant="row" count={4} />}
 
       {answered && rows.length === 0 && (
-        <Teach title="No agent has been hired yet">
-          <p>
-            An agent is a name, a speciality a director reads to delegate, a prompt, an engine and a
-            tool policy. Add one to start the catalogue.
-          </p>
-          <p>
+        <Quiet
+          says="No agent has been hired yet"
+          action={
             <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
               New agent
             </Button>
-          </p>
-        </Teach>
+          }
+        >
+          An agent is a name, a speciality a director reads to delegate, a prompt, an engine and a
+          tool policy. Add one to start the catalogue.
+        </Quiet>
       )}
 
       {rows.length > 0 && (
@@ -812,10 +811,10 @@ function NewAgentForm({ onDone }: { onDone: () => void }) {
         }}
       >
         <AgentFields draft={draft} onChange={patch} />
-        <p className="agents-aside">
-          The id is taken from the name, once, and never recomputed. Renaming later changes the
-          label and not the address.
-        </p>
+        <Tip
+          name="About the id"
+          tip="The id is taken from the name, once, and never recomputed. Renaming later changes the label and not the address."
+        />
       </form>
       {create.isError && <SaveRefusal error={create.error} />}
     </Modal>
@@ -882,9 +881,15 @@ function AgentEditor({
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
+            {/* The one consequence of this form that is not obvious: `job::persona_for` reads an
+                agent's prompt when an item is DISPATCHED, so saving reaches work planned before. */}
             <Button type="submit" form={formId} intent="go" disabled={!valid || update.isPending}>
               {update.isPending ? "Saving…" : "Save changes"}
             </Button>
+            <Tip
+              name="About saving"
+              tip="Saving reaches work that is already queued: an item reads its agent's prompt when it is dispatched, not when it was planned."
+            />
           </>
         ) : (
           <Button variant="ghost" onClick={onClose}>
@@ -929,16 +934,6 @@ function AgentEditor({
             }}
           >
             <AgentFields draft={draft} onChange={patch} />
-            {/*
-              Said here rather than nowhere, because it is the one consequence of
-              this form that is not obvious: `job::persona_for` reads an agent's
-              prompt when an item is DISPATCHED and does not store it on the row,
-              so saving reaches work that was planned before the edit.
-            */}
-            <p className="agents-aside">
-              Saving reaches work that is already queued: an item reads its agent&rsquo;s prompt
-              when it is dispatched, not when it was planned.
-            </p>
           </form>
           {update.isError && <SaveRefusal error={update.error} />}
         </TabsContent>

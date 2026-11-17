@@ -501,7 +501,6 @@ describe("Runs - the index", () => {
     await renderRuns();
 
     const teach = (await screen.findByText(/No runs yet/)).parentElement as HTMLElement;
-    expect(teach.textContent).toMatch(/Start one with New run/);
     fireEvent.click(within(teach).getByRole("button", { name: "New run" }));
     expect(await screen.findByRole("dialog", { name: "New run" })).toBeTruthy();
   });

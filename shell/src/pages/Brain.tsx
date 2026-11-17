@@ -83,7 +83,6 @@ export function Brain() {
     <>
       <PageHeader
         title="Brain"
-        headline="your notes and what the agent has been taught"
         actions={
           <div className="brain-head">
             <Tally />
@@ -247,7 +246,8 @@ function Capture({ hidden = false, onStamp }: { hidden?: boolean; onStamp?: () =
         ref={areaRef}
         className="brain-compose-input"
         rows={2}
-        placeholder="Write it down: a fact, a reminder, a loose end. No agent reads it until you teach it."
+        placeholder="Write it down…"
+        title="A fact, a reminder, a loose end. No agent reads it until you teach it."
         value={text}
         aria-describedby="brain-capture-hint"
         onChange={(event) => {
@@ -514,9 +514,9 @@ export function BrainListView({
           </ErrorNote>
         ) : (
           <>
-            <Quiet compact says="Nothing open.">
-              Pick a row to read it whole, see what it links to, or teach it to the agent.
-            </Quiet>
+            <span title="Pick a row to read it whole, see what it links to, or teach it to the agent.">
+              <Quiet compact says="Nothing open." />
+            </span>
             <AboutYou />
           </>
         )}

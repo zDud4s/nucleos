@@ -149,7 +149,7 @@ describe("the pins document on the Workflows screen", () => {
     );
 
     const panel = within(await screen.findByRole("region", { name: "Workflow pins" }));
-    expect(await panel.findByText(/has no workflow_pins document/)).toBeTruthy();
+    expect(await panel.findByTitle("This project has no workflow_pins document to edit.")).toBeTruthy();
     expect(panel.queryByRole("button", { name: "Save" })).toBeNull();
   });
 });

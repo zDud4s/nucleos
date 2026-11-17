@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
@@ -198,10 +198,11 @@ describe("Web — search", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Search the web" }));
 
+    expect(await screen.findByText("No search provider")).toBeDefined();
+    const quiet = screen.getByText("No search provider").closest(".ui-quiet") as HTMLElement;
+    fireEvent.click(within(quiet).getByRole("button", { name: "Why?" }));
     expect(
-      await screen.findByText(
-        "no search provider is configured on this machine: showing only what is already in the archive",
-      ),
+      screen.getByText("None is configured on this machine: showing only what is already in the archive."),
     ).toBeDefined();
 
     // Never routed through the failure path — this is a 200 the daemon

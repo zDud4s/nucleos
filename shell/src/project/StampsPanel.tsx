@@ -11,7 +11,7 @@ import {
   type Watch,
 } from "../data/project-map";
 import { pluralWord } from "../lib/plural";
-import { Inset, RelativeTime, SectionTitle } from "../ui";
+import { Inset, RelativeTime, SectionTitle, Tip } from "../ui";
 import { GiveStamp } from "./GiveStamp";
 
 /**
@@ -113,6 +113,16 @@ interface Stood<S extends Standing = Standing> {
 /** A decision the owner called done. Narrowed, so the piles below can read `watch` without a guard. */
 type Green = Stood<Extract<Standing, { state: "settled" }>>;
 
+/** A pile's heading, with the sentence that explains it behind an ⓘ that stays in the document. */
+function Titled({ about, tip, children }: { about: string; tip: ReactNode; children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-2">
+      <SectionTitle>{children}</SectionTitle>
+      <Tip name={about} persist tip={tip} />
+    </div>
+  );
+}
+
 export function StampsPanel({
   projectId,
   junction,
@@ -185,27 +195,30 @@ export function StampsPanel({
         false confidence manufactured by the arithmetic of its own cure, on the one line that
         exists to be uncomfortable.
       */}
-      <p className="font-display text-2xl text-text">
-        {`${stamps.settled} stamped · ${stamps.partial} part-way · ${triageCounts.unseen} never looked at · ${triageCounts.waiting} on your desk`}
-      </p>
-      {stamps.decisions > 0 ? (
-        <div className="flex flex-col gap-1">
-          <p className="max-w-prose text-xs text-text-muted">
-            The third number is debt, and it is meant to be uncomfortable. On day one it is nearly
-            all of them, because history does not get stamped (§10).
-          </p>
-          {/*
-            Said once here rather than under every row that can be stamped. A pile of 350 lines
-            would otherwise carry 350 copies of it, which is the wall of identical sentences this
-            panel refuses on `git_would_not_answer` for the same reason: nobody reads to the bottom
-            of one, and whatever mattered underneath goes unseen.
-          */}
-          <p className="max-w-prose text-xs text-text-muted">
-            Three verdicts, and the middle one always carries a note: §5.2 makes the note the whole
-            of amber, so its button waits until you have written one.
-          </p>
-        </div>
-      ) : null}
+      <div className="flex items-center gap-2">
+        <p className="font-display text-2xl text-text">
+          {`${stamps.settled} stamped · ${stamps.partial} part-way · ${triageCounts.unseen} never looked at · ${triageCounts.waiting} on your desk`}
+        </p>
+        {/* Said once here rather than under every row that can be stamped: 350 copies is a wall. */}
+        {stamps.decisions > 0 ? (
+          <Tip
+            name="About these numbers"
+            persist
+            tip={
+              <>
+                <span>
+                  The third number is debt, and it is meant to be uncomfortable. On day one it is
+                  nearly all of them, because history does not get stamped (§10).
+                </span>{" "}
+                <span>
+                  Three verdicts, and the middle one always carries a note: §5.2 makes the note the
+                  whole of amber, so its button waits until you have written one.
+                </span>
+              </>
+            }
+          />
+        ) : null}
+      </div>
 
       {gitWouldNotAnswer ? <GitSilent /> : null}
 
@@ -278,9 +291,8 @@ export function StampsPanel({
 function GitSilent() {
   return (
     <p className="max-w-prose rounded-md border border-tone-pending-border bg-tone-pending-bg p-2 text-xs text-text-muted">
-      Git would not answer when this map was read, so not one stamp below could be checked against
-      the code. Nothing here reports a change, and nothing here reports that there was none. Read
-      it again in a moment.
+      Git would not answer when this map was read, so no stamp below could be checked. Read it
+      again in a moment.
     </p>
   );
 }
@@ -295,9 +307,7 @@ function GitSilent() {
 function NothingApproved() {
   return (
     <p className="max-w-prose text-sm text-text-muted">
-      No decision has been approved for this project yet, so there is nothing to stamp. A stamp is
-      your verdict on a line that is already in the map, and nothing gets into the map without you
-      answering it first.
+      No decision approved yet.
     </p>
   );
 }
@@ -312,8 +322,7 @@ function NothingApproved() {
 function DayOne({ never }: { never: number }) {
   return (
     <p className="max-w-prose text-sm text-text-muted">
-      Nothing here is stamped. On day one that is the whole map: all {never} of it, and §10 is
-      deliberate about it: history does not get stamped, and this backlog blocks nothing.
+      Nothing here is stamped. On day one that is all {never} of it.
     </p>
   );
 }
@@ -347,14 +356,12 @@ function OnYourDesk({
 
   return (
     <div className="flex flex-col gap-2">
-      <SectionTitle>
+      <Titled
+        about="About this pile"
+        tip={`${total} ${pluralWord(total, "stamp", "stamps")} you gave stopped being true. §7 puts the diff between what you stamped and what is there now on the row: re-stamping is one click when it is cosmetic, and it is the right moment to look when it is not.`}
+      >
         On your desk
-      </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {total} {pluralWord(total, "stamp", "stamps")} you gave stopped being true. §7 puts the diff
-        between what you stamped and what is there now on the row: re-stamping is one click when it
-        is cosmetic, and it is the right moment to look when it is not.
-      </p>
+      </Titled>
       {/*
         §5.3's `J` is two halves and this panel draws one of them, so the header's number is larger
         than this pile. Said out loud rather than left to be noticed: a count above a list that
@@ -364,8 +371,7 @@ function OnYourDesk({
       */}
       {flagged > 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
-          The other {flagged} on your desk are not stamps of yours at all: the triager put them
-          there, and they are on its own panel below with the reason it gave.
+          The other {flagged} on your desk are the triager's, on its panel below.
         </p>
       ) : null}
       <ul aria-label="Stamps that stopped being true" className="flex flex-col gap-2">
@@ -399,8 +405,7 @@ function Why({ why }: { why: Lapse }) {
   if (why.kind === "unreadable") {
     return (
       <p className="max-w-prose text-xs text-text-muted">
-        This map could not read what this stamp is watching, so it cannot say whether the code
-        moved: neither that it did nor that it did not.
+        Could not read what this stamp watches, so it cannot say whether the code moved.
       </p>
     );
   }
@@ -409,8 +414,7 @@ function Why({ why }: { why: Lapse }) {
     return (
       <div className="flex flex-col gap-1">
         <p className="max-w-prose text-xs text-text-muted">
-          Your note is older than thirty days, so this map is asking whether it is still true.
-          Amber expires by time and not by the code moving, because what rots is the note.
+          Your note is older than thirty days. Is it still true?
         </p>
         <p className="max-w-prose text-sm text-text">{why.note}</p>
       </div>
@@ -462,14 +466,12 @@ function PartWay({
 
   return (
     <div className="flex flex-col gap-2">
-      <SectionTitle>
+      <Titled
+        about="About this pile"
+        tip={`${total} ${pluralWord(total, "decision", "decisions")} you stamped with a note. The note is on the row and never on a hover. §5.2 makes it the whole of amber. This verdict does not expire when the code moves; it expires by time, because what rots is the note.`}
+      >
         Part-way, and you know it
-      </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {total} {pluralWord(total, "decision", "decisions")} you stamped with a note. The note is on the
-        row and never on a hover. §5.2 makes it the whole of amber. This verdict does not expire
-        when the code moves; it expires by time, because what rots is the note.
-      </p>
+      </Titled>
       <ul aria-label="Stamps you gave with a note" className="flex flex-col gap-2">
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
@@ -521,15 +523,12 @@ function Withdrawn({
 
   return (
     <div className="flex flex-col gap-3">
-      <SectionTitle>
+      <Titled
+        about="About this pile"
+        tip={`${total} ${pluralWord(total, "decision", "decisions")} you changed your mind about. Withdrawing is a statement and not a forgetting: it stops the map asking without the line disappearing in silence. They are grouped by the document that still claims them, because the document is the thing to change, and this map does not change one (§12).`}
+      >
         Withdrawn, and the document has not caught up
-      </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {total} {pluralWord(total, "decision", "decisions")} you changed your mind about. Withdrawing is
-        a statement and not a forgetting: it stops the map asking without the line disappearing in
-        silence. They are grouped by the document that still claims them, because the document is
-        the thing to change, and this map does not change one (§12).
-      </p>
+      </Titled>
       {Array.from(bySlug.entries()).map(([slug, held]) => {
         const { shown, hidden } = capped(held);
         return (
@@ -590,14 +589,12 @@ function NeverExpires({
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <SectionTitle>
+      <Titled
+        about="About this pile"
+        tip={`${stamps.unwatched} of your greens are standing on something that cannot move, so nothing will ever expire them. §7 says such a stamp is to be shown rather than enjoyed, and the three reasons below want three different repairs: one of which is nothing.`}
+      >
         Stamped, and it will never come back to ask
-      </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {`${stamps.unwatched} of your greens are standing on something that cannot move, so nothing will ever expire them.`}{" "}
-        §7 says such a stamp is to be shown rather than enjoyed, and the three reasons below want
-        three different repairs: one of which is nothing.
-      </p>
+      </Titled>
 
       <Silence
         projectId={projectId}
@@ -637,7 +634,10 @@ function Silence({
   const { shown, hidden } = capped(rows);
   return (
     <div className="flex flex-col gap-2">
-      <p className="max-w-prose text-xs text-text-muted">{sentence}</p>
+      <p className="flex items-center gap-2 text-xs text-text-muted">
+        {label}
+        <Tip name={`About ${label.toLowerCase()}`} persist tip={sentence} />
+      </p>
       <ul aria-label={label} className="flex flex-col gap-2">
         {shown.map(({ row, standing }) => (
           <Line key={row.decision_id} row={row} at={standing.stamped_at}>
@@ -687,15 +687,21 @@ function Guessed({
         under it and one of them is the reassuring one. A heading that said only "guessed" would
         make the certain count read as a footnote to a complaint.
       */}
-      <SectionTitle>
+      <Titled
+        about="About this pile"
+        tip={
+          <>
+            <span>
+              {`${stamps.guessed} of your greens are watching files matched by section number alone. Code names the section and never says which document the section belongs to, so such a stamp will expire, and it may expire because an unrelated file that happens to write the same §N about a different document changed.`}
+            </span>{" "}
+            <span>
+              {`${certain} of your greens are watching an anchor this map is certain about: a readable module names the section and names the document it belongs to.`}
+            </span>
+          </>
+        }
+      >
         What your greens are watching
-      </SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        {`${stamps.guessed} of your greens are watching files matched by section number alone. Code names the section and never says which document the section belongs to, so such a stamp will expire, and it may expire because an unrelated file that happens to write the same §N about a different document changed.`}
-      </p>
-      <p className="max-w-prose text-xs text-text-muted">
-        {`${certain} of your greens are watching an anchor this map is certain about: a readable module names the section and names the document it belongs to.`}
-      </p>
+      </Titled>
       {guessed.length > 0 ? (
         <>
           <ul aria-label="Greens over a guessed anchor" className="flex flex-col gap-2">
@@ -748,10 +754,13 @@ function NeverLooked({
         is total: everything whose anchors did not move inside the walk's window ties, and the
         triage panel below is where that window's size is stated.
       */}
-      <p className="max-w-prose text-xs text-text-muted">
-        {`${total} approved ${pluralWord(total, "decision carries", "decisions carry")} no verdict of yours.`}{" "}
-        Most recently moved first, which is the order §10 asks for, and it is a fact about the git
-        log rather than a ranking: everything that has not moved lately ties.
+      <p className="flex items-center gap-2 text-xs text-text-muted">
+        {`${total} approved ${pluralWord(total, "decision carries", "decisions carry")} no verdict of yours.`}
+        <Tip
+          name="About this order"
+          persist
+          tip="Most recently moved first, which is the order §10 asks for, and it is a fact about the git log rather than a ranking: everything that has not moved lately ties."
+        />
       </p>
       {/*
         The silenced are in this pile and not in a pile of their own, which is §5.1 rather than an
@@ -761,9 +770,7 @@ function NeverLooked({
       */}
       {silenced > 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
-          {silenced} of them the triager silenced, and they are still counted here: silencing says
-          the triager saw nothing worth your time, which is a claim about the triager and not about
-          the code. Nobody has looked at them.
+          {silenced} of them the triager silenced. Nobody has looked at them.
         </p>
       ) : null}
       <ul aria-label="Decisions nobody has stamped" className="flex flex-col gap-2">
@@ -829,7 +836,7 @@ function Line({
 function Hidden({ count }: { count: number }) {
   return (
     <p className="text-xs text-text-faint">
-      {count} more not shown here. The count above is the whole pile.
+      {count} more not shown.
     </p>
   );
 }

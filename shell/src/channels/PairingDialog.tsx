@@ -156,7 +156,7 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
       )}
       {code !== null && state !== "paired" && !(state !== undefined && state in ENDED) && (
         <div className="pairing-code">
-          <p>Send this to the bot in the conversation you want to pair:</p>
+          <p title="Send this to the bot in the conversation you want to pair">Send to the bot</p>
           <div className="pairing-code-command">
             <code>{code.command}</code>
             <CopyButton value={code.command} label="the pairing command" />

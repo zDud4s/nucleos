@@ -33,6 +33,7 @@ import {
   RunPipeline,
   partOfText,
   Section,
+  Tip,
   usePaletteGroup,
 } from "../ui";
 import { usePageKeys } from "../project/pageKeys";
@@ -372,7 +373,7 @@ function RouteBlock({ run }: { run: Run }) {
           )}
         </p>
       )}
-      {unadvised && <p className="runs-successor">The router gave no usable advice; the run launched as configured.</p>}
+      {unadvised && <p className="runs-successor">No usable advice; ran as configured.</p>}
       {failed !== null && <p className="runs-successor">{`Already failed on this item: ${failed}`}</p>}
     </div>
   );
@@ -423,11 +424,14 @@ function PromptBudget({ authored, cliOwn }: { authored: number | null; cliOwn: n
           {cliOwn === null ? "the rest is unknown" : `≈ ${grouped(cliOwn)} estimate: the CLI's own`}
         </span>
       </p>
-      <p className="runs-successor">
-        {cliOwn === null
-          ? "This run reported no token usage, so there is nothing to subtract our share from."
-          : "Tool schemas, standing instructions, helpers and the prompt, against everything else the CLI sent: undivided, because nothing here can tell its parts apart."}
-      </p>
+      <Tip
+        name="About this estimate"
+        tip={
+          cliOwn === null
+            ? "This run reported no token usage, so there is nothing to subtract our share from."
+            : "Tool schemas, standing instructions, helpers and the prompt, against everything else the CLI sent: undivided, because nothing here can tell its parts apart."
+        }
+      />
     </>
   );
 }
@@ -492,8 +496,7 @@ function GateSection({ run }: { run: Run }) {
       )}
       {!measured && (
         <p className="runs-gate-note">
-          Nothing measured this run. There is no gate configured for it, so there is nothing that
-          could have passed or failed.
+          Nothing measured: no gate configured.
         </p>
       )}
       {run.gate_output !== null && run.gate_output !== "" && (
@@ -538,8 +541,7 @@ function StopSection({ id, alive }: { id: number; alive: boolean }) {
           person's time. */}
       {!data.decisions_recorded && (
         <p className="runs-gate-note">
-          This run was watched by the person who started it, so the tool gate recorded no decisions
-          for it. Nothing is missing.
+          Watched by its starter: no tool gate decisions recorded.
         </p>
       )}
 
@@ -549,8 +551,8 @@ function StopSection({ id, alive }: { id: number; alive: boolean }) {
             data.timeout.silence_ceiling_seconds,
           )} silence ceiling and a ${minutes(data.timeout.wall_ceiling_seconds)} wall clock. `}
           {data.timeout.verdict === "silence"
-            ? "It went quiet: the wall clock was nowhere near, so what ran out was patience with a run that had stopped reporting."
-            : "Which of the two fired cannot be told apart from here, because the elapsed time is measured from when the run was created rather than from when it began."}
+            ? "It went quiet."
+            : "Which limit fired is unknown."}
         </p>
       )}
 
@@ -582,13 +584,13 @@ function BriefingBlock({ id }: { id: number }) {
   let explanation: string | null = null;
   if (data.reason === "no_trace_context") {
     explanation =
-      "This kind of run is briefed without a trace, so there is nothing to show here. That is not an empty briefing.";
+      "This kind of run is briefed without a trace.";
   } else if (data.reason === "past_retention") {
     explanation =
-      "The explanation of this briefing is past its retention window and has been deleted. What the run was told is not recoverable from here.";
+      "The briefing trace is past its retention window and was deleted.";
   } else if (data.reason === "nothing_offered") {
     explanation =
-      "Nothing was on offer for this run: no approved knowledge was in its scope when it started.";
+      "Nothing was on offer: no approved knowledge in scope.";
   }
 
   return (
@@ -775,8 +777,8 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
       )}
       {chunk === RECORDED && (
         <p className="runs-tail-note">
-          recorded: this run has no live tail; what it wrote is in the stored output below
-          {recorded === null ? ", and the daemon kept none of it" : ""}.
+          recorded: no live tail; see the stored output below
+          {recorded === null ? " (none kept)" : ""}.
         </p>
       )}
       {text !== "" &&
@@ -802,7 +804,7 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
             aria-label="Live output"
           >
             {events.length === 0 ? (
-              <p className="runs-tail-note">nothing to read yet: the agent is working</p>
+              <p className="runs-tail-note">nothing to read yet</p>
             ) : (
               <RunEventList events={events} />
             )}
@@ -960,7 +962,7 @@ function StdStreams({ run }: { run: Run }) {
           ) : (
             <div className="runs-events-well" tabIndex={0} role="region" aria-label="Stored output">
               {events.length === 0 ? (
-                <p className="runs-tail-note">nothing a person reads: Raw shows the wire</p>
+                <p className="runs-tail-note">nothing to read: see Raw</p>
               ) : (
                 <RunEventList events={events} />
               )}
@@ -973,7 +975,7 @@ function StdStreams({ run }: { run: Run }) {
         <p className="runs-tail-note">
           {run.stdout === null && run.stderr === null
             ? "nothing was recorded for this run"
-            : "hidden: this is usually long, and the gate above is the verdict"}
+            : "hidden: usually long"}
         </p>
       )}
     </Panel>
@@ -1003,8 +1005,7 @@ function SteeringBox({ id, running }: { id: number; running: boolean }) {
       <Panel title="Speak to this run">
         <div className="runs-steer">
           <p className="runs-tail-note">
-            This run is no longer running, so it cannot take another turn. Ending the turns is still
-            safe, and it is how one is closed.
+            No longer running: it cannot take another turn.
           </p>
           <div className="runs-steer-actions">
             <ConfirmButton

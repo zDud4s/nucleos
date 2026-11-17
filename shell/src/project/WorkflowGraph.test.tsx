@@ -272,7 +272,7 @@ describe("the workflow canvas", () => {
   it("closes the instructions guard on Escape and returns focus to its button", async () => {
     openGraph();
     fireEvent.click(await screen.findByLabelText(/Plan, a model is asked/));
-    fireEvent.click(await screen.findByRole("button", { name: "edit the instructions" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit the instructions" }));
     const guard = screen.getByRole("group", { name: "Edit this node's instructions" });
     expect(document.activeElement).toBe(guard);
 
@@ -280,7 +280,7 @@ describe("the workflow canvas", () => {
     expect(screen.queryByRole("group", { name: "Edit this node's instructions" })).toBeNull();
     // One press closed one thing: the inspector is still open on the node.
     await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "edit the instructions" })),
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit the instructions" })),
     );
   });
 
@@ -302,12 +302,12 @@ describe("the workflow canvas", () => {
   it("guards editing the instructions of a referenced node, inline and never as a dialog", async () => {
     const { rendered } = openGraph();
     fireEvent.click(await screen.findByLabelText(/Plan, a model is asked/));
-    fireEvent.click(await screen.findByRole("button", { name: "edit the instructions" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit the instructions" }));
 
     expect(screen.getByRole("group", { name: "Edit this node's instructions" })).toBeTruthy();
     expect(rendered.container.querySelector("dialog")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "edit in the library" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit in the library" }));
     expect(opener.openUrl).toHaveBeenCalledWith("vscode://file/C:/lib/harness/1.0");
   });
 
@@ -318,7 +318,7 @@ describe("the workflow canvas", () => {
   it("opens an ejected node's instructions with no guard at all", async () => {
     openGraph({ graph: graph({ source: "project" }) }, { ejected: true });
     fireEvent.click(await screen.findByLabelText(/Plan, a model is asked/));
-    fireEvent.click(await screen.findByRole("button", { name: "edit the instructions" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit the instructions" }));
     expect(screen.queryByRole("group", { name: "Edit this node's instructions" })).toBeNull();
     expect(opener.openUrl).toHaveBeenCalled();
   });
@@ -340,7 +340,7 @@ describe("the workflow canvas", () => {
     openGraph({ graph: null });
     // Matched on the half that lives in one text node — the file name is its own `<span>`, so a
     // regex across the whole sentence matches nothing.
-    expect(await screen.findByText(/halfway state, not a broken bundle/)).toBeTruthy();
+    expect(await screen.findByText(/This bundle has no/)).toBeTruthy();
   });
 });
 

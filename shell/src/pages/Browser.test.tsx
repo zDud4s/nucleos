@@ -837,7 +837,8 @@ describe("Browser - the bar while the sidecar is down", () => {
 
     await renderBrowser();
 
-    expect(await screen.findByText(/the browser is not running, so no window can open/i)).toBeDefined();
+    const note = await screen.findByText("Browser not running");
+    expect(note.getAttribute("title")).toMatch(/the browser is not running, so no window can open/i);
     const button = screen.getByRole("button", { name: "Open a window" }) as HTMLButtonElement;
     expect(button.disabled).toBe(false);
   });

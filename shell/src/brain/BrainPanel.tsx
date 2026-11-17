@@ -84,7 +84,13 @@ function Failure({ error, sentences }: { error: unknown; sentences?: Record<stri
 
 export function BrainPanel({ nodeId, graph, model, onSelect }: BrainPanelProps) {
   const wide = useNotesGraph(true);
-  if (nodeId === null) return <Quiet says="Select a node to see what it is linked to." />;
+  if (nodeId === null) {
+    return (
+      <Quiet says="Select a node">
+        <p>Select a node to see what it is linked to.</p>
+      </Quiet>
+    );
+  }
   // The archived-inclusive graph decides whether a note exists; the global one stands in while it loads.
   const known = wide.data ?? graph;
   const item = itemOfNode(nodeId);
@@ -108,7 +114,11 @@ export function BrainPanel({ nodeId, graph, model, onSelect }: BrainPanelProps) 
     };
     return <OtherPanel node={gone} model={model} onSelect={onSelect} />;
   }
-  return <Quiet says="That node is not in the graph as filtered." />;
+  return (
+    <Quiet says="Not in this filter">
+      <p>That node is not in the graph as filtered.</p>
+    </Quiet>
+  );
 }
 
 /** An entity, a knowledge row, or a note that is gone: a label and who points at it. */

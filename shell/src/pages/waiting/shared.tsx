@@ -229,7 +229,7 @@ export const QUEUES = {
     title: "Git queue",
     id: "waiting-git",
     index: () => "in the git queue",
-    says: "nothing in the git queue needs your approval",
+    says: "git queue clear",
     why: (
       <>
         Every push, merge and rebase the daemon has been asked to make. One

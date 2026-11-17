@@ -104,29 +104,29 @@ export function ModeGithub({ projectId }: ModeGithubProps) {
       <Standing projectId={projectId} stopped={stopped} />
 
       {/* Autonomy first: the mode, the proposal ceiling and the action classes (six sections). */}
-      <Section label="Autonomy">
+      <TipSection label="Autonomy" tip={STANDING_TIP}>
         <Settings projectId={projectId} />
-      </Section>
+      </TipSection>
 
       <Section label="The remote">
         <Remote projectId={projectId} />
       </Section>
 
-      <Section label="GitHub operations without asking">
+      <TipSection label="GitHub operations without asking" tip={GITHUB_OPS_TIP}>
         <AutonomousOps projectId={projectId} stopped={stopped} />
-      </Section>
+      </TipSection>
 
-      <Section label="Git operations the queue may perform">
+      <TipSection label="Git operations the queue may perform" tip={GIT_OPS_TIP}>
         <GitOps projectId={projectId} stopped={stopped} />
-      </Section>
+      </TipSection>
 
-      <Section label="What the worktrees may run">
+      <TipSection label="What the worktrees may run" tip={RULES_TIP}>
         <ShellRules projectId={projectId} stopped={stopped} />
-      </Section>
+      </TipSection>
 
-      <Section label="Where the work lands">
+      <TipSection label="Where the work lands" tip={LAND_TIP}>
         <LandTargets projectId={projectId} />
-      </Section>
+      </TipSection>
     </div>
   );
 }
@@ -196,11 +196,6 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
 
   return (
     <div className="flex flex-col gap-3" aria-label="Standing" role="group">
-      <Quiet says="Changes here reach the very next tool call of every run already working in this project.">
-        The {DAEMON_NAME} reads these tables at the moment it decides, with no cache and no restart, so
-        this is a live control and not a preference. Narrowing takes effect at the first press;
-        anything that widens what runs may do on their own asks you to press twice.
-      </Quiet>
 
       <dl className="flex flex-wrap items-baseline gap-x-6 gap-y-2 text-sm">
         <Fact term="GitHub reads" value={githubReads} />
@@ -224,6 +219,101 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
         </ConflictNote>
       ) : null}
     </div>
+  );
+}
+
+/* The ⓘ texts of the five tips below. Module-level so a section's heading can carry its own. */
+
+const STANDING_TIP = (
+  <>
+    <p>Changes here reach the very next tool call of every run already working in this project.</p>
+    <p>
+      The {DAEMON_NAME} reads these tables at the moment it decides, with no cache and no restart,
+      so this is a live control and not a preference. Narrowing takes effect at the first press;
+      anything that widens what runs may do on their own asks you to press twice.
+    </p>
+  </>
+);
+
+const GITHUB_OPS_TIP = (
+  <>
+    <p>Each grant lets this project's runs do that on GitHub without stopping to ask you.</p>
+    <p>
+      A granted read is used when an agent types <span className="font-mono">gh …</span> in one
+      of this project's worktrees, and only while GitHub is switched on for this machine:{" "}
+      <span className="font-mono">enabled: false</span> in{" "}
+      <span className="font-mono">~/.nucleos/github.yaml</span> (System › Settings) makes the{" "}
+      {DAEMON_NAME} ignore every project's grants, and nothing on this page overrides that. A
+      granted action is stored and does nothing yet. An operation this build does not allow is
+      listed so you know it exists; nothing on this machine can grant it.
+    </p>
+  </>
+);
+
+const GIT_OPS_TIP = (
+  <>
+    <p>
+      A granted operation is carried out by the queue for an autonomous run, without waiting for
+      you.
+    </p>
+    <p>
+      The agent's own command still comes back denied, with a ticket id: the queue runs it
+      instead. A person running a command never waited for approval, so these grants change
+      nothing for them. A matching refusal under "What the worktrees may run" wins and makes the
+      grant do nothing. Only spellings the queue can build are covered: bare{" "}
+      <span className="font-mono">git push</span>, <span className="font-mono">-u</span>,{" "}
+      <span className="font-mono">--force</span> and{" "}
+      <span className="font-mono">git branch -D</span> still stop and ask. A{" "}
+      <span className="font-mono">rebase</span> a run asks for comes back as a blocked ticket,
+      because that run holds the branch, and the ticket says which worktree holds it.
+    </p>
+  </>
+);
+
+const RULES_TIP = (
+  <>
+    <p>
+      {`A refusal here beats a permission here, and beats one compiled into the ${DAEMON_NAME}. A permission never lifts a refusal.`}
+    </p>
+    <p>
+      A permission only widens what the {DAEMON_NAME} would otherwise have <em>asked</em> about.
+      So <span className="font-mono">rm</span> allowed here leaves{" "}
+      <span className="font-mono">rm -rf /</span> refused, and a line carrying{" "}
+      <span className="font-mono">$( )</span> stays refused whatever these lists say. A project
+      with no rules at all classifies exactly as it did before there were any.
+    </p>
+  </>
+);
+
+const LAND_TIP = (
+  <>
+    <p>
+      A landing may go to the integration branch or to a branch added here; any other name is
+      refused.
+    </p>
+    <p>
+      <span className="font-mono">nucleos-core --land &lt;branch&gt;</span> sends what is in the
+      worktree it is called from, and a refused name comes back with the list of what would have
+      been admissible. A branch that does not exist yet can be added: it is often made by the run
+      that lands into it.
+    </p>
+  </>
+);
+
+/**
+ * A section whose ⓘ sits inline right after its heading text, never at the far edge.
+ *
+ * Same markup as `Section` (same region name, same heading) with the tip beside the heading.
+ */
+function TipSection({ label, tip, children }: { label: string; tip: ReactNode; children: ReactNode }) {
+  return (
+    <section aria-label={label} className="ui-section">
+      <div className="ws-headline">
+        <h2 className="ui-section-title">{label}</h2>
+        <Tip name={`About ${label}`} tip={<div className="flex flex-col gap-2">{tip}</div>} persist />
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -369,7 +459,7 @@ function Remote({ projectId }: { projectId: string }) {
             }}
             disabled={asking}
           >
-            {asking ? "asking GitHub…" : "ask again"}
+            {asking ? "Asking GitHub…" : "Ask again"}
           </Button>
         </span>
       </p>
@@ -887,15 +977,6 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
 
   return (
     <div className="flex flex-col gap-4">
-      <Quiet says="Each grant lets this project's runs do that on GitHub without stopping to ask you.">
-        A granted read is used when an agent types <span className="font-mono">gh …</span> in one of
-        this project's worktrees, and only while GitHub is switched on for this machine:{" "}
-        <span className="font-mono">enabled: false</span> in{" "}
-        <span className="font-mono">~/.nucleos/github.yaml</span> (System › Settings) makes the
-        {DAEMON_NAME} ignore every project's grants, and nothing on this page overrides that. A granted
-        action is stored and does nothing yet. An operation this build does not allow is listed so
-        you know it exists; nothing on this machine can grant it.
-      </Quiet>
 
       <Inset>
         <GroupTitle
@@ -1063,7 +1144,7 @@ function OpList({
       {rows.length === 0 ? (
         // A caller that folds the outside line elsewhere would leave this group's title over
         // nothing; say why in the group itself.
-        foldOutside || stranded ? null : <Quiet says="None of these is allowed by this build." />
+        foldOutside || stranded ? null : <Quiet says="None allowed" />
       ) : (
         <ul className="ws-items">
           {rows.map((op) => {
@@ -1092,7 +1173,11 @@ function OpList({
                         <span>asks first</span>
                       )
                     ) : stranded ? null : (
-                      <span>{has ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}</span>
+                      has ? (
+                        <span title={OUTSIDE_AND_DECLARED}>Granted, not in build</span>
+                      ) : (
+                        <span title={OUTSIDE_TITLE}>{OUTSIDE_THE_CEILING}</span>
+                      )
                     )}
                   </span>
                 </div>
@@ -1102,14 +1187,14 @@ function OpList({
                     <Receipt stamp={writes.stamp(op.kind)} />
                     {has ? (
                       <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
-                        withdraw
+                        Withdraw
                       </Button>
                     ) : (
                       <>
                         <ConfirmButton
                           variant="quiet"
-                          label="grant"
-                          confirmLabel="grant without asking"
+                          label="Grant"
+                          confirmLabel="Grant without asking"
                           subject={op.kind}
                           disabled={busy}
                           unavailable={stopped}
@@ -1142,7 +1227,7 @@ function OpList({
                       <span className="ws-trail">
                         <Receipt stamp={writes.stamp(op.kind)} />
                         <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
-                          withdraw
+                          Withdraw
                         </Button>
                       </span>
                     ) : null}
@@ -1178,7 +1263,7 @@ function OutsideLine({ ops }: { ops: { kind: string }[] }) {
           <span className="font-mono">{op.kind}</span>
         </span>
       ))}{" "}
-      — {OUTSIDE_THE_CEILING}
+      <span title={OUTSIDE_TITLE}>{OUTSIDE_THE_CEILING}</span>
     </p>
   );
 }
@@ -1192,7 +1277,8 @@ function outsideOps(ops: { kind: string; declarable: boolean }[], declared: Set<
  * The caption for an operation the build does not admit. "Compiled ceiling" was the núcleo's word
  * for it; what somebody deciding needs is the consequence.
  */
-const OUTSIDE_THE_CEILING = "not allowed by this build, so nothing on this machine can grant it";
+const OUTSIDE_THE_CEILING = "Not in build";
+const OUTSIDE_TITLE = "Not allowed by this build, so nothing on this machine can grant it";
 
 /**
  * The row that used to be a contradiction: stored, and captioned as though it were not.
@@ -1272,17 +1358,6 @@ function GitOps({ projectId, stopped }: { projectId: string; stopped: boolean })
 
   return (
     <div className="flex flex-col gap-4">
-      <Quiet says="A granted operation is carried out by the queue for an autonomous run, without waiting for you.">
-        The agent's own command still comes back denied, with a ticket id: the queue runs it
-        instead. A person running a command never waited for approval, so these grants change
-        nothing for them. A matching refusal under "What the worktrees may run" wins and makes the
-        grant do nothing. Only spellings the queue can build are covered: bare{" "}
-        <span className="font-mono">git push</span>, <span className="font-mono">-u</span>,{" "}
-        <span className="font-mono">--force</span> and{" "}
-        <span className="font-mono">git branch -D</span> still stop and ask. A{" "}
-        <span className="font-mono">rebase</span> a run asks for comes back as a blocked ticket,
-        because that run holds the branch, and the ticket says which worktree holds it.
-      </Quiet>
 
       <Inset>
         <OpList
@@ -1385,13 +1460,6 @@ function ShellRules({ projectId, stopped }: { projectId: string; stopped: boolea
         rule; the worked example behind "why?" is the half nobody guesses, and it stays one press
         away rather than one paragraph in the way of every opening.
       */}
-      <Quiet says={`A refusal here beats a permission here, and beats one compiled into the ${DAEMON_NAME}. A permission never lifts a refusal.`}>
-        A permission only widens what the {DAEMON_NAME} would otherwise have <em>asked</em> about. So{" "}
-        <span className="font-mono">rm</span> allowed here leaves{" "}
-        <span className="font-mono">rm -rf /</span> refused, and a line carrying{" "}
-        <span className="font-mono">$( )</span> stays refused whatever these lists say. A project
-        with no rules at all classifies exactly as it did before there were any.
-      </Quiet>
 
       {/*
         **Both captions say only what is true of EVERY row beneath them**, which is a smaller claim
@@ -1513,16 +1581,57 @@ function RuleList({
   /** The whole rule and not its prefix: the DELETE needs the tool to name the row — see {@link useForgetShellRule}. */
   onWithdraw: (rule: ShellRule) => void;
 }) {
+  /*
+    A long list starts folded and gets a filter: forty rows drawn at once was a page of scrolling
+    to reach the next section. The list is the scroll container itself (capped in CSS) and stays
+    the direct child of the group, so nothing is wrapped between a row and its title.
+  */
+  const long = rows.length > LONG_RULE_LIST;
+  const [expanded, setExpanded] = useState(!long);
+  const [filter, setFilter] = useState("");
+  const needle = filter.trim().toLowerCase();
+  const shown =
+    needle === ""
+      ? rows
+      : rows.filter((rule) =>
+          `${rule.tool ?? ""} ${rule.prefix} ${rule.note ?? ""}`.toLowerCase().includes(needle),
+        );
   return (
     <Inset>
-      <GroupTitle about={says}>{title}</GroupTitle>
+      <div className="ws-rule-head">
+        <GroupTitle about={says}>{title}</GroupTitle>
+        <span className="ws-rule-count">{rows.length}</span>
+        {long ? (
+          <Button
+            variant="quiet"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((now) => !now)}
+          >
+            {expanded ? "Hide" : "Show"}
+          </Button>
+        ) : null}
+      </div>
       {rows.length === 0 ? (
         <Quiet says="None declared." />
-      ) : (
-        <ul className="ws-items">
-          {rows.map((rule) => {
+      ) : !expanded ? null : (
+        <>
+          {long ? (
+            <input
+              type="search"
+              className="ws-rule-filter"
+              aria-label={`Filter ${title.toLowerCase()} rules`}
+              placeholder="Filter"
+              value={filter}
+              spellCheck={false}
+              onChange={(event) => setFilter(event.target.value)}
+            />
+          ) : null}
+          {shown.length === 0 ? <Quiet says="No rule matches this filter." /> : null}
+        <ul className="ws-items ws-rule-list">
+          {shown.map((rule) => {
             const key = ruleKey(rule);
             const busy = writes.isPending(key);
+            const inert = rule.tool !== null && rule.verdict === "allow";
             return (
               <li
                 /*
@@ -1533,7 +1642,7 @@ function RuleList({
                 */
                 key={key}
                 aria-label={ruleLabel(rule)}
-                className="ws-item"
+                className={inert ? "ws-item ws-rule ws-rule-wrap" : "ws-item ws-rule"}
               >
                 {/*
                   A write rule wears its tool and a command rule does not, and that IS the visual
@@ -1555,6 +1664,12 @@ function RuleList({
                 */}
                 <div className="ws-item-main">
                   <span className="ws-item-name">
+                    {/* The effect, as a badge: a row read alone says what it does. */}
+                    <span
+                      className={`ws-rule-effect ${inert ? "ws-rule-effect-inert" : rule.verdict === "allow" ? "ws-rule-effect-allow" : "ws-rule-effect-deny"}`}
+                    >
+                      {inert ? "Inert" : rule.verdict === "allow" ? "Allow" : "Deny"}
+                    </span>
                     {rule.tool === null ? null : rule.verdict === "deny" ? (
                       <span className="text-xs text-text-muted">
                         <span className="font-mono text-text">{rule.tool}</span> may not write to
@@ -1579,7 +1694,7 @@ function RuleList({
                   the rule was meant and was written with the wrong verdict — and this page cannot
                   know which.
                 */}
-                  <span className="ws-item-sub">
+                  <span className="ws-item-sub" title={rule.note ?? undefined}>
                     {rule.tool !== null && rule.verdict === "allow" ? (
                       <span className="text-text">
                         a rule about a tool can only refuse; withdraw it, or declare it as a refusal
@@ -1616,13 +1731,13 @@ function RuleList({
                   */}
                   {rule.tool !== null ? null : rule.verdict === "allow" ? (
                     <Button variant="quiet" disabled={busy} onClick={() => onFlip(rule)}>
-                      refuse it instead
+                      Refuse it instead
                     </Button>
                   ) : (
                     <ConfirmButton
                       variant="quiet"
-                      label="allow it instead"
-                      confirmLabel="allow without asking"
+                      label="Allow it instead"
+                      confirmLabel="Allow without asking"
                       subject={rule.prefix}
                       disabled={busy}
                       unavailable={stopped}
@@ -1641,16 +1756,16 @@ function RuleList({
                   */}
                   {rule.verdict === "allow" ? (
                     <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(rule)}>
-                      withdraw
+                      Withdraw
                     </Button>
                   ) : (
                     <ConfirmButton
                       variant="quiet"
-                      label="withdraw"
+                      label="Withdraw"
                       confirmLabel={
                         rule.note === null
-                          ? "stop refusing this"
-                          : "stop refusing this, and drop its justification"
+                          ? "Stop refusing this"
+                          : "Stop refusing this, and drop its justification"
                       }
                       subject={rule.prefix}
                       disabled={busy}
@@ -1663,10 +1778,14 @@ function RuleList({
             );
           })}
         </ul>
+        </>
       )}
     </Inset>
   );
 }
+
+/** More rules than this in one group start folded and get a filter box. */
+const LONG_RULE_LIST = 10;
 
 /**
  * PURE: the day half of the daemon's `datetime('now')` text.
@@ -1776,7 +1895,7 @@ function DeclareRule({
     // Wrapped like LandTargets' button: a bare Button stretches across a column-flex parent.
     return (
       <div ref={focus.trigger} className="flex flex-wrap items-center gap-3">
-        <Button onClick={() => setOpen(true)}>add a rule</Button>
+        <Button onClick={() => setOpen(true)}>Add a rule</Button>
       </div>
     );
   }
@@ -1826,7 +1945,7 @@ function DeclareRule({
           </Field>
           <Field label="Why it is here">
             <input
-              placeholder="the gate installs before it runs"
+              placeholder="Why it is here"
               value={note}
               onChange={(event) => setNote(event.target.value)}
             />
@@ -1864,7 +1983,7 @@ function DeclareRule({
               ) : null}
             </p>
             {existing.note !== null && note.trim() === "" ? (
-              <Button onClick={() => setNote(existing.note ?? "")}>keep its justification</Button>
+              <Button onClick={() => setNote(existing.note ?? "")}>Keep its justification</Button>
             ) : null}
           </div>
         ) : null}
@@ -1878,8 +1997,8 @@ function DeclareRule({
           {tool === null ? (
             <ConfirmButton
               variant="ghost"
-              label="allow it here"
-              confirmLabel="allow without asking"
+              label="Allow it here"
+              confirmLabel="Allow without asking"
               subject={folded === "" ? undefined : folded}
               disabled={!ready}
               unavailable={stopped}
@@ -1892,20 +2011,20 @@ function DeclareRule({
             />
           ) : null}
           <Button type="submit" disabled={!ready}>
-            refuse it here
+            Refuse it here
           </Button>
           <Button type="button" onClick={cancel}>
-            cancel
+            Cancel
           </Button>
           {tool === null ? (
-            <Quiet says="A refusal can name a pipe or a redirection; a permission cannot.">
+            <Quiet says="Refusal versus permission">
               A refusal answers at the whole line and needs no shape the classifier can read, so a
               pipe, a redirection or an <span className="font-mono">-exec</span> is fine in one. A
               permission has to match a command the {DAEMON_NAME} can take apart. Enter declares a refusal;
               allowing always asks for a second press.
             </Quiet>
           ) : (
-            <Quiet says="A rule about a tool can only refuse.">
+            <Quiet says="Refuse only">
               There is nothing to allow: a write the {DAEMON_NAME} does not refuse is already local work it
               does not stop for, so a permission here would widen nothing and be enforced by
               nothing. The path is read from the project root, and everything under it is refused
@@ -2013,12 +2132,6 @@ function LandTargets({ projectId }: { projectId: string }) {
 
   return (
     <div className="flex flex-col gap-4">
-      <Quiet says="A landing may go to the integration branch or to a branch added here; any other name is refused.">
-        <span className="font-mono">nucleos-core --land &lt;branch&gt;</span> sends what is in the
-        worktree it is called from, and a refused name comes back with the list of what would have
-        been admissible. A branch that does not exist yet can be added: it is often made by the run
-        that lands into it.
-      </Quiet>
 
       <Inset>
         <ul className="ws-items">
@@ -2035,7 +2148,12 @@ function LandTargets({ projectId }: { projectId: string }) {
                   default at all, so borrowing the caption would assert exactly what the {DAEMON_NAME} would
                   refuse.
                 */}
-                <span className="text-xs text-text-muted">{CAPTION[integration.state]}</span>
+                <span
+                  className="text-xs text-text-muted"
+                  title={integration.state === "declared" ? INTEGRATION_TITLE : undefined}
+                >
+                  {CAPTION[integration.state]}
+                </span>
               </>
             )}
           </li>
@@ -2053,7 +2171,7 @@ function LandTargets({ projectId }: { projectId: string }) {
                     )
                   }
                 >
-                  withdraw
+                  Withdraw
                 </Button>
               </span>
               <RowFailure error={writes.failure(target)} sentences={TARGET_SENTENCES} />
@@ -2064,7 +2182,7 @@ function LandTargets({ projectId }: { projectId: string }) {
 
       {!open ? (
         <div ref={focus.trigger} className="flex flex-wrap items-center gap-3">
-          <Button onClick={() => setOpen(true)}>add a landing target</Button>
+          <Button onClick={() => setOpen(true)}>Add a landing target</Button>
           <Receipt stamp={writes.stamp("+")} />
         </div>
       ) : (
@@ -2082,10 +2200,10 @@ function LandTargets({ projectId }: { projectId: string }) {
                 />
               </Field>
               <Button type="submit" disabled={wanted === "" || adding}>
-                add
+                Add
               </Button>
               <Button type="button" onClick={cancel}>
-                cancel
+                Cancel
               </Button>
               <Receipt stamp={writes.stamp("+")} />
             </div>
@@ -2110,8 +2228,10 @@ function LandTargets({ projectId }: { projectId: string }) {
  * would be derived if anything landed*. `unknown` has no entry because it names no branch — it
  * renders the daemon's own sentence instead.
  */
+const INTEGRATION_TITLE = "Always admissible, with or without a row";
+
 const CAPTION: Record<"declared" | "stale" | "derived", string> = {
-  declared: "the integration branch, always admissible with or without a row",
+  declared: "integration branch",
   stale:
     "declared as the integration branch, and git cannot find that ref, so nothing lands by default until it is corrected",
   derived:

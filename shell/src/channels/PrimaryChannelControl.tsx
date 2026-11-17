@@ -6,6 +6,7 @@ import { ConfirmButton } from "../ui/ConfirmButton";
 import { ErrorNote } from "../ui/ErrorNote";
 import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
+import { Tip } from "../ui/Tip";
 
 /**
  * What the two refusals of `PUT /channels/primary` mean on this screen.
@@ -57,10 +58,14 @@ export function PrimaryChannelControl({ channel, primary }: { channel: Channel; 
         </Button>
       )}
       {channel.state === "offline" ? (
-        <Quiet compact says="the outbox keeps the notifications and delivers them when the adapter is back" />
+        <Quiet compact says="Offline: held in the outbox">
+          <Tip name="About an offline channel" persist tip="the outbox keeps the notifications and delivers them when the adapter is back" />
+        </Quiet>
       ) : null}
       {setPrimary.isSuccess && reseeded ? (
-        <Quiet compact announce says="new channel: it starts from now, without replaying what it missed" />
+        <Quiet compact announce says="New channel">
+          <Tip name="About a new channel" persist tip="new channel: it starts from now, without replaying what it missed" />
+        </Quiet>
       ) : null}
       {error ? (
         isApiRefusal(error) ? (

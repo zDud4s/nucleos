@@ -1,5 +1,5 @@
 import { aboutYou, useKnowledge, useRevertKnowledge } from "../../data/knowledge";
-import { ConfirmButton, Count, Panel, Rows } from "../../ui";
+import { ConfirmButton, Count, Panel, Rows, Tip } from "../../ui";
 import { KnownRow } from "./KnownRow";
 import { DecisionRefusal } from "./WaitingPanel";
 import "./knowledge.css";
@@ -14,11 +14,18 @@ export function AboutYou() {
   const revert = useRevertKnowledge();
   if (rows.length === 0) return null;
   return (
-    <Panel title="About you" aside={<Count n={rows.length} />}>
-      <p className="learned-lede">
-        What the agent holds about you and about every project. Revoke any of it: it stays on the
-        record and does not come back.
-      </p>
+    <Panel
+      title="About you"
+      aside={
+        <>
+          <Tip
+            name="About this list"
+            tip="What the agent holds about you and about every project. Revoke any of it: it stays on the record and does not come back."
+          />
+          <Count n={rows.length} />
+        </>
+      }
+    >
       {revert.error !== null && <DecisionRefusal error={revert.error} />}
       <Rows label="About you">
         {rows.map((row) => (

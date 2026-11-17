@@ -10,7 +10,7 @@ import {
 } from "../data/feed";
 import { KindBadge } from "../pages/Feed";
 import { DAEMON_NAME } from "../copy";
-import { Drawer, ErrorNote, Quiet, RelativeTime, Skeleton } from "../ui";
+import { Drawer, ErrorNote, Quiet, RelativeTime, Skeleton, Tip } from "../ui";
 import { useReportOverlay } from "../ui/overlay";
 
 /**
@@ -117,7 +117,7 @@ export function NotificationsDrawer() {
             <h3 className="app-drawer-heading">Held by the calendar</h3>
             {held.length === 0 ? (
               <Quiet compact says="Nothing is being held.">
-                A notification waits here only while the calendar says you are in something.
+                <Tip name="About held notifications" tip="A notification waits here only while the calendar says you are in something." />
               </Quiet>
             ) : (
               <ul className="app-drawer-list" aria-label="Held notifications">
@@ -131,8 +131,8 @@ export function NotificationsDrawer() {
           <section className="app-drawer-section">
             <h3 className="app-drawer-heading">Held, then delivered</h3>
             {delivered.length === 0 ? (
-              <Quiet compact says="Nothing has been held and let through yet.">
-                These are kept so that “did it ever arrive?” stays answerable.
+              <Quiet compact says="Nothing delivered yet.">
+                <Tip name="About delivered notifications" tip="These are kept so that “did it ever arrive?” stays answerable." />
               </Quiet>
             ) : (
               <ul className="app-drawer-list" aria-label="Delivered notifications">

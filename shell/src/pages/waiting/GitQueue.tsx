@@ -71,7 +71,9 @@ export function GitQueuePanel({
       }
     >
       {owed.length === 0 ? (
-        <Quiet says="nothing in the git queue needs your approval." />
+        <div title="Nothing in the git queue needs your approval.">
+          <Quiet says="Git queue clear" />
+        </div>
       ) : (
         <Rows label="Git requests waiting on you" className={dense(owed.length) ? "waiting-dense" : undefined}>
           {owed.map((row) => (

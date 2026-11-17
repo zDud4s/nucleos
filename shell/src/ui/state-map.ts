@@ -174,6 +174,12 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // A node failed on a transient API error and its item runs again after a backoff
     // (`execution/job/ingest.rs`). Stated Blue, as `job_node_retried` is: the job retries on its own.
     job_item_retry: { tone: "info", label: "job item retried" },
+    // An account hit its usage limit: the item is retried, or a tree waits for the account to
+    // recover or switches to another one. The núcleo handles it itself, so stated Blue.
+    job_item_account_limit: { tone: "info", label: "job item hit account limit" },
+    account_limit_wait: { tone: "info", label: "waiting on account limit" },
+    // A run parked on a transient error (`execution/runs/transient.rs`); it resumes by itself.
+    run_parked: { tone: "paused", label: "run parked" },
     job_gate_failed: { tone: "danger", label: "job gate failed" },
     job_gate_scoped: { tone: "info", label: "job gated by scope" },
     // The graph walker's own lines (`execution/job/drive.rs`, `engine.rs`): a node that failed, a

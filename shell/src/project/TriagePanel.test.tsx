@@ -200,7 +200,7 @@ function open(options: Open = {}) {
 
 /** The run, pressed and waited for — every report assertion needs it first. */
 async function run() {
-  fireEvent.click(screen.getByRole("button", { name: /run the triager with the cloud brain/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Run the triager with the cloud brain/ }));
   await waitFor(() => expect(screen.getByLabelText("What the run did")).toBeTruthy());
 }
 
@@ -238,7 +238,7 @@ describe("what the triager thought, and what it never gets to decide", () => {
 
     // A silence is a claim about the triager and never about the code, and the panel has to say
     // so in words rather than leaving it to a colour nobody can name.
-    expect(screen.getByText(/Nobody looked/)).toBeTruthy();
+    expect(screen.getByTitle(/nobody looked/)).toBeTruthy();
     expect(screen.getByText(/not green/i)).toBeTruthy();
     // No word on this panel may report a silence as a verdict. `settled`, `done` and `checked` are
     // the three a later tidy-up reaches for.
@@ -293,8 +293,8 @@ describe("what the triager thought, and what it never gets to decide", () => {
 
     const row = within(screen.getByLabelText("Decisions the triager flagged")).getByRole("listitem");
     expect(within(row).getByText(/written by NucleOS/i)).toBeTruthy();
-    // The model is still named — it is the machine that was asked — but never as the author.
-    expect(within(row).getByText(/cloud/)).toBeTruthy();
+    // The model is still named (in the title) — it is the machine that was asked — but never as the author.
+    expect(within(row).getByTitle(/cloud brain answered/)).toBeTruthy();
     expect(row.textContent ?? "").not.toMatch(/cloud said/i);
   });
 
@@ -360,7 +360,7 @@ describe("what the triager thought, and what it never gets to decide", () => {
     // The two that moved together are announced as tied, and the sentence says the panel is not
     // ordering them — not that they happen to be adjacent.
     expect(screen.getByText(/2 .*moved at the same moment/)).toBeTruthy();
-    expect(screen.getByText(/nothing here orders/i)).toBeTruthy();
+    expect(screen.getByTitle(/Nothing here orders them/)).toBeTruthy();
   });
 
   /**
@@ -572,7 +572,7 @@ describe("what the triager thought, and what it never gets to decide", () => {
       pile: [silencing({ decision_id: 9 })],
     });
 
-    expect(await screen.findByText(/nothing was left behind by the daemon/)).toBeTruthy();
+    expect(await screen.findByText(/All of them are on this reading/)).toBeTruthy();
   });
 
   /**
@@ -591,6 +591,6 @@ describe("what the triager thought, and what it never gets to decide", () => {
       within(row).getByRole("button", { name: /stamp .* as part-way/ }),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: /dismiss|ignore|not now/i })).toBeNull();
-    expect(screen.getByText(/half the cure/)).toBeTruthy();
+    expect(screen.getByTitle(/There is no dismiss/)).toBeTruthy();
   });
 });

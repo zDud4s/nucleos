@@ -56,7 +56,7 @@ export function CouncilDeliberation({ view, running }: { view: CouncilView; runn
   return (
     <Panel title="Deliberation" aside={<Count n={view.seats.length} />}>
       {view.seats.length === 0 ? (
-        <Quiet says="no seat has been recorded for this council yet." />
+        <Quiet says="No seats recorded" />
       ) : (
         <Tabs value={picked ?? String(lastRound)} onValueChange={setPicked}>
           <TabsList aria-label="Rounds">
@@ -84,8 +84,7 @@ export function CouncilDeliberation({ view, running }: { view: CouncilView; runn
         /* Its own element, apart from the facts line in the header: the round it
            stopped at is the fact here, and the header only says that it did. */
         <p className="council-note council-stopped">
-          Stopped early at round {view.rounds_run}: no seat changed its answer,
-          so another round would have changed nothing.
+          Stopped early at round {view.rounds_run}: no seat changed its answer.
         </p>
       )}
     </Panel>
@@ -229,7 +228,7 @@ function AnswerCell({ seat }: { seat: SeatView }) {
             aria-label={`${full ? "less" : "more"} of ${seatName(seat)}'s answer`}
             onClick={() => setFull(!full)}
           >
-            {full ? "less" : "more"}
+            {full ? "Less" : "More"}
           </Button>
         </>
       ) : (

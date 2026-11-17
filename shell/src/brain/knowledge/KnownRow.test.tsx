@@ -124,7 +124,7 @@ describe("KnownRow", () => {
     );
 
     await renderRows();
-    fireEvent.click(await screen.findByRole("button", { name: "knowledge 2" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Knowledge 2" }));
 
     expect(await screen.findByText("older evidence")).toBeDefined();
     expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/2");

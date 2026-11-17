@@ -61,7 +61,9 @@ export function Pairing({ onPaired }: { onPaired: (session: RemoteSession) => vo
     <main className="remote-pairing">
       <form onSubmit={submit} className="remote-pairing-form" aria-label="Pair this browser">
         <h1>Pair this browser</h1>
-        <p>Enter the code shown in NucleOS on your computer, under Remote devices.</p>
+        <p title="Enter the code shown in NucleOS on your computer, under Remote devices.">
+          Enter the pairing code
+        </p>
         <Field label="Pairing code">
           <input
             value={code}

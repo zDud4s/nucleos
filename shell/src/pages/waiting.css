@@ -831,6 +831,11 @@
   gap: var(--space-3);
 }
 
+/* Grid items default to `min-width: auto`, which let the Speciality input push past its track. */
+.waiting-recruit-form > * {
+  min-width: 0;
+}
+
 .waiting-recruit-span-2 {
   grid-column: span 2;
 }
@@ -854,6 +859,8 @@
 .waiting-recruit-form .ui-field :is(input, textarea) {
   min-width: 0;
   width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .waiting-recruit-form .ui-field textarea {

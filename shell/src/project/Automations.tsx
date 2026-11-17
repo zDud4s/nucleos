@@ -21,7 +21,7 @@ export function Automations({ projectId }: { projectId: string }) {
 
   const listed = index.data?.some((row) => row.scope === scope && row.name === NAME);
   if (index.data !== undefined && listed !== true) {
-    return <p className="text-sm text-text-muted">This project has no {NAME} document to edit.</p>;
+    return <p className="text-sm text-text-muted" title={`This project has no ${NAME} document to edit.`}>Not set up</p>;
   }
   return <Editor scope={scope} />;
 }
@@ -52,7 +52,7 @@ function Editor({ scope }: { scope: string }) {
 
   if (doc.isPending) return <p className="text-sm text-text-faint">Reading this document…</p>;
   if (doc.data === undefined) {
-    return <p className="text-sm text-text-muted">The automations could not be read. Reopening the page asks again.</p>;
+    return <p className="text-sm text-text-muted">Could not read the automations.</p>;
   }
 
   const rules = readRules(doc.data.body);
@@ -110,9 +110,7 @@ function Editor({ scope }: { scope: string }) {
     ) : null;
 
   return (
-    <div className="flex flex-col gap-3">
-      <p className="text-sm text-text-muted">A new rule starts switched off.</p>
-
+    <div className="flex flex-col gap-2">
       {notice?.kind === "stale" ? (
         <ConflictNote>
           {`Someone else changed the automations${notice.rule === "" ? "" : ` while you were editing "${notice.rule}"`}. Showing the latest version — your draft is kept, so check it and save again.`}
@@ -120,8 +118,11 @@ function Editor({ scope }: { scope: string }) {
       ) : null}
 
       {rules.length === 0 && form === null ? (
-        <p className="text-sm text-text-muted">
-          No automations yet. Nothing here acts on its own until you add a rule and switch it on.
+        <p
+          className="text-sm text-text-muted"
+          title="Nothing here acts on its own until you add a rule and switch it on."
+        >
+          No automations yet.
         </p>
       ) : (
         <ul className="flex flex-col gap-2">
@@ -172,6 +173,7 @@ function Editor({ scope }: { scope: string }) {
         <div>
           <Button
             variant="ghost"
+            title="A new rule starts switched off."
             onClick={() => {
               setNotice(null);
               setForm({ at: null, was: null, draft: blankDraft(), version, stale: false });

@@ -56,7 +56,7 @@ describe("Autopilot - exclusions", () => {
   it("says so when no two jobs are kept apart", async () => {
     daemon.apiFetch.mockImplementation(respond({ jobs: [], rules: [] }));
     await renderWithRouter(<ExclusionsPanel />);
-    expect(await screen.findByText("No two jobs are kept apart.")).toBeDefined();
+    expect(await screen.findByText("None")).toBeDefined();
   });
 
   it("lifts a rule only through the interlock", async () => {
@@ -83,7 +83,7 @@ describe("Autopilot - exclusions", () => {
         body: JSON.stringify({ job_a: 41, job_b: 55, paths: [] }),
       }),
     );
-    expect(await screen.findByText(/Nothing changes until it is answered in/)).toBeDefined();
+    expect(await screen.findByText(/Answer it in/)).toBeDefined();
   });
 
   it("never offers a pair of different projects, nor a pair already kept apart", async () => {
@@ -100,14 +100,13 @@ describe("Autopilot - exclusions", () => {
     daemon.apiFetch.mockImplementation(respond({ jobs: [job(41), job(9, "beta")], rules: [] }));
     const first = await renderWithRouter(<ExclusionsPanel />);
     await answered(first);
-    expect(screen.getByText(/two live jobs in the same project/i)).toBeDefined();
+    expect(screen.getByTitle(/two live jobs in one project/i)).toBeDefined();
     expect(screen.queryByRole("button", { name: "Ask" })).toBeNull();
     first.unmount();
 
     daemon.apiFetch.mockImplementation(respond({ jobs: [job(41), job(55)], rules: [rule()] }));
     const second = await renderWithRouter(<ExclusionsPanel />);
     await answered(second);
-    expect(screen.getByText(/two live jobs in the same project/i)).toBeDefined();
     expect(screen.queryByRole("button", { name: "Ask" })).toBeNull();
   });
 
@@ -117,7 +116,6 @@ describe("Autopilot - exclusions", () => {
     const first = (await screen.findByLabelText("Job")) as HTMLSelectElement;
     expect([...first.options].map((o) => o.textContent)).toEqual(["job 41 · alpha", "job 55 · alpha"]);
     expect(screen.getByRole("button", { name: "Ask" })).toBeDefined();
-    expect(screen.queryByText(/two live jobs in the same project/i)).toBeNull();
   });
 
   it("is a section of the Autopilot page, beside the jobs", async () => {

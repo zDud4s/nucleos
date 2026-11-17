@@ -31,7 +31,7 @@ import { DAEMON_NAME } from "../copy";
 export const MODE_MEANING: Record<AutopilotMode, string> = {
   off: `the ${DAEMON_NAME} never starts anything here`,
   shadow: "it decides and records what it would have done, and enforces none of it",
-  active: "it does the thing",
+  active: "it acts on what it decides, within this project's permissions",
 };
 
 /**

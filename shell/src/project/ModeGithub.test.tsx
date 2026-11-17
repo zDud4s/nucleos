@@ -73,13 +73,13 @@ async function pressTwice(scope: HTMLElement, name: string, armed: string | RegE
  * Waits for the button, because the section draws it only once its lists have been read.
  */
 async function openRuleForm(): Promise<HTMLElement> {
-  fireEvent.click(await screen.findByRole("button", { name: "add a rule" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Add a rule" }));
   return screen.getByRole("form", { name: "Add a rule" });
 }
 
 /** Open the landing target form, closed behind `add a landing target` until asked for. */
 async function openTargetForm(): Promise<HTMLElement> {
-  fireEvent.click(await screen.findByRole("button", { name: "add a landing target" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Add a landing target" }));
   return screen.getByRole("form", { name: "Add a landing target" });
 }
 
@@ -155,7 +155,8 @@ describe("what runs on its own", () => {
     const outside = region.querySelectorAll(".ws-outside");
     expect(outside).toHaveLength(1);
     const line = outside[0] as HTMLElement;
-    expect(line.textContent).toContain("not allowed by this build");
+    expect(line.textContent).toContain("Not in build");
+    expect(line.querySelector("[title]")?.getAttribute("title")).toMatch(/not allowed by this build/i);
     const mono = [...line.querySelectorAll("span.font-mono")].map((span) => span.textContent);
     expect(mono).toContain("run_logs");
     expect(mono).toContain("api_read");
@@ -164,7 +165,7 @@ describe("what runs on its own", () => {
 
     // The comparison that gives the assertion its teeth: an operation the ceilings DO admit keeps
     // the control the folded ones are denied, from the same list.
-    expect(within(admitted).getByRole("button", { name: "grant" })).toBeDefined();
+    expect(within(admitted).getByRole("button", { name: "Grant" })).toBeDefined();
   });
 
   /**
@@ -230,13 +231,14 @@ describe("what runs on its own", () => {
     const state = open({ githubOps: ["api_read"] });
 
     const row = await screen.findByRole("listitem", { name: "operation api_read" });
-    expect(row.textContent).toContain("granted here");
-    expect(row.textContent).toMatch(/it does not run/i);
+    expect(row.textContent).toContain("Granted, not in build");
+    const why = row.querySelector("[title*='granted here']")?.getAttribute("title") ?? "";
+    expect(why).toMatch(/it does not run/i);
 
     // Still never a grant: the ceilings do not admit it, so there is nothing to re-grant.
-    expect(within(row).queryByRole("button", { name: "grant" })).toBeNull();
+    expect(within(row).queryByRole("button", { name: "Grant" })).toBeNull();
 
-    fireEvent.click(within(row).getByRole("button", { name: "withdraw" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Withdraw" }));
     await waitFor(() => expect(state.githubOps).toEqual([]));
     expect(state.policyWrites[0]).toMatchObject({
       method: "DELETE",
@@ -258,7 +260,7 @@ describe("what runs on its own", () => {
     const row = await screen.findByRole("listitem", {
       name: "operation an_op_this_build_no_longer_has",
     });
-    fireEvent.click(within(row).getByRole("button", { name: "withdraw" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Withdraw" }));
 
     await waitFor(() => expect(state.githubOps).toEqual([]));
   });
@@ -276,11 +278,11 @@ describe("what runs on its own", () => {
     const declared = await screen.findByRole("listitem", { name: "operation run_list" });
     expect(declared.textContent).toContain("list recent CI runs");
     expect(declared.textContent).toContain("without asking");
-    expect(within(declared).getByRole("button", { name: "withdraw" })).toBeDefined();
+    expect(within(declared).getByRole("button", { name: "Withdraw" })).toBeDefined();
 
     const not = screen.getByRole("listitem", { name: "operation pr_list" });
     expect(not.textContent).toContain("asks first");
-    expect(within(not).getByRole("button", { name: "grant" })).toBeDefined();
+    expect(within(not).getByRole("button", { name: "Grant" })).toBeDefined();
   });
 
   /**
@@ -295,14 +297,14 @@ describe("what runs on its own", () => {
     const state = open();
 
     const row = await screen.findByRole("listitem", { name: "operation pr_list" });
-    fireEvent.click(within(row).getByRole("button", { name: "grant" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Grant" }));
 
     // Armed, and saying what it will do, with nothing sent.
-    expect(within(row).getByRole("button", { name: "grant without asking · pr_list" })).toBeDefined();
+    expect(within(row).getByRole("button", { name: "Grant without asking · pr_list" })).toBeDefined();
     expect(state.policyWrites).toEqual([]);
 
     await afterDwell();
-    fireEvent.click(within(row).getByRole("button", { name: "grant without asking · pr_list" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Grant without asking · pr_list" }));
 
     await waitFor(() => expect(state.githubOps).toEqual(["pr_list"]));
     expect(state.policyWrites[0]).toMatchObject({
@@ -322,7 +324,7 @@ describe("what runs on its own", () => {
     const state = open({ githubOps: ["run_list"] });
 
     const row = await screen.findByRole("listitem", { name: "operation run_list" });
-    fireEvent.click(within(row).getByRole("button", { name: "withdraw" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Withdraw" }));
 
     await waitFor(() => expect(state.githubOps).toEqual([]));
     expect(state.policyWrites[0]).toMatchObject({ method: "DELETE", body: { op_kind: "run_list" } });
@@ -339,7 +341,7 @@ describe("what runs on its own", () => {
     open({ policyRefusal: { status: 423, code: "kill_switch", detail: "" } });
 
     const row = await screen.findByRole("listitem", { name: "operation pr_list" });
-    await pressTwice(row, "grant", "grant without asking · pr_list");
+    await pressTwice(row, "Grant", "Grant without asking · pr_list");
 
     // The refusal is a toast now, so the row keeps its footprint.
     await waitFor(() => expect(toastText()).toContain("kill_switch"));
@@ -361,12 +363,12 @@ describe("what runs on its own", () => {
 
     const row = await screen.findByRole("listitem", { name: "operation pr_list" });
     await waitFor(() =>
-      expect(within(row).getByRole("button", { name: "grant" }).getAttribute("aria-disabled")).toBe(
+      expect(within(row).getByRole("button", { name: "Grant" }).getAttribute("aria-disabled")).toBe(
         "true",
       ),
     );
-    fireEvent.click(within(row).getByRole("button", { name: "grant" }));
-    expect(within(row).queryByRole("button", { name: /grant without asking/ })).toBeNull();
+    fireEvent.click(within(row).getByRole("button", { name: "Grant" }));
+    expect(within(row).queryByRole("button", { name: /Grant without asking/ })).toBeNull();
     expect(state.policyWrites).toEqual([]);
   });
 
@@ -396,9 +398,11 @@ describe("what runs on its own", () => {
     const reads = screen.getByText(/Used the next time an agent types gh/i);
     expect(reads.textContent).toMatch(/while GitHub is switched on for this machine/i);
 
-    // Where that switch lives is one press away, not a line every opening has to read past.
+    // Where that switch lives is behind the section's ⓘ, not a line every opening has to read past.
     const section = screen.getByRole("region", { name: "GitHub operations without asking" });
-    fireEvent.click(within(section).getAllByRole("button", { name: "why?" })[0]);
+    expect(
+      within(section).getByRole("button", { name: "About GitHub operations without asking" }),
+    ).toBeTruthy();
     expect(section.textContent).toContain("~/.nucleos/github.yaml");
   });
 
@@ -424,7 +428,7 @@ describe("what the queue may do on its own", () => {
     open();
 
     const section = await screen.findByRole("region", { name: "Git operations the queue may perform" });
-    const grants = await within(section).findAllByRole("button", { name: "grant" });
+    const grants = await within(section).findAllByRole("button", { name: "Grant" });
 
     expect(grants).toHaveLength(6);
     expect(
@@ -440,13 +444,13 @@ describe("what the queue may do on its own", () => {
     const push = await within(section).findByRole("listitem", { name: "git operation push" });
     expect(push.textContent).toContain("push to the remote");
 
-    await pressTwice(push, "grant", "grant without asking · push");
+    await pressTwice(push, "Grant", "Grant without asking · push");
     await waitFor(() => expect(state.gitOps).toEqual(["merge", "push"]));
 
     fireEvent.click(
       within(within(section).getByRole("listitem", { name: "git operation merge" })).getByRole(
         "button",
-        { name: "withdraw" },
+        { name: "Withdraw" },
       ),
     );
     await waitFor(() => expect(state.gitOps).toEqual(["push"]));
@@ -472,8 +476,8 @@ describe("what the queue may do on its own", () => {
     const row = await within(section).findByRole("listitem", { name: "git operation cherry-pick" });
 
     expect(row.textContent).toContain("cherry-pick");
-    expect(within(row).queryByRole("button", { name: "grant" })).toBeNull();
-    expect(within(row).getByRole("button", { name: "withdraw" })).toBeDefined();
+    expect(within(row).queryByRole("button", { name: "Grant" })).toBeNull();
+    expect(within(row).getByRole("button", { name: "Withdraw" })).toBeDefined();
   });
 });
 
@@ -498,9 +502,9 @@ describe("what the worktrees may run", () => {
     expect(said).toContain("compiled into the background service");
     expect(said).toMatch(/never lifts a refusal/i);
 
-    // And the worked example, one press away.
+    // And the worked example, behind the same ⓘ.
     const region = screen.getByRole("region", { name: "What the worktrees may run" });
-    fireEvent.click(within(region).getAllByRole("button", { name: "why?" })[0]);
+    expect(within(region).getByRole("button", { name: "About What the worktrees may run" })).toBeTruthy();
     expect(region.textContent).toContain("rm -rf /");
   });
 
@@ -560,7 +564,7 @@ describe("what the worktrees may run", () => {
     });
 
     const row = await screen.findByRole("listitem", { name: "rule npm ci" });
-    fireEvent.click(within(row).getByRole("button", { name: "refuse it instead" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Refuse it instead" }));
 
     await waitFor(() => expect(state.policyWrites).toHaveLength(1));
     expect(state.policyWrites[0].body).toEqual({
@@ -587,7 +591,7 @@ describe("what the worktrees may run", () => {
     const state = open({ shellRules: [shellRule({ prefix: "npm ci", note: null })] });
 
     const row = await screen.findByRole("listitem", { name: "rule npm ci" });
-    fireEvent.click(within(row).getByRole("button", { name: "refuse it instead" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Refuse it instead" }));
 
     await waitFor(() => expect(state.policyWrites).toHaveLength(1));
     expect(state.policyWrites[0].body).toEqual({
@@ -610,7 +614,7 @@ describe("what the worktrees may run", () => {
 
     expect(screen.getByText(/is already declared as/i).textContent).toContain("erases");
 
-    fireEvent.click(screen.getByRole("button", { name: "keep its justification" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep its justification" }));
     expect(screen.getByLabelText<HTMLInputElement>("Why it is here").value).toBe(
       "the gate needs it",
     );
@@ -634,7 +638,7 @@ describe("what the worktrees may run", () => {
     await openRuleForm();
     const box = screen.getByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "ls | sh" } });
-    await pressTwice(document.body, "allow it here", "allow without asking · ls | sh");
+    await pressTwice(document.body, "Allow it here", "Allow without asking · ls | sh");
 
     const note = await screen.findByText(detail);
     expect(note).toBeDefined();
@@ -657,7 +661,7 @@ describe("what the worktrees may run", () => {
     await openRuleForm();
     const box = screen.getByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "bash scripts/gates.sh" } });
-    await pressTwice(document.body, "allow it here", "allow without asking · bash scripts/gates.sh");
+    await pressTwice(document.body, "Allow it here", "Allow without asking · bash scripts/gates.sh");
 
     const note = (await screen.findByText(/is not blocked/i)).closest(".ui-toast") as HTMLElement;
     expect(note.textContent).toContain("kill_switch");
@@ -695,7 +699,7 @@ describe("what the worktrees may run", () => {
     fireEvent.change(screen.getByLabelText("Why it is here"), {
       target: { value: "nothing writes a migration by hand" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refuse it here" }));
 
     await waitFor(() => expect(state.shellRules).toHaveLength(2));
 
@@ -733,12 +737,12 @@ describe("what the worktrees may run", () => {
     const write = await screen.findByRole("listitem", { name: "rule Edit writing to migrations" });
     expect(within(write).queryByRole("button", { name: /instead/ })).toBeNull();
     // Withdrawing it is still offered: a refusal a project can never remove is a different problem.
-    expect(within(write).getByRole("button", { name: "withdraw" })).toBeDefined();
+    expect(within(write).getByRole("button", { name: "Withdraw" })).toBeDefined();
 
     // And the command rule beside it keeps the gesture, so this is about the KIND of rule and not
     // about the section having lost its controls.
     const command = screen.getByRole("listitem", { name: "rule git push" });
-    expect(within(command).getByRole("button", { name: "allow it instead" })).toBeDefined();
+    expect(within(command).getByRole("button", { name: "Allow it instead" })).toBeDefined();
   });
 
   /**
@@ -753,19 +757,19 @@ describe("what the worktrees may run", () => {
 
     await openRuleForm();
     const kind = screen.getByLabelText("What this rule is about");
-    expect(screen.getByRole("button", { name: "allow it here" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Allow it here" })).toBeDefined();
 
     fireEvent.change(kind, { target: { value: "Edit" } });
 
-    expect(screen.queryByRole("button", { name: "allow it here" })).toBeNull();
-    expect(screen.getByRole("button", { name: "refuse it here" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Allow it here" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Refuse it here" })).toBeDefined();
     // The reason stands in its place, which is what stops this reading as a missing feature.
-    expect(screen.getByText(/can only refuse/i)).toBeDefined();
+    expect(screen.getByText("Refuse only")).toBeDefined();
 
     // Back to a command, and the widening half returns — the control is about the kind of rule
     // being written and not a switch somebody turned off for the session.
     fireEvent.change(kind, { target: { value: "" } });
-    expect(screen.getByRole("button", { name: "allow it here" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Allow it here" })).toBeDefined();
   });
 
   /**
@@ -811,7 +815,7 @@ describe("what the worktrees may run", () => {
       target: { value: "Edit" },
     });
     fireEvent.change(screen.getByLabelText("Path prefix"), { target: { value: ".ai" } });
-    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refuse it here" }));
 
     expect(await screen.findByText(detail)).toBeDefined();
     // The name travels with it: it is the string that survives a rewording of the sentence.
@@ -833,6 +837,27 @@ describe("what the worktrees may run", () => {
     // get right and the only thing that could silently be got wrong.
     expect(allowed.closest("div")?.textContent).toContain("Allowed");
     expect(refused.closest("div")?.textContent).toContain("Refused");
+  });
+
+  it("folds a long group behind a count, and filters it once shown", async () => {
+    open({
+      shellRules: Array.from({ length: 12 }, (_, i) =>
+        shellRule({ prefix: `tool-${i}`, verdict: "allow" }),
+      ),
+    });
+
+    const show = await screen.findByRole("button", { name: "Show" });
+    expect(screen.queryByRole("listitem", { name: "rule tool-3" })).toBeNull();
+    expect(show.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(show);
+    expect(screen.getByRole("listitem", { name: "rule tool-3" })).toBeDefined();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter allowed rules" }), {
+      target: { value: "tool-11" },
+    });
+    expect(screen.getAllByRole("listitem", { name: /^rule tool-/ })).toHaveLength(1);
+    expect(screen.getByRole("listitem", { name: "rule tool-11" })).toBeDefined();
   });
 
   /**
@@ -869,7 +894,7 @@ describe("what the worktrees may run", () => {
 
     // And it is the owner's to remove — a row that decides nothing and cannot be withdrawn is the
     // same problem one move further on, and filtering it out of the list would be that too.
-    expect(within(stranded).getByRole("button", { name: "withdraw" })).toBeDefined();
+    expect(within(stranded).getByRole("button", { name: "Withdraw" })).toBeDefined();
 
     // The ordinary permission beside it is untouched: this is about the KIND of row, and not about
     // the Allowed panel having learned to disclaim everything in it.
@@ -934,13 +959,13 @@ describe("where the work lands", () => {
       name: "land target the integration branch",
     });
     expect(always.textContent).toContain("master");
-    expect(always.textContent).toContain("always admissible");
+    expect(always.querySelector("[title*='always admissible' i]")).not.toBeNull();
     expect(within(always).queryByRole("button")).toBeNull();
 
     // A declared target IS closable, from the same list, which is what makes the absence above a
     // decision rather than an omission.
     const declared = screen.getByRole("listitem", { name: "land target release/next" });
-    expect(within(declared).getByRole("button", { name: "withdraw" })).toBeDefined();
+    expect(within(declared).getByRole("button", { name: "Withdraw" })).toBeDefined();
   });
 
   it("adds a target and reads it back", async () => {
@@ -949,7 +974,7 @@ describe("where the work lands", () => {
     await openTargetForm();
     const box = screen.getByLabelText("Branch");
     fireEvent.change(box, { target: { value: "release/next" } });
-    fireEvent.click(screen.getByRole("button", { name: "add" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
   });
@@ -994,7 +1019,7 @@ describe("where the work lands", () => {
       name: "land target the integration branch",
     });
     expect(always.textContent).toContain("master");
-    expect(always.textContent).toContain("always admissible");
+    expect(always.querySelector("[title*='always admissible' i]")).not.toBeNull();
     expect(always.textContent).not.toContain("parked");
   });
 
@@ -1027,7 +1052,7 @@ describe("where the work lands", () => {
     expect(always.textContent).toMatch(sentence);
     // The claim that must not be borrowed. A branch is named in two of these three and captioned
     // admissible in none of them.
-    expect(always.textContent).not.toContain("always admissible");
+    expect(always.querySelector("[title*='always admissible' i]")).toBeNull();
     if (named !== null) expect(always.textContent).toContain(named);
   });
 });
@@ -1140,7 +1165,7 @@ describe("the remote", () => {
     const section = await remote();
     expect(section.textContent).toMatch(says);
 
-    fireEvent.click(within(section).getByRole("button", { name: "why?" }));
+    fireEvent.click(within(section).getByRole("button", { name: "Why?" }));
     expect(section.textContent).toMatch(why);
 
     // And nothing was asked of GitHub, because there was nothing to ask it about. A page that sent
@@ -1285,7 +1310,7 @@ describe("the remote", () => {
     const section = await remote();
     await waitFor(() => expect(state.githubReads).toHaveLength(2));
 
-    fireEvent.click(within(section).getByRole("button", { name: "ask again" }));
+    fireEvent.click(within(section).getByRole("button", { name: "Ask again" }));
     await waitFor(() => expect(state.githubReads).toHaveLength(4));
   });
 });
@@ -1348,7 +1373,7 @@ describe("the page as a whole", () => {
     const before = repoReads();
 
     const row = await screen.findByRole("listitem", { name: "operation pr_list" });
-    await pressTwice(row, "grant", "grant without asking · pr_list");
+    await pressTwice(row, "Grant", "Grant without asking · pr_list");
     await waitFor(() => expect(screen.getByRole("listitem", { name: "operation pr_list" })).toBeDefined());
     await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -1382,11 +1407,11 @@ describe("the page as a whole", () => {
 
     // One sentence on every opening, and the mechanism behind it one press away.
     const said = await screen.findByText(/very next tool call of every run already working/i);
-    const standing = screen.getByRole("group", { name: "Standing" });
-    expect(standing.contains(said)).toBe(true);
+    const autonomy = screen.getByRole("region", { name: "Autonomy" });
+    expect(autonomy.contains(said)).toBe(true);
 
-    fireEvent.click(within(standing).getByRole("button", { name: "why?" }));
-    expect(standing.textContent).toMatch(/no cache and no restart/i);
+    expect(within(autonomy).getByRole("button", { name: "About Autonomy" })).toBeTruthy();
+    expect(autonomy.textContent).toMatch(/no cache and no restart/i);
   });
 
   it("draws Autonomy first, then the five sections in the order the designs fix", async () => {
@@ -1424,29 +1449,29 @@ describe("the forms stay closed until they are asked for", () => {
   it("keeps the add a rule form closed until it is asked for", async () => {
     open();
 
-    const button = await screen.findByRole("button", { name: "add a rule" });
+    const button = await screen.findByRole("button", { name: "Add a rule" });
     expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull();
 
     fireEvent.click(button);
     const form = screen.getByRole("form", { name: "Add a rule" });
 
-    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
+    fireEvent.click(within(form).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull();
-    expect(screen.getByRole("button", { name: "add a rule" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Add a rule" })).toBeDefined();
   });
 
   it("keeps the add a landing target form closed until it is asked for", async () => {
     open();
 
-    const button = await screen.findByRole("button", { name: "add a landing target" });
+    const button = await screen.findByRole("button", { name: "Add a landing target" });
     expect(screen.queryByRole("form", { name: "Add a landing target" })).toBeNull();
 
     fireEvent.click(button);
     const form = screen.getByRole("form", { name: "Add a landing target" });
 
-    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
+    fireEvent.click(within(form).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("form", { name: "Add a landing target" })).toBeNull();
-    expect(screen.getByRole("button", { name: "add a landing target" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Add a landing target" })).toBeDefined();
   });
 
   /** What was typed is the owner's work, and a refusal must not throw it away. */
@@ -1457,7 +1482,7 @@ describe("the forms stay closed until they are asked for", () => {
     await openRuleForm();
     const box = screen.getByLabelText<HTMLInputElement>("Command prefix");
     fireEvent.change(box, { target: { value: "ls | sh" } });
-    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refuse it here" }));
 
     expect(await screen.findByText(detail)).toBeDefined();
     expect(screen.getByRole("form", { name: "Add a rule" })).toBeDefined();
@@ -1469,7 +1494,7 @@ describe("the forms stay closed until they are asked for", () => {
 
     await openRuleForm();
     fireEvent.change(screen.getByLabelText("Command prefix"), { target: { value: "git push" } });
-    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refuse it here" }));
 
     await waitFor(() => expect(state.shellRules).toHaveLength(1));
     await waitFor(() => expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull());
@@ -1486,8 +1511,8 @@ describe("the forms stay closed until they are asked for", () => {
     await waitFor(() => expect(form.contains(document.activeElement)).toBe(true));
     expect(document.activeElement).not.toBe(document.body);
 
-    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
-    const back = await screen.findByRole("button", { name: "add a rule" });
+    fireEvent.click(within(form).getByRole("button", { name: "Cancel" }));
+    const back = await screen.findByRole("button", { name: "Add a rule" });
     await waitFor(() => expect(document.activeElement).toBe(back));
   });
 
@@ -1496,11 +1521,11 @@ describe("the forms stay closed until they are asked for", () => {
 
     await openRuleForm();
     fireEvent.change(screen.getByLabelText("Command prefix"), { target: { value: "git push" } });
-    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refuse it here" }));
 
     await waitFor(() => expect(state.shellRules).toHaveLength(1));
     await waitFor(() => expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull());
-    const back = await screen.findByRole("button", { name: "add a rule" });
+    const back = await screen.findByRole("button", { name: "Add a rule" });
     await waitFor(() => expect(document.activeElement).toBe(back));
   });
 
@@ -1511,8 +1536,8 @@ describe("the forms stay closed until they are asked for", () => {
     await waitFor(() => expect(form.contains(document.activeElement)).toBe(true));
     expect(document.activeElement).not.toBe(document.body);
 
-    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
-    const back = await screen.findByRole("button", { name: "add a landing target" });
+    fireEvent.click(within(form).getByRole("button", { name: "Cancel" }));
+    const back = await screen.findByRole("button", { name: "Add a landing target" });
     await waitFor(() => expect(document.activeElement).toBe(back));
   });
 
@@ -1521,13 +1546,13 @@ describe("the forms stay closed until they are asked for", () => {
 
     await openTargetForm();
     fireEvent.change(screen.getByLabelText("Branch"), { target: { value: "release/next" } });
-    fireEvent.click(screen.getByRole("button", { name: "add" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
     await waitFor(() =>
       expect(screen.queryByRole("form", { name: "Add a landing target" })).toBeNull(),
     );
-    const back = await screen.findByRole("button", { name: "add a landing target" });
+    const back = await screen.findByRole("button", { name: "Add a landing target" });
     await waitFor(() => expect(document.activeElement).toBe(back));
   });
 
@@ -1547,7 +1572,7 @@ describe("the forms stay closed until they are asked for", () => {
 
     // The group keeps its title, holds no row, and says why in one quiet sentence of its own.
     expect(within(group).queryAllByRole("listitem")).toHaveLength(0);
-    expect(group.textContent).toMatch(/none of these is allowed by this build/i);
+    expect(group.textContent).toContain("None allowed");
   });
 
   it("closes the landing target form once the target is added", async () => {
@@ -1555,7 +1580,7 @@ describe("the forms stay closed until they are asked for", () => {
 
     await openTargetForm();
     fireEvent.change(screen.getByLabelText("Branch"), { target: { value: "release/next" } });
-    fireEvent.click(screen.getByRole("button", { name: "add" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
     await waitFor(() =>
@@ -1655,7 +1680,7 @@ describe("the answer at the top, and the gestures that widen", () => {
 
     const section = await screen.findByRole("region", { name: "The remote" });
     await waitFor(() => expect(section.textContent).toMatch(/read \d\d:\d\d/));
-    expect(within(section).getByRole("button", { name: "ask again" })).toBeDefined();
+    expect(within(section).getByRole("button", { name: "Ask again" })).toBeDefined();
   });
 
   /**
@@ -1688,16 +1713,16 @@ describe("the answer at the top, and the gestures that widen", () => {
     });
 
     const refusal = await screen.findByRole("listitem", { name: "rule git push" });
-    fireEvent.click(within(refusal).getByRole("button", { name: "withdraw" }));
+    fireEvent.click(within(refusal).getByRole("button", { name: "Withdraw" }));
     expect(
       within(refusal).getByRole("button", {
-        name: "stop refusing this, and drop its justification · git push",
+        name: "Stop refusing this, and drop its justification · git push",
       }),
     ).toBeDefined();
     expect(state.policyWrites).toEqual([]);
 
     const permission = screen.getByRole("listitem", { name: "rule npm ci" });
-    fireEvent.click(within(permission).getByRole("button", { name: "withdraw" }));
+    fireEvent.click(within(permission).getByRole("button", { name: "Withdraw" }));
     await waitFor(() => expect(state.shellRules.map((rule) => rule.prefix)).toEqual(["git push"]));
   });
 
@@ -1706,11 +1731,11 @@ describe("the answer at the top, and the gestures that widen", () => {
     const state = open({ shellRules: [shellRule({ prefix: "git push", verdict: "deny" })] });
 
     const row = await screen.findByRole("listitem", { name: "rule git push" });
-    fireEvent.click(within(row).getByRole("button", { name: "allow it instead" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Allow it instead" }));
     expect(state.policyWrites).toEqual([]);
 
     await afterDwell();
-    fireEvent.click(within(row).getByRole("button", { name: "allow without asking · git push" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Allow without asking · git push" }));
     await waitFor(() => expect(state.shellRules[0].verdict).toBe("allow"));
   });
 });

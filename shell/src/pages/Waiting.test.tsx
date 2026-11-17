@@ -1456,7 +1456,8 @@ describe("Waiting - one verb pair", () => {
     const caution = document.getElementById(engine.getAttribute("aria-describedby") ?? "");
     if (caution === null) throw new Error("no caution line");
     expect(caution.hidden).toBe(false);
-    expect(caution.className).not.toContain("sr-only");
+    // The sentence is for assistive tech; sighted readers get it from the Tip on the card head.
+    expect(caution.className).toContain("sr-only");
     expect(caution.textContent).not.toMatch(/Changed from what the director proposed/);
 
     fireEvent.change(engine, { target: { value: "codex" } });

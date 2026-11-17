@@ -35,7 +35,6 @@ import {
   StateBadge,
   Table,
   Td,
-  Teach,
   Th,
   Tip,
   usd,
@@ -212,13 +211,13 @@ export function Teams() {
         // which would say the teams are gone about a read that has not finished.
         teams.isError ? null : <Skeleton label="Loading the teams" variant="row" count={4} />
       ) : rows.length === 0 ? (
-        <Teach title="No team yet">
+        <Quiet says="No team yet">
           <p>
             A team is a permanent unit (Finance, Marketing, Security), not a task. It has a
             director, a roster of specialists, what it may do on its own, and the ceilings every
             task of its runs under. Tasks and routines belong to it and are set up inside it.
           </p>
-        </Teach>
+        </Quiet>
       ) : (
         // One column with one gap, so the strip, the table and the matrix never butt against
         // each other and no block carries its own margin to make room.
@@ -470,7 +469,6 @@ function DepartmentTable({
           <Mark mode="rule" /> routines armed
         </li>
       </ul>
-      <p className="teams-key-pulse">Pulse: a bar per day with runs, newest on the right.</p>
       <div className="teams-table-scroller">
       <Table label="Every team, with what it is doing now">
         <thead>
@@ -500,7 +498,7 @@ function DepartmentTable({
             <Th>On its own</Th>
             {/* Right-aligned because the bars are flushed right: a left-aligned title over
                 bars hugging the other edge reads as two columns. The unit is in the key above. */}
-            <Th num>Pulse</Th>
+            <Th num title="A bar per day with runs, newest on the right.">Pulse</Th>
           </tr>
         </thead>
         <tbody>

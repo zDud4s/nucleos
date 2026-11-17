@@ -275,7 +275,7 @@ describe("Council - the empty catalogue", () => {
 
     await renderCouncil("/council");
 
-    expect(await screen.findByRole("heading", { level: 3, name: "No council has met yet" })).toBeDefined();
+    expect(await screen.findByText("No council has met yet")).toBeDefined();
     expect(screen.queryByRole("region", { name: "Councils" })).toBeNull();
   });
 
@@ -1383,7 +1383,7 @@ describe("Council - the list row and the config", () => {
     await renderCouncil("/council");
 
     await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
-    expect(screen.queryByRole("heading", { level: 3, name: "No council has met yet" })).toBeNull();
+    expect(screen.queryByText("No council has met yet")).toBeNull();
     expect(screen.queryByRole("heading", { level: 3, name: "Choose a council" })).toBeNull();
   });
 });

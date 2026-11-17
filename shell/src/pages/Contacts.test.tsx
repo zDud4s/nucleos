@@ -204,7 +204,7 @@ describe("Contacts — identity questions", () => {
 
     renderWithQuery(<Contacts />);
 
-    const note = await screen.findByText(/standing decisions that disagree/);
+    const note = await screen.findByText("Decisions disagree");
     const approve = screen.getByRole("button", { name: "Yes, one person" });
 
     // The conflict is said up front, and the approve control is unavailable (aria-disabled, still

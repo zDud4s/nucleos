@@ -124,7 +124,7 @@ import { chatKey, chatMachineOf, rememberChatMachine, useChatMachine } from "../
 import { useMachines } from "../data/machines";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
-import { Image, Skeleton, toastManager, useUndoable, usePaletteGroup, usePaletteQuery } from "../ui";
+import { Image, Skeleton, Tip, toastManager, useUndoable, usePaletteGroup, usePaletteQuery } from "../ui";
 import {
   anyTurnLive,
   marksBetween,
@@ -747,7 +747,7 @@ function EditorDetail({
         placeholder="Carry on where you left off…"
         /* The `@` note, corrected for this one case: there IS a folder — it is the one the session
            was had in — and what is missing is a conversation here to ask about it. */
-        noFolderNote={`this conversation is not open here yet. Say something to carry it on, and an @ will name the files in ${chosen.cwd}`}
+        noFolderNote="Not open here yet"
         /* The one door that can answer this before the conversation exists. `chosen.tools` is the
            same question the turn itself asks, already answered for this session — see
            `OfferedSession`. */
@@ -1293,11 +1293,10 @@ function NothingOpen() {
           }
         />
         {start.isError && <CreateRefusal error={start.error} />}
-        <p className="chats-front-note">
-          Every turn is a billed run. Nothing here is ever quietly deleted:
-          ending a conversation only archives it, and every turn it ever had
-          stays readable.
-        </p>
+        <Tip
+          name="About conversations"
+          tip="Every turn is a billed run. Nothing here is ever quietly deleted: ending a conversation only archives it, and every turn it ever had stays readable."
+        />
       </div>
     </div>
   );
@@ -1323,7 +1322,7 @@ function StartBox({
   pending,
   onSay,
   placeholder = "Say something…",
-  noFolderNote = "this conversation has no folder yet. Open it, point it at a project, and an @ will name its files",
+  noFolderNote = "No folder yet",
   tools = false,
 }: {
   pending: boolean;
@@ -1926,7 +1925,7 @@ function Project({
  * closed once a project is chosen. `NoProject` owns the same dialog for the unrooted case.
  */
 const REMOTE_PROJECT_NOTE =
-  "This chat runs on another machine, so its project can only be changed there.";
+  "Runs on another machine: change its project there.";
 
 export function ChangeProject({
   chatId,
@@ -2087,8 +2086,11 @@ function PermissionPicker({
         <DropdownMenuLabel>What it may do without asking</DropdownMenuLabel>
         {/* Says when a pick lands: a rung is re-read on the running turn, Plan is fixed when the
             turn starts. Without the line, picking Plan mid-turn looks like it did nothing. */}
-        <DropdownMenuLabel className="chats-permission-why pt-0 font-normal">
-          Applies to the running turn at once. Plan only from the next message.
+        <DropdownMenuLabel
+          className="chats-permission-why pt-0 font-normal"
+          title="Applies to the running turn at once. Plan only from the next message."
+        >
+          When it applies
         </DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={mode}
@@ -2243,11 +2245,14 @@ function NoProject({
       <div className="chats-unrooted" role="status">
         <FolderOpen className="chats-unrooted-icon" strokeWidth={1.5} aria-hidden="true" />
         <p className="chats-unrooted-title">Choose where this conversation works</p>
-        <p className="chats-unrooted-why">
-          {held === null
-            ? "It runs inside a project folder. Nothing is sent until one is chosen."
-            : "Your message is held, and goes out as soon as it has a project."}
-        </p>
+        <Tip
+          name="About choosing a project"
+          tip={
+            held === null
+              ? "It runs inside a project folder. Nothing is sent until one is chosen."
+              : "Your message is held, and goes out as soon as it has a project."
+          }
+        />
         <Button type="button" onClick={() => onPicking(true)}>
           Choose a project
         </Button>
@@ -3458,7 +3463,7 @@ function ChatInstructions({
             rows={8}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
-            placeholder="Answer in European Portuguese. Prefer the smallest correct change."
+            placeholder="Instructions"
           />
         </label>
         {patch.isError && <HelperRefusal error={patch.error} />}
@@ -3546,7 +3551,7 @@ function ContextControls({ chatId }: { chatId: string }) {
         <Button variant="quiet" disabled={fresh.isPending} onClick={() => fresh.mutate(chatId)}>
           Fresh context
         </Button>
-        <p className="chats-context-why">a new window, told what was recently said</p>
+        <Tip name="About fresh context" tip="A new window, told what was recently said." />
       </div>
       {/* The interlock, because this one cannot be undone by pressing it again: the floor only ever
           moves forward. `ConfirmButton` is why this block is menu CONTENT — a menu item would close
@@ -3558,7 +3563,7 @@ function ContextControls({ chatId }: { chatId: string }) {
           variant="quiet"
           onConfirm={() => clear.mutate(chatId)}
         />
-        <p className="chats-context-why">hold: the model stops seeing every turn so far; they stay here</p>
+        <Tip name="About clearing context" tip="Hold: the model stops seeing every turn so far; they stay here." />
       </div>
       {fresh.isError && <HelperRefusal error={fresh.error} />}
       {clear.isError && <HelperRefusal error={clear.error} />}
@@ -3596,9 +3601,11 @@ function AutoCompactSwitch({ chatId }: { chatId: string }) {
         Compact automatically
       </DropdownMenuCheckboxItem>
       {cannot && (
-        <p className="chats-context-why">
-          This engine reports no context reading, so this conversation cannot compact itself.
-        </p>
+        <Tip
+          name="About compaction"
+          tip="This engine reports no context reading, so this conversation cannot compact itself."
+          persist
+        />
       )}
       {set.isError && <AutoCompactRefusal error={set.error} />}
     </>
@@ -3891,9 +3898,13 @@ function ChatHelpers({
     >
       <div className="chats-helpers">
         {draft.length === 0 && (
-          <Quiet compact says="None yet.">
-            A helper is a name, what it is for, and the instructions it runs under.
-          </Quiet>
+          <p className="ui-quiet-compact">
+            None yet
+            <Tip
+              name="What a helper is"
+              tip="A helper is a name, what it is for, and the instructions it runs under."
+            />
+          </p>
         )}
 
         <ul className="chats-helpers-list">
@@ -3918,7 +3929,7 @@ function ChatHelpers({
                   onChange={(event) =>
                     change(index, { description: event.target.value })
                   }
-                  placeholder="Reviews a diff for correctness"
+                  placeholder="Describe the helper"
                 />
               </label>
               <label className="chats-helper-field">
@@ -3929,7 +3940,7 @@ function ChatHelpers({
                   onChange={(event) =>
                     change(index, { prompt: event.target.value })
                   }
-                  placeholder="You are a code reviewer. Read the diff and…"
+                  placeholder="Instructions"
                 />
               </label>
               <div className="chats-helper-row">
@@ -4028,7 +4039,7 @@ function ArchiveControl({ onArchive }: { onArchive: () => void }) {
       <Button variant="quiet" onClick={onArchive}>
         Archive
       </Button>
-      <p className="chats-context-why">off the list, with a few seconds to undo; every turn stays readable</p>
+      <Tip name="About archiving" tip="Off the list, with a few seconds to undo; every turn stays readable." />
     </div>
   );
 }
@@ -4079,8 +4090,7 @@ function PickedUp({
   if (view.data === undefined) {
     return (
       <p className="chats-picked-up-unread">
-        what was said in the editor could not be read. Only the turns below are
-        shown
+        editor history could not be read
       </p>
     );
   }
@@ -4088,8 +4098,8 @@ function PickedUp({
     return (
       <p className="chats-picked-up-cut">
         {already
-          ? "this was picked up from a conversation in the editor that nobody spoke in."
-          : "nobody spoke in this one. Saying something here starts it."}
+          ? "picked up from the editor: nobody spoke in it."
+          : "nobody spoke in this one."}
       </p>
     );
   }
@@ -4099,8 +4109,7 @@ function PickedUp({
           footnote. A person reads down from the top; the top is exactly where the gap is. */}
       {view.data.cut && (
         <p className="chats-picked-up-cut">
-          older messages are not shown: this conversation was read from its
-          recent end
+          older messages are not shown
         </p>
       )}
       <ul className="chats-said" aria-label="Said in the editor">
@@ -4146,8 +4155,8 @@ function PickedUp({
           somewhere else and cost nothing here. Only the tense changes. */}
       <p className="chats-picked-up-cut">
         {already
-          ? "picked up here: everything above was said in the editor and read back out of its own file. None of it was a run, and none of it was billed here."
-          : "everything above was said in the editor, and reading it here cost nothing. Say something and it carries on from this line."}
+          ? "picked up here: everything above was said in the editor, not billed here."
+          : "everything above was said in the editor, at no cost here."}
       </p>
       {/* Only once it HAS continued. Before that there is nothing to disclose about how it did,
           and `WhatItCarries` above has already said what continuing would carry. */}
@@ -4193,8 +4202,7 @@ function HowItContinued({
     if (carries === null || carries > largestWindow) return null;
     return (
       <p className="chats-picked-up-cut">
-        this session was resumed, so the model has all of the above in its
-        context.
+        resumed: the model has all of the above.
       </p>
     );
   }
@@ -4213,7 +4221,7 @@ function HowItContinued({
         aria-expanded={open}
         onClick={() => setOpen(!open)}
       >
-        {open ? "hide what it was handed" : "show what it was handed"}
+        {open ? "Hide what it was handed" : "Show what it was handed"}
       </button>
       {open && (
         <ul
@@ -4296,10 +4304,10 @@ function ProjectChanges({ chatId }: { chatId: string }) {
         >
           <div className="chats-changes-head">
             <p className="chats-changes-title">What is different in this project</p>
-            <p className="chats-changes-note">
-              The working tree against its last commit, as it is now, not only what this
-              conversation did.
-            </p>
+            <Tip
+              name="About these changes"
+              tip="The working tree against its last commit, as it is now, not only what this conversation did."
+            />
           </div>
           {diff.isError && <ChangedRefusal error={diff.error} />}
           {files === null && !diff.isError && (
@@ -4546,7 +4554,7 @@ function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
             disabled={drop.isPending}
             onClick={() => drop.mutate(message.id)}
           >
-            don't send this
+            Don't send this
           </button>
         </li>
       ))}
@@ -4665,7 +4673,7 @@ function Transcript({
             disabled={older.isPending}
             onClick={() => older.mutate()}
           >
-            {older.isPending ? "reading…" : "Earlier turns"}
+            {older.isPending ? "Reading…" : "Earlier turns"}
           </Button>
           {older.isError && (
             <ErrorNote>the earlier turns could not be read</ErrorNote>
@@ -5660,7 +5668,7 @@ function RelayChain({ chatId, turnId }: { chatId: string; turnId: number }) {
         aria-expanded={open}
         onClick={() => setOpen((was) => !was)}
       >
-        {open ? "hide the path" : "where did this start?"}
+        {open ? "Hide the path" : "Where did this start?"}
       </button>
       {open && chain.data !== undefined && (
         <ol className="chats-relay-chain-steps" aria-label="The path this turn travelled">
@@ -5708,7 +5716,7 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
           setOpen((was) => !was);
         }}
       >
-        {open ? "cancel" : "hand to another conversation"}
+        {open ? "Cancel" : "Hand to another conversation"}
       </button>
       {open && (
         <ForwardPanel
@@ -5771,7 +5779,7 @@ export function ForwardPanel({
             onChange={(event) => onText(event.target.value)}
           />
           {elsewhere.length === 0 && otherMachines.length === 0 && (
-            <Quiet compact says="there is no other conversation to hand this to." />
+            <Quiet compact says="No other conversation" />
           )}
           <ul className="chats-forward-targets" aria-label="Hand it to">
             {elsewhere.map((row) => (
@@ -5807,9 +5815,11 @@ export function ForwardPanel({
           </ul>
           {otherMachines.length > 0 && (
             <>
-              <p className="chats-forward-label">
-                On another machine. It is sent as a message, not handed over: the other side sees your
-                words under a note of where they came from.
+              <p
+                className="chats-forward-label"
+                title="It is sent as a message, not handed over: the other side sees your words under a note of where they came from."
+              >
+                On another machine
               </p>
               <ul className="chats-forward-targets" aria-label="Send as a message to">
                 {otherMachines.map((row) => (
@@ -6400,7 +6410,7 @@ ${was}`));
         </div>
       )}
       {nowhere && (
-        <Quiet compact says="this conversation has no directory, so there are no files to name here" />
+        <Quiet compact says="No directory" />
       )}
       {cards.map(({ id, card }) => (
         <SlashCard

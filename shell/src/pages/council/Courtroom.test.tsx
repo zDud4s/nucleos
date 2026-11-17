@@ -491,7 +491,7 @@ describe("Dossier", () => {
   it("asks for neither catalogue while nothing is chosen", () => {
     setupDossier();
     expect(screen.getByRole("heading", { name: "The case" })).toBeDefined();
-    expect(screen.getByText("Write the question on the lectern.")).toBeDefined();
+    expect(screen.getByText("No question")).toBeDefined();
     expect(daemon.apiFetch).not.toHaveBeenCalled();
   });
 

@@ -5,7 +5,7 @@ import { Check, Search, X } from "lucide-react";
 import { useAllCaptures } from "../data/captures";
 import { useApproveKnowledge, useKnowledge, useRejectKnowledge, type Known, type KnownLayer } from "../data/knowledge";
 import { useOwnerNotes, useSearchOwnerNotes } from "../data/owner-notes";
-import { Button, ErrorNote, Quiet, RelativeTime, Row, Rows, Select, Teach } from "../ui";
+import { Button, ErrorNote, Quiet, RelativeTime, Row, Rows, Select } from "../ui";
 import { Segments } from "./Segments";
 import { formatItem } from "./item-ref";
 import { MeasuredSummary } from "./knowledge/MeasuredSummary";
@@ -105,11 +105,11 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
 
   if (nothingAtAll) {
     return (
-      <Teach title="Nothing has been learned yet">
+      <Quiet says="Nothing has been learned yet">
         This is where your notes, supplemental instructions, facts about a project, and reusable
         ways of working are kept once you have approved them. Nothing reaches a prompt until you
         say so, so an empty layer means the agent is running on its standing brief alone.
-      </Teach>
+      </Quiet>
     );
   }
 
@@ -126,7 +126,8 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
           <input
             type="search"
             aria-label="Search"
-            placeholder="Search notes, knowledge and questions"
+            title="Search notes, knowledge and questions"
+            placeholder="Search"
             value={q}
             onChange={(event) => setQ(event.target.value)}
           />

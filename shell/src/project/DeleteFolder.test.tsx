@@ -71,7 +71,7 @@ describe("deleting a project's folder", () => {
     const { state } = await openEstado();
     const panel = await openDelete();
 
-    const button = () => panel.getByRole("button", { name: "delete the folder" });
+    const button = () => panel.getByRole("button", { name: "Delete the folder" });
     expect(button()).toHaveProperty("disabled", true);
 
     // A near miss is still a miss. Nothing here is a prefix match.
@@ -97,7 +97,7 @@ describe("deleting a project's folder", () => {
 
     fireEvent.click(panel.getByRole("checkbox"));
     typeTheName(panel, "nucleos");
-    fireEvent.click(panel.getByRole("button", { name: "delete the folder" }));
+    fireEvent.click(panel.getByRole("button", { name: "Delete the folder" }));
 
     await waitFor(() => expect(state.folderDeleted.length).toBe(1));
     expect(state.folderDeleted[0].forgetHistory).toBe(true);
@@ -121,7 +121,7 @@ describe("deleting a project's folder", () => {
     });
     const panel = await openDelete();
 
-    expect(await panel.findByText(/not a git repository/)).toBeTruthy();
+    expect(await panel.findByText(/Not a git repository/)).toBeTruthy();
     expect(panel.queryByText(/not committed/)).toBeNull();
   });
 
@@ -183,7 +183,7 @@ describe("deleting a project's folder", () => {
 
     expect(await panel.findByText(/too near the top of a disk/)).toBeTruthy();
     typeTheName(panel, "nucleos");
-    expect(panel.getByRole("button", { name: "delete the folder" })).toHaveProperty(
+    expect(panel.getByRole("button", { name: "Delete the folder" })).toHaveProperty(
       "disabled",
       true,
     );
@@ -209,7 +209,7 @@ describe("deleting a project's folder", () => {
 
     expect(await panel.findByText(/1 slot in flight and 2 worktrees checked out/)).toBeTruthy();
     typeTheName(panel, "nucleos");
-    expect(panel.getByRole("button", { name: "delete the folder" })).toHaveProperty(
+    expect(panel.getByRole("button", { name: "Delete the folder" })).toHaveProperty(
       "disabled",
       true,
     );
@@ -230,7 +230,7 @@ describe("deleting a project's folder", () => {
 
     expect(await panel.findByText(/not on this disk any more/)).toBeTruthy();
     typeTheName(panel, "nucleos");
-    expect(panel.getByRole("button", { name: "delete the folder" })).toHaveProperty(
+    expect(panel.getByRole("button", { name: "Delete the folder" })).toHaveProperty(
       "disabled",
       true,
     );
@@ -250,7 +250,7 @@ describe("deleting a project's folder", () => {
     const panel = await openDelete();
 
     typeTheName(panel, "nucleos");
-    fireEvent.click(panel.getByRole("button", { name: "delete the folder" }));
+    fireEvent.click(panel.getByRole("button", { name: "Delete the folder" }));
     expect(await screen.findByText(/kill switch is engaged: nothing was deleted/)).toBeTruthy();
   });
 
@@ -298,7 +298,7 @@ describe("deleting a project's folder", () => {
       expect(document.activeElement?.textContent).toMatch(/^This deletes .* Nothing here can undo it\.$/),
     );
 
-    fireEvent.click(panel.getByRole("button", { name: "cancel" }));
+    fireEvent.click(panel.getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(document.activeElement).toBe(trigger));
   });
 

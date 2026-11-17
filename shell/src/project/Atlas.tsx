@@ -10,7 +10,7 @@ import {
 } from "react";
 import { X } from "lucide-react";
 import type { ProjectMap } from "../data/project-map";
-import { IconButton } from "../ui";
+import { IconButton, Tip } from "../ui";
 import {
   drawColumn,
   neighbours,
@@ -57,8 +57,7 @@ export function Atlas({ data, atlas }: { data: ProjectMap; atlas: AtlasModel }) 
         <div className="flex min-w-0 flex-1 flex-col gap-1">
           <p className="m-0 text-sm font-medium text-text">No code this map can read</p>
           <p className="m-0 text-sm text-text-muted">
-            The map reads Rust and TypeScript. What it could not read is under &ldquo;Not
-            read&rdquo;.
+            The map reads Rust and TypeScript.
           </p>
         </div>
       </div>
@@ -257,9 +256,9 @@ function Canvas({
         {children}
       </div>
 
-      <p className="ws-canvas-hint">
-        Folders use the ones below them. Drag to move, scroll to zoom, choose a folder to open it.
-      </p>
+      <span className="ws-canvas-hint">
+        <Tip tip="Drag to move, scroll to zoom, choose a folder to open it." name="Canvas help" />
+      </span>
 
       <div className="ws-canvas-tools" role="group" aria-label="Zoom">
         <button type="button" className="hit-area" aria-label="Zoom out" onClick={() => zoomCentre(1 / 1.25)}>
@@ -305,7 +304,7 @@ export function NotRead({ atlas }: { atlas: AtlasModel }) {
       <p className="m-0 text-sm text-text-faint">
         Not code, so not drawn: <span className="tabular-nums">{atlas.notCode}</span> files (
         {atlas.notCodeKinds.slice(0, 5).join(", ")}
-        {atlas.notCodeKinds.length > 5 ? ", …" : ""}). Build output is left out.
+        {atlas.notCodeKinds.length > 5 ? ", …" : ""}).
       </p>
     );
   if (atlas.unread.length === 0) {
@@ -611,7 +610,7 @@ function SeamDetail({ data }: { data: ProjectMap }) {
       <header className="flex flex-col gap-1">
         <h3 className="m-0 text-base font-semibold text-text">The boundary</h3>
         <p className="m-0 max-w-prose text-sm text-text-muted">
-          The sides share no source; they talk over HTTP. The daemon serves{" "}
+          The daemon serves{" "}
           <span className="tabular-nums">{seam.served.length}</span> routes and the screens make{" "}
           <span className="tabular-nums">{seam.calls}</span> calls, of which{" "}
           <span className="tabular-nums">{seam.matched}</span> reach a route.

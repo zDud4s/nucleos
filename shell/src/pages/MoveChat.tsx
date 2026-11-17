@@ -17,7 +17,7 @@ import { pairedMachine, type MachineId } from "../data/machineStore";
 import { useMachines, withMachine } from "../data/machines";
 import { requestNativeStepUp } from "../remote/nativeTransport";
 import { isRemote } from "../remote/host";
-import { Button, ErrorNote, Modal, Select } from "../ui";
+import { Button, ErrorNote, Modal, Select, Tip } from "../ui";
 
 type Project = { project_root: string | null; remote?: string | null };
 type When = "after_turn" | "now";
@@ -469,7 +469,7 @@ export function MoveChatDialog({
       }
     >
       <div className="chats-helpers">
-        <p>The current turn can finish; messages already queued move with this chat.</p>
+        <Tip name="About moving" tip="The current turn can finish; messages already queued move with this chat." />
         {originProblem !== null && <ErrorNote>{originProblem}</ErrorNote>}
         <label>
           Move to
@@ -496,8 +496,10 @@ export function MoveChatDialog({
 
 export function TransferNotes({ preview }: { preview: ChatTransferPreview }) {
   return <>
-    <h2>Before you move</h2>
-    <p>A running turn can finish first. While the move is frozen, new messages are refused until it arrives.</p>
+    <h2>
+      Before you move
+      <Tip name="About the freeze" tip="A running turn can finish first. While the move is frozen, new messages are refused until it arrives." />
+    </h2>
     <h3>What stops</h3>
     {preview.will_stop.length === 0 ? <p>Nothing else will stop.</p> : <ul>{preview.will_stop.map((item) => <li key={item}>{item}</li>)}</ul>}
     <h3>What stays behind</h3>

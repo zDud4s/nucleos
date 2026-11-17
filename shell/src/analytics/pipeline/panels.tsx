@@ -11,7 +11,7 @@ import {
   type Pressure,
 } from "../../data/analytics-pipeline";
 import { compactTokens } from "../../data/project-readings";
-import { AreaChart, Badge, ShareBar, usd, type ChartKey } from "../../ui";
+import { AreaChart, Badge, ShareBar, Tip, usd, type ChartKey } from "../../ui";
 import { versus } from "../series";
 import { plural } from "../../lib/plural";
 import { joined, summary, type PanelContent } from "../sections";
@@ -401,10 +401,10 @@ function autopilotPanel(autopilot: Autopilot): PanelContent {
             ["Agree", `${percentOr(judge.agree)} · ${judge.reviewed} actions with your verdict`],
           ]}
         />
-        <p className="an-note">
-          Agree is the judge&apos;s opinion against your verdict, counted per distinct action. A capped allow counts as
-          an allow.
-        </p>
+        <Tip
+          name="About Agree"
+          tip="Agree is the judge's opinion against your verdict, counted per distinct action. A capped allow counts as an allow."
+        />
         <ShareBar
           label="Refused actions by status"
           format={count}

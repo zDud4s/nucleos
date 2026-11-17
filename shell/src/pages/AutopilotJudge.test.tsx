@@ -45,7 +45,7 @@ describe("the judge's panel", () => {
       initialPath: "/autopilot",
     });
 
-    expect(await screen.findByText(/9 distinct actions reviewed, 9 agreed/)).toBeDefined();
+    expect(await screen.findByText(/9\/10 reviewed · 100% agreed/)).toBeDefined();
     expect(screen.getByText("unrecognized")).toBeDefined();
     expect(screen.getByText(JUDGE_RESIDUAL_RISK)).toBeDefined();
     // The switch segment stays focusable and inert (aria-disabled), and a click opens no dialog.

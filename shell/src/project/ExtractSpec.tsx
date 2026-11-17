@@ -74,14 +74,11 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
   if (specs.data.length === 0) {
     return (
       <section aria-label="Read a spec" className="flex flex-col gap-2">
-        <p className="max-w-prose text-sm text-text-muted">
-          This project keeps no specs, so there is no intention layer to make: the structure above
-          is the whole map it can have, and it is not wrong, only thin.
-        </p>
-        <p className="max-w-prose text-xs text-text-faint">
-          The {DAEMON_NAME} looks in <span className="font-mono">docs/specs/</span> and{" "}
-          <span className="font-mono">docs/superpowers/specs/</span>. One document in any of them is
-          all this needs.
+        <p
+          className="text-sm text-text-muted"
+          title={`No specs, so no intention layer. The ${DAEMON_NAME} looks in docs/specs/ and docs/superpowers/specs/; one document in either is enough.`}
+        >
+          No specs
         </p>
       </section>
     );
@@ -133,19 +130,16 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
         <Button
           variant="ghost"
           aria-label={`read ${chosen ?? "the chosen spec"} with the ${brain} brain`}
+          title={brain === "cloud" ? CLOUD_COST : undefined}
           disabled={chosen === null || extract.isPending}
           onClick={() => {
             if (chosen === null) return;
             extract.mutate({ specSlug: chosen, brain });
           }}
         >
-          read with the {brain} brain
+          Read with the {brain} brain
         </Button>
       </div>
-      {/* Only the brain that costs something says so; the local one has nothing to warn about. */}
-      {brain === "cloud" ? (
-        <p className="m-0 max-w-prose text-xs text-text-faint">{CLOUD_COST}</p>
-      ) : null}
 
       {/*
         The wait, said out loud. `POST /map/extract` is synchronous on purpose — the owner pressed a
@@ -153,10 +147,11 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
         minute would look broken at exactly the moment it is working.
       */}
       {extract.isPending ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          Reading {chosen} with the {brain} brain. This is a whole document going through a model in
-          one request, and the answer arrives only when it has finished. A cloud read can take a
-          minute.
+        <p
+          className="text-xs text-text-muted"
+          title="A whole document goes through a model in one request. A cloud read can take a minute."
+        >
+          Reading {chosen} with the {brain} brain…
         </p>
       ) : null}
 
@@ -168,10 +163,13 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
         read. The sentence counts what is waiting, which is the number that is true.
       */}
       {extract.isSuccess && extract.data !== undefined ? (
-        <p className="max-w-prose text-xs text-text-muted">
+        <p
+          className="text-xs text-text-muted"
+          title="None of them is in the map until you answer it."
+        >
           {extract.data.length === 0
-            ? "Read, and nothing is waiting below. The model pointed at no decision it could name a section for, which is a real answer and not a failure."
-            : `Read. ${extract.data.length} ${extract.data.length === 1 ? "line is" : "lines are"} waiting below, this document's among them, and not one of them is in the map until you answer it.`}
+            ? "Read: nothing waiting."
+            : `Read: ${extract.data.length} waiting below.`}
         </p>
       ) : null}
     </section>
@@ -201,9 +199,9 @@ function Failed({ error }: { error: unknown }) {
 
   const sentence =
     error.status === 503
-      ? `This machine has no local model configured, so the local brain has nothing to read with. The ${DAEMON_NAME} refuses rather than sending the document to a cloud you did not ask for, which is the whole reason the choice is yours to make.`
+      ? "This machine has no local model configured. Nothing was sent to the cloud."
       : error.status === 502
-        ? "A model was reached and the read failed. Nothing was recorded: an empty list would have claimed this document decides nothing, and nobody is in a position to claim that when nobody read it."
+        ? "A model was reached and the read failed. Nothing was recorded."
         : error.status === 404
           ? "That document is not there any more, or it cannot be read."
           : error.status === 422

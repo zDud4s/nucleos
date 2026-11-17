@@ -68,7 +68,6 @@ import {
   Select,
   StateBadge,
   Switch,
-  Teach,
 } from "../ui";
 import "./runs.css";
 
@@ -443,7 +442,7 @@ function RunFilterBar({
           aria-label={`Remove status filter: ${readState("run", otherStatus)?.label ?? otherStatus}`}
           onClick={() => onChange({ status: undefined })}
         >
-          status: {readState("run", otherStatus)?.label ?? otherStatus}{" "}
+          Status: {readState("run", otherStatus)?.label ?? otherStatus}{" "}
           <span aria-hidden="true">×</span>
         </Button>
       )}
@@ -565,8 +564,8 @@ function RunList({
 
   if (rows.length === 0) {
     return (
-      <Teach
-        title={filtered ? "Nothing matches those filters" : "No runs yet"}
+      <Quiet
+        says={filtered ? "Nothing matches those filters" : "No runs yet"}
         action={
           !filtered && onCompose !== undefined ? (
             <Button intent="go" onClick={onCompose}>
@@ -589,7 +588,7 @@ function RunList({
             you ask for.
           </p>
         )}
-      </Teach>
+      </Quiet>
     );
   }
 
@@ -1538,9 +1537,11 @@ function ModePicker({
                 </span>
               )}
             </span>
-            <p id={saysId} className="runs-mode-says">
-              {choice.says}
-            </p>
+            <Tip
+              name={`About ${choice.mode} mode`}
+              tip={<span id={saysId}>{choice.says}</span>}
+              persist
+            />
           </div>
         );
       })}

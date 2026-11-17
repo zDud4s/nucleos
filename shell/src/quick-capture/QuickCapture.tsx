@@ -88,7 +88,7 @@ export function QuickCapture() {
         id="quick-capture-text"
         ref={area}
         className="quick-capture-input"
-        placeholder="Write it down: a fact, a reminder, a loose end."
+        placeholder="Write a note"
         value={text}
         aria-describedby="quick-capture-hint"
         onChange={(event) => {

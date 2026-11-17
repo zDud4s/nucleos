@@ -223,7 +223,7 @@ function BlockFiles({
               disabled={setLayer.isPending}
               onClick={() => setLayer.mutate({ path, layer: null })}
             >
-              reset
+              Reset
             </Button>
           ) : null}
         </li>

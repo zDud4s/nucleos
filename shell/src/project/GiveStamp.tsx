@@ -65,7 +65,7 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
         aria-label={`note for ${name}`}
         value={note}
         onChange={(event) => setNote(event.target.value)}
-        placeholder="what is missing, in your words"
+        placeholder="What is missing"
         className="rounded-md border border-border bg-surface-sunken px-2 py-1 text-xs text-text placeholder:text-text-faint"
       />
       <div className="flex flex-wrap items-center gap-2">
@@ -74,21 +74,21 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
           disabled={giveStamp.isPending}
           onClick={() => send("settled")}
         >
-          as I want it
+          As I want it
         </Button>
         <Button
           aria-label={`stamp ${name} as part-way`}
           disabled={giveStamp.isPending || written === ""}
           onClick={() => send("partial")}
         >
-          part-way, and I know
+          Part-way, and I know
         </Button>
         <Button
           aria-label={`stamp ${name} as changed your mind`}
           disabled={giveStamp.isPending}
           onClick={() => send("withdrawn")}
         >
-          changed my mind
+          Changed my mind
         </Button>
       </div>
       {giveStamp.isError ? <Refused error={giveStamp.error} /> : null}

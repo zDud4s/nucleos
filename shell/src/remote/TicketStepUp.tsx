@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Tip } from "../ui/Tip";
 import { creationOptions, credentialJson, requestOptions } from "./StepUp";
 
 type Ticket = { device_name: string; label: string; code: string; registered: boolean; can_register: boolean };
@@ -45,7 +46,7 @@ export function TicketStepUp() {
   const unavailable = !info.registered && !info.can_register;
   return <main className="remote-pairing"><section className="remote-pairing-form">
     <h1>Confirm this action</h1><p>Requesting device: {info.device_name}</p><p>Action: {info.label}</p><p>Comparison code: <strong>{info.code}</strong></p>
-    <p>Do not continue unless you started this action on that device just now.</p>
-    {unavailable ? <p>Pair again on that machine to get another 15 minutes to register its first passkey.</p> : <button type="button" disabled={busy} onClick={() => void continueStepUp()}>{busy ? "Waiting for the passkey…" : info.registered ? "Confirm with passkey" : "Register and confirm with passkey"}</button>}
+    <p>Continue only if you just started this on that device.</p>
+    {unavailable ? <p>No passkey registered <Tip tip="Pair again on that machine to get another 15 minutes to register its first passkey." name="About passkey registration" /></p> : <button type="button" disabled={busy} onClick={() => void continueStepUp()}>{busy ? "Waiting for the passkey…" : info.registered ? "Confirm with passkey" : "Register and confirm with passkey"}</button>}
   </section></main>;
 }

@@ -852,7 +852,7 @@ describe("Chats - handing a turn over yourself", () => {
     );
 
     await renderChats("/chats/c-1");
-    fireEvent.click(await screen.findByRole("button", { name: "hand to another conversation" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Hand to another conversation" }));
 
     const box = await screen.findByLabelText("What to send");
     // Pre-filled with what the turn answered, which is what somebody almost always means to send.
@@ -882,7 +882,7 @@ describe("Chats - handing a turn over yourself", () => {
     await renderChats("/chats/c-1");
     await screen.findByRole("list", { name: "Transcript" });
 
-    expect(screen.queryByRole("button", { name: "hand to another conversation" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Hand to another conversation" })).toBeNull();
   });
 });
 
@@ -912,7 +912,7 @@ describe("Chats - where a relayed turn started", () => {
     await renderChats("/chats/c-3");
     expect(screen.queryByRole("list", { name: "The path this turn travelled" })).toBeNull();
 
-    fireEvent.click(await screen.findByRole("button", { name: "where did this start?" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Where did this start?" }));
 
     const path = await screen.findByRole("list", { name: "The path this turn travelled" });
     expect(within(path).getByRole("link", { name: "a primeira" })).toBeDefined();
@@ -1740,7 +1740,7 @@ describe("Chats - choosing a model", () => {
     await renderChats("/chats");
     await openPermissionMenu();
 
-    expect(screen.getByText(/Plan only from the next message/)).toBeDefined();
+    expect(screen.getByTitle(/Plan only from the next message/)).toBeDefined();
   });
 });
 
@@ -2081,7 +2081,7 @@ describe("Chats - the front door's own slash", () => {
 
     // An `@` names files inside the conversation's folder and there is no folder yet. A list that
     // silently never appears is indistinguishable from a feature that is broken.
-    expect(await screen.findByText(/has no folder yet/i)).toBeDefined();
+    expect(await screen.findByText(/no folder yet/i)).toBeDefined();
   });
 });
 
@@ -2228,7 +2228,7 @@ describe("Chats - what a conversation is told, and what it may not touch", () =>
     await renderChats("/chats/c-1");
     await openConversationSettings();
 
-    fireEvent.click(await screen.findByRole("button", { name: /fresh context/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /^fresh context$/i }));
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/fresh-context", {
         method: "POST",
@@ -3040,7 +3040,8 @@ describe("Chats - an empty list", () => {
 
     await renderChats("/chats");
 
-    expect(await screen.findByRole("heading", { name: "No conversations yet" })).toBeDefined();
+    const said = await screen.findByText("No conversations yet");
+    fireEvent.click(within(said.parentElement as HTMLElement).getByRole("button", { name: "Why?" }));
     expect(await screen.findByText(/Conversations from other channels/)).toBeDefined();
   });
 });
@@ -3924,7 +3925,7 @@ describe("Chats - a conversation picked up from the editor", () => {
 
     await renderChats("/chats/c-1");
 
-    expect(await screen.findByText(/was resumed/i)).toBeTruthy();
+    expect(await screen.findByText(/^resumed: the model has all/i)).toBeTruthy();
     expect(screen.queryByText(/too large to resume/i)).toBeNull();
   });
 
@@ -3946,7 +3947,7 @@ describe("Chats - a conversation picked up from the editor", () => {
     await renderChats("/chats/c-1");
 
     expect(await screen.findByText(/picked up here/i)).toBeTruthy();
-    expect(screen.queryByText(/was resumed/i)).toBeNull();
+    expect(screen.queryByText(/^resumed: the model has all/i)).toBeNull();
     expect(screen.queryByText(/too large to resume/i)).toBeNull();
   });
 
@@ -7714,7 +7715,7 @@ describe("Chats - what a turn costs the page", () => {
         .find({ queryKey: keys.chats.all, exact: true })
         ?.getObserversCount() ?? 0;
 
-    const buttons = await screen.findAllByRole("button", { name: "hand to another conversation" });
+    const buttons = await screen.findAllByRole("button", { name: "Hand to another conversation" });
     expect(buttons).toHaveLength(3);
     const before = observers();
     expect(before).toBeGreaterThan(0);

@@ -102,6 +102,7 @@ describe("adding a project", () => {
     // By its radio: the path is also in the receipt of what adding will write.
     expect(await screen.findByRole("radio", { name: /\.ai/ })).toBeTruthy();
     expect(screen.getByText("42 files")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "About adopting" }));
     expect(screen.getByText(/receives no updates/)).toBeTruthy();
     expect(screen.getByText(/not copied, not rewritten/)).toBeTruthy();
     // The first one found is preselected, and declining all of them is an option rather than an
@@ -190,7 +191,7 @@ describe("adding a project", () => {
     expect(within(ask).getByText("cargo test --workspace")).toBeTruthy();
     expect(state.adopted).toEqual([]);
 
-    fireEvent.click(within(ask).getByRole("button", { name: "agree and record the workflow" }));
+    fireEvent.click(within(ask).getByRole("button", { name: "Agree and record the workflow" }));
     await waitFor(() =>
       expect(state.adopted).toEqual([{ name: "harness", path: ".ai", consent_digest: "digest-adopt" }]),
     );
@@ -343,7 +344,7 @@ describe("adding a project", () => {
     expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", true);
     expect(screen.getByText("the kill switch would refuse the workflow")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "leave the workflow for later" }));
+    fireEvent.click(screen.getByRole("button", { name: "Leave the workflow for later" }));
     expect(screen.getByRole("radio", { name: /adopt none of them/ })).toHaveProperty("checked", true);
     fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
 
@@ -374,7 +375,7 @@ describe("adding a project", () => {
     expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", true);
     expect(screen.getByText(/not an id yet/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "use my-project" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use my-project" }));
     expect(id.value).toBe("my-project");
     fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
     await waitFor(() => expect(state.projects[0]?.project_id).toBe("my-project"));
@@ -397,7 +398,7 @@ describe("adding a project", () => {
     const { state } = await openWizard({ detected: detected() });
     await look();
 
-    fireEvent.click(await screen.findByRole("button", { name: "no ceiling" }));
+    fireEvent.click(await screen.findByRole("button", { name: "No ceiling" }));
     expect(screen.getByText("off")).toBeTruthy();
     expect(screen.getByText("no open-proposal ceiling")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
@@ -436,7 +437,7 @@ describe("adding a project", () => {
 
     const gate = (await screen.findByLabelText("Gate command")) as HTMLInputElement;
     expect(gate.value).toBe("npm run test");
-    expect(screen.getByText(/proposed from package\.json/)).toBeTruthy();
+    expect(screen.getByText(/Proposed from package\.json/)).toBeTruthy();
     fireEvent.change(gate, { target: { value: "npm run ci" } });
     expect(screen.getByText(/onboarded with the gate/).textContent).toContain("npm run ci");
 

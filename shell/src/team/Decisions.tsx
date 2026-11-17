@@ -30,6 +30,7 @@ import {
   Select,
   StateBadge,
   Teach,
+  Tip,
 } from "../ui";
 import { daemonProse } from "./prose";
 
@@ -95,7 +96,7 @@ export function Decisions({ team, runs }: DecisionsProps) {
         )}
         {actions.isLoading && <Quiet says="Asking NucleOS…" />}
         {actions.data !== undefined && theirs.length === 0 && (
-          <Quiet says="Nothing is waiting on you for this team." />
+          <Quiet says="Nothing waiting">Nothing is waiting on you for this team.</Quiet>
         )}
         {theirs.length > 0 && (
           <ul className="teams-acts" aria-label="Actions">
@@ -108,10 +109,10 @@ export function Decisions({ team, runs }: DecisionsProps) {
 
       <Panel title="Specialists it asked for" aside={<Count n={recruits.data === undefined ? undefined : asked.length} />}>
         {asked.length > 0 && (
-          <p className="teams-note">
-            A director found a gap in its roster. The request is editable here before it is
-            granted; saying not now leaves nothing behind, and the team may ask again.
-          </p>
+          <Tip
+            name="About requests"
+            tip="A director found a gap in its roster. The request is editable here before it is granted; saying not now leaves nothing behind, and the team may ask again."
+          />
         )}
         {recruits.isError && recruits.data === undefined && (
           <ErrorNote>
@@ -120,7 +121,7 @@ export function Decisions({ team, runs }: DecisionsProps) {
         )}
         {recruits.isLoading && <Quiet says="Asking NucleOS…" />}
         {recruits.data !== undefined && asked.length === 0 && (
-          <Quiet says="This team hasn't asked for anybody." />
+          <Quiet says="No recruits">This team hasn't asked for anybody.</Quiet>
         )}
         {asked.length > 0 && (
           <ul className="teams-acts" aria-label="Recruitment">

@@ -4925,3 +4925,51 @@ table,
 .ui-table .ui-table-muted {
   color: var(--text-muted);
 }
+
+/* ClampedText: text cut to a few lines with an in-place "Show more" toggle. */
+.ui-clamped {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.ui-clamped-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--ui-clamp-lines, 3);
+  line-clamp: var(--ui-clamp-lines, 3);
+  overflow: hidden;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A subtle fade over the last line, only while the text is really cut. */
+.ui-clamped-text[data-clamped="true"] {
+  -webkit-mask-image: linear-gradient(to bottom, #000 65%, transparent);
+  mask-image: linear-gradient(to bottom, #000 65%, transparent);
+}
+
+.ui-clamped-text[data-expanded="true"] {
+  display: block;
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  overflow: visible;
+}
+
+.ui-clamped-toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.ui-clamped-toggle:hover {
+  color: var(--text);
+}

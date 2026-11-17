@@ -345,6 +345,7 @@ describe("the first passkey after an owner pairs", () => {
     const onDone = vi.fn();
     mount(onDone);
 
+    fireEvent.click(screen.getByRole("button", { name: "About passkeys" }));
     expect(screen.getByText(/main machine/)).toBeTruthy();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));

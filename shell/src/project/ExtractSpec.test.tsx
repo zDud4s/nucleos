@@ -150,7 +150,7 @@ describe("choosing what gets read, and by whom", () => {
     openExtractor({ hold: true });
     await ask(MAP, "cloud");
 
-    expect(await screen.findByText(/can take a minute/)).toBeTruthy();
+    expect(await screen.findByText(/Reading .* with the cloud brain/)).toBeTruthy();
     // And it cannot be started twice while the first one is still out.
     await waitFor(() =>
       expect(screen.getByRole("button", { name: new RegExp(`read ${MAP}`) })).toHaveProperty(
@@ -167,7 +167,7 @@ describe("choosing what gets read, and by whom", () => {
   it("says a project keeps no specs rather than showing an empty picker", async () => {
     openExtractor({ specs: [] });
 
-    expect(await screen.findByText(/keeps no specs/)).toBeTruthy();
+    expect(await screen.findByText(/No specs/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^read/ })).toBeNull();
   });
 

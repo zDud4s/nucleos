@@ -67,8 +67,8 @@ import {
   StateBadge,
   Table,
   Td,
-  Teach,
   Th,
+  Tip,
   readState,
   usd,
   usePaletteGroup,
@@ -87,7 +87,6 @@ import {
   evidence,
   fanConfig,
   gateFor,
-  headlineFor,
   holdOrder,
   nearestTarget,
   shortPath,
@@ -257,10 +256,7 @@ export function Autopilot() {
     <>
       {/* Always the span, even before the roster answers: the box is two lines tall from the
           first paint, so the page does not move down when the sentence arrives. */}
-      <PageHeader
-        title="Autopilot"
-        headline={<span className="ap-headline">{headlineFor(rows, answered) ?? ""}</span>}
-      />
+      <PageHeader title="Autopilot" />
 
       {kill.data?.engaged === true && <KillBanner />}
       {budget.data?.paused === true && (
@@ -272,7 +268,11 @@ export function Autopilot() {
         <RosterError error={projects.error} />
       )}
 
-      <SectionNav label="Autopilot sections" items={SECTIONS} current={currentSection} />
+      {/* A secondary, in-page switcher: it sits under the project cards, so it reads as sections
+          of the selected project. */}
+      <div className="ap-nav">
+        <SectionNav label="Autopilot sections" items={SECTIONS} current={currentSection} />
+      </div>
 
       <div className="ap-sections">
         <div id="ap-setting" className="ap-block">
@@ -347,9 +347,7 @@ function RosterError({ error }: { error: unknown }) {
 function KillBanner() {
   return (
     <Callout tone="danger" title="Emergency stop is engaged" role="status">
-      Nothing autonomous starts while this is on: no scheduled rule, no repo
-      trigger, no job. The switch is under the rail, on every page. Everything
-      below is what <em>would</em> happen once it is released.
+      Nothing autonomous starts.
     </Callout>
   );
 }
@@ -364,8 +362,6 @@ function BudgetPausedBanner({ budget }: { budget: BudgetView }) {
       {budget.limit_usd === null
         ? ""
         : ` against a ceiling of $${budget.limit_usd.toFixed(2)}`}
-      . This clears itself when the window rolls or the ceiling is raised; it
-      is not a fault.
     </Callout>
   );
 }
@@ -843,13 +839,11 @@ function ProjectCarousel({
     // the setting is the control, so the control is never pushed below the picture.
     <section className={fanOn ? "ap-fan" : "ap-fan ap-fan-nofan"} aria-label="Projects">
       {answered && rows.length === 0 && (
-        <Teach title="No project is under autopilot">
-          <p>
+        <Quiet says="No project is under autopilot">
+          <p className="ap-note">
             A project appears here once the {DAEMON_NAME} has been told where it lives.
-            Nothing is broken and nothing is hidden. There is simply no project
-            to govern yet.
           </p>
-        </Teach>
+        </Quiet>
       )}
       {/* The fan stage's own height (card + its room), so the cards drop in without a jump. */}
       {!answered && <RosterSkeleton />}
@@ -873,12 +867,6 @@ function ProjectCarousel({
                 onChange={(mode, withRoot) => change(focused, mode, withRoot)}
               />
             </div>
-            {/* What each setting means, said once rather than on every card, in the map's words. */}
-            <p className="ap-note ap-fan-note">
-              Three settings and not two. <strong>Off</strong> means {MODE_MEANING.off}.{" "}
-              <strong>Shadow</strong> means {MODE_MEANING.shadow}.{" "}
-              <strong>Active</strong> means {MODE_MEANING.active}.
-            </p>
           </div>
 
           <div className="ap-fan-view">
@@ -913,8 +901,7 @@ function ProjectCarousel({
                 ))}
               </div>
               {many && fanOn && (
-                <p className="ap-fan-hint">
-                  <kbd>←</kbd> <kbd>→</kbd> on the list, or drag the cards ·{" "}
+                <p className="ap-fan-hint" title="Arrow keys on the list, or drag the cards">
                   <Button variant="quiet" onClick={toggleFan}>
                     Hide the fan
                   </Button>
@@ -1099,7 +1086,7 @@ function FanVisor({ project }: { project: ProjectSummary }) {
   if (project.mode === "active") {
     return (
       <div className="ap-fan-visor">
-        <span className="ap-fan-visor-label">waiting for review</span>
+        <span className="ap-fan-visor-label">To review</span>
         <div className="ap-fan-reading">
           <span className="ap-fan-figure">
             {project.open_review_items}
@@ -1121,7 +1108,7 @@ function FanVisor({ project }: { project: ProjectSummary }) {
   }
   return (
     <div className="ap-fan-visor">
-      <span className="ap-fan-visor-label">classes ready</span>
+      <span className="ap-fan-visor-label">Ready</span>
       <div className="ap-fan-reading">
         {project.classes_total === 0 ? (
           <span className="ap-fan-figure ap-fan-figure-word">none yet</span>
@@ -1159,7 +1146,7 @@ function FanFacts({ project }: { project: ProjectSummary }) {
     return (
       <dl className="ap-fan-facts">
         <div className="ap-fan-fact">
-          <dt>classes ready</dt>
+          <dt title="Classes ready">Ready</dt>
           <dd>
             {project.classes_ready}/{project.classes_total}
           </dd>
@@ -1259,10 +1246,23 @@ function FocusSetting({
   return (
     <>
       <p className="ap-fan-focus-title">
-        Setting for <strong>{project.project_id}</strong>
+        Setting for <strong>{project.project_id}</strong>{" "}
+        <Tip
+          name="What the settings mean"
+          tip={
+            <>
+              <strong>Off</strong> means {MODE_MEANING.off}. <strong>Shadow</strong> means{" "}
+              {MODE_MEANING.shadow}. <strong>Active</strong> means {MODE_MEANING.active}.
+            </>
+          }
+        />
       </p>
-      <p id={gateId} className={gate.open ? "ap-fan-gate" : "ap-fan-gate ap-fan-gate-locked"}>
-        {armed ? promotionConsequence(project) : gate.text}
+      <p
+        id={gateId}
+        className={gate.open ? "ap-fan-gate" : "ap-fan-gate ap-fan-gate-locked"}
+        title={project.mode === "active" && !armed ? gate.text : undefined}
+      >
+        {armed ? promotionConsequence(project) : project.mode === "active" ? "Acting" : gate.text}
       </p>
       <ModeSwitch
         value={project.mode}
@@ -1382,8 +1382,7 @@ function ShadowReviewPanel({
   if (projectId !== null && decisions.data !== undefined && rows.length === 0) {
     return (
       <Section label="Shadow decisions">
-        {/* The selected row is the subject; name it because its light-theme mark has no fill weight, while "this project" is only for the first render. */}
-        <Quiet says={`Nothing is waiting for a verdict on ${project?.project_id ?? "this project"}.`}>
+        <Quiet says="Nothing waiting">
           <p className="ap-note">What the classifier decided while enforcing nothing. Answering these is the only thing that moves a project toward acting on its own: agreeing says the classifier read the action the way you would, disagreeing says it did not, and both are evidence.</p>
         </Quiet>
       </Section>
@@ -1544,7 +1543,7 @@ function ScoreboardPanel({
   if (projectId !== null && scoreboard.data !== undefined && rows.length === 0) {
     return (
       <Section label="Scoreboard">
-        <Quiet says={`${project?.project_id ?? "This project"} has recorded no classified decision yet.`}>
+        <Quiet says="No decisions yet">
           <p className="ap-note">Read-only. The bar is {READINESS_MIN_REVIEWED} reviews at {READINESS_MIN_AGREE_PERCENT}% agreement per action class; the ready/total figure is the {DAEMON_NAME}&apos;s own and gates the promote control.</p>
         </Quiet>
       </Section>
@@ -1561,6 +1560,18 @@ function ScoreboardPanel({
             <span className="ui-count">
               {`${project.classes_ready}/${project.classes_total} classes ready`}
             </span>
+            <Tip
+              name="About the scoreboard"
+              persist
+              tip={
+                <>
+                  These verdicts are hypothetical: what the classifier would do, not something it
+                  did. The count that decides it is not the count below: the {DAEMON_NAME} counts
+                  reviews distinct by tool and arguments, so ten answers to the same command are
+                  ten here and one at the bar.
+                </>
+              }
+            />
           </>
         )
       }
@@ -1590,11 +1601,6 @@ function ScoreboardPanel({
           </Section>
         </div>
       )}
-      {rows.length > 0 && (
-        <p className="ap-note ap-note-foot">
-          the count that decides it is not the count below: the {DAEMON_NAME} counts reviews distinct by tool and arguments, so ten answers to the same command are ten here and one at the bar.
-        </p>
-      )}
     </Panel>
   );
 }
@@ -1613,6 +1619,9 @@ function TallyTable({
   const unreviewedWithheld = rows.filter((row) => row.would_pend > 0 && row.reviewed_pend === 0);
   return (
     <>
+      {/* Fifteen columns do not fit a narrow panel: the table scrolls inside its own region (keyboard
+          reachable) instead of spilling over the box. */}
+      <div className="ap-score-scroll" role="region" aria-label={`${label}, scrollable`} tabIndex={0}>
       <Table caption={label}>
         <thead>
           <tr>
@@ -1661,17 +1670,19 @@ function TallyTable({
           ))}
         </tbody>
       </Table>
-      <p className="ap-note">
-        These verdicts are hypothetical: what the classifier would do, not something it did.
-      </p>
+      </div>
       {unreviewedWithheld.map((row) => (
-        <p key={`${row.mode}:${row.action_class}`} className="ap-note">
-          {/* Only shadow rows count toward the bar: the same table also lists enforced decisions. */}
-          {`${row.action_class}: ${row.would_pend} withheld decisions, none reviewed${
+        <p
+          key={`${row.mode}:${row.action_class}`}
+          className="ap-note"
+          title={
             row.mode === SHADOW_EVIDENCE_MODE && projectMode === "shadow"
-              ? ": this blocks promotion until one is"
-              : ""
-          }`}
+              ? "This blocks promotion until one is reviewed"
+              : undefined
+          }
+        >
+          {/* Only shadow rows count toward the bar: the same table also lists enforced decisions. */}
+          {`${row.action_class}: ${row.would_pend} withheld decisions, none reviewed`}
         </p>
       ))}
     </>
@@ -1835,11 +1846,8 @@ function TriggerKills() {
                   {engaged ? "Release" : "Hold"}
                 </Button>
               ) : (
-                <p className="ap-trigger-note">
-                  The {DAEMON_NAME} will store this brake and nothing in it reads the
-                  value, so engaging it would stop nothing. It becomes a real
-                  switch when the Teams slice lands and team triggers exist to
-                  be held.
+                <p className="ap-trigger-note" title={`The ${DAEMON_NAME} stores this brake but nothing reads it yet.`}>
+                  Not wired
                 </p>
               )}
             </Row>
@@ -1869,7 +1877,6 @@ function RosterSkeleton() {
         <Skeleton label="Reading the roster" variant="line" width="45%" />
         <Skeleton label="Reading the gate" lines={2} />
         <Skeleton label="Reading the mode" variant="block" height="2.75rem" />
-        <Skeleton label="Reading the note" lines={4} />
       </div>
       <div className="ap-fan-view">
         <div className="ap-fan-pane">
@@ -1911,7 +1918,7 @@ function JobsPanel({
         // The shape of a job row: id and state on one line, the round under it, the actions last.
         <Skeleton label="Reading the jobs" variant="cards" count={1} gridClassName="ap-list" height="5.75rem" />
       )}
-      {jobs.data !== undefined && live.length === 0 && <Quiet says="Nothing is running. Start one below." />}
+      {jobs.data !== undefined && live.length === 0 && <Quiet says="Nothing is running." />}
       {live.length > 0 && (
         <ul className="ap-list" aria-label="Jobs in flight">
           {live.map((job) => (
@@ -1941,19 +1948,15 @@ function JobsPanel({
             explains. A project that is off starts nothing, and one whose queue is full defers
             rather than refuses — two different reasons the button would not do what it says. */}
         {target !== undefined && target.mode === "off" && (
-          <p className="ap-hedge">
-            {target.project_id} is off, so the {DAEMON_NAME} would not start this.
-          </p>
+          <p className="ap-hedge">{target.project_id} is off.</p>
         )}
         {target !== undefined && target.queue_full && (
           <p className="ap-hedge">
-            {target.project_id} is holding {target.open_review_items} items waiting for review
-            {targetWaitingWhere === null ? "" : ` (${targetWaitingWhere})`} against its ceiling of{" "}
-            {target.wip_limit ?? "none"}.{" "}
+            {target.open_review_items} of {target.wip_limit ?? "no ceiling"} waiting
+            {targetWaitingWhere === null ? "" : ` (${targetWaitingWhere})`}.{" "}
             <Link className="ap-link" to="/waiting">
               Review {plural(target.open_review_items, "item")}
-            </Link>{" "}
-            and the brake releases itself.
+            </Link>
           </p>
         )}
         <Button

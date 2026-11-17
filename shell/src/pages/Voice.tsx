@@ -42,7 +42,7 @@ import {
   TabsContent,
   TabsList,
   TabsTrigger,
-  Teach,
+  Tip,
   Section,
   useUndoable,
 } from "../ui";
@@ -419,8 +419,7 @@ const VOICE_YAML_PATH = "~/.nucleos/voice.yaml";
 function NotArmed() {
   return (
     <div className="voice-notarmed">
-      <Quiet says="no transcriber is set up: spoken turns cannot be understood yet" />
-      <Teach title="Voice needs a transcriber">
+      <Quiet says="Voice needs a transcriber">
         <p>
           Voice turns your speech into text with a transcriber program that runs on this machine. None is
           set up yet, so the talk and capture buttons are hidden.
@@ -443,7 +442,7 @@ function NotArmed() {
             succeeding.
           </p>
         </details>
-      </Teach>
+      </Quiet>
     </div>
   );
 }
@@ -678,7 +677,7 @@ function CaptureButtons({
             )}
           </Button>
         </div>
-        <p className="voice-capture-hint">Dictation is pasted into the app in focus. A memo is saved as a note.</p>
+        <Tip name="About capture" tip="Dictation is pasted into the app in focus. A memo is saved as a note." />
       </>
     );
   }

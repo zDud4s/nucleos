@@ -26,7 +26,7 @@ export function StatesView({ projectId }: { projectId: string }) {
       <ErrorNote>
         The {DAEMON_NAME} could not read this project&rsquo;s state machines.{" "}
         <Button variant="quiet" onClick={() => void states.refetch()} disabled={states.isFetching}>
-          {states.isFetching ? "reading…" : "read it again"}
+          {states.isFetching ? "Reading…" : "Read it again"}
         </Button>
       </ErrorNote>
     );
@@ -37,8 +37,11 @@ export function StatesView({ projectId }: { projectId: string }) {
   const { root, machines } = states.data;
   if (machines.length === 0) {
     return (
-      <p className="m-0 text-sm text-text-muted">
-        No state machine found: nothing in this project&rsquo;s source sets a status with a guard.
+      <p
+        className="m-0 text-sm text-text-muted"
+        title="Nothing in this project's source sets a status with a guard."
+      >
+        No state machines
       </p>
     );
   }

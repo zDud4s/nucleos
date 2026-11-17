@@ -488,7 +488,7 @@ describe("the project workspace", () => {
     expect(screen.getByText("distance unknown")).toBeTruthy();
 
     // A ceiling that hid what it dropped would read as "these are all your branches".
-    expect(screen.getByText("2 older branches not measured.")).toBeTruthy();
+    expect(screen.getByText("+2 older, not measured")).toBeTruthy();
   });
 
   it("takes the run to review from the route, so a slot can link straight to it", async () => {
@@ -837,7 +837,7 @@ describe("the autopilot rules", () => {
     await openState(state);
 
     const panel = within(await screen.findByRole("region", { name: "Autopilot rules" }));
-    expect(await panel.findByText(/has no autopilot document/)).toBeTruthy();
+    expect(await panel.findByTitle("This project has no autopilot document to edit.")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
     const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
     expect(asked.filter((path) => path.includes("/settings/"))).toEqual([]);
@@ -868,7 +868,7 @@ describe("the settings this app authors", () => {
 
     expect(await screen.findByText("2 of 3 taken")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "no ceiling" }));
+    fireEvent.click(screen.getByRole("button", { name: "No ceiling" }));
     await waitFor(() => expect(state.projects[0].wip_limit).toBe(null));
     expect(await screen.findByText(/no ceiling: 2 proposals waiting on you/)).toBeTruthy();
   });
@@ -1079,6 +1079,8 @@ describe("the settings this app authors", () => {
   it("says no class was measured rather than saying none cleared", async () => {
     await openState(settingsState(), AUTHORITY);
     expect(await screen.findByText(/Nothing recorded in shadow yet/)).toBeTruthy();
+    const quiet = screen.getByText(/Nothing recorded in shadow yet/).closest(".ui-quiet") as HTMLElement;
+    fireEvent.click(within(quiet).getByRole("button", { name: "Why?" }));
     expect(screen.getByText(/not the same as a bad one/)).toBeTruthy();
   });
 });
@@ -1116,7 +1118,7 @@ describe("what this project can be asked to do", () => {
     expect(screen.queryByRole("button", { name: /^docs,/ })).toBeNull();
     // And the door to the rest says how many there are, so a short bar is not mistaken for a short
     // list.
-    expect(screen.getByRole("button", { name: /all 3/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /All 3/ })).toBeTruthy();
   });
 
   /**
@@ -1166,7 +1168,7 @@ describe("what this project can be asked to do", () => {
    */
   it("says nothing here claims to know whether the project is green", async () => {
     await openState(withCommands([projectCommand({ id: 2, name: "fmt", is_gate: false })]));
-    expect(await screen.findByText(/No command here is marked a gate/)).toBeTruthy();
+    expect(await screen.findByText("No gate marked")).toBeTruthy();
   });
 
   /** What was SENT — the id the núcleo will act on, not the button the component thinks it drew. */
@@ -1307,7 +1309,7 @@ describe("what this project can be asked to do", () => {
       context both a reader and a screen reader get it from.
     */
     const commands = within(screen.getByRole("region", { name: "Commands" }));
-    fireEvent.click(commands.getByRole("button", { name: "why?" }));
+    fireEvent.click(commands.getByRole("button", { name: "Why?" }));
     expect(commands.getByText(/declaration rather than detection/)).toBeTruthy();
   });
 
@@ -1324,11 +1326,11 @@ describe("what this project can be asked to do", () => {
     const state = withCommands([]);
     await openState(state);
 
-    fireEvent.click(await screen.findByRole("button", { name: "declare a command" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Declare a command" }));
     fireEvent.change(screen.getByLabelText("Command name"), { target: { value: "  gate  " } });
     fireEvent.change(screen.getByLabelText("What it runs"), { target: { value: "cargo test" } });
     fireEvent.click(screen.getByLabelText(/says whether this project is green/));
-    fireEvent.click(screen.getByRole("button", { name: "declare" }));
+    fireEvent.click(screen.getByRole("button", { name: "Declare" }));
 
     await waitFor(() => expect(state.declared.length).toBe(1));
     expect(state.declared[0]).toEqual({
@@ -1359,12 +1361,12 @@ describe("what this project can be asked to do", () => {
       return daemonFetch(state)(path, init);
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "declare a command" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Declare a command" }));
     fireEvent.change(screen.getByLabelText("Command name"), { target: { value: "gate" } });
     fireEvent.change(screen.getByLabelText("What it runs"), {
       target: { value: 'bash -c "cargo test' },
     });
-    fireEvent.click(screen.getByRole("button", { name: "declare" }));
+    fireEvent.click(screen.getByRole("button", { name: "Declare" }));
 
     expect(await screen.findByText(/unbalanced quote/)).toBeTruthy();
     expect((screen.getByLabelText("Command name") as HTMLInputElement).value).toBe("gate");
@@ -1382,8 +1384,8 @@ describe("what this project can be asked to do", () => {
     ]);
     await openState(state);
 
-    fireEvent.click(await screen.findByRole("button", { name: "declare a command" }));
-    const forgets = screen.getAllByRole("button", { name: "forget" });
+    fireEvent.click(await screen.findByRole("button", { name: "Declare a command" }));
+    const forgets = screen.getAllByRole("button", { name: "Forget" });
     expect(forgets.length).toBe(1);
     expect(screen.getByText("the workflow's")).toBeTruthy();
 
@@ -1525,8 +1527,10 @@ describe("the workspace header", () => {
       "/projects/nucleos/code",
     );
     await screen.findByText("Nothing to review");
-    const reviewTeach = review.container.querySelector(".ui-teach") as HTMLElement;
-    expect(reviewTeach.parentElement?.classList.contains("ws-teach")).toBe(true);
+    // Review's empty state is a Quiet now, styled by `.ws-page .ui-quiet`; Workflows still draws a
+    // Teach and pulls it flush through the `ws-teach` wrapper.
+    const reviewQuiet = review.container.querySelector(".ui-quiet") as HTMLElement;
+    expect(reviewQuiet).not.toBeNull();
     review.unmount();
 
     const workflows = await openState(

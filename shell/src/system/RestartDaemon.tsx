@@ -7,7 +7,7 @@ import {
   type UpdateReadiness,
 } from "../data/client";
 import { DAEMON_NAME } from "../copy";
-import { Button, ConfirmButton, ErrorNote, Panel } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Panel, Tip } from "../ui";
 
 /** Where a restart is: nothing asked, waiting for running work, waiting for the new daemon, done. */
 type Stage =
@@ -138,10 +138,6 @@ export function RestartDaemon({
   const waiting = stage.kind === "waiting";
   return (
     <Panel title="Restart the daemon">
-      <p className="sy-note">
-        Restarting waits for running work to finish, so no turn is cut. New work is refused while it
-        waits.
-      </p>
       <div className="sy-actions">
         <Button
           variant="ghost"
@@ -157,6 +153,11 @@ export function RestartDaemon({
           variant="ghost"
           disabled={asking || stage.kind === "restarting"}
           onConfirm={() => void ask(true)}
+        />
+        <Tip
+          name="About restarting"
+          persist
+          tip="Restarting waits for running work to finish, so no turn is cut. New work is refused while it waits."
         />
       </div>
       {already && stage.kind === "idle" && (

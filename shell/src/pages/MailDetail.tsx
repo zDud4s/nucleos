@@ -550,7 +550,7 @@ function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
             }}
           />
         </span>
-        <p className="mail-note">If no sending account is set up, Send will say so. Ctrl+Enter arms Send.</p>
+        <Tip name="About sending" tip="If no sending account is set up, Send will say so. Ctrl+Enter arms Send." />
       </form>
       {outcome?.ok === true && (
         <p className="mail-outcome" role="status">

@@ -1,4 +1,4 @@
-
+import { ClampedText } from "../../ui";
 
 /* ---------------------------------------------------------------- tool input -- */
 
@@ -76,9 +76,12 @@ export function ToolInput({ raw }: { raw: string | null }) {
 export function CulpritLead({
   segment,
   reason,
+  overflowing,
 }: {
   segment: string | null | undefined;
   reason: string | null | undefined;
+  /** Forces the clamp toggle on without measuring; for tests, where jsdom has no layout. */
+  overflowing?: boolean;
 }) {
   const seg = segment?.trim() ?? "";
   if (seg === "") return null;
@@ -86,8 +89,14 @@ export function CulpritLead({
   return (
     <div className="waiting-culprit">
       <p className="waiting-approval-label">this part stopped it</p>
-      <code className="waiting-culprit-segment">{seg}</code>
-      {why !== "" && <p className="waiting-culprit-reason">{why}</p>}
+      <ClampedText as="code" className="waiting-culprit-segment" overflowing={overflowing}>
+        {seg}
+      </ClampedText>
+      {why !== "" && (
+        <ClampedText as="p" className="waiting-culprit-reason" overflowing={overflowing}>
+          {why}
+        </ClampedText>
+      )}
     </div>
   );
 }

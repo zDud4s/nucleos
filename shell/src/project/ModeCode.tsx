@@ -26,7 +26,6 @@ import {
   RefusalNote,
   StaleNote,
   StateBadge,
-  Teach,
 } from "../ui";
 // By its own path until the barrel exports it — `ui/index.ts` is not this change's file.
 import { Diff, type LineLink } from "../ui/Diff";
@@ -112,15 +111,10 @@ export function ModeCode({ projectId, run, onPickRun }: ModeCodeProps) {
       left here is what a person needs once they have pressed anyway.
     */
     return (
-      <div className="ws-teach">
-        <Teach title="Nothing to review">
-          <p>
-            This mode reads a run&rsquo;s worktree. When one is working here, its changed files appear
-            on the left, and the whole repository stays where it is, in the editor.
-          </p>
-          <InspectorLink projectId={projectId} />
-        </Teach>
-      </div>
+      <Quiet says="Nothing to review" action={<InspectorLink projectId={projectId} />}>
+        This mode reads a run&rsquo;s worktree. When one is working here, its changed files appear
+        on the left, and the whole repository stays where it is, in the editor.
+      </Quiet>
     );
   }
 
@@ -350,16 +344,15 @@ function InspectorLink({ projectId }: { projectId: string }) {
         params={{ projectId, view: "browse" }}
       >
         Browse, search and diff the folder itself
-      </Link>:
-      the project as it is on disk, with no run in the way. Or{" "}
+      </Link>
+      {" · "}
       <Link
         className="underline underline-offset-2"
         to="/projects/$projectId/inspect/$view"
         params={{ projectId, view: "rules" }}
       >
         what it does on its own
-      </Link>:
-      its schedules, its repo triggers, its gate and its ceiling.
+      </Link>
     </p>
   );
 }
@@ -448,8 +441,7 @@ function ChangedFiles({
         </Button>
       </div>
       <p className="text-xs text-text-muted">
-        {read === null ? "Not read yet." : `Read at ${read}.`} Read when you open this and again when
-        you ask, never on a timer, because every read walks the worktree with git.
+        {read === null ? "Not read yet." : `Read at ${read}.`}
       </p>
       <ChangedBody changed={changed} path={path} onPick={onPick} />
       {/*
@@ -676,7 +668,7 @@ function Centre({
         </div>
         {path === "" ? (
           <p id={reasonId} className="text-xs text-text-muted">
-            Pick a file on the left to read it whole or to see who wrote each line.
+            Pick a file on the left.
           </p>
         ) : null}
         {door.failed === "file" ? <DoorFailed /> : null}

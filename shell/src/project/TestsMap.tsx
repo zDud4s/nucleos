@@ -54,8 +54,11 @@ export function TestsMap({ projectId }: TestsMapProps) {
         </div>
       )}
       {state === "absent" && (
-        <p className="text-sm">
-          No <code>nucleos.tests.yaml</code> yet. Every change runs the whole gate.
+        <p
+          className="text-sm"
+          title="Every change runs the whole gate."
+        >
+          No <code>nucleos.tests.yaml</code>
         </p>
       )}
 
@@ -65,7 +68,12 @@ export function TestsMap({ projectId }: TestsMapProps) {
         opened. The listing is a sunken well with its copy control in the corner, as code blocks are.
       */}
       <details open={state === "absent"}>
-        <summary className="cursor-pointer text-sm text-text-muted">Proposed map</summary>
+        <summary
+          className="cursor-pointer text-sm text-text-muted"
+          title={`${from.charAt(0).toUpperCase() + from.slice(1)}. Commit it at the repository root.`}
+        >
+          Proposed map
+        </summary>
         <div className="mt-2 flex flex-col gap-2">
           <div className="relative rounded-md bg-surface-sunken px-3 py-2">
             <pre className="overflow-x-auto pr-16 text-xs leading-relaxed">{proposal.yaml}</pre>
@@ -73,10 +81,6 @@ export function TestsMap({ projectId }: TestsMapProps) {
               <CopyButton value={proposal.yaml} label="the proposed map" />
             </div>
           </div>
-          <p className="text-xs text-text-faint">
-            {from.charAt(0).toUpperCase() + from.slice(1)}. Commit it at the repository root; it
-            lands through the queue like any change.
-          </p>
         </div>
       </details>
     </div>

@@ -3,7 +3,7 @@ import { AGENT_CAPABILITIES, proposedCapabilities, sameCapabilities, type AgentE
 import type { Proposal } from "../../data/system";
 import { parseActionPayload, useHireRecruit } from "../../data/teams";
 import { useRejectProposal } from "../../data/waiting";
-import { Button, Callout, ConfirmButton, Field, RelativeTime, Row, Rows, Select } from "../../ui";
+import { Button, Callout, ConfirmButton, Field, RelativeTime, Row, Rows, Select, Tip } from "../../ui";
 import type { Reading } from "./reading";
 import { DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
 import { DepartmentContext, hasDepartmentContext } from "./TeamActions";
@@ -155,6 +155,7 @@ function RecruitmentCard({
         <div className="waiting-card-head">
           <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>recruit #{proposal.id}</span>
           <RelativeTime at={proposal.created_at} />
+          {form !== null && <Tip tip={careful} name="About engine and capabilities" persist />}
         </div>
         <Reasoning>
           {proposal.reasoning.trim() === ""
@@ -262,20 +263,17 @@ function RecruitmentCard({
     ))}
   </div>
 </div>
-                {/* Visible, not a `title`: this is what costs money per turn, and a tooltip waits,
-                    never shows on touch and is not read by most readers. It is also the two
-                    fields' description. */}
-                <p
-                  className={
-                    carefulChanged
-                      ? "waiting-recruit-careful waiting-recruit-careful-changed waiting-recruit-span-all"
-                      : "waiting-recruit-careful waiting-recruit-span-all"
-                  }
-                  id={carefulId}
-                >
+                {/* The caution is the two fields' description for assistive tech only; sighted
+                    readers get it from the Tip beside the card id. */}
+                <p className="sr-only" id={carefulId}>
                   {careful}
                   {carefulChanged && " Changed from what the director proposed."}
                 </p>
+                {carefulChanged && (
+                  <p className="waiting-recruit-careful waiting-recruit-careful-changed waiting-recruit-span-all">
+                    Changed from proposal
+                  </p>
+                )}
               </div>
             </div>
           </>

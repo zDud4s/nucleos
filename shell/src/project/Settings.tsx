@@ -29,6 +29,7 @@ import {
   Table,
   Td,
   Th,
+  Tip,
 } from "../ui";
 import { OnboardPanel } from "./Onboard";
 
@@ -77,14 +78,14 @@ export function Settings({ projectId }: SettingsProps) {
   const stale = projects.isError;
 
   /*
-    Two blocks side by side and the evidence under both. Two cards sharing a row share its height:
-    the owner's rule, since two boxes ending at different lines read as a layout that broke. (The
-    old `items-start` answered a different grid, where Mode filled a column holding two others.)
+    Two blocks side by side and the evidence under both. Each card takes the height its own
+    content needs (`items-start`): stretched to share a row, the shorter one was a card with a
+    large empty area under three words and a sentence.
   */
   return (
     <div className="flex flex-col gap-3">
       {stale ? <StaleNote dataUpdatedAt={projects.dataUpdatedAt} /> : null}
-      <div className="grid grid-cols-1 items-stretch gap-3 lg:grid-cols-2">
+      <div className="ws-autonomy grid grid-cols-1 items-start gap-3 lg:grid-cols-2">
         <ModeChoice project={project} />
         <Ceiling project={project} stale={stale} />
         <div className="lg:col-span-2">
@@ -121,22 +122,35 @@ function sentence(text: string): string {
 function Block({
   label,
   id,
+  about,
   children,
 }: {
   label: string;
   /** For a control inside that wants the heading as its name. */
   id?: string;
+  /** What the block is, said only on hover or focus beside the heading. */
+  about?: React.ReactNode;
   children: React.ReactNode;
 }) {
   /*
     An `h3`, under the section's `h2`. These were paragraphs, so the one control on the page that
     decides whether a project acts on its own could not be reached by walking the headings.
   */
+  const heading = (
+    <h3 id={id} className="text-sm font-semibold text-text-muted">
+      {label}
+    </h3>
+  );
   return (
     <Inset>
-      <h3 id={id} className="text-sm font-semibold text-text-muted">
-        {label}
-      </h3>
+      {about === undefined ? (
+        heading
+      ) : (
+        <div className="flex items-center gap-1.5">
+          {heading}
+          <Tip name={`About ${label}`} tip={about} persist />
+        </div>
+      )}
       {children}
     </Inset>
   );
@@ -221,6 +235,11 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         actConsequence={promotionConsequence(project)}
         onArmedChange={setArmed}
         actDescribedBy={proven ? consequenceId : blockerId}
+        titles={{
+          off: sentence(MODE_MEANING.off),
+          shadow: sentence(MODE_MEANING.shadow),
+          active: sentence(MODE_MEANING.active),
+        }}
         busy={setMode.isPending}
         focusableWhenInert
         onChoose={(mode) => change(mode)}
@@ -235,15 +254,12 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
         {promotionConsequence(project)}
       </p>
 
-      <p className="text-xs text-text-muted">{sentence(MODE_MEANING[project.mode])}</p>
-
       {/*
-        The gate, stated whether or not it is open — and only while it is still a gate. A project
-        already acting has passed it, and repeating the criteria at that point reads as a warning
-        about something that is not happening.
+        The gate, described but not drawn: the segment points at it, so it is read with the
+        control, and the warning an unproven press opens says it on screen when it matters.
       */}
       {project.mode !== "active" ? (
-        <p id={blockerId} className="text-xs text-text-muted">
+        <p id={blockerId} className="sr-only">
           {sentence(proven ? PROMOTION_EARNED : blocker)}
         </p>
       ) : null}
@@ -372,27 +388,23 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
     );
 
   return (
-    <Block label="Open-proposal ceiling" id={headingId}>
-      {/* What the number bounds, said once where it is set. The worktree slots above are a
-          different ceiling, and a reader meeting two unexplained fours has to guess which is which. */}
-      <p className="text-xs text-text-muted">
-        How many proposals may wait on you before new work here is held.
-      </p>
-
+    <Block
+      label="Open-proposal ceiling"
+      id={headingId}
+      about="How many proposals may wait on you before new work here is held."
+    >
       {reading}
       {meter}
 
       {/*
-        The controls sit on the card's floor, not under the text: the card shares its row with Mode
-        and is as tall as it, and the empty air belongs between the reading and the controls rather
-        than under everything. The stepper is one joined control, the way off at the far end.
+        The stepper is one joined control, the way off at the far end.
       */}
       {stale ? null : (
         <div
           role="group"
           aria-labelledby={headingId}
           aria-busy={busy}
-          className="mt-auto flex flex-wrap items-center justify-between gap-2 pt-2"
+          className="flex flex-wrap items-center justify-between gap-2 pt-1"
         >
           <span className="inline-flex items-center rounded-md border border-border-strong">
             <Step
@@ -414,15 +426,13 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
             </Step>
           </span>
           <Step inert={limit === null || busy} describedBy={readingId} onPress={() => set(null)}>
-            no ceiling
+            No ceiling
           </Step>
         </div>
       )}
 
       {project.queue_full ? (
-        <p className="text-xs text-tone-paused-fg">
-          The brake is holding new work here until something is reviewed.
-        </p>
+        <p className="text-xs text-tone-paused-fg">Holding new work</p>
       ) : null}
 
       {/* A failed write used to say nothing, so the number on screen was the only answer — and it
@@ -492,7 +502,10 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
   const rows = (scoreboard.data ?? []).filter((row) => row.mode === SHADOW_EVIDENCE_MODE);
 
   return (
-    <Block label="Action classes">
+    <Block
+      label="Action classes"
+      about="The bar counts each distinct command once; the table counts every decision, so its numbers run higher than the bar's."
+    >
       {scoreboard.data === undefined ? (
         scoreboard.isError ? (
           <ErrorNote>The {DAEMON_NAME} did not say what the classifier has been judged on here.</ErrorNote>
@@ -504,7 +517,9 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
           Nothing recorded is not "zero of zero clear". A project that has never run in shadow has
           taken no measurement, and saying it failed one would be inventing a result.
         */
-        <Quiet says="Nothing recorded in shadow yet. There is no measurement here, which is not the same as a bad one." />
+        <Quiet says="Nothing recorded in shadow yet.">
+          There is no measurement here, which is not the same as a bad one.
+        </Quiet>
       ) : (
         <>
           {/*
@@ -538,10 +553,6 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
               </tbody>
             </Table>
           </div>
-          <p className="text-xs text-text-muted">
-            The bar counts each distinct command once; this table counts every decision, so its
-            numbers run higher than the bar&rsquo;s.
-          </p>
         </>
       )}
       {scoreboard.isError && scoreboard.data !== undefined ? (

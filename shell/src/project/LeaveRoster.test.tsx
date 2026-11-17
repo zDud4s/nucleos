@@ -87,7 +87,7 @@ describe("leaving the roster, from inside the project", () => {
     expect(panel.getByText(/stays exactly where it is/)).toBeTruthy();
     expect(panel.getByText("C:/Projects/spent")).toBeTruthy();
 
-    fireEvent.click(panel.getByRole("button", { name: "remove" }));
+    fireEvent.click(panel.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(state.removed.length).toBe(1));
     expect(state.removed[0]).toEqual({ projectId: "spent", forgetHistory: false });
 
@@ -136,11 +136,11 @@ describe("leaving the roster, from inside the project", () => {
     fireEvent.click(panel.getByRole("checkbox"));
     expect(panel.getByText(/and cannot be brought back; adding it again starts with no history/)).toBeTruthy();
 
-    fireEvent.click(panel.getByRole("button", { name: "remove and forget" }));
+    fireEvent.click(panel.getByRole("button", { name: "Remove and forget" }));
     expect(state.removed).toEqual([]);
     await pastTheDwell();
     fireEvent.click(
-      panel.getByRole("button", { name: "delete 312 runs, 8 proposals and 40 stamps for good · spent" }),
+      panel.getByRole("button", { name: "Delete 312 runs, 8 proposals and 40 stamps for good · spent" }),
     );
     await waitFor(() => expect(state.removed[0]).toEqual({ projectId: "spent", forgetHistory: true }));
     expect(
@@ -160,8 +160,8 @@ describe("leaving the roster, from inside the project", () => {
 
     const panel = await openRemove("busy");
     expect(await panel.findByText(/1 slot in flight and 2 worktrees checked out/)).toBeTruthy();
-    expect(panel.getByRole("button", { name: "remove" })).toHaveProperty("disabled", true);
-    fireEvent.click(panel.getByRole("button", { name: "remove" }));
+    expect(panel.getByRole("button", { name: "Remove" })).toHaveProperty("disabled", true);
+    fireEvent.click(panel.getByRole("button", { name: "Remove" }));
     expect(state.removed).toEqual([]);
   });
 
@@ -172,7 +172,7 @@ describe("leaving the roster, from inside the project", () => {
     });
 
     const panel = await openRemove("busy");
-    fireEvent.click(panel.getByRole("button", { name: "remove" }));
+    fireEvent.click(panel.getByRole("button", { name: "Remove" }));
     expect(await screen.findByText(/work is still in flight here/)).toBeTruthy();
     expect(rendered.router.state.location.pathname).toBe("/projects/busy/state");
   });
@@ -189,20 +189,20 @@ describe("leaving the roster, from inside the project", () => {
     const trigger = screen.getByRole("button", { name: "More actions", hidden: true });
     const panel = screen.getByRole("group", { name: "Remove one from NucleOS" });
     // Exactly one `cancel` on screen, and it is the panel's.
-    expect(screen.getAllByRole("button", { name: "cancel" })).toEqual([
-      within(panel).getByRole("button", { name: "cancel" }),
+    expect(screen.getAllByRole("button", { name: "Cancel" })).toEqual([
+      within(panel).getByRole("button", { name: "Cancel" }),
     ]);
     // Exactly one `remove` on screen, and it is the one that removes.
-    expect(screen.getAllByRole("button", { name: "remove" })).toEqual([
-      within(panel).getByRole("button", { name: "remove" }),
+    expect(screen.getAllByRole("button", { name: "Remove" })).toEqual([
+      within(panel).getByRole("button", { name: "Remove" }),
     ]);
 
-    fireEvent.click(within(panel).getByRole("button", { name: "cancel" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(trigger));
 
     const again = await openRemove("one");
-    fireEvent.keyDown(again.getByRole("button", { name: "cancel" }), { key: "Escape" });
+    fireEvent.keyDown(again.getByRole("button", { name: "Cancel" }), { key: "Escape" });
     expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(trigger));
   });

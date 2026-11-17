@@ -2,7 +2,7 @@
 import type { Anchored, Junction, MapModule } from "../data/project-map";
 import { OrphanCheck } from "./OrphanCheck";
 import { pluralWord } from "../lib/plural";
-import { Inset, SectionTitle } from "../ui";
+import { Inset, SectionTitle, Tip } from "../ui";
 
 /**
  * The junction: the nodes that do not match.
@@ -150,9 +150,7 @@ function NoIntention() {
       <div className="flex min-w-0 flex-1 flex-col gap-1">
         <p className="m-0 text-sm font-medium text-text">Nothing to read the structure against</p>
         <p className="m-0 text-sm text-text-muted">
-          No decision has been approved for this project yet, so every number here would be a zero
-          for something never measured. Extract a spec behind the Specs door and answer the lines it
-          proposes.
+          No decision approved yet. Extract a spec behind the Specs door.
         </p>
       </div>
     </div>
@@ -175,10 +173,13 @@ function NoIntention() {
 function Silent({ rows, projectId }: { rows: Anchored[]; projectId: string }) {
   if (rows.length === 0) {
     return (
-      <p className="max-w-prose text-sm text-text-muted">
-        No approved decision is declared with no code right now: every section that could be looked
-        for was named by something. That is not a pass: how firmly it is named is below, and none of
-        it has read a line of code against what a decision actually says.
+      <p className="flex items-center gap-2 text-sm text-text-muted">
+        No approved decision is declared with no code.
+        <Tip
+          name="About this result"
+          persist
+          tip="No approved decision is declared with no code right now: every section that could be looked for was named by something. That is not a pass: how firmly it is named is below, and none of it has read a line of code against what a decision actually says."
+        />
       </p>
     );
   }
@@ -187,16 +188,16 @@ function Silent({ rows, projectId }: { rows: Anchored[]; projectId: string }) {
 
   return (
     <div className="flex flex-col gap-2">
-      <p className="font-display text-3xl text-text">
+      <p className="flex items-center gap-2 font-display text-3xl text-text">
         {rows.length}
         <span className="ml-2 text-sm text-text-faint">
           approved {pluralWord(rows.length, "decision", "decisions")} that nothing in this project names
         </span>
-      </p>
-      <p className="max-w-prose text-xs text-text-muted">
-        Declared, with no code. It is the one answer here the map is certain about: a section no
-        file names anywhere is claimed under no document, whichever document each bare § was meant
-        to point at.
+        <Tip
+          name="About this pile"
+          persist
+          tip="Declared, with no code. It is the one answer here the map is certain about: a section no file names anywhere is claimed under no document, whichever document each bare § was meant to point at."
+        />
       </p>
       <ul aria-label="Decisions nothing names" className="flex flex-col gap-2">
         {shown.map((row) => (
@@ -233,15 +234,16 @@ function LostTheComment({ rows }: { rows: Anchored[] }) {
 
   return (
     <div className="flex flex-col gap-2">
-      <p className="max-w-prose text-sm text-text">
-        {rows.length} {pluralWord(rows.length, "decision", "decisions")}{" "}
-        {pluralWord(rows.length, "has", "have")} files written down and no comment naming them any more.
-      </p>
-      <p className="max-w-prose text-xs text-text-muted">
-        The § that anchored each of these is gone from the code. The files are still here because
-        somebody wrote them down, which is the only reason these rows are not sitting above looking
-        like decisions nobody ever implemented. Whether the comment went on purpose is for you to
-        say. Nothing here read a line of code.
+      <p className="flex items-center gap-2 text-sm text-text">
+        <span>
+          {rows.length} {pluralWord(rows.length, "decision", "decisions")}{" "}
+          {pluralWord(rows.length, "has", "have")} files written down and no comment naming them any more.
+        </span>
+        <Tip
+          name="About this pile"
+          persist
+          tip="The § that anchored each of these is gone from the code. The files are still here because somebody wrote them down, which is the only reason these rows are not sitting above looking like decisions nobody ever implemented. Whether the comment went on purpose is for you to say. Nothing here read a line of code."
+        />
       </p>
       <ul aria-label="Decisions whose comment is gone" className="flex flex-col gap-2">
         {shown.map((row) => (
@@ -266,10 +268,16 @@ function Unnumbered({ rows }: { rows: Anchored[] }) {
 
   return (
     <div className="flex flex-col gap-2">
-      <p className="max-w-prose text-xs text-text-muted">
-        {rows.length} approved {pluralWord(rows.length, "line", "lines")} came from a heading with no
-        number, so there was nothing to look for. They are counted apart from the pile above rather
-        than folded into it: calling them code-less would report a search that never ran.
+      <p className="flex items-center gap-2 text-xs text-text-muted">
+        <span>
+          {rows.length} approved {pluralWord(rows.length, "line", "lines")} came from a heading with no
+          number, so there was nothing to look for.
+        </span>
+        <Tip
+          name="About this pile"
+          persist
+          tip="They are counted apart from the pile above rather than folded into it: calling them code-less would report a search that never ran."
+        />
       </p>
       <ul aria-label="Decisions whose heading carried no number" className="flex flex-col gap-2">
         {shown.map((row) => (
@@ -303,15 +311,13 @@ function Unclaimed({ paths, uncited }: { paths: string[]; uncited: number | null
             The junction lists no module nobody asked for, yet {uncited}{" "}
             {pluralWord(uncited, "module names", "modules name")} no section at all.
           </span>{" "}
-          Both are read off the same answer and must agree, so this is a fault in the reading and
-          not a fact about your code: report it.
+          A fault in the reading, not in your code: report it.
         </p>
       );
     }
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        Every module this reader could read names a spec section, so none of them is code nobody
-        asked for.
+        Every module this reader could read names a spec section.
       </p>
     );
   }
@@ -320,15 +326,16 @@ function Unclaimed({ paths, uncited }: { paths: string[]; uncited: number | null
 
   return (
     <div className="flex flex-col gap-2">
-      <p className="font-display text-3xl text-text">
+      <p className="flex items-center gap-2 font-display text-3xl text-text">
         {paths.length}
         <span className="ml-2 text-sm text-text-faint">
           {pluralWord(paths.length, "module", "modules")} nobody asked for
         </span>
-      </p>
-      <p className="max-w-prose text-xs text-text-muted">
-        They name no spec section at all, and neither does whatever tests them: code nobody asked
-        for, the pile that fills up inside a plan nobody read to the end.
+        <Tip
+          name="About this pile"
+          persist
+          tip="They name no spec section at all, and neither does whatever tests them: code nobody asked for, the pile that fills up inside a plan nobody read to the end."
+        />
       </p>
       <ul aria-label="Modules nobody asked for" className="flex flex-col gap-1">
         {shown.map((path) => (
@@ -367,8 +374,7 @@ function Plausible({
   if (total === 0) {
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        Nothing here is joined to code on a guess right now: no approved decision is named by code
-        this map could not tie to it.
+        Nothing here is joined to code on a guess right now.
       </p>
     );
   }
@@ -387,12 +393,11 @@ function Plausible({
 
       {unattributed.length > 0 ? (
         <div className="flex flex-col gap-2">
-          <p className="max-w-prose text-xs text-text-muted">
-            Code names the section, and never says which document the section belongs to. A § in a
-            file is a number and nothing else, so it may just as easily be another document&rsquo;s
-            section of the same number. Until a citation carries a document slug, each of these is a
-            guess, shown because it might be the join, and never counted as one.
-          </p>
+          <Tip
+            name="About joins that name no document"
+            persist
+            tip="Code names the section, and never says which document the section belongs to. A § in a file is a number and nothing else, so it may just as easily be another document&rsquo;s section of the same number. Until a citation carries a document slug, each of these is a guess, shown because it might be the join, and never counted as one."
+          />
           <ul aria-label="Joins whose citation names no document" className="flex flex-col gap-2">
             {named.shown.map((row) => (
               <Line key={row.decision_id} row={row} paths={row.modules} />
@@ -404,12 +409,11 @@ function Plausible({
 
       {abroad.length > 0 ? (
         <div className="flex flex-col gap-2">
-          <p className="max-w-prose text-xs text-text-muted">
-            Named only by code this map cannot read yet: the Go sidecars. Something in there points
-            at the section; nothing here can open the file and say what it does with it. That is a
-            different amount of not-knowing from the one above, and it is deliberately not the same
-            sentence.
-          </p>
+          <Tip
+            name="About joins from unreadable code"
+            persist
+            tip="Named only by code this map cannot read yet: the Go sidecars. Something in there points at the section; nothing here can open the file and say what it does with it. That is a different amount of not-knowing from the one above, and it is deliberately not the same sentence."
+          />
           <ul
             aria-label="Joins named only by code this map cannot read"
             className="flex flex-col gap-2"
@@ -443,30 +447,45 @@ function Plausible({
 function Missing({ declared, decisions }: { declared: number; decisions: number }) {
   return (
     <div className="flex flex-col gap-2 border-t border-border pt-4">
-      <SectionTitle>What this panel cannot see</SectionTitle>
-      <p className="max-w-prose text-xs text-text-muted">
-        The map derives four states for a decision and this panel draws two of them. The other two
-        (waiting on you, and silenced) both mean a triager looked at a node and formed an opinion
-        about it, and they are behind the Triage door. Nothing on this panel says whether anybody
-        looked.
-      </p>
-      {decisions === 0 ? null : declared === 0 ? (
-        <p className="max-w-prose text-xs text-text-muted">
-          No decision here is confirmed either. That state needs a citation that names its own
-          document, and nothing this map read carries one yet, so every join above is a guess,
-          while every decision with no code is sound.
-        </p>
-      ) : (
-        <p className="max-w-prose text-xs text-text-muted">
-          {declared} {pluralWord(declared, "decision is", "decisions are")} confirmed: a readable module
-          names the section and names the document. Those are the only ones here that are certain,
-          and everything else above is a guess or an absence.
+      <div className="flex items-center gap-2">
+        <SectionTitle>What this panel cannot see</SectionTitle>
+        <Tip
+          name="About what this panel cannot see"
+          persist
+          tip={
+            <>
+              <span>
+                The map derives four states for a decision and this panel draws two of them. The
+                other two (waiting on you, and silenced) both mean a triager looked at a node and
+                formed an opinion about it, and they are behind the Triage door. Nothing on this
+                panel says whether anybody looked.
+              </span>{" "}
+              {decisions === 0 ? null : declared === 0 ? (
+                <span>
+                  No decision here is confirmed either. That state needs a citation that names its
+                  own document, and nothing this map read carries one yet, so every join above is a
+                  guess, while every decision with no code is sound.
+                </span>
+              ) : (
+                <span>
+                  A readable module names the section and names the document for each confirmed
+                  decision. Those are the only ones here that are certain, and everything else above
+                  is a guess or an absence.
+                </span>
+              )}{" "}
+              <span>
+                Nothing on this panel is a verdict. Whether the code is what you wanted is yours to
+                say, and no count decides it.
+              </span>
+            </>
+          }
+        />
+      </div>
+      {decisions === 0 || declared === 0 ? null : (
+        <p className="text-xs text-text-muted">
+          {declared} {pluralWord(declared, "decision is", "decisions are")} confirmed.
         </p>
       )}
-      <p className="max-w-prose text-xs text-text-muted">
-        Nothing on this panel is a verdict. Whether the code is what you wanted is yours to say, and
-        no count decides it.
-      </p>
     </div>
   );
 }
@@ -524,7 +543,7 @@ function Line({
 function Hidden({ count }: { count: number }) {
   return (
     <p className="text-xs text-text-faint">
-      {count} more not shown here. The count above is the whole pile.
+      {count} more not shown.
     </p>
   );
 }

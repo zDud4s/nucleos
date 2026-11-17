@@ -1,4 +1,4 @@
-import { Panel, Quiet, Skeleton, Switch } from "../ui";
+import { Panel, Quiet, Skeleton, Switch, Tip } from "../ui";
 import { useHiddenProviders } from "../app/notch-providers";
 import { useQuota } from "../data/quota";
 
@@ -20,15 +20,13 @@ export function NotchProviders() {
 
   return (
     <Panel title="Quota notch">
-      <p className="sy-note sy-notch-note">
-        A preference of this screen only: it is kept in this browser, not on the background service,
-        and does not follow you to another machine. Each switch below decides whether the notch at
-        the top of the window draws that subscription.
-      </p>
+      <Tip name="About this preference" tip="A preference of this screen only: it is kept in this browser, not on the background service, and does not follow you to another machine. Each switch below decides whether the notch at the top of the window draws that subscription." />
       {quota.isPending && names.length === 0 ? (
         <Skeleton label="Reading the subscriptions" />
       ) : names.length === 0 ? (
-        <Quiet compact says="No subscription has been read on this machine yet. Sign in to one and it will appear here." />
+        <Quiet says="No subscription read">
+          No subscription has been read on this machine yet. Sign in to one and it will appear here.
+        </Quiet>
       ) : (
         <ul className="sy-notch-list" aria-label="Subscriptions">
           {names.map((name) => (
@@ -38,9 +36,7 @@ export function NotchProviders() {
           ))}
         </ul>
       )}
-      <p className="sy-note sy-notch-note">
-        Saved as you switch. Only what the notch draws changes; the quota brake is not affected.
-      </p>
+      <Tip name="About saving" tip="Saved as you switch. Only what the notch draws changes; the quota brake is not affected." />
     </Panel>
   );
 }
