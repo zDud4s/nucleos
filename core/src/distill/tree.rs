@@ -424,23 +424,6 @@ mod tests {
         "job-1".to_owned()
     }
 
-    async fn seed_work_node(pool: &SqlitePool, id: &str, tree: &str, status: &str) {
-        sqlx::query(
-            "INSERT INTO work_nodes (id, root_id, parent_id, depth, kind, title, goal, status,
-                                     tree_job_id, created_at, updated_at)
-             VALUES (?, ?, NULL, 1, 'orchestrator', 'Branch', 'goal', ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(format!("{tree}-root"))
-        .bind(status)
-        .bind(tree)
-        .bind("2026-11-16T10:00:00+00:00")
-        .bind("2026-11-16T10:00:00+00:00")
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
     async fn seed_decision(pool: &SqlitePool, id: &str, tree: &str) {
         sqlx::query(
             "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
@@ -530,7 +513,13 @@ mod tests {
     async fn queue_once_key_covers_tree_node_request_and_decision() {
         let pool = crate::testdb::fresh_pool().await;
         // (tree_id, node_id, request_id, decision_id): each differs from the others in one column.
-        let keys: [(Option<&str>, Option<&str>, Option<i64>, Option<&str>); 5] = [
+        type Key = (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<i64>,
+            Option<&'static str>,
+        );
+        let keys: [Key; 5] = [
             (Some("t1"), None, None, None),
             (Some("t2"), None, None, None),
             (Some("t1"), Some("n1"), None, None),
