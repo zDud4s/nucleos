@@ -59,6 +59,8 @@ pub struct JobNodeMcp {
     pub(super) allowed: Vec<String>,
     /// The directories the CLI is widened to with `--add-dir`; empty unless a loadout names some.
     pub(super) add_dirs: Vec<std::path::PathBuf>,
+    /// Built-in tools the CLI is started without; empty unless the run's creator asked.
+    pub(super) denied_tools: Vec<String>,
 }
 
 impl JobNodeMcp {
@@ -102,6 +104,7 @@ impl JobNodeMcp {
                 .map(|tool| (*tool).to_owned())
                 .collect(),
             add_dirs: Vec::new(),
+            denied_tools: Vec::new(),
         })
     }
 
@@ -135,6 +138,7 @@ impl JobNodeMcp {
                 .map(|tool| (*tool).to_owned())
                 .collect(),
             add_dirs: Vec::new(),
+            denied_tools: Vec::new(),
         })
     }
 }
@@ -523,6 +527,7 @@ mod tests {
             job_id: 1,
             allowed: Vec::new(),
             add_dirs: Vec::new(),
+            denied_tools: Vec::new(),
         }
         .with_loadout(&crate::loadout::RunTools {
             tools: vec![
