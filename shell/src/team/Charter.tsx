@@ -22,7 +22,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Button, ConfirmButton, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote, Select, Tip } from "../ui";
+import { Button, Checkbox, ConfirmButton, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote, Select, Tip } from "../ui";
 import { detectDrift, snapshotFromView, type Drift, type DriftField } from "./drift";
 import { daemonProse } from "./prose";
 
@@ -547,8 +547,7 @@ function TeamForm({
                 return (
                   <li key={agent.id}>
                     <label className="teams-check">
-                      <input
-                        type="checkbox"
+                      <Checkbox
                         checked={form.members.includes(agent.id)}
                         onChange={(event) =>
                           edit("members", {
@@ -1019,8 +1018,7 @@ function CeilingRow({ value, onChange }: { value: string; onChange: (value: stri
           />
         </span>
         <label className="teams-check teams-ceiling-none">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={none}
             onChange={(event) => {
               const ticked = event.target.checked;

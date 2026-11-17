@@ -43,6 +43,8 @@ import {
   Select,
   StateBadge,
   Tip,
+  Checkbox,
+  Radio,
 } from "../ui";
 
 /**
@@ -796,8 +798,7 @@ function Found({
               <div className="np-list">
                 {found.commands.map((suggestion) => (
                   <label key={suggestion.name} className="np-command">
-                    <input
-                      type="checkbox"
+                    <Checkbox
                       checked={taking.has(suggestion.name)}
                       onChange={(event) => {
                         const next = new Set(taking);
@@ -1132,8 +1133,7 @@ function Harnesses({
       <div className="np-options">
         {harnesses.map((harness) => (
           <label key={harness.path} className="np-option">
-            <input
-              type="radio"
+            <Radio
               name={group}
               checked={chosen === harness.path}
               onChange={() => onChoose(harness.path)}
@@ -1147,7 +1147,7 @@ function Harnesses({
           </label>
         ))}
         <label className="np-option">
-          <input type="radio" name={group} checked={chosen === null} onChange={() => onChoose(null)} />
+          <Radio name={group} checked={chosen === null} onChange={() => onChoose(null)} />
           <span className="np-option-name">adopt none of them</span>
         </label>
       </div>

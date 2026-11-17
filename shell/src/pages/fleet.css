@@ -517,20 +517,6 @@
   color: var(--tone-danger-fg);
 }
 
-.fleet-confirm button {
-  padding: 0 6px;
-  font: inherit;
-  color: inherit;
-  background: transparent;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-
-.fleet-confirm .fleet-confirm-yes {
-  border-color: var(--tone-danger-border);
-}
-
 .fleet-confirm-note {
   color: var(--tone-danger-fg);
 }

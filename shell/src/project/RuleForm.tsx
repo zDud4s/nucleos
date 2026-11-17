@@ -1,5 +1,5 @@
 import type { FormEvent, ReactNode } from "react";
-import { Button, Field, Select } from "../ui";
+import { Button, Field, Select, Switch } from "../ui";
 import { actionsFor, withEvent, type ActionKind, type Conclusion, type Draft, type Event } from "./automations-model";
 
 const EVENT_LABEL: Record<Event, string> = {
@@ -95,14 +95,11 @@ export function RuleForm({ draft, onChange, onSave, onCancel, busy, failure }: R
               ))}
             </Select>
           </Field>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={draft.byAutomation}
-              onChange={(event) => set({ byAutomation: event.target.checked })}
-            />
-            Only runs of pushes made by an automation
-          </label>
+          <Switch
+            label="Only runs of pushes made by an automation"
+            checked={draft.byAutomation}
+            onChange={(checked) => set({ byAutomation: checked })}
+          />
         </>
       ) : null}
 
@@ -126,14 +123,7 @@ export function RuleForm({ draft, onChange, onSave, onCancel, busy, failure }: R
           />
         </Field>
       ) : (
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={draft.autoFix}
-            onChange={(event) => set({ autoFix: event.target.checked })}
-          />
-          Fix it automatically
-        </label>
+        <Switch label="Fix it automatically" checked={draft.autoFix} onChange={(checked) => set({ autoFix: checked })} />
       )}
 
       {failure}

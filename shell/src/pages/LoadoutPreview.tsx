@@ -1,7 +1,7 @@
 import { useId, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { apiFetch } from "../data/client";
-import { Button, ErrorNote, Field, Quiet } from "../ui";
+import { Button, ErrorNote, Field, Quiet, Radio } from "../ui";
 import "./loadout-preview.css";
 import { DAEMON_NAME } from "../copy";
 
@@ -70,8 +70,7 @@ export function LoadoutPreview({ agentId }: { agentId: string }) {
           <legend>Runs in</legend>
           {BOXES.map((option) => (
             <label key={option.value}>
-              <input
-                type="radio"
+              <Radio
                 name={boxName}
                 value={option.value}
                 checked={box === option.value}

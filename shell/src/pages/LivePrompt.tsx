@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Button, Field, Modal } from "../ui";
+import { Button, Field, Modal, Radio } from "../ui";
 import type { OpenPrompt, PromptAnswer } from "../data/liveRecords";
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -139,9 +139,8 @@ export function LivePrompt({ prompt, onAnswer, pending = false }: LivePromptProp
           const id = `live-prompt-option-${index}`;
           return (
             <div key={option.value}>
-              <input
+              <Radio
                 id={id}
-                type="radio"
                 name="live-prompt-select"
                 checked={chosen === option.value}
                 disabled={pending}

@@ -3,6 +3,7 @@ import type { KeyboardEvent } from "react";
 
 import { ComposerBox } from "../chats/ComposerBox";
 import { MessageList } from "../chats/MessageList";
+import { Switch } from "../ui";
 import {
   clearKeep,
   collapse,
@@ -140,14 +141,7 @@ export function Panel({ send, subscribe }: PanelProps) {
                 <li key={h}>{h}</li>
               ))}
             </ul>
-            <label>
-              <input
-                type="checkbox"
-                checked={writable}
-                onChange={(e) => setWritable(e.target.checked)}
-              />
-              Also submit forms
-            </label>
+            <Switch label="Also submit forms" checked={writable} onChange={setWritable} />
             <div className="panel-keep-actions">
               <button
                 type="button"

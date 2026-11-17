@@ -1582,11 +1582,16 @@ const TOKEN_LEVEL_HINT: Record<ApiTokenLevel, string> = {
 function TokensView() {
   return (
     <>
-      <TokensPanel />
-      <RemoteDevices />
-      <Autostart />
-      <RestartDaemon />
-      <ConfigIndex />
+      {/* Side by side when there is room: each is a short form over a short list, and stacked at
+          the page's full width they were mostly empty row. */}
+      <div className="sy-health-pair">
+        <TokensPanel />
+        <RemoteDevices />
+      </div>
+      <ConfigIndex>
+        <Autostart />
+        <RestartDaemon />
+      </ConfigIndex>
     </>
   );
 }
@@ -1631,11 +1636,6 @@ function TokensPanel() {
 
   return (
     <Panel title="API tokens">
-      <Tip
-        name="About token levels"
-        tip="A read-only token cannot read the budget or the kill switch, since both sit outside its read allowlist. A run-creating token may start work. An admin token is everything."
-      />
-
       {minted !== null && (
         <CopyOnce
           value={minted.token}
@@ -1693,7 +1693,7 @@ function TokensPanel() {
           <Tip
             name="About token names and levels"
             persist
-            tip={`1–64 characters: letters, digits, hyphen or underscore. The ${level} level ${TOKEN_LEVEL_HINT[level]}`}
+            tip={`1–64 characters: letters, digits, hyphen or underscore. The ${level} level ${TOKEN_LEVEL_HINT[level]} A read-only token cannot read the budget or the kill switch, since both sit outside its read allowlist.`}
           />
         </span>
       </form>
@@ -1815,9 +1815,10 @@ function RevokeError({ error }: { error: unknown }) {
  * `models` as areas with no configuration route is gone, because that is no
  * longer true of any of them.
  */
-function ConfigIndex() {
+function ConfigIndex({ children }: { children?: ReactNode }) {
   return (
     <div className="sy-config-grid">
+      {children}
       <EmailConfigPanel />
       <VoiceConfigPanel />
       <CalendarConfigPanel />

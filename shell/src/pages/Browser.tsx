@@ -47,6 +47,7 @@ import {
   StateBadge,
   toastManager,
   Tip,
+  Checkbox,
 } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
@@ -403,8 +404,7 @@ function ChainDialogue({
         ))}
       </ol>
       <label className="browser-check">
-        <input
-          type="checkbox"
+        <Checkbox
           checked={writable}
           disabled={keepChain.isPending}
           onChange={(event) => setWritable(event.target.checked)}

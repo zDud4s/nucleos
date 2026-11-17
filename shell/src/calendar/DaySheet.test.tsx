@@ -260,7 +260,7 @@ describe("the draft form", () => {
     renderWithQuery(<DraftEventForm slot={{ day: new Date(2026, 7, 20), hour: null }} config={CONFIG} />);
 
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Standup" } });
-    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("switch", { name: "Repeats" }));
     fireEvent.change(screen.getByLabelText("Repeat frequency"), { target: { value: "daily" } });
     fireEvent.click(screen.getByRole("button", { name: "Add to calendar" }));
 

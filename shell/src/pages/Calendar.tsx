@@ -33,6 +33,7 @@ import {
   Row,
   Rows,
   Section,
+  Segmented,
   Skeleton,
   StaleNote,
   usePaletteGroup,
@@ -392,24 +393,15 @@ export function Calendar() {
         actions={
           <div className="calendar-nav">
             <BusyIndicator busy={busy.data?.busy} />
-            <div className="calendar-views" role="group" aria-label="Calendar view">
-              <button
-                type="button"
-                className={view === "month" ? "calendar-view calendar-view-on" : "calendar-view"}
-                aria-pressed={view === "month"}
-                onClick={() => switchTo("month")}
-              >
-                Month
-              </button>
-              <button
-                type="button"
-                className={view === "week" ? "calendar-view calendar-view-on" : "calendar-view"}
-                aria-pressed={view === "week"}
-                onClick={() => switchTo("week")}
-              >
-                Week
-              </button>
-            </div>
+            <Segmented
+              label="Calendar view"
+              value={view}
+              options={[
+                { value: "month", label: "Month" },
+                { value: "week", label: "Week" },
+              ]}
+              onChange={switchTo}
+            />
             <div className="calendar-step" role="group" aria-label="Change period">
               {/* aria-label and not title: a title is no accessible name. Each one still
                   contains its visible word, so the spoken name matches what is on screen. */}

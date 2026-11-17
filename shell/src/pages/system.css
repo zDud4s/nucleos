@@ -993,18 +993,37 @@
 
 /* -- machine settings ------------------------------------------------------ */
 
-/* The three single-value settings side by side, each a label, a control and a hint. */
-.sy-machine-prefs {
+/* A settings list line: the label (and its tip) on the left, the control right-aligned in a column
+   of one shared width, so every row in every card lines up and has the same height. */
+.sy-prefrow {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(16rem, 100%), 1fr));
-  align-items: start;
-  gap: var(--space-4) var(--space-5);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 2.25rem;
 }
 
-.sy-pref {
+.sy-prefrow-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.sy-prefrow-control {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
   gap: var(--space-2);
+  min-width: 0;
+}
+
+/* A text or number box fills the control column; a Save or action button sits beside it. */
+.sy-prefrow-control > select,
+.sy-prefrow-control > .sy-pref-input {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -1034,31 +1053,12 @@
   cursor: not-allowed;
 }
 
-.sy-pref-actions {
-  display: flex;
-  gap: var(--space-2);
-}
-
-/* The notch's subscriptions, one switch per row. */
-.sy-notch-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
 .sy-notch-note {
   margin: 0 0 var(--space-3);
 }
 
 .sy-notch-note:last-child {
   margin-bottom: 0;
-}
-
-.sy-notch-list + .sy-notch-note {
-  margin-top: var(--space-3);
 }
 
 .sy-machine-intro {
@@ -1086,6 +1086,14 @@
   gap: var(--space-2);
   flex: 1 1 14rem;
   max-width: 100%;
+}
+
+/* The legend and the page's one tip, on one line under the list. */
+.sy-settings-legend-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
 }
 
 /* What the two kinds of mark mean, in words under the list. */

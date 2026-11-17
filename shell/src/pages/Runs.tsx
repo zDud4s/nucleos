@@ -68,6 +68,7 @@ import {
   Select,
   StateBadge,
   Switch,
+  Radio,
 } from "../ui";
 import "./runs.css";
 
@@ -1507,8 +1508,7 @@ function ModePicker({
         const saysId = `${inputId}-says`;
         return (
           <div key={choice.mode} className="runs-mode">
-            <input
-              type="radio"
+            <Radio
               id={inputId}
               name={name}
               value={choice.mode}

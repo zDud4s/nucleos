@@ -3,6 +3,12 @@ import { DAEMON_NAME } from "../copy";
 import { ApiRefusal } from "../data/client";
 import { useMergeTheme, useRenameTheme } from "../data/themes";
 import { Button, ErrorNote, Select } from "../ui";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../ui/vendor/dropdown-menu";
 import "./ThemesProposed.css";
 
 /** A refused rename in the owner's words; anything else means the daemon did not answer. */
@@ -31,7 +37,6 @@ export function ThemeEdit({ id, name, others }: { id: number; name: string; othe
   const rename = useRenameTheme();
   const merge = useMergeTheme();
   const [mode, setMode] = useState<"idle" | "rename" | "merge">("idle");
-  const [menuOpen, setMenuOpen] = useState(false);
   const [draft, setDraft] = useState(name);
   const targets = others.filter((t) => t.id !== id);
   const [into, setInto] = useState<number | null>(null);
@@ -54,51 +59,36 @@ export function ThemeEdit({ id, name, others }: { id: number; name: string; othe
   return (
     <>
       {mode === "idle" && (
-        <span className="themes-menu">
-          <Button
-            variant="quiet"
-            aria-label={`More actions for theme ${id}`}
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((v) => !v)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setMenuOpen(false);
-            }}
-          >
-            ⋯
-          </Button>
-          {menuOpen && (
-            <span className="themes-menu-pop" role="menu">
-              <Button
-                variant="quiet"
-                role="menuitem"
-                aria-label={`Rename theme ${id}`}
-                onClick={() => {
-                  rename.reset();
-                  setDraft(name);
-                  setMenuOpen(false);
-                  setMode("rename");
-                }}
-              >
-                Rename
-              </Button>
-              <Button
-                variant="quiet"
-                role="menuitem"
-                aria-label={`Merge theme ${id}`}
-                disabled={targets.length === 0}
-                onClick={() => {
-                  merge.reset();
-                  setInto(null);
-                  setMenuOpen(false);
-                  setMode("merge");
-                }}
-              >
-                Merge
-              </Button>
-            </span>
-          )}
-        </span>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="quiet" aria-label={`More actions for theme ${id}`}>
+              ⋯
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              aria-label={`Rename theme ${id}`}
+              onSelect={() => {
+                rename.reset();
+                setDraft(name);
+                setMode("rename");
+              }}
+            >
+              Rename
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              aria-label={`Merge theme ${id}`}
+              disabled={targets.length === 0}
+              onSelect={() => {
+                merge.reset();
+                setInto(null);
+                setMode("merge");
+              }}
+            >
+              Merge
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       )}
       {mode === "rename" && (
         <>

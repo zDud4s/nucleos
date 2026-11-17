@@ -5269,7 +5269,7 @@ describe("slash commands routed to /command", () => {
     expect(screen.getByText(/2 turns? (with no cost|unmeasured)/i)).toBeTruthy();
   });
 
-  it("slash d mcp card renders the panel, and its checkbox switches the server", async () => {
+  it("slash d mcp card renders the panel, and its switch switches the server", async () => {
     const data: McpCardData = {
       engine: "claude",
       supported: true,
@@ -5295,7 +5295,7 @@ describe("slash commands routed to /command", () => {
     const card = await screen.findByRole("region", { name: "Command" });
     expect(within(card).getByText(/MCP servers \(claude, mode mcponly\)/)).toBeTruthy();
     expect(within(card).getByText("mode mcponly only allows NucleOS tools")).toBeTruthy();
-    const box = within(card).getByRole("checkbox", { name: /gh/ });
+    const box = within(card).getByRole("switch", { name: /gh/ });
     fireEvent.click(box);
     await waitFor(() => expect(callsTo("/assistant/chats/c-1/mcp/gh", "DELETE")).toHaveLength(1));
   });

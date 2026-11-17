@@ -17,7 +17,7 @@ import { pairedMachine, type MachineId } from "../data/machineStore";
 import { useMachines, withMachine } from "../data/machines";
 import { requestNativeStepUp } from "../remote/nativeTransport";
 import { isRemote } from "../remote/host";
-import { Button, ErrorNote, Modal, Select, Tip } from "../ui";
+import { Button, ErrorNote, Modal, Select, Tip, Radio } from "../ui";
 
 type Project = { project_root: string | null; remote?: string | null };
 type When = "after_turn" | "now";
@@ -481,8 +481,8 @@ export function MoveChatDialog({
         {preview?.running === true && (
           <fieldset disabled={busy}>
             <legend>Running turn</legend>
-            <label><input type="radio" checked={when === "after_turn"} onChange={() => setWhen("after_turn")} /> Let it finish; new messages wait and move in the queue.</label>
-            <label><input type="radio" checked={when === "now"} onChange={() => setWhen("now")} /> Move now and cut the running turn.</label>
+            <label><Radio checked={when === "after_turn"} onChange={() => setWhen("after_turn")} /> Let it finish; new messages wait and move in the queue.</label>
+            <label><Radio checked={when === "now"} onChange={() => setWhen("now")} /> Move now and cut the running turn.</label>
           </fieldset>
         )}
         {preview !== null && <TransferNotes preview={preview} />}

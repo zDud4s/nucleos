@@ -5,7 +5,8 @@ import {
   useSetDistillerModel,
   type DistillerModel as Choice,
 } from "../data/distiller";
-import { ErrorNote, Field, RefusalNote, Select } from "../ui";
+import { ErrorNote, RefusalNote, Select } from "../ui";
+import { PrefRow } from "./PrefRow";
 import { DAEMON_NAME } from "../copy";
 
 const LABELS: Record<Choice, string> = {
@@ -30,30 +31,31 @@ export function DistillerModel() {
   const refusal = [set.error, stored.error].find(isApiRefusal);
 
   return (
-    <div className="sy-pref">
-      <Field
-        label="Distiller model"
-        helper="Read by the distiller on its next pass; a choice this machine cannot serve leaves the queue waiting rather than using the cloud."
+    <PrefRow
+      label="Distiller model"
+      htmlFor="sy-distiller-model"
+      tip="Read by the distiller on its next pass; a choice this machine cannot serve leaves the queue waiting rather than using the cloud."
+      note={
+        refusal ? (
+          <RefusalNote refusal={refusal} />
+        ) : set.error ? (
+          <ErrorNote>the {DAEMON_NAME} is not responding: the distiller's model was not changed</ErrorNote>
+        ) : null
+      }
+    >
+      <Select
+        id="sy-distiller-model"
+        block
+        value={shown}
+        disabled={set.isPending}
+        onChange={(event) => set.mutate(event.target.value as Choice)}
       >
-        <Select
-          id="sy-distiller-model"
-          block
-          value={shown}
-          disabled={set.isPending}
-          onChange={(event) => set.mutate(event.target.value as Choice)}
-        >
-          {DISTILLER_MODELS.map((model) => (
-            <option key={model} value={model}>
-              {LABELS[model]}
-            </option>
-          ))}
-        </Select>
-      </Field>
-      {refusal ? (
-        <RefusalNote refusal={refusal} />
-      ) : set.error ? (
-        <ErrorNote>the {DAEMON_NAME} is not responding: the distiller's model was not changed</ErrorNote>
-      ) : null}
-    </div>
+        {DISTILLER_MODELS.map((model) => (
+          <option key={model} value={model}>
+            {LABELS[model]}
+          </option>
+        ))}
+      </Select>
+    </PrefRow>
   );
 }

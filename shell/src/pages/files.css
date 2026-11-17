@@ -1068,65 +1068,12 @@ th.fi-col-num .fi-sort-mark {
   }
 }
 
-/* Drawn from the tokens rather than left to the browser: the shell declares no
-   `color-scheme`, so the native box was a light-theme white square on the dark
-   page, the brightest thing on it, and ticked it differed from unticked only
-   by a hairline mark. Unticked sits sunken inside a strong hairline; ticked and
-   "some" fill with the text colour — not the brand accent, which is reserved,
-   and the same voice as the tint on the row it marks. */
-.fi-table input[type="checkbox"] {
-  appearance: none;
-  display: inline-grid;
-  place-content: center;
-  width: 1rem;
-  height: 1rem;
-  margin: 0;
-  vertical-align: middle;
-  border: var(--hairline) solid var(--text-faint);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  cursor: pointer;
-}
-
-.fi-table input[type="checkbox"]:hover {
-  border-color: var(--text-muted);
-}
-
 /* A row's box stands hidden until it is wanted — under the pointer, on the row
    the keyboard is on, or on every row once anything is picked. Hidden and not
    removed: it keeps its column, so nothing moves when it arrives, and a screen
    reader still finds it. The head's select-all is always there. */
 .fi-table:not(.fi-table-picking) tbody .fi-row:not(:hover):not(:has(:focus-visible)) input[type="checkbox"] {
   opacity: 0;
-}
-
-/* Muted, not the full text colour: a column of black squares in the light
-   theme was the heaviest thing on the page, over the names it marks. The
-   faint edge unticked is the floor a control boundary needs — `--border-strong`
-   measured 1.9:1 on the light rows. */
-.fi-table input[type="checkbox"]:checked,
-.fi-table input[type="checkbox"]:indeterminate {
-  border-color: var(--text-muted);
-  background: var(--text-muted);
-}
-
-/* The tick: two sides of a box, turned. */
-.fi-table input[type="checkbox"]:checked::before {
-  content: "";
-  width: 0.55rem;
-  height: 0.3rem;
-  margin-top: -0.1rem;
-  border-bottom: 2px solid var(--bg);
-  border-left: 2px solid var(--bg);
-  transform: rotate(-45deg);
-}
-
-/* "Some but not all": a bar, as every checkbox that has the state draws it. */
-.fi-table input[type="checkbox"]:indeterminate::before {
-  content: "";
-  width: 0.5rem;
-  height: 2px;
-  background: var(--bg);
 }
 
 /* A row picks itself on a click, so the pointer is a pointer over all of it,

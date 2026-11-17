@@ -12,7 +12,7 @@ import {
   type WorkflowGraph as Graph,
 } from "../data/workflow-graph";
 import { editorAvailable, openInVscode } from "../lib/vscode";
-import { Button, ErrorNote, Quiet, RefusalNote, Well } from "../ui";
+import { Button, ErrorNote, Quiet, RefusalNote, Switch, Well } from "../ui";
 
 /**
  * The canvas, its inspector, and the guard that stands between an overlay and an eject.
@@ -356,24 +356,18 @@ function Inspector({
         change is how every project ends up ejected over one word.
       */}
       <div className="flex flex-col gap-2 border-t border-border pt-3">
-        <label className="flex items-center gap-2 text-xs text-text-muted">
-          <input
-            type="checkbox"
-            // The neutral ladder's top rung, not the browser's blue: an unstyled checkbox was the one
-            // control on this surface wearing a colour the system never chose.
-            className="accent-text"
-            checked={node.disabled}
-            onChange={(event) =>
-              overlay.mutate({
-                projectId,
-                name,
-                node: node.id,
-                disabled: event.target.checked ? true : null,
-              })
-            }
-          />
-          skip this node in this project
-        </label>
+        <Switch
+          label="skip this node in this project"
+          checked={node.disabled}
+          onChange={(checked) =>
+            overlay.mutate({
+              projectId,
+              name,
+              node: node.id,
+              disabled: checked ? true : null,
+            })
+          }
+        />
         <ModelField
           label="model"
           value={node.fields.find((field) => field.name === "model")?.value ?? ""}

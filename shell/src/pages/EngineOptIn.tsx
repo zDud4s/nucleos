@@ -3,6 +3,7 @@ import { isApiRefusal } from "../data/client";
 import { useEngineOptIn, useSetEngineOptIn } from "../data/engines";
 import { Button, ErrorNote, Modal, RefusalNote, Skeleton, Switch } from "../ui";
 import { DAEMON_NAME } from "../copy";
+import { PrefRow } from "./PrefRow";
 
 /**
  * The opt-in for one CLI engine: a switch, and a dialog that shows the daemon's warning before
@@ -26,8 +27,33 @@ export function EngineOptIn({ engine, label }: { engine: string; label: string }
   };
 
   return (
-    <div className="sy-pref">
-      <strong>{label}</strong>
+    <PrefRow
+      label={label}
+      note={
+        <>
+          {reading !== undefined && !reading.installed ? (
+            <span className="sy-meta">{label} was not found on this machine</span>
+          ) : null}
+          {set.isSuccess && set.data.takes_effect !== "" ? <span className="sy-meta">{set.data.takes_effect}</span> : null}
+          {refusal ? (
+            <RefusalNote refusal={refusal} />
+          ) : set.error ? (
+            // A write that got no answer may still have landed, so it never claims "not changed".
+            // Once a read has settled after the write the switch shows the truth; a read that failed
+            // leaves `dataUpdatedAt` before `submittedAt`, so that state stays unknown.
+            state.dataUpdatedAt < set.submittedAt ? (
+              <ErrorNote>the {DAEMON_NAME} is not responding: whether {label} was changed is unknown</ErrorNote>
+            ) : (
+              <ErrorNote>the {DAEMON_NAME} gave no reply to that change: the switch shows the current setting</ErrorNote>
+            )
+          ) : state.error ? (
+            <ErrorNote>
+              the {DAEMON_NAME} is not responding: could not read the setting for {label}
+            </ErrorNote>
+          ) : null}
+        </>
+      }
+    >
       {reading === undefined ? (
         state.isPending ? <Skeleton label={`Reading ${label}`} variant="line" width="12rem" /> : null
       ) : (
@@ -42,7 +68,6 @@ export function EngineOptIn({ engine, label }: { engine: string; label: string }
               else set.mutate({ enabled: false });
             }}
           />
-          {reading.installed ? null : <span className="sy-meta">{label} was not found on this machine</span>}
           <Modal
             open={asking}
             onOpenChange={setAsking}
@@ -62,23 +87,6 @@ export function EngineOptIn({ engine, label }: { engine: string; label: string }
           </Modal>
         </>
       )}
-      {set.isSuccess && set.data.takes_effect !== "" ? <span className="sy-meta">{set.data.takes_effect}</span> : null}
-      {refusal ? (
-        <RefusalNote refusal={refusal} />
-      ) : set.error ? (
-        // A write that got no answer may still have landed, so it never claims "not changed".
-        // Once a read has settled after the write the switch shows the truth; a read that failed
-        // leaves `dataUpdatedAt` before `submittedAt`, so that state stays unknown.
-        state.dataUpdatedAt < set.submittedAt ? (
-          <ErrorNote>the {DAEMON_NAME} is not responding: whether {label} was changed is unknown</ErrorNote>
-        ) : (
-          <ErrorNote>the {DAEMON_NAME} gave no reply to that change: the switch shows the current setting</ErrorNote>
-        )
-      ) : state.error ? (
-        <ErrorNote>
-          the {DAEMON_NAME} is not responding: could not read the setting for {label}
-        </ErrorNote>
-      ) : null}
-    </div>
+    </PrefRow>
   );
 }

@@ -1,7 +1,7 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useId, useLayoutEffect, useState, type RefObject } from "react";
 import { File as FileIcon, Folder as FolderIcon } from "lucide-react";
 import { formatBytes, joinPath, middleEllipsis, useFolder, type Entry, type SortColumn, type SortDirection } from "../../data/files";
-import { Button, Panel, Quiet, RelativeTime, Skeleton, StaleNote } from "../../ui";
+import { Button, Panel, Quiet, RelativeTime, Skeleton, StaleNote, Checkbox } from "../../ui";
 import { LIST_SENTENCES, MOVE_SENTENCES, RefusalOrError, remPx } from "./shared";
 import type { FocusAfter } from "./pageParts";
 
@@ -77,7 +77,6 @@ export function FileTable(props: FileTableProps) {
   } = props;
 
   const [anchor, setAnchor] = useState<number | null>(null);
-  const selectAllRef = useRef<HTMLInputElement>(null);
   const keysId = useId();
   const [nameHead, setNameHead] = useState<HTMLTableCellElement | null>(null);
   const nameMax = useNameFit(nameHead);
@@ -90,14 +89,6 @@ export function FileTable(props: FileTableProps) {
   // what the arrows already do.
   const tabStop = focusIndex !== null && focusIndex < ordered.length ? focusIndex : 0;
   const selectedHere = ordered.filter((entry) => selected.has(entry.name)).length;
-
-  // "Some but not all" is a third state a checkbox can show and a screen
-  // reader can say ("mixed"); without it a partial selection read as none.
-  useEffect(() => {
-    if (selectAllRef.current !== null) {
-      selectAllRef.current.indeterminate = selectedHere > 0 && selectedHere < ordered.length;
-    }
-  }, [selectedHere, ordered.length]);
 
   /**
    * Moves the keyboard to a row for real. The row used to be only painted as
@@ -275,9 +266,10 @@ export function FileTable(props: FileTableProps) {
             <thead>
               <tr>
                 <th scope="col" className="fi-col-select">
-                  <input
-                    ref={selectAllRef}
-                    type="checkbox"
+                  {/* "Some but not all" is a third state a checkbox can show and a screen
+                      reader can say ("mixed"); without it a partial selection read as none. */}
+                  <Checkbox
+                    indeterminate={selectedHere > 0 && selectedHere < ordered.length}
                     aria-label="Select all"
                     checked={ordered.length > 0 && selectedHere === ordered.length}
                     onChange={(event) => onSelectAll(event.target.checked ? ordered.map((entry) => entry.name) : [])}
@@ -537,8 +529,7 @@ function FileRow({
       <td className="fi-col-select">
         {/* Out of the tab order: Space on the row picks it, and a second stop
             per row is what made the listing a wall to Tab through. */}
-        <input
-          type="checkbox"
+        <Checkbox
           tabIndex={-1}
           aria-label={`Select ${entry.name}`}
           checked={selected}

@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, ReactNode, Ref } from "react";
 
 /**
  * How much weight the button carries.
@@ -38,6 +38,8 @@ export type ButtonIntent = "go" | "stop" | "create";
 export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "className"> {
   variant?: ButtonVariant;
   intent?: ButtonIntent;
+  /** React 19 passes `ref` as a prop; it lands on the `<button>` through `...rest`. */
+  ref?: Ref<HTMLButtonElement>;
   children: ReactNode;
 }
 

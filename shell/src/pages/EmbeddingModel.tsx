@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useEmbeddingModel, useSetEmbeddingModel } from "../data/embedding";
-import { Button, ErrorNote, Field, RefusalNote } from "../ui";
+import { Button, ErrorNote, RefusalNote } from "../ui";
+import { PrefRow } from "./PrefRow";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -21,33 +22,35 @@ export function EmbeddingModel() {
   const refusal = [set.error, stored.error].find(isApiRefusal);
 
   return (
-    <div className="sy-pref">
-      <Field
-        label="Embedding model"
-        helper="An Ollama model that is already pulled. Applied at once; rows embedded by the previous model are re-embedded in the background."
-      >
-        <input
-          id="sy-embedding-model"
-          className="sy-pref-input"
-          type="text"
-          value={shown}
-          disabled={set.isPending}
-          onChange={(event) => setDraft(event.target.value)}
-        />
-      </Field>
-      <div className="sy-pref-actions">
+    <PrefRow
+      label="Embedding model"
+      htmlFor="sy-embedding-model"
+      tip="An Ollama model that is already pulled. Applied at once; rows embedded by the previous model are re-embedded in the background."
+      note={
+        refusal ? (
+          <RefusalNote refusal={refusal} />
+        ) : set.error ? (
+          <ErrorNote>the {DAEMON_NAME} is not responding: the embedding model was not changed</ErrorNote>
+        ) : null
+      }
+    >
+      <input
+        id="sy-embedding-model"
+        className="sy-pref-input"
+        type="text"
+        value={shown}
+        disabled={set.isPending}
+        onChange={(event) => setDraft(event.target.value)}
+      />
+      {/* Offered only while the typed name differs from the stored one. */}
+      {changed || set.isPending ? (
         <Button
           disabled={!changed || set.isPending}
           onClick={() => set.mutate((draft ?? "").trim(), { onSuccess: () => setDraft(null) })}
         >
           {set.isPending ? "Saving…" : "Save"}
         </Button>
-      </div>
-      {refusal ? (
-        <RefusalNote refusal={refusal} />
-      ) : set.error ? (
-        <ErrorNote>the {DAEMON_NAME} is not responding: the embedding model was not changed</ErrorNote>
       ) : null}
-    </div>
+    </PrefRow>
   );
 }

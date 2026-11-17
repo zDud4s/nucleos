@@ -27,7 +27,7 @@ describe("EmbeddingModel", () => {
     const input = (await screen.findByLabelText("Embedding model")) as HTMLInputElement;
     await waitFor(() => expect(input.value).toBe("nomic-embed-text"));
     expect(daemon.apiFetch).toHaveBeenCalledWith("/config/embedding");
-    expect(saveButton().disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
 
     fireEvent.change(input, { target: { value: "mxbai-embed-large" } });
     expect(saveButton().disabled).toBe(false);

@@ -4,6 +4,7 @@ import { isApiRefusal } from "../data/client";
 import { useProjectRecord, useRemoveProject } from "../data/projects";
 import { heldBy, onRecord } from "../data/roster";
 import { Button } from "../ui/Button";
+import { Checkbox } from "../ui/Checkbox";
 import { ConfirmButton } from "../ui/ConfirmButton";
 import { ErrorNote } from "../ui/ErrorNote";
 import { RefusalNote } from "../ui/RefusalNote";
@@ -160,8 +161,7 @@ export function RemoveProject({
         <p className="text-xs text-text-muted">{projectId} has nothing on record.</p>
       ) : (
         <label className="ws-dialog-option">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={forget}
             onChange={(event) => setForget(event.target.checked)}
           />

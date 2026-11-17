@@ -61,7 +61,7 @@ describe("Panel ask_keep", () => {
     deliver({ v: 1, kind: "ask_keep", hosts: ["https://example.org"] });
 
     expect(screen.getByText("May the agent use these sites?")).toBeTruthy();
-    fireEvent.click(screen.getByRole("checkbox", { name: /also submit forms/i }));
+    fireEvent.click(screen.getByRole("switch", { name: /also submit forms/i }));
     fireEvent.click(screen.getByRole("button", { name: /^yes$/i }));
 
     expect(sent).toContainEqual({ v: 1, kind: "keep", keep: true, writable: true });

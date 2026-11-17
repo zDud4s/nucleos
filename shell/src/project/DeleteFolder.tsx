@@ -4,6 +4,7 @@ import { isApiRefusal } from "../data/client";
 import { useDeleteProjectFolder, useProjectFolder } from "../data/projects";
 import { heldBy } from "../data/roster";
 import { Button } from "../ui/Button";
+import { Checkbox } from "../ui/Checkbox";
 import { Field } from "../ui/Field";
 import { RefusalNote } from "../ui/RefusalNote";
 import { Tip } from "../ui/Tip";
@@ -126,8 +127,7 @@ export function DeleteFolder({ projectId, onClose, onBusyChange, warningRef }: D
         standing decision is that history stays unless somebody says otherwise.
       */}
       <label className="ws-dialog-option">
-        <input
-          type="checkbox"
+        <Checkbox
           checked={forget}
           onChange={(event) => setForget(event.target.checked)}
         />
