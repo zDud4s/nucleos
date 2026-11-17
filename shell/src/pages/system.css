@@ -956,12 +956,16 @@
   margin: 0 0 var(--space-3);
 }
 
-/* The three running configurations, side by side. */
+/* The running configurations packed as balanced columns: cards of very
+   different heights stack under each other instead of leaving row gaps. */
 .sy-config-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
-  align-items: start;
-  gap: var(--space-4);
+  columns: 20rem;
+  column-gap: var(--space-4);
+}
+
+.sy-config-grid > * {
+  break-inside: avoid;
+  margin: 0 0 var(--space-4);
 }
 
 /* Key on the left, value on the right, one per line under a hairline — a
