@@ -3777,8 +3777,35 @@ mod tests {
         assert_eq!(lines[0].1, Some(format!("vcs:{id}")));
     }
 
+    /// A merge of a branch that is neither a job's nor a tree's, into a branch outside `nucleos/`,
+    /// is a `--land` the distiller learns from: one `branch_landed` row keyed by the request.
+    #[tokio::test]
+    async fn a_landed_non_job_branch_is_queued_as_branch_landed() {
+        let pool = test_pool().await;
+
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
+
+        let rows: Vec<(String, String, Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT cause, project_id, job_id, request_id FROM distill_queue")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "branch_landed".to_string(),
+                "alpha".to_string(),
+                None,
+                Some(id)
+            )]
+        );
+    }
+
     /// A merge of a job's own branch into a branch outside `nucleos/` is the land the distiller
-    /// learns from; any other merge is not, and queues nothing.
+    /// learns from as a job landing.
     #[tokio::test]
     async fn a_landed_job_branch_is_queued_for_distillation() {
         let pool = test_pool().await;
@@ -3790,18 +3817,6 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-
-        // A feature branch landing is not a job landing.
-        submit(&pool, &repo(), &merge_op(), Origin::Human)
-            .await
-            .unwrap();
-        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
-        let none: Vec<(String, Option<i64>)> =
-            sqlx::query_as("SELECT cause, job_id FROM distill_queue")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert!(none.is_empty(), "a feature-branch merge queued: {none:?}");
 
         let op = Op::Merge {
             source: "nucleos/job-7".into(),

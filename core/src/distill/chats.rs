@@ -361,15 +361,7 @@ pub(super) async fn process(
     let known_titles: Vec<String> = if row.project_id.is_empty() {
         Vec::new()
     } else {
-        match sqlx::query_scalar(
-            "SELECT title FROM knowledge
-              WHERE scope_kind = 'project' AND scope_id = ? AND status IN ('active', 'proposed')
-              ORDER BY id DESC LIMIT 50",
-        )
-        .bind(&row.project_id)
-        .fetch_all(pool)
-        .await
-        {
+        match super::known::titles(pool, &row.project_id).await {
             Ok(titles) => titles,
             Err(_) => {
                 fail(pool, row, "db", "reading the chat failed", now).await;

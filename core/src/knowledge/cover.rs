@@ -23,8 +23,9 @@ fn knowledge_ids(evidence: Option<&str>) -> Vec<i64> {
 /// proposals (`expired`, not `rejected`: the owner said nothing) and note `covers:[ids]` on the lesson. Returns rows covered.
 pub async fn tidy_covered(pool: &SqlitePool) -> sqlx::Result<u64> {
     let lessons: Vec<(i64, Option<String>)> = sqlx::query_as(
+        // Only the permanent covers: a lesson still on trial covers nothing (spec §7.2).
         "SELECT id, evidence FROM knowledge
-          WHERE distill_cause = 'generalised' AND status = 'active' ORDER BY id",
+          WHERE distill_cause = 'generalised' AND status = 'active' AND trial = 0 ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
@@ -241,6 +242,50 @@ mod tests {
             0,
             "nothing left to cover"
         );
+    }
+
+    #[tokio::test]
+    async fn a_trial_lesson_covers_nothing() {
+        let pool = crate::testdb::fresh_pool().await;
+        let (a, _) = propose(
+            &pool,
+            Some("alpha"),
+            "Use PATH",
+            "job_failed",
+            r#"[{"t":"job","id":1}]"#,
+        )
+        .await;
+        let (b, _) = propose(
+            &pool,
+            Some("bravo"),
+            "Use PATH too",
+            "job_failed",
+            r#"[{"t":"job","id":2}]"#,
+        )
+        .await;
+        let evidence = format!(r#"[{{"t":"knowledge","id":{a}}},{{"t":"knowledge","id":{b}}}]"#);
+        let (lesson, lp) = propose(
+            &pool,
+            None,
+            "Put Git usr/bin first",
+            "generalised",
+            &evidence,
+        )
+        .await;
+        approve(&pool, lp).await.unwrap();
+        // The lesson is active but still on trial: the owner has not kept it yet.
+        sqlx::query("UPDATE knowledge SET trial = 1, trial_started_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(lesson)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(col(&pool, "knowledge", lesson).await, "active");
+
+        assert_eq!(tidy_covered(&pool).await.unwrap(), 0);
+        for id in [a, b] {
+            assert_eq!(col(&pool, "knowledge", id).await, "proposed");
+        }
     }
 
     #[tokio::test]

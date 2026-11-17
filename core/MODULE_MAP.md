@@ -713,6 +713,7 @@ the contract, not a snapshot.
 | `knowledge/decide.rs` | Knowledge decision paths and decision errors. |
 | `knowledge/history.rs` | Knowledge history, evidence tagging, and findings. |
 | `knowledge/propose.rs` | Knowledge proposal write paths and provenance. |
+| `knowledge/rework.rs` | Rework ledger records (root cause, fix, lesson) become episodic trial lessons without a model, one per cause, reinforced when the cause recurs in another task. |
 | `knowledge/select.rs` | Pure knowledge scoring, selection, and rendering. |
 | `knowledge/signature.rs` | Failure signature generation and normalisation helpers. |
 | `knowledge/store.rs` | Knowledge-store reads and closing working rows. |
@@ -770,6 +771,11 @@ the contract, not a snapshot.
 | `knowledge/observe.rs` | The write door of conversation observations (`observed`, scope `observation`, never in a prompt) and their 60-day age sweep. |
 | `distill/extract.rs` | **Pure.** The extraction steps: the dossier, the extraction prompt and its schema, strict parsing of the answer (`parse_items`), the layer-to-door mapping and the retry backoff. |
 | `distill/week.rs` | The `calendar_week` cause: one queue row per ISO week (`enqueue_week_if_due`, called at the start of `tick`), the owner's `human` calendar events of a `-28 d .. +14 d` window turned into day/hour/duration/recurrence lines, a contact mark (a correspondent the owner both wrote to and named in an event title; name only), and the model's episodic items written as week-scoped `observed` rows. Reads the calendar and the contact roster only: no notes, no themes (a test pins it). |
+| `distill/known.rs` | The titles the distiller already knows about a project (live lessons and thrown-away ones), handed to the model so it is not asked to repeat them. |
+| `distill/tree.rs` | Tree, parked-decision, recovered-branch and landed-branch triggers that queue distillation in `distill_queue`, plus the pre-filter and volume caps that keep model calls few. |
+| `distill/tree_dossier.rs` | **Pure.** Builds the dossier text of a finished tree: blocks cut by priority, clipped per block and scrubbed. |
+| `distill/tree_gather.rs` | Gathers the facts of a finished tree or merge request (node handoffs, answered decisions, failed verifications, last run messages, diff stat and commit subjects) into the dossier blocks. |
+| `distill/tree_worker.rs` | The worker half of the tree and land causes: what happens to a claimed tree or branch queue row once `process_one_with` hands it over. |
 | `embed.rs` | Local (Ollama) embeddings of knowledge rows: the client behind a trait, f32 blobs and cosine, the backfill and the nearest-row query. Never logs a text or a vector. |
 | `engines.rs` | The engine description table: one row per engine (`claude`, `codex`, `local`) with id, display name, seat kind, transport (CLI process or HTTP), installed probe, utility default and runner constructor. Plain data plus lookups, each taking the table as an argument so a test can add a fourth row without a production registration path. `capabilities::Engine`, `RunnerKind`, `ChatEngine`, `ENGINE_SEAT_KINDS`, `translatable_runners` and `installed_engines` derive from or iterate it; an unknown runner string still collapses to `claude`. |
 | `engines_descriptor.rs` | The engine descriptor as data (`EngineDescriptor`: binary, config var, settings flag, domains) in the `engine_descriptors` machine settings document, stored in nucleos.db and never under `.ai/`; `refuse_under_grants` refuses one that sits under a sandbox grant; `builtin()` holds claude and codex. |

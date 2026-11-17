@@ -162,11 +162,13 @@ async fn candidates(pool: &SqlitePool, model: &str) -> sqlx::Result<Vec<Candidat
             vector,
         })
         .collect();
+    // `k.trial = 0`: only the permanent is clustered (spec §7.2).
     let rows: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
         "SELECT e.knowledge_id, e.dim, e.vector
            FROM knowledge_embeddings e JOIN knowledge k ON k.id = e.knowledge_id
           WHERE e.model = ? AND k.status IN ('active', 'proposed', 'observed')
             AND k.source IN ('distiller', 'owner')
+            AND k.trial = 0
           ORDER BY e.knowledge_id",
     )
     .bind(model)
@@ -1175,6 +1177,30 @@ mod tests {
         assert_eq!(
             cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn theme_candidates_leave_trial_rows_out() {
+        let pool = crate::testdb::fresh_pool().await;
+        let permanent = knowledge_row(&pool, "kept", "distiller", "active", [1.0, 0.0, 0.0]).await;
+        let on_trial = knowledge_row(&pool, "trial", "distiller", "active", [1.0, 0.1, 0.0]).await;
+        sqlx::query("UPDATE knowledge SET trial = 1, trial_started_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(on_trial)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let keys: Vec<(MemberKind, i64)> = candidates(&pool, "m")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        assert!(keys.contains(&(MemberKind::Knowledge, permanent)));
+        assert!(
+            !keys.contains(&(MemberKind::Knowledge, on_trial)),
+            "a lesson on trial is not themes material"
         );
     }
 
