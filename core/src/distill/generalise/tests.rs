@@ -172,6 +172,24 @@ async fn rows_older_than_ninety_days_and_rows_without_a_vector_are_left_out() {
     assert_eq!(groups.iter().map(|g| g.members.len()).sum::<usize>(), 2);
 }
 
+#[tokio::test]
+async fn generalisation_groups_leave_trial_rows_out() {
+    let pool = pool().await;
+    let [a, b, c] = trio(&pool).await;
+    sqlx::query("UPDATE knowledge SET trial = 1, trial_started_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let groups = form_groups(&pool, MODEL, Utc::now()).await.unwrap();
+    let ids: Vec<i64> = groups
+        .iter()
+        .flat_map(|g| g.members.iter().map(|m| m.id))
+        .collect();
+    assert_eq!(ids, vec![b, c], "a lesson on trial is not material");
+}
+
 #[test]
 fn the_answer_is_empty_or_one_semantic_or_procedural_lesson() {
     assert!(parse_lessons("[]").unwrap().is_empty());

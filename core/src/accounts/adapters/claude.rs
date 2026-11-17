@@ -63,8 +63,10 @@ impl ProviderAdapter for ClaudeAdapter {
     fn cache_model(&self) -> Option<CacheModel> {
         None
     }
-    fn classify_failure(&self, _stdout: &str, _stderr: &str) -> Option<LimitHit> {
-        None
+    /// A usage limit (5-hour/weekly, with its parsed reset) or a 429 (short mark) on the
+    /// stream-json result; see [`super::classify_claude_stream`].
+    fn classify_failure(&self, stdout: &str, _stderr: &str) -> Option<LimitHit> {
+        super::classify_claude_stream(stdout, chrono::Utc::now())
     }
 }
 

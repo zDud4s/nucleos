@@ -51,6 +51,22 @@ pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not
 /// verbatim.
 pub(super) const FORMAT_RULES: &str = "A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py --agent leaf-<node id> ...`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`.";
 
+/// Built-in tools a leaf never calls, so its CLI starts without their schemas (~8k tokens of the
+/// first request). Its prompt and `wf-leaf` allow only Bash, Read, Edit, Write, Glob, Grep and the
+/// node tools: shell work goes through Bash (`python scripts/heavy.py`), a leaf opens no branch
+/// (no `Agent`), and nobody wakes a headless run (no `ScheduleWakeup`, no `Workflow`).
+const LEAF_DENIED_TOOLS: [&str; 4] = ["PowerShell", "Workflow", "ScheduleWakeup", "Agent"];
+
+/// What this node's CLI is denied on top of its policy: the leaf list for a leaf, nothing for an
+/// orchestrator or a root (which dispatch subagents and keep every schema).
+pub(super) fn node_denied_tools(kind: &str) -> Vec<String> {
+    if kind == crate::work_nodes::KIND_LEAF {
+        LEAF_DENIED_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Gives a tree node the protocol it needs to split work and report its result.
 ///
 /// A relaunch receives the already stored prompt, so the marker must make this a no-op after the
@@ -455,6 +471,7 @@ pub async fn launch_resuming(
 
     // A node normally inherits its worktree cwd. Keep legacy cwd-less shadow launches unchanged:
     // without a worktree there is neither a box nor a handoff location for the node protocol.
+    let mut node_kind = String::new();
     let prompt = match cwd.as_ref() {
         Some(_) => {
             // A missing row yields empty ids, as it did before the root id was read.
@@ -464,6 +481,7 @@ pub async fn launch_resuming(
                     .fetch_optional(pool)
                     .await?
                     .unwrap_or((None, None, String::new()));
+            node_kind.clone_from(&kind);
             // The report goes to the node's own file in the project's state dir (the same lookup
             // as the PreToolUse hook), outside the worktree; without a state dir the worktree
             // fallback stays.
@@ -508,6 +526,7 @@ pub async fn launch_resuming(
                 project_root,
                 tree,
                 session,
+                node_denied_tools(&node_kind),
             )
             .await?
         }
@@ -1352,6 +1371,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(seen_launch(&runner).await, (None, None, None));
+    }
+
+    #[test]
+    fn a_leaf_is_denied_the_unused_tool_schemas_but_an_orchestrator_is_not() {
+        let leaf = node_denied_tools(crate::work_nodes::KIND_LEAF);
+        for tool in ["PowerShell", "Workflow", "ScheduleWakeup", "Agent"] {
+            assert!(leaf.iter().any(|t| t == tool), "leaf must deny {tool}");
+        }
+        assert!(node_denied_tools(crate::work_nodes::KIND_ORCHESTRATOR).is_empty());
+        assert!(node_denied_tools(crate::work_nodes::KIND_ROOT).is_empty());
     }
 
     #[test]

@@ -110,6 +110,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "POST",
+        path: "/knowledge/{id}/confirm-trial",
+        purpose: "The two decisions a person takes on a distilled lesson that is on trial.",
+        body: Body::None,
+        handler: "confirm_knowledge_trial",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/knowledge/{id}/retire-trial",
+        purpose: "Retire knowledge trial.",
+        body: Body::None,
+        handler: "retire_knowledge_trial",
+    },
+    RouteEntry {
+        method: "POST",
         path: "/knowledge/{id}/revert",
         purpose: "Revert knowledge.",
         body: Body::Shapeless("RevertKnowledgeRequest"),

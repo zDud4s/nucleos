@@ -63,8 +63,10 @@ impl ProviderAdapter for CodexAdapter {
     fn cache_model(&self) -> Option<CacheModel> {
         None
     }
-    fn classify_failure(&self, _stdout: &str, _stderr: &str) -> Option<LimitHit> {
-        None
+    /// A usage limit (reset read from "try again in ...") or a 429; see
+    /// [`super::classify_codex_text`].
+    fn classify_failure(&self, stdout: &str, stderr: &str) -> Option<LimitHit> {
+        super::classify_codex_text(stdout, stderr, chrono::Utc::now())
     }
 }
 

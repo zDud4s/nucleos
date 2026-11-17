@@ -79,6 +79,10 @@ pub struct Group {
     /// some filter, `select` runs with `{filter}` set to the union of the matched `expr`s.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<Filter>,
+    /// Whether a full sweep (a `full_sweep` path, an unclaimed path) also runs this group. `false`
+    /// keeps a slow group that only its own `paths` can affect out of unrelated branches' plans.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub sweep: bool,
 }
 
 /// One slice of a group's tests: the paths that select it and the runner expression (a nextest

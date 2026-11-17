@@ -90,7 +90,7 @@ pub(super) async fn fetch(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Kno
 }
 
 /// The complete vocabulary a run may use to point at the source of a finding.
-pub const EVIDENCE_TAGS: [&str; 8] = [
+pub const EVIDENCE_TAGS: [&str; 13] = [
     "job",
     "run",
     "job_item",
@@ -99,6 +99,11 @@ pub const EVIDENCE_TAGS: [&str; 8] = [
     "project",
     "command",
     "gate",
+    "record",
+    "verify_run",
+    "tree",
+    "chat",
+    "note",
 ];
 
 pub(super) fn known_element(value: &serde_json::Value) -> bool {

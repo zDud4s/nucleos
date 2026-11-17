@@ -118,6 +118,13 @@ pub(super) async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -
         crate::quota::QuotaDecision::Pause { reason, .. } => return Brake::Stop { detail: reason },
     }
 
+    // Every account of the engine is at its usage limit: wait for the earliest reset instead of
+    // launching a node that dies on the same wall. One account with room is not a brake, the pool
+    // hands it to the node.
+    if let Some(brake) = account_limit_brake(job, now) {
+        return brake;
+    }
+
     // The job's own ceiling — under the house's for work nobody asked for, and INSTEAD of it for
     // work somebody did. Two different questions and both worth asking: a job can be stopped by
     // what it was given or by what is left in the till.

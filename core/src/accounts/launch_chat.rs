@@ -326,7 +326,47 @@ pub async fn note_limit_and_announce(
     now: DateTime<Utc>,
 ) -> Option<LimitHit> {
     let hit = note_limit(&PoolState::global(), engine, account, stdout, stderr, now)?;
-    if limit_notice_due(account, &hit, now) {
+    announce_and_store_hit(db, project_id, engine, account, &hit, now).await;
+    Some(hit)
+}
+
+/// How long a limit hit with no known reset holds the account out of the pool: a short mark, so
+/// a 429 that names no window does not park the account for a whole usage window.
+pub const SHORT_MARK: chrono::Duration = chrono::Duration::minutes(15);
+
+/// The hit a mid-session limit stands for: the provider's reset when the CLI said one, else a
+/// short mark (`now + SHORT_MARK`) so the in-memory mark expires on its own.
+pub fn mid_session_hit(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> LimitHit {
+    LimitHit {
+        window: None,
+        resets_at: Some(resets_at.unwrap_or(now + SHORT_MARK)),
+    }
+}
+
+/// Marks `account` exhausted in the pool for a hit the caller already classified (auth watch),
+/// then announces and stores it exactly like `note_limit_and_announce`.
+pub async fn mark_hit_and_announce(
+    db: &SqlitePool,
+    project_id: Option<&str>,
+    engine: &str,
+    account: &AccountId,
+    hit: &LimitHit,
+    now: DateTime<Utc>,
+) {
+    PoolState::global().mark_exhausted(account, hit, now);
+    announce_and_store_hit(db, project_id, engine, account, hit, now).await;
+}
+
+/// The once-per-window feed row and the persisted mark of a hit.
+async fn announce_and_store_hit(
+    db: &SqlitePool,
+    project_id: Option<&str>,
+    engine: &str,
+    account: &AccountId,
+    hit: &LimitHit,
+    now: DateTime<Utc>,
+) {
+    if limit_notice_due(account, hit, now) {
         let window = hit.window.as_deref().unwrap_or("a usage window");
         let summary = format!(
             "Account {} ({engine}) hit its limit on {window}; new work goes to other accounts",
@@ -343,13 +383,34 @@ pub async fn note_limit_and_announce(
         account_id: account.clone(),
         window: hit.window.clone().unwrap_or_default(),
         resets_at: hit.resets_at,
-        until: notice_until(&hit, now),
+        until: notice_until(hit, now),
         announced_at: now,
     };
     if let Err(error) = store::upsert_exhaustion(db, &mark).await {
         tracing::warn!(%error, "could not store the account exhaustion mark");
     }
-    Some(hit)
+}
+
+/// Why a blocked pick refuses a chat turn, or `None` when the turn falls back to today's launch.
+pub fn refusal_reason(decision: &Decision) -> Option<String> {
+    match decision {
+        Decision::PinnedBlocked { pinned, why, .. } => Some(format!(
+            "the pinned account {} cannot take this turn ({why:?})",
+            pinned.as_str()
+        )),
+        Decision::SessionStuck { current, .. } => Some(format!(
+            "the account {} holding this session is at its limit",
+            current.as_str()
+        )),
+        Decision::AllExhausted { earliest_resets_at } => Some(match earliest_resets_at {
+            Some(at) => format!(
+                "all accounts exhausted until {}",
+                at.format("%Y-%m-%d %H:%M UTC")
+            ),
+            None => "all accounts exhausted; no reset time is known".to_owned(),
+        }),
+        _ => None,
+    }
 }
 
 /// Records the turn's cache usage and classifies its output for a limit hit.
@@ -455,6 +516,67 @@ mod tests {
             .unwrap();
         crate::storage::MIGRATOR.run(&db).await.unwrap();
         db
+    }
+
+    #[test]
+    fn all_exhausted_refuses_with_the_reset_time() {
+        let at = DateTime::parse_from_rfc3339("2026-11-15T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let said = refusal_reason(&Decision::AllExhausted {
+            earliest_resets_at: Some(at),
+        })
+        .unwrap();
+        assert_eq!(said, "all accounts exhausted until 2026-11-15 09:30 UTC");
+        let unknown = refusal_reason(&Decision::AllExhausted {
+            earliest_resets_at: None,
+        })
+        .unwrap();
+        assert!(unknown.starts_with("all accounts exhausted"), "{unknown}");
+    }
+
+    #[test]
+    fn stuck_sessions_and_no_candidate_keep_their_behaviour() {
+        let stuck = refusal_reason(&Decision::SessionStuck {
+            current: AccountId("a:1".into()),
+            alternative: None,
+        })
+        .unwrap();
+        assert!(
+            stuck.contains("a:1") && stuck.contains("at its limit"),
+            "{stuck}"
+        );
+        assert_eq!(
+            refusal_reason(&Decision::NoCandidate { why: "x".into() }),
+            None
+        );
+        assert_eq!(refusal_reason(&Decision::Default), None);
+    }
+
+    #[test]
+    fn a_mid_session_hit_without_a_reset_is_a_short_mark() {
+        let now = Utc::now();
+        let hit = mid_session_hit(None, now);
+        assert_eq!(hit.resets_at, Some(now + SHORT_MARK));
+        let at = now + chrono::Duration::hours(3);
+        assert_eq!(mid_session_hit(Some(at), now).resets_at, Some(at));
+    }
+
+    #[tokio::test]
+    async fn a_mid_session_hit_is_marked_in_the_pool_and_stored() {
+        let db = db().await;
+        let now = Utc::now();
+        let id = AccountId("fake:mid".into());
+        PoolState::global().set_accounts(vec![account("fake:mid")]);
+        mark_hit_and_announce(&db, None, "fake", &id, &mid_session_hit(None, now), now).await;
+        let marked = PoolState::global()
+            .view()
+            .candidates
+            .iter()
+            .any(|c| c.account.id == id && !c.exhausted.is_empty());
+        assert!(marked);
+        let stored = store::live_exhaustions(&db, now).await.unwrap();
+        assert!(stored.iter().any(|m| m.account_id == id));
     }
 
     fn token_account(id: &str) -> Account {
