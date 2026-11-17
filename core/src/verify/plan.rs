@@ -808,6 +808,41 @@ tests:
     }
 
     #[test]
+    fn a_core_only_change_plans_only_the_core_group() {
+        let map = MapState::Valid(
+            crate::tests_map::parse(
+                "version: 1
+tests:
+  groups:
+    core:
+      paths: [core/]
+      command: cargo test -p nucleos-core
+    shell:
+      paths: [scripts/]
+      command: bash scripts/test.sh
+    sidecars:
+      paths: [sidecars/]
+      command: npm test
+",
+            )
+            .unwrap(),
+        );
+        let plan = plan_with(
+            &map,
+            Kind::Test,
+            ScopeArg::Own,
+            &["core/src/a.rs"],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.units.len(), 1);
+        assert_eq!(plan.units[0].group.as_deref(), Some("core"));
+        assert!(plan.unclaimed.is_empty());
+        assert!(plan.note.is_none());
+    }
+
+    #[test]
     fn nothing_changed_plans_nothing() {
         let plan = plan_with(&valid(), Kind::Test, ScopeArg::Scope, &[], None, true).unwrap();
         assert!(plan.units.is_empty());

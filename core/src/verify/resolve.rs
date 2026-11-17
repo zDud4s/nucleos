@@ -523,6 +523,15 @@ pub(super) fn nul_separated(stdout: &str) -> impl Iterator<Item = &str> {
     stdout.split('\0').filter(|entry| !entry.is_empty())
 }
 
+/// Files the daemon itself writes into a ticket worktree. Untracked, they are not the caller's code
+/// and match no test group, so counting them would force a full sweep.
+fn is_daemon_footprint(path: &str) -> bool {
+    path == ".mcp.json"
+        || [".nucleos/", ".claude/", ".agents/", ".ai/", ".codex/"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+}
+
 /// Every path that differs from `base`: committed or not, and untracked files too, because a new
 /// file nobody has added yet is still code the caller is about to hand in.
 pub async fn changed_paths(
@@ -557,7 +566,7 @@ pub async fn changed_paths(
         )));
     }
     let paths: BTreeSet<String> = nul_separated(&diff.stdout)
-        .chain(nul_separated(&untracked.stdout))
+        .chain(nul_separated(&untracked.stdout).filter(|path| !is_daemon_footprint(path)))
         .map(str::to_owned)
         .collect();
     Ok(paths.into_iter().collect())
@@ -611,6 +620,44 @@ mod tests {
         run_git(root, &["add", "-A"]);
         run_git(root, &["commit", "-q", "-m", "work change"]);
         (dir, c0, c1)
+    }
+
+    #[test]
+    fn a_daemon_footprint_path_is_recognised() {
+        for yes in [
+            ".mcp.json",
+            ".nucleos/workflow/x.md",
+            ".claude/settings.json",
+            ".agents/a",
+            ".ai/b",
+            ".codex/c",
+        ] {
+            assert!(is_daemon_footprint(yes), "{yes}");
+        }
+        for no in ["core/src/a.rs", "docs/.mcp.json.md", ".nucleosx/a"] {
+            assert!(!is_daemon_footprint(no), "{no}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_paths_skips_untracked_footprint_but_keeps_tracked_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q", "-b", "master"]);
+        std::fs::create_dir_all(root.join(".nucleos")).unwrap();
+        std::fs::write(root.join(".nucleos/flows.yaml"), "a: 1").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-q", "-m", "c0"]);
+        let base = run_git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join(".nucleos/flows.yaml"), "a: 2").unwrap();
+        std::fs::write(root.join(".mcp.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::write(root.join(".codex/x"), "x").unwrap();
+        std::fs::create_dir_all(root.join("core/src")).unwrap();
+        std::fs::write(root.join("core/src/new.rs"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let paths = changed_paths(root, &base, deadline).await.unwrap();
+        assert_eq!(paths, [".nucleos/flows.yaml", "core/src/new.rs"]);
     }
 
     #[tokio::test]
