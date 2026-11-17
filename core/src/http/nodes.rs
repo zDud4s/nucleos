@@ -284,7 +284,10 @@ async fn patch_node(
         .map_err(refused)?;
     let mut body = serde_json::to_value(&updated)
         .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let widened = args.widen_paths.as_ref().is_some_and(|paths| !paths.is_empty());
+    let widened = args
+        .widen_paths
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty());
     if widened
         && crate::tree_job::close::tree_job_of(&state.pool, &id)
             .await
