@@ -22,21 +22,23 @@ function AcceptedTheme({ id, name, others }: { id: number; name: string; others:
   return (
     <li>
       <span className="themes-head">
-        <span>{name}</span>
+        <span className="themes-name">{name}</span>
         <span className="themes-id">#{id}</span>
       </span>
       {detail.data === undefined ? (
         detail.isError ? (
           <ErrorNote>the synthesis is not known</ErrorNote>
         ) : (
-          <Skeleton label="Loading the synthesis" lines={2} />
+          <Skeleton label="Loading the synthesis" lines={1} />
         )
       ) : synthesis === null || synthesis === "" ? (
         <span title="It is made after a theme is accepted, and weekly.">
           <Quiet compact says="No synthesis yet" />
         </span>
       ) : (
-        <p className="themes-synthesis">{synthesis}</p>
+        <p className="themes-synthesis" title={synthesis}>
+          {synthesis}
+        </p>
       )}
       <span className="themes-act">
         <Button
@@ -54,19 +56,16 @@ function AcceptedTheme({ id, name, others }: { id: number; name: string; others:
   );
 }
 
-/** Accepted themes with their synthesis, and a button to force a new one (at most once an hour). */
+/** Accepted theme rows with their one-line synthesis, and a button to force a new one (at most once an hour). */
 export function ThemesAccepted() {
   const themes = useThemes("accepted");
   const rows = themes.data ?? [];
   if (rows.length === 0) return null;
   return (
-    <section className="brain-sec themes-accepted" aria-label="Themes">
-      <h4>Themes</h4>
-      <ul className="themes-list" aria-label="Accepted themes">
-        {rows.map((theme) => (
-          <AcceptedTheme key={theme.id} id={theme.id} name={theme.name} others={rows} />
-        ))}
-      </ul>
-    </section>
+    <ul className="themes-list themes-accepted" aria-label="Accepted themes">
+      {rows.map((theme) => (
+        <AcceptedTheme key={theme.id} id={theme.id} name={theme.name} others={rows} />
+      ))}
+    </ul>
   );
 }

@@ -61,7 +61,6 @@ import {
   Row,
   Rows,
   Section,
-  SectionNav,
   Skeleton,
   StaleNote,
   StateBadge,
@@ -109,9 +108,8 @@ import { ExclusionsPanel } from "./AutopilotExclusions";
 import "./autopilot.css";
 
 /**
- * The page's map: where each group of panels starts, in the order the page reads. Each label is
- * the heading the reader lands on ("Setting for alpha", "Trigger brakes", "Shadow decisions",
- * "Jobs in flight", "Records and feed"), so a jump never arrives somewhere named differently.
+ * The page's map: where each group of panels starts, in the order the page reads. Only the command
+ * palette jumps to them now (the on-page section nav is gone), so the ids stay as anchors.
  */
 const SECTIONS = [
   { id: "ap-setting", label: "Setting" },
@@ -120,41 +118,11 @@ const SECTIONS = [
   { id: "ap-jobs", label: "Jobs in flight" },
   { id: "ap-records", label: "Records and feed" },
 ];
-const SECTION_IDS = SECTIONS.map((section) => section.id);
 
 // Hovering the rail link warms the roster the whole page is built from (#7).
 registerPrefetcher("/autopilot", (qc) =>
   qc.prefetchQuery({ queryKey: keys.projects.all, queryFn: () => apiFetch<ProjectSummary[]>("/projects"), staleTime: 5_000 }),
 );
-
-/**
- * The section the reader is in: the first group, in page order, whose box crosses the top 40% of
- * the viewport. `undefined` with no `IntersectionObserver` (jsdom), and the nav then marks none.
- */
-function useCurrentSection(ids: readonly string[]): string | undefined {
-  const [current, setCurrent] = useState<string | undefined>(undefined);
-  useEffect(() => {
-    if (typeof IntersectionObserver === "undefined") return;
-    const inView = new Set<string>();
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting) inView.add(entry.target.id);
-          else inView.delete(entry.target.id);
-        }
-        const first = ids.find((id) => inView.has(id));
-        if (first !== undefined) setCurrent(first);
-      },
-      { rootMargin: "0px 0px -60% 0px" },
-    );
-    for (const id of ids) {
-      const element = document.getElementById(id);
-      if (element !== null) observer.observe(element);
-    }
-    return () => observer.disconnect();
-  }, [ids]);
-  return current;
-}
 
 /** The three periods the núcleo writes, as the noun each one is: `daily` becomes `day`, not `dai`. */
 const PERIOD_NOUN: Record<string, string> = {
@@ -188,7 +156,6 @@ const PERIOD_NOUN: Record<string, string> = {
  * Waiting queue.
  */
 export function Autopilot() {
-  const currentSection = useCurrentSection(SECTION_IDS);
   const projects = useProjects();
   const budget = useBudget();
   const kill = useKillSwitch();
@@ -279,11 +246,6 @@ export function Autopilot() {
             onRefusals={setRefusals}
           />
         </div>
-        {/* A secondary, in-page switcher: it sits under the project cards, so it reads as sections
-            of the selected project. */}
-        <div className="ap-nav">
-          <SectionNav label="Autopilot sections" items={SECTIONS} current={currentSection} />
-        </div>
         {/* The brakes sit with the ledger, before any evidence: the order this page's doc-comment
             promises (brakes, then the setting, then the proof, then the work). */}
         <div id="ap-brakes" className="ap-block">
@@ -306,6 +268,7 @@ export function Autopilot() {
               <div className="ap-panel-pair">
                 <JudgePanel projectId={selected} project={focused} />
                 <ResolvePanel projectId={selected} project={focused} />
+                <ExclusionsPanel />
               </div>
               <JudgeReviewPanel projectId={selected} />
             </Disclosure>
@@ -313,9 +276,6 @@ export function Autopilot() {
         </div>
         <div id="ap-jobs" className="ap-block">
           <JobsPanel rows={rows} selected={selected} />
-          <div className="ap-panel-pair">
-            <ExclusionsPanel />
-          </div>
         </div>
         {/* Records of what the night and the barrier already settled. They were on the Waiting
             page, which now holds only what asks for a decision. Records, not controls: shut until

@@ -1582,18 +1582,6 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
     expect(screen.queryByRole("button", { name: /the fan/ })).toBeNull();
   });
 
-  it("puts the section nav under the project cards", async () => {
-    daemon.apiFetch.mockImplementation(
-      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
-    );
-
-    await renderCockpit();
-
-    const nav = await screen.findByRole("navigation", { name: "Autopilot sections" });
-    const fan = screen.getByRole("region", { name: "Projects" });
-    expect(fan.compareDocumentPosition(nav) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  });
-
   it("shows a single project's card with no list", async () => {
     const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
@@ -1607,40 +1595,27 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
 });
 
 describe("Autopilot - the page map and the advanced panels", () => {
-  it("offers a section nav whose entries land on a heading that says the same thing", async () => {
+  it("carries no section nav and no separate project heading", async () => {
     daemon.apiFetch.mockImplementation(
       cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
     );
 
     await renderCockpit();
 
-    const nav = await screen.findByRole("navigation", { name: "Autopilot sections" });
-    const links = within(nav).getAllByRole("link");
-    expect(links.map((link) => link.textContent)).toEqual([
-      "Setting",
-      "Trigger brakes",
-      "Shadow decisions",
-      "Jobs in flight",
-      "Records and feed",
-    ]);
-    for (const link of links) {
-      const id = (link.getAttribute("href") ?? "").replace(/^#/, "");
-      const target = document.getElementById(id);
-      expect(target).not.toBeNull();
-      await waitFor(() => expect(target?.textContent).toContain(link.textContent ?? ""));
-    }
+    await screen.findByRole("button", { name: "Records and feed" });
+    expect(screen.queryByRole("navigation", { name: "Autopilot sections" })).toBeNull();
+    expect(screen.queryByRole("heading", { level: 2, name: /alpha\s*·\s*Autopilot/ })).toBeNull();
   });
 
-  it("carries no separate project heading over the section nav", async () => {
+  it("puts Judge, Resolving blocks and Never at the same time in one row", async () => {
     daemon.apiFetch.mockImplementation(
       cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
     );
 
     await renderCockpit();
 
-    const nav = await screen.findByRole("navigation", { name: "Autopilot sections" });
-    expect(screen.queryByRole("heading", { level: 2, name: /alpha\s*·\s*Autopilot/ })).toBeNull();
-    expect(nav.closest(".ap-nav")).not.toBeNull();
+    const judge = await screen.findByRole("heading", { name: "Judge" });
+    expect(judge.closest(".ap-panel-pair")?.textContent).toContain("Never at the same time");
   });
 
   it("scrolls the scoreboard table inside its own region instead of overflowing", () => {

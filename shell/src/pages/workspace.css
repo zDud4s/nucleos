@@ -821,11 +821,78 @@ a.ws-lead-door:hover {
   width: auto;
 }
 
+/* The Mode card's switch (`fill`): the track spans the card, the segments share it equally. */
+.ws-page.ws-authority .ui-switch.ui-switch-fill {
+  display: flex;
+  align-self: stretch;
+  width: 100%;
+}
+
+.ws-page.ws-authority .ui-switch.ui-switch-fill > * {
+  flex: 1 1 0;
+  min-width: 0;
+  justify-content: center;
+}
+
+.ws-page.ws-authority .ui-switch-fill .ui-switch-seg-wrap > .ui-confirm,
+.ws-page.ws-authority .ui-switch-fill .ui-switch-seg-wrap > .ui-confirm > .ui-button {
+  flex: 1 1 auto;
+  width: 100%;
+}
+
+/*
+  The standing strip: one card divided into equal cells, value over label. The DOM keeps term
+  before value (the reading order); \`order\` puts the value on top.
+*/
+.ws-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  margin: 0;
+  overflow: hidden;
+  border-radius: var(--radius-xl);
+  background: var(--surface-raised);
+}
+
+.ws-stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  min-width: 0;
+  box-shadow: inset 1px 0 0 var(--border);
+}
+
+.ws-stat:first-child {
+  box-shadow: none;
+}
+
+.ws-stat > dd {
+  order: 1;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--leading-snug);
+}
+
+.ws-stat > dt {
+  order: 2;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.ws-stat-wrong > dd {
+  color: var(--tone-danger-fg);
+}
+
 /*
   The sentences that sit between the groups — a section's lead, the status line, the remote's
   header — start where the text inside the groups starts, not at the groups' edge.
 */
-.ws-authority > [aria-label="Standing"],
 .ws-authority .ui-section > div > .ui-quiet,
 .ws-authority .ui-section > div > p {
   padding-inline: var(--space-4);

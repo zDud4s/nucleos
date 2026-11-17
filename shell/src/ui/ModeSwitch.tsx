@@ -73,6 +73,11 @@ export interface ModeSwitchProps {
    * exactly what it was before this existed.
    */
   focusableWhenInert?: boolean;
+  /**
+   * Span the container: the track takes the full width and the three segments share it equally.
+   * Only adds the `ui-switch-fill` class; the page stylesheet decides what it means.
+   */
+  fill?: boolean;
   onChoose: (mode: SwitchMode) => void;
 }
 
@@ -136,6 +141,7 @@ export function ModeSwitch({
   titles,
   busy,
   focusableWhenInert,
+  fill,
   onChoose,
 }: ModeSwitchProps) {
   const focusable = focusableWhenInert === true;
@@ -184,7 +190,9 @@ export function ModeSwitch({
   const offInert = value === "off" || busy;
   const shadowInert = value === "shadow" || busy;
   const track = (
-    <div className="ui-switch" role="group" aria-label="Autopilot mode" onKeyDown={onEscape}>
+    <div
+      className={fill === true ? "ui-switch ui-switch-fill" : "ui-switch"}
+      role="group" aria-label="Autopilot mode" onKeyDown={onEscape}>
       <button
         type="button"
         className="ui-switch-seg"

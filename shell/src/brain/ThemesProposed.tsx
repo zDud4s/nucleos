@@ -5,8 +5,9 @@ import { ThemeEdit } from "./ThemeEdit";
 import "./ThemesProposed.css";
 
 /**
- * "Proposed themes": the groups the daemon found above the owner's notes and lessons, waiting for a
- * yes or a no. The `#id` keeps two themes with the same name apart. Nothing renders when none wait.
+ * The proposed-theme rows: the groups the daemon found above the owner's notes and lessons, waiting
+ * for a yes or a no. The `#id` keeps two themes with the same name apart. Nothing renders when none
+ * wait; the `Themes` block owns the heading.
  */
 export function ThemesProposed() {
   const themes = useThemes("proposed");
@@ -23,14 +24,14 @@ export function ThemesProposed() {
   if (rows.length === 0) return null;
   const busy = accept.isPending || refuse.isPending;
   return (
-    <section className="brain-sec themes-proposed" aria-label="Proposed themes">
-      <h4>Proposed themes</h4>
-      <ul className="themes-list" aria-label="Proposed themes">
+    <>
+      <ul className="themes-list themes-proposed" aria-label="Proposed themes">
         {rows.map((theme) => (
           <li key={theme.id}>
             <span className="themes-head">
-              <span>{theme.name}</span>
+              <span className="themes-name">{theme.name}</span>
               <span className="themes-id">#{theme.id}</span>
+              <span className="themes-badge">proposed</span>
               <span className="themes-count">
                 {theme.members} {theme.members === 1 ? "member" : "members"}
               </span>
@@ -60,6 +61,6 @@ export function ThemesProposed() {
       {(accept.isError || refuse.isError) && (
         <ErrorNote>that did not go through: the theme may already have been decided</ErrorNote>
       )}
-    </section>
+    </>
   );
 }

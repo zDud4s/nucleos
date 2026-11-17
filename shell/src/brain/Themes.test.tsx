@@ -3,6 +3,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { ApiRefusal } from "../data/client";
 import type { ThemeDetail, ThemeRow } from "../data/themes";
 import { renderWithQuery } from "../test/harness";
+import { Themes } from "./Themes";
 import { ThemesAccepted } from "./ThemesAccepted";
 import { ThemesProposed } from "./ThemesProposed";
 
@@ -54,7 +55,8 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     daemon.apiText.mockResolvedValue("");
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     const input = screen.getByRole("textbox", { name: "New name for theme 3" }) as HTMLInputElement;
     const save = screen.getByRole("button", { name: "Save name of theme 3" }) as HTMLButtonElement;
     expect(input.value).toBe("Theme 3");
@@ -76,7 +78,8 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     daemon.apiText.mockRejectedValue(new ApiRefusal(422, "bad_name", ""));
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     fireEvent.change(screen.getByRole("textbox", { name: "New name for theme 3" }), { target: { value: "Sleep" } });
     fireEvent.click(screen.getByRole("button", { name: "Save name of theme 3" }));
     expect(await screen.findByText(/it must be 1 to 80 characters/)).toBeTruthy();
@@ -86,7 +89,8 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     daemon.apiText.mockRejectedValue(new TypeError("network down"));
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     fireEvent.change(screen.getByRole("textbox", { name: "New name for theme 3" }), { target: { value: "Sleep" } });
     fireEvent.click(screen.getByRole("button", { name: "Save name of theme 3" }));
     expect(await screen.findByText(/is not responding: the name was not changed/)).toBeTruthy();
@@ -96,7 +100,8 @@ describe("ThemesProposed", () => {
   it("cancels a rename on Escape without posting", async () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     fireEvent.keyDown(screen.getByRole("textbox", { name: "New name for theme 3" }), { key: "Escape" });
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(daemon.apiText).not.toHaveBeenCalled();
@@ -106,7 +111,8 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed"), row(4, "proposed")]);
     daemon.apiText.mockResolvedValue("");
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "Merge theme 3" }));
+    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Merge theme 3" }));
     const select = screen.getByRole("combobox", { name: "Merge theme 3 into" }) as HTMLSelectElement;
     const values = Array.from(select.options).map((o) => o.value);
     expect(values).toEqual(["4"]);
@@ -162,5 +168,25 @@ describe("ThemesAccepted", () => {
     renderWithQuery(<ThemesAccepted />);
     fireEvent.click(await screen.findByRole("button", { name: /synthesise theme 5 now/i }));
     expect(await screen.findByText(/less than an hour ago/)).toBeTruthy();
+  });
+});
+
+describe("Themes", () => {
+  it("is collapsed by default with the counts in its header, and opens to one row per theme", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path.startsWith("/themes?state=proposed")) return [row(3, "proposed"), row(4, "proposed")];
+      if (path.startsWith("/themes?state=accepted")) return [row(5, "accepted"), row(6, "accepted")];
+      if (path.startsWith("/themes/")) return detail(Number(path.slice(8)), "Sleep keeps coming up.");
+      throw new Error(`unexpected ${path}`);
+    });
+    renderWithQuery(<Themes />);
+    const toggle = await screen.findByRole("button", { name: /Themes 2 · 2 proposed/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("Theme 3")).toBeNull();
+    fireEvent.click(toggle);
+    expect(await screen.findByText("Theme 3")).toBeTruthy();
+    expect(screen.getByText("Theme 5")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept theme 3" })).toBeTruthy();
+    expect(screen.queryByRole("menuitem")).toBeNull();
   });
 });
