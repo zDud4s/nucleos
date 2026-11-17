@@ -602,6 +602,10 @@ mod tests {
             run_id: None,
             chat_id: None,
             attempts: 0,
+            tree_id: None,
+            node_id: None,
+            request_id: None,
+            decision_id: None,
         }
     }
 

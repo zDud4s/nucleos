@@ -44,12 +44,14 @@ pub(crate) async fn form_groups(
     model: &str,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Vec<Group>> {
+    // `k.trial = 0`: only the permanent is generalised (spec §7.2).
     let rows = sqlx::query(
         "SELECT k.id, k.scope_kind, k.scope_id, k.evidence, k.title, k.body FROM knowledge k
           WHERE k.source = 'distiller' AND k.created_at >= ? AND k.scope_kind <> 'machine'
             AND (k.status IN ('active', 'proposed')
                  OR (k.scope_kind = 'observation' AND k.status = 'observed'))
             AND COALESCE(k.distill_cause, '') <> 'generalised'
+            AND k.trial = 0
             AND NOT EXISTS (SELECT 1 FROM knowledge_events e
                              WHERE e.knowledge_id = k.id AND e.note = 'quoted_owner_text')
           ORDER BY k.id",

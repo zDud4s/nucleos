@@ -25,7 +25,9 @@ pub mod probe;
 pub mod provision;
 pub mod render;
 pub mod runs;
+pub mod skip_clippy;
 pub mod store;
+pub mod supersede;
 
 mod caller;
 mod live;
@@ -60,6 +62,7 @@ use crate::verify::postgate as verify_postgate;
 use crate::verify::postgate_worker as verify_postgate_worker;
 use crate::verify::runs::{self as verify_runs, ORIGIN_VERIFY};
 use crate::verify::store::{self as verify_store, CacheKey, NewRequest, PlannedUnit};
+use crate::verify::supersede as verify_supersede;
 use crate::workflow_records;
 
 pub use self::caller::*;
@@ -456,6 +459,24 @@ async fn submit_with(
             .map_err(internal)?
     };
 
+    // Only the post-land gate runs the composed, targets-only command; every other caller keeps
+    // the whole `gate_command`.
+    let gate_cmd = if caller == Caller::Postgate {
+        rules.postgate_command()
+    } else {
+        rules.gate_command.clone()
+    };
+
+    // Persist the local targets this very command was composed from, from the same `rules` read,
+    // so the green that follows covers exactly them (`None` = the command runs whole). Stored
+    // before the request exists: a request never runs without its targets on record.
+    if caller == Caller::Postgate {
+        let composed = rules.gate_targets.is_some().then(|| rules.local_targets());
+        verify_postgate::set_running_targets(pool, &project_id, composed.as_deref())
+            .await
+            .map_err(internal)?;
+    }
+
     // `true` until a project can declare that it gates after landing (there is no
     // `gate_after_land` yet); the planner already knows how to refuse `full` once there is.
     let planned = match (caller, args.groups.as_deref(), terms.recheck.as_deref()) {
@@ -467,7 +488,7 @@ async fn submit_with(
             args.scope,
             &changed,
             &fillable,
-            rules.gate_command.as_deref(),
+            gate_cmd.as_deref(),
             true,
             // Filters narrow only a session's own iteration run and a tree branch's gate
             // (`submit_narrowed`). A scope run (the daemon's item and merge gates, the evidence a
@@ -492,6 +513,16 @@ async fn submit_with(
     })?;
 
     let worktree = root.to_string_lossy().into_owned();
+    if !plan.unclaimed.is_empty() {
+        tracing::warn!(
+            base = base.as_deref().unwrap_or(""),
+            worktree = %worktree,
+            caller = %caller.label(),
+            count = plan.unclaimed.len(),
+            paths = ?plan.unclaimed.iter().take(20).collect::<Vec<_>>(),
+            "verify: unclaimed paths make every group run"
+        );
+    }
     let scope = args.scope.as_str();
     let kind = args.kind.as_str();
     let priority = terms.priority(caller);
@@ -566,13 +597,7 @@ async fn submit_with(
             }
         };
         let fingerprint = content.and_then(|content| {
-            unit_fingerprint(
-                &unit,
-                group,
-                map_version,
-                rules.gate_command.as_deref(),
-                &content,
-            )
+            unit_fingerprint(&unit, group, map_version, gate_cmd.as_deref(), &content)
         });
         match fingerprint {
             Ok(fingerprint) => unit.fingerprint = Some(fingerprint),
@@ -634,23 +659,29 @@ async fn submit_with(
             }
         }
 
+        let since = terms
+            .queued_since_ms
+            .filter(|_| matches!(caller, Caller::Job(_)));
         let submitted = executor
-            .submit(verify_runs::Request {
-                project_id: Some(project_id.clone()),
-                worktree: worktree.clone(),
-                scope: scope.to_owned(),
-                origin: ORIGIN_VERIFY.to_owned(),
-                origin_id: Some(id),
-                requested_by: caller.requested_by(scope),
-                group_name: unit.group.clone(),
-                kind: Some(kind.to_owned()),
-                argv: unit.argv.clone(),
-                fingerprint: unit.fingerprint.clone(),
-                priority,
-                // Zero lets the executor derive both from the argv and its own config.
-                weight: 0,
-                timeout_ms: terms.unit_timeout_ms(caller),
-            })
+            .submit_since(
+                verify_runs::Request {
+                    project_id: Some(project_id.clone()),
+                    worktree: worktree.clone(),
+                    scope: scope.to_owned(),
+                    origin: ORIGIN_VERIFY.to_owned(),
+                    origin_id: Some(id),
+                    requested_by: caller.requested_by(scope),
+                    group_name: unit.group.clone(),
+                    kind: Some(kind.to_owned()),
+                    argv: unit.argv.clone(),
+                    fingerprint: unit.fingerprint.clone(),
+                    priority,
+                    // Zero lets the executor derive both from the argv and its own config.
+                    weight: 0,
+                    timeout_ms: terms.unit_timeout_ms(caller),
+                },
+                since,
+            )
             .await;
         let submitted = match submitted {
             Ok(submitted) => submitted,
@@ -681,6 +712,14 @@ async fn submit_with(
     verify_store::set_plan(pool, id, &units)
         .await
         .map_err(internal)?;
+    // Queued units of this caller's older requests at another fingerprint are now pointless.
+    match verify_supersede::supersede_older(pool, id, &project_id, &worktree, kind, &label, &units)
+        .await
+    {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(request = id, count, "verify: superseded older queued units"),
+        Err(error) => tracing::warn!(%error, request = id, "verify: cannot supersede older units"),
+    }
     if let Some(task_id) = args
         .task_id
         .as_deref()
@@ -1414,6 +1453,7 @@ tests:
             fix: false,
             unit_timeout_secs: 3600,
             recheck: None,
+            queued_since_ms: None,
         };
         assert_eq!(scoped.unit_timeout_ms(job), 3_600_000);
     }
@@ -1979,6 +2019,51 @@ tests:
         let (ticket, _) = finished(&f.pool, second.unwrap()).await;
         assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
         assert_eq!(ticket.units[0].why, "gate_command");
+    }
+
+    /// `(argv, fingerprint)` of the gate unit a `full` request from `caller` queued under `rules`.
+    /// Nothing runs: the fixture has no worker, the queued row is what the plan decided.
+    async fn queued_gate_unit(rules: &str, caller: Caller) -> (String, Option<String>) {
+        let f = fixture(None, None, false).await;
+        crate::project::rules::testing::publish_rules("alpha", rules);
+        let request = args(Kind::Test, ScopeArg::Full, f.repo.path(), None, None);
+        let id = submit(&f.ex, caller, &request).await.unwrap();
+        sqlx::query_as(
+            "SELECT argv, fingerprint FROM verify_runs WHERE origin = 'verify' AND origin_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    const TARGETED: &str = "gate_command: \"git --version\"\ngate_targets: {core: local}\n";
+
+    #[tokio::test]
+    async fn a_postgate_full_unit_runs_the_composed_command() {
+        let (argv, _) = queued_gate_unit(TARGETED, Caller::Postgate).await;
+        assert!(argv.contains("gate-diff.sh"), "{argv}");
+        assert!(argv.contains("core"), "{argv}");
+        assert!(!argv.contains("--version"), "{argv}");
+    }
+
+    #[tokio::test]
+    async fn a_non_postgate_full_unit_keeps_gate_command() {
+        let (argv, _) = queued_gate_unit(TARGETED, Caller::Owner).await;
+        assert!(argv.contains("--version"), "{argv}");
+        assert!(!argv.contains("gate-diff.sh"), "{argv}");
+    }
+
+    #[tokio::test]
+    async fn the_fingerprint_follows_the_composed_command() {
+        let (_, core_only) = queued_gate_unit(TARGETED, Caller::Postgate).await;
+        let (_, with_hooks) = queued_gate_unit(
+            "gate_command: \"git --version\"\ngate_targets: {core: local, hooks: local}\n",
+            Caller::Postgate,
+        )
+        .await;
+        assert!(core_only.is_some() && with_hooks.is_some());
+        assert_ne!(core_only, with_hooks);
     }
 
     #[tokio::test]

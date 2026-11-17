@@ -30,6 +30,13 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/knowledge/findings", post(post_finding))
         .route("/knowledge/{id}", get(get_knowledge))
         .route("/knowledge/{id}/revert", post(revert_knowledge))
+        // The two decisions a person takes on a distilled lesson that is on trial. In no `auth.rs`
+        // table on purpose: Control and Admin only, like the revert above.
+        .route(
+            "/knowledge/{id}/confirm-trial",
+            post(confirm_knowledge_trial),
+        )
+        .route("/knowledge/{id}/retire-trial", post(retire_knowledge_trial))
         // Where each distilled row came from. In no `auth.rs` table on purpose: Control and Admin
         // only, like `/knowledge` above.
         .route(
@@ -385,6 +392,37 @@ pub(super) async fn revert_knowledge(
         Ok(false) => Err(StatusCode::CONFLICT),
         Err(error) => {
             tracing::warn!(knowledge_id = id, %error, "reverting what is known failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Keeping a lesson that is on trial, which makes it permanent.
+pub(super) async fn confirm_knowledge_trial(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::knowledge::confirm_trial(&state.pool, id).await {
+        // 409: the row may exist and simply not be an active trial row.
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(knowledge_id = id, %error, "confirming a lesson on trial failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Withdrawing a lesson that is on trial.
+pub(super) async fn retire_knowledge_trial(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::knowledge::retire_trial(&state.pool, id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::CONFLICT),
+        Err(error) => {
+            tracing::warn!(knowledge_id = id, %error, "retiring a lesson on trial failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

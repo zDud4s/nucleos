@@ -275,7 +275,7 @@ pub async fn drain_once(
         std::path::Path::new(&claimed.project_root),
         &claimed.op,
         claimed.from_resolution,
-        queue_origin,
+        queue_origin.clone(),
         claimed.run_id,
         claimed.integration_branch.as_ref(),
     )
@@ -517,6 +517,11 @@ pub(super) async fn write_terminal(
                 && let Err(error) = crate::distill::enqueue_landed_in(&mut tx, id).await
             {
                 tracing::warn!(request_id = id, %error, "distill: could not queue a landed job");
+            }
+            if matches!(outcome, Outcome::Succeeded { .. })
+                && let Err(error) = crate::distill::enqueue_branch_landed_in(&mut tx, id).await
+            {
+                tracing::warn!(request_id = id, %error, "distill: could not queue a landed branch");
             }
             tx.commit().await
         }

@@ -27,6 +27,32 @@ pub async fn open_machine_ticket(
     now: DateTime<Utc>,
 ) -> sqlx::Result<TaskRow> {
     let report_text = title.clone();
+    open_machine_ticket_reporting(
+        pool,
+        project_id,
+        key,
+        title,
+        report_text,
+        detail,
+        hint_paths,
+        now,
+    )
+    .await
+}
+
+/// [`open_machine_ticket`] with its own report text, for a ticket whose launch goal needs more than
+/// the title (the goal is built from the title and the stored reports only).
+#[allow(clippy::too_many_arguments)]
+async fn open_machine_ticket_reporting(
+    pool: &SqlitePool,
+    project_id: &str,
+    key: TaskKey,
+    title: String,
+    report_text: String,
+    detail: Value,
+    hint_paths: Vec<String>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
     let new = NewTask {
         key,
         kind: TaskKind::Incident,
@@ -341,6 +367,124 @@ pub async fn close_release_diverged(
     now: DateTime<Utc>,
 ) -> sqlx::Result<bool> {
     close_machine_ticket(pool, project_id, &release_diverged_key(), note, now).await
+}
+
+/// The key `remote-diverged:<branch>`.
+pub fn remote_diverged_key(branch: &str) -> TaskKey {
+    TaskKey::remote_diverged(branch)
+}
+
+/// Opens (or reports again) the `remote-diverged:<branch>` ticket: an automation's push found the
+/// remote branch on a history that neither contains nor is contained by the local green sha. Never
+/// auto-launched and never forced over; the owner decides which history wins. `detail` carries
+/// `branch`, `remote`, `local_sha` and `remote_sha`; a non-object is kept under `detail.detail`.
+pub async fn open_remote_diverged_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
+    let fields = match detail {
+        Value::Object(fields) => fields,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut fields = serde_json::Map::new();
+            fields.insert("detail".to_owned(), other);
+            fields
+        }
+    };
+    open_machine_ticket(
+        pool,
+        project_id,
+        remote_diverged_key(branch),
+        format!("the remote branch {branch} diverged from the local green sha"),
+        Value::Object(fields),
+        Vec::new(),
+        now,
+    )
+    .await
+}
+
+/// Closes the live `remote-diverged:<branch>` ticket by resolution. `false` when there is none.
+pub async fn close_remote_diverged(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    note: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    close_machine_ticket(pool, project_id, &remote_diverged_key(branch), note, now).await
+}
+
+/// The key `ci-red:<branch>`; `None` for an empty branch.
+pub fn ci_red_key(branch: &str) -> Option<TaskKey> {
+    TaskKey::ci_red(branch)
+}
+
+/// Opens (or reports again) the `ci-red:<branch>` ticket: the CI of a pushed sha finished red. One
+/// live ticket per branch. The title is fixed and never carries log text; `detail` is kept as is
+/// (a non-object is kept under `detail.detail`).
+pub async fn open_ci_red_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    title: String,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
+    let report_text = title.clone();
+    open_ci_red_ticket_reporting(pool, project_id, branch, title, report_text, detail, now).await
+}
+
+/// [`open_ci_red_ticket`] with its own report text: the launch goal carries the title and the reports,
+/// so the sha, run and failed jobs the agent needs go here (never the log: that stays in `detail`).
+pub async fn open_ci_red_ticket_reporting(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    title: String,
+    report_text: String,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
+    let key = ci_red_key(branch).ok_or_else(|| {
+        sqlx::Error::Protocol(format!("empty branch for a ci-red ticket: '{branch}'"))
+    })?;
+    let detail = match detail {
+        Value::Null => Value::Object(serde_json::Map::new()),
+        object @ Value::Object(_) => object,
+        other => {
+            let mut fields = serde_json::Map::new();
+            fields.insert("detail".to_owned(), other);
+            Value::Object(fields)
+        }
+    };
+    open_machine_ticket_reporting(
+        pool,
+        project_id,
+        key,
+        title,
+        report_text,
+        detail,
+        Vec::new(),
+        now,
+    )
+    .await
+}
+
+/// Closes the live `ci-red:<branch>` ticket by resolution. `false` when there is none.
+pub async fn close_ci_red_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    branch: &str,
+    note: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let Some(key) = ci_red_key(branch) else {
+        return Ok(false);
+    };
+    close_machine_ticket(pool, project_id, &key, note, now).await
 }
 
 /// Why the target moved without the queue: a write the hook did not see (`Violation`) or one it
@@ -788,6 +932,123 @@ mod tests {
                 .await
                 .unwrap(),
             "nothing left to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ci_red_ticket_is_one_per_branch_and_closes() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
+        let title = "CI is red on master".to_owned();
+        let first = open_ci_red_ticket(
+            &pool,
+            "proj",
+            "master",
+            title.clone(),
+            json!({ "auto_fix": true }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.key.as_str(), "ci-red:master");
+        assert!(first.key.is_machine());
+        let again = open_ci_red_ticket(
+            &pool,
+            "proj",
+            "master",
+            title,
+            json!({ "auto_fix": true }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.id, first.id, "one ticket per branch");
+        let live = store::live_by_key(&pool, "proj", &ci_red_key("master").unwrap(), now)
+            .await
+            .unwrap()
+            .expect("the ticket is live");
+        assert_eq!(live.report_count, 2);
+        let other = open_ci_red_ticket(
+            &pool,
+            "proj",
+            "fix/x",
+            "CI is red on fix/x".to_owned(),
+            json!({}),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_ne!(other.id, first.id, "another branch is another ticket");
+        assert!(
+            close_ci_red_ticket(&pool, "proj", "master", "green again", now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !close_ci_red_ticket(&pool, "proj", "master", "again", now)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_ci_red_after_the_close_is_a_new_ticket() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
+        let open = || {
+            open_ci_red_ticket(
+                &pool,
+                "proj",
+                "master",
+                "CI is red on master".to_owned(),
+                json!({ "auto_fix": true }),
+                now,
+            )
+        };
+        let first = open().await.unwrap();
+        assert!(
+            close_ci_red_ticket(&pool, "proj", "master", "green", now)
+                .await
+                .unwrap()
+        );
+        let second = open().await.unwrap();
+        assert_ne!(second.id, first.id, "a closed ticket is never reopened");
+        assert_eq!(
+            second.key, first.key,
+            "same key, so the history still counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_remote_diverged_twice_is_one_ticket_with_two_reports() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
+        let detail = |remote_sha: &str| json!({ "branch": "master", "remote": "origin", "local_sha": "a1", "remote_sha": remote_sha });
+        let first = open_remote_diverged_ticket(&pool, "proj", "master", detail("r1"), now)
+            .await
+            .unwrap();
+        assert_eq!(first.key.as_str(), "remote-diverged:master");
+        assert!(first.key.is_machine());
+        assert_eq!(first.detail["remote_sha"], json!("r1"));
+        let again = open_remote_diverged_ticket(&pool, "proj", "master", detail("r2"), now)
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id, "one ticket per branch");
+        let live = store::live_by_key(&pool, "proj", &remote_diverged_key("master"), now)
+            .await
+            .unwrap()
+            .expect("the ticket is live");
+        assert_eq!(live.report_count, 2);
+        assert_eq!(ticket_count(&pool).await, 1);
+        assert!(
+            close_remote_diverged(&pool, "proj", "master", "pushed", now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !close_remote_diverged(&pool, "proj", "master", "again", now)
+                .await
+                .unwrap()
         );
     }
 }

@@ -134,8 +134,33 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 {
                     return outcome;
                 }
-                match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
-                {
+                // `git.squash_checkpoints`: a leaf merged into its tree branch is merged as a rebuilt
+                // chain with its checkpoint and autoformat runs collapsed. The leaf branch itself is
+                // untouched, so rollback points stay valid. Fails open to the plain merge.
+                let squashed = if squash_applies(source.as_str(), target.as_str()) {
+                    squashed_tip(project_root, source.as_str(), target.as_str(), deadline).await
+                } else {
+                    None
+                };
+                // The declared `land` flow names `compute_merge` here, so the plain merge keeps
+                // calling it; only a squashed tip goes through `compute_merge_of`.
+                let merged = match squashed.as_deref() {
+                    Some(tip) => {
+                        compute_merge_of(
+                            project_root,
+                            source.as_str(),
+                            tip,
+                            target.as_str(),
+                            deadline,
+                        )
+                        .await
+                    }
+                    None => {
+                        compute_merge(project_root, source.as_str(), target.as_str(), deadline)
+                            .await
+                    }
+                };
+                match merged {
                     Ok(mut computed) => {
                         // Integration steps (plan 2026-11-09): only a merge INTO the integration
                         // branch runs them, and only when it moved the target. A project with no
@@ -436,11 +461,161 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 self.promote(request, from.as_str(), to.as_str(), deadline)
                     .await
             }
+            // Daemon-only: an automation rule's push of one green sha, as a fast-forward.
+            crate::execution::vcs::Op::PushSha {
+                remote,
+                branch,
+                sha,
+            } => {
+                self.push_sha_by_automation(
+                    request,
+                    remote.as_str(),
+                    branch.as_str(),
+                    sha.as_str(),
+                    deadline,
+                )
+                .await
+            }
         }
     }
 }
 
 impl GitExecutor {
+    /// Executes an automation's `push-sha`: the rule that queued it is read again here, and the push
+    /// only happens while that rule still exists, still pushes and is still switched on.
+    ///
+    /// **Fails closed.** A row with no `automation_rule`, no database, an unreadable `automations`
+    /// document, or a rule that is gone or switched off since it queued: the request fails without
+    /// touching the network and the firing settles as `skipped`. Switching a rule off must stop the
+    /// pushes it already queued, not only the next ones.
+    ///
+    /// Otherwise [`push_sha_ff`] (never forced) and the firing settles as `pushed`, `rejected`,
+    /// `diverged` or `failed`, with one feed line. A divergence opens `remote-diverged:<branch>`; a
+    /// push that lands closes it.
+    async fn push_sha_by_automation(
+        &self,
+        request: &crate::execution::vcs::ClaimedRequest,
+        remote: &str,
+        branch: &str,
+        sha: &str,
+        deadline: std::time::Instant,
+    ) -> Outcome {
+        use crate::automations::firings;
+        let fail = |reason: String| Outcome::Failed {
+            reason,
+            exit_code: None,
+            output_tail: String::new(),
+        };
+        let project_id = request.project_id.as_str();
+        let Some(pool) = self.pool.as_ref() else {
+            return fail(
+                "a push-sha needs the daemon's database, and this executor has none".to_owned(),
+            );
+        };
+        let rule: Option<String> = match sqlx::query_scalar(
+            "SELECT automation_rule FROM vcs_requests WHERE id = ?",
+        )
+        .bind(request.id)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(rule) => rule.flatten(),
+            Err(error) => {
+                return fail(format!(
+                    "the automation rule of this push-sha could not be read, so nothing was pushed: {error}"
+                ));
+            }
+        };
+        let Some(rule) = rule else {
+            return fail(
+                "this push-sha names no automation rule, so nothing was pushed".to_owned(),
+            );
+        };
+        let settle = |outcome: &'static str, detail: String| {
+            let rule = rule.clone();
+            async move {
+                match firings::settle(pool, project_id, &rule, sha, outcome, &detail).await {
+                    Ok(Some(firing)) => firings::announce(pool, &firing).await,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(vcs_request_id = request.id, %error, "could not settle a push firing")
+                    }
+                }
+            }
+        };
+        let still_pushes = match crate::project::rules::automations(project_id) {
+            Ok(document) => document.rule(&rule).is_some_and(|found| {
+                found.enabled && matches!(found.action, crate::automations::Action::Push { .. })
+            }),
+            Err(error) => {
+                let reason = format!(
+                    "the project's automations could not be read, so nothing was pushed: {error}"
+                );
+                settle(firings::SKIPPED, reason.clone()).await;
+                return fail(reason);
+            }
+        };
+        if !still_pushes {
+            let reason =
+                format!("the automation `{rule}` is gone or switched off, so nothing was pushed");
+            settle(firings::SKIPPED, reason.clone()).await;
+            return fail(reason);
+        }
+
+        let project_root = Path::new(&request.project_root);
+        let (outcome, verdict) =
+            push_sha_ff(project_root, remote, branch, sha.to_owned(), deadline).await;
+        let now = chrono::Utc::now();
+        let (settled, detail) = match &verdict {
+            PushVerdict::Pushed => (firings::PUSHED, format!("{remote}/{branch}")),
+            PushVerdict::Rejected => (
+                firings::REJECTED,
+                format!("{remote}/{branch} moved on; not a fast-forward"),
+            ),
+            PushVerdict::Diverged { remote_sha } => (
+                firings::DIVERGED,
+                format!("{remote}/{branch} is at {remote_sha}, on another line of history"),
+            ),
+            PushVerdict::Other => (
+                firings::FAILED,
+                match &outcome {
+                    Outcome::Failed { reason, .. } => reason.clone(),
+                    _ => "the push did not complete".to_owned(),
+                },
+            ),
+        };
+        settle(settled, detail).await;
+        match &verdict {
+            PushVerdict::Diverged { remote_sha } => {
+                let detail = serde_json::json!({
+                    "branch": branch,
+                    "remote": remote,
+                    "local_sha": sha,
+                    "remote_sha": remote_sha,
+                });
+                if let Err(error) = crate::task_claims::machine::open_remote_diverged_ticket(
+                    pool, project_id, branch, detail, now,
+                )
+                .await
+                {
+                    tracing::warn!(vcs_request_id = request.id, %error, "could not open remote-diverged");
+                }
+            }
+            PushVerdict::Pushed => {
+                let _ = crate::task_claims::machine::close_remote_diverged(
+                    pool,
+                    project_id,
+                    branch,
+                    "an automation pushed the branch as a fast-forward",
+                    now,
+                )
+                .await;
+            }
+            PushVerdict::Rejected | PushVerdict::Other => {}
+        }
+        outcome
+    }
+
     /// Moves the release branch (`to`) to the last sha the post-merge gate proved green on `from`.
     ///
     /// `to` must be the project's published `release_branch`. No green sha parks the request
@@ -512,6 +687,17 @@ impl GitExecutor {
             Err(outcome) => return outcome,
         };
         if release_tip == green {
+            // A crash, or a failed dispatch, after the publish leaves the release here with no
+            // event sent. The retry sends it: the firing key (`green:<sha>`) makes it idempotent.
+            let _ = crate::automations::dispatch(
+                pool,
+                &request.project_id,
+                crate::automations::Event::Promoted {
+                    sha: green.clone(),
+                    branch: to.to_owned(),
+                },
+            )
+            .await;
             return Outcome::Succeeded {
                 sha: Some(green),
                 output_tail: format!("{to} is already at the green sha"),
@@ -557,38 +743,17 @@ impl GitExecutor {
                 chrono::Utc::now(),
             )
             .await;
-            // Only the release branch leaves the machine, and only through the queue. Best effort:
-            // the promotion itself is already done.
-            if let (Ok(branch), Ok(remote)) = (
-                crate::execution::vcs::Branch::new(to),
-                crate::execution::vcs::Remote::new("origin"),
-            ) {
-                match crate::execution::vcs::resolve_repo(pool, &request.project_id).await {
-                    Ok(repo) => {
-                        if let Err(error) = crate::execution::vcs::submit_declared(
-                            pool,
-                            &repo,
-                            &crate::execution::vcs::Op::Push { remote, branch },
-                            crate::execution::vcs::Origin::Daemon,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                vcs_request_id = request.id,
-                                ?error,
-                                "could not queue the push of the promoted branch"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            vcs_request_id = request.id,
-                            ?error,
-                            "could not resolve the repository to push the promoted branch"
-                        );
-                    }
-                }
-            }
+            // Whether the promoted sha leaves the machine is the owner's call, made in the project's
+            // automations (a `push` rule on `published_green`). Best effort: the promotion is done.
+            let _ = crate::automations::dispatch(
+                pool,
+                &request.project_id,
+                crate::automations::Event::Promoted {
+                    sha: green,
+                    branch: to.to_owned(),
+                },
+            )
+            .await;
         }
         outcome
     }

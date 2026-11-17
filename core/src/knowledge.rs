@@ -32,6 +32,7 @@ mod decide;
 mod history;
 mod observe;
 mod propose;
+mod rework;
 mod select;
 mod signature;
 mod store;
@@ -41,6 +42,7 @@ pub use self::decide::*;
 pub use self::history::*;
 pub use self::observe::*;
 pub use self::propose::*;
+pub use self::rework::*;
 pub use self::select::*;
 pub use self::signature::*;
 pub use self::store::*;
@@ -482,6 +484,36 @@ mod tests {
         .expect("a failure has a signature");
 
         assert_eq!(first.fingerprint, second.fingerprint);
+    }
+
+    /// Colour and cursor escapes are terminal noise, never part of a failure's text.
+    #[test]
+    fn strip_ansi_removes_colour_and_cursor_sequences_and_keeps_the_text() {
+        assert_eq!(strip_ansi("\x1b[31merror\x1b[0m: boom"), "error: boom");
+        assert_eq!(strip_ansi("\x1b[1;31;4mred\x1b[m"), "red");
+        assert_eq!(strip_ansi("\x1b[2K\x1b[1Gdone"), "done");
+        assert_eq!(strip_ansi("\x1b[?25lhidden\x1b[?25h"), "hidden");
+        assert_eq!(strip_ansi("\x1b]0;window title\x07text"), "text");
+        assert_eq!(strip_ansi("\x1b]8;;http://example.test\x1b\\link"), "link");
+        assert_eq!(strip_ansi("end\x1b"), "end");
+        assert_eq!(strip_ansi("ação — ok"), "ação — ok");
+        assert_eq!(strip_ansi(""), "");
+        assert!(!strip_ansi("\x1b[31mx\x1b[0m\x1b[2K").contains('\x1b'));
+    }
+
+    /// Guards that a terminal that painted the same failure in colour does not split its identity.
+    #[test]
+    fn a_failure_that_differs_only_in_ansi_colour_is_the_same_failure() {
+        let plain = failure_signature("error: build failed because the linker refused output.exe")
+            .expect("a failure has a signature");
+        let coloured = failure_signature(
+            "\x1b[1m\x1b[31merror\x1b[0m: build failed because the linker refused \x1b[33moutput.exe\x1b[0m",
+        )
+        .expect("a failure has a signature");
+
+        assert_eq!(plain.fingerprint, coloured.fingerprint);
+        assert!(!coloured.headline.contains('\x1b'));
+        assert_eq!(plain.headline, coloured.headline);
     }
 
     /// Guards that silence has no identity while non-empty unclassified output keeps a fallback.
@@ -1452,7 +1484,7 @@ mod tests {
         assert_eq!(row.points_at.as_deref(), Some("core/src/main.rs"));
         assert!(row.last_confirmed_at.is_some());
         assert!(row.activated_at.is_some());
-        assert_eq!(row.observations, None);
+        assert_eq!(row.observations, Some(1));
         assert_eq!(row.generator, None);
         assert_eq!(row.proposal_id, None);
         assert_eq!(row.origin_run_id, None);
@@ -1729,6 +1761,71 @@ mod tests {
         assert_eq!(
             tagged_evidence(&serde_json::json!([{"t": "job", "id": 7}])).as_deref(),
             Some(r#"[{"t":"job","id":7}]"#)
+        );
+    }
+
+    /// A workflow record and a verify run are things a finding can point at, and the vocabulary
+    /// still refuses a tag nobody declared.
+    #[test]
+    fn record_and_verify_run_are_evidence() {
+        assert!(EVIDENCE_TAGS.contains(&"record"));
+        assert!(EVIDENCE_TAGS.contains(&"verify_run"));
+        assert!(known_element(&serde_json::json!({"t": "record", "id": 7})));
+        assert!(known_element(
+            &serde_json::json!({"t": "verify_run", "id": 7})
+        ));
+        assert!(!known_element(&serde_json::json!({"t": "nope", "id": 7})));
+        assert_eq!(
+            tagged_evidence(&serde_json::json!([
+                {"t": "record", "id": 7},
+                {"t": "nope", "id": 7}
+            ]))
+            .as_deref(),
+            Some(r#"[{"t":"record","id":7}]"#)
+        );
+    }
+
+    /// The distiller points tree lessons at a `tree` and chat lessons at a `chat`; reconfirming
+    /// must keep both rather than drop them as unknown tags.
+    #[tokio::test]
+    async fn reconfirming_keeps_tree_and_chat_evidence() {
+        let pool = test_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let episode = record_distilled(
+            &mut tx,
+            &distilled("Tagged twice", "An episode.", Kind::Memory),
+            &Provenance {
+                distill_cause: Some("job_landed"),
+                evidence: Some(r#"[{"t":"job","id":7}]"#),
+                fingerprint: Some("title:tagged twice"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        reconfirm_in(
+            &mut tx,
+            "p",
+            "title:tagged twice",
+            r#"[{"t":"tree","id":"t-1"},{"t":"chat","id":"alpha:chat:5"}]"#,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch(&pool, episode).await.unwrap().unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_str(row.evidence.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!([
+                {"t":"job","id":7},
+                {"t":"tree","id":"t-1"},
+                {"t":"chat","id":"alpha:chat:5"},
+            ])
         );
     }
 
@@ -3950,6 +4047,166 @@ mod tests {
                 before,
                 "a refused move wrote events"
             );
+        }
+    }
+
+    /// Lessons on trial (spec §2 D1, E1, E4, E5): active and admissible, kept or withdrawn by the
+    /// owner.
+    mod trial {
+        use sqlx::SqlitePool;
+
+        use crate::knowledge::{approved, confirm_trial, retire_trial};
+
+        async fn pool() -> SqlitePool {
+            crate::testdb::fresh_pool().await
+        }
+
+        /// A distiller row; `on_trial` sets `trial = 1` with a start, expiry stays NULL unless set.
+        async fn seed(pool: &SqlitePool, status: &str, layer: &str, on_trial: bool) -> i64 {
+            sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, trial,
+                    trial_started_at, expires_after_runs, created_at, activated_at)
+                 VALUES (?, 'project', 'p', 'distiller', 'prompt', 'a lesson', 'its body', ?, ?,
+                         ?, 50, '2026-09-01T00:00:00+00:00', '2026-09-01T00:00:00+00:00')",
+            )
+            .bind(layer)
+            .bind(status)
+            .bind(i64::from(on_trial))
+            .bind(on_trial.then_some("2026-09-01T00:00:00+00:00"))
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+        }
+
+        /// `(status, trial, trial_started_at, expires_after_runs)`.
+        async fn state(pool: &SqlitePool, id: i64) -> (String, i64, Option<String>, Option<i64>) {
+            sqlx::query_as(
+                "SELECT status, trial, trial_started_at, expires_after_runs
+                   FROM knowledge WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn events(pool: &SqlitePool, id: i64) -> Vec<(String, String, Option<String>)> {
+            sqlx::query_as(
+                "SELECT from_status, to_status, note FROM knowledge_events
+                  WHERE knowledge_id = ? ORDER BY id",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn an_active_trial_row_is_approved_and_selectable() {
+            let pool = pool().await;
+            let id = seed(&pool, "active", "procedural", true).await;
+
+            let row = crate::knowledge::history::fetch(&pool, id)
+                .await
+                .unwrap()
+                .expect("the row exists");
+
+            assert_eq!(row.status, "active");
+            assert_eq!(row.source, "distiller");
+            assert_eq!(row.layer, "procedural");
+            assert!(approved(&row), "a lesson on trial is admissible");
+        }
+
+        #[tokio::test]
+        async fn confirm_trial_makes_the_row_permanent_and_is_idempotent() {
+            let pool = pool().await;
+            let id = seed(&pool, "active", "semantic", true).await;
+
+            assert!(confirm_trial(&pool, id).await.unwrap());
+
+            assert_eq!(state(&pool, id).await, ("active".to_owned(), 0, None, None));
+            let first = events(&pool, id).await;
+            assert_eq!(
+                first,
+                vec![(
+                    "active".to_owned(),
+                    "active".to_owned(),
+                    Some("approved by the owner".to_owned())
+                )]
+            );
+
+            assert!(
+                !confirm_trial(&pool, id).await.unwrap(),
+                "a second confirmation has nothing to do"
+            );
+            assert_eq!(events(&pool, id).await, first, "no new event");
+
+            // A permanent row is out of the trial sweep for good.
+            let sweep = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM knowledge WHERE status = 'active' AND trial = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(sweep, 0);
+        }
+
+        #[tokio::test]
+        async fn confirm_trial_refuses_a_permanent_or_proposed_row() {
+            let pool = pool().await;
+            let permanent = seed(&pool, "active", "semantic", false).await;
+            let proposed = seed(&pool, "proposed", "semantic", false).await;
+            let permanent_before = state(&pool, permanent).await;
+            let proposed_before = state(&pool, proposed).await;
+
+            assert!(!confirm_trial(&pool, permanent).await.unwrap());
+            assert!(!confirm_trial(&pool, proposed).await.unwrap());
+
+            assert_eq!(state(&pool, permanent).await, permanent_before);
+            assert_eq!(state(&pool, proposed).await, proposed_before);
+            assert!(events(&pool, permanent).await.is_empty());
+            assert!(events(&pool, proposed).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn retire_trial_reverts_with_the_rejected_during_trial_note() {
+            let pool = pool().await;
+            let id = seed(&pool, "active", "procedural", true).await;
+
+            assert!(retire_trial(&pool, id).await.unwrap());
+
+            assert_eq!(state(&pool, id).await.0, "reverted");
+            let ended: Option<String> =
+                sqlx::query_scalar("SELECT ended_at FROM knowledge WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(ended.is_some());
+            assert_eq!(
+                events(&pool, id).await,
+                vec![(
+                    "active".to_owned(),
+                    "reverted".to_owned(),
+                    Some("rejected during trial".to_owned())
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn retire_trial_refuses_a_row_that_is_not_on_trial() {
+            let pool = pool().await;
+            let permanent = seed(&pool, "active", "semantic", false).await;
+            let proposed = seed(&pool, "proposed", "semantic", false).await;
+
+            assert!(!retire_trial(&pool, permanent).await.unwrap());
+            assert!(!retire_trial(&pool, proposed).await.unwrap());
+
+            assert_eq!(state(&pool, permanent).await.0, "active");
+            assert_eq!(state(&pool, proposed).await.0, "proposed");
+            assert!(events(&pool, permanent).await.is_empty());
         }
     }
 }

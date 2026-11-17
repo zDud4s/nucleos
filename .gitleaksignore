@@ -71,3 +71,22 @@ f764d37de65f460b702ea97a2a8ef8867162e1c9:core/src/capture.rs:stripe-access-token
 ed91c0db7eb9c9b8843cb3c8787431dd889fcd70:core/src/distill.rs:github-pat:1452
 f272e43ba9358fcc12e79ebba6672f23d9b224a5:core/src/distill.rs:github-pat:1509
 76836b18946b54234e13c78343813e153bc39bc0:core/src/capture/digest.rs:stripe-access-token:460
+
+# The same fixtures once more, as commit 77db4611 ("restore the 2407 files the checkpoint b863a5ab
+# dropped from the index") re-added them: redactor inputs (PEM headers around a few characters of
+# body, a truncated jwt.io token, Stripe- and GitLab-shaped keys), the capture-digest fact, the
+# `action_bad_token` case in the decoder test and its shared fixture, and the RFC 6455 sample nonce
+# in the fence proxy test. Each line was read on 2026-11-15; none is key material.
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/capture/digest.rs:stripe-access-token:520
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/channels/contract/decode/event.rs:generic-api-key:724
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:private-key:1073
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:private-key:1257
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:private-key:1305
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:private-key:1419
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:jwt:1176
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:jwt:1247
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:stripe-access-token:1093
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:stripe-access-token:1096
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:core/src/governance/redact.rs:gitlab-pat:992
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:sidecars/lib/channelkit/contract/fixtures/events/action-bad-token.json:generic-api-key:1
+77db4611d0bd556eee3ddfc1940bb1e5dc04e6fa:sidecars/browser/fence/proxy_test.go:generic-api-key:180

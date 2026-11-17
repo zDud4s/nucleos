@@ -1814,6 +1814,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_agent_can_declare_a_ci_red_ticket() {
+        let pool = test_pool().await;
+        let key = "ci-red:main";
+        let claimed = claim(&pool, "p", task(key), &session("s1"), t0()).await;
+        assert!(matches!(claimed, Err(sqlx::Error::Protocol(_))));
+        let reported = report(
+            &pool,
+            "p",
+            task(key),
+            &Reporter::Holder(&session("s1")),
+            "seen",
+            &[],
+            false,
+            None,
+            t0(),
+        )
+        .await;
+        assert!(matches!(reported, Err(sqlx::Error::Protocol(_))));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "neither attempt left a row");
+    }
+
+    #[tokio::test]
     async fn done_by_resolved_closes_without_an_owner_and_keeps_the_note() {
         let pool = test_pool().await;
         let id = seed(

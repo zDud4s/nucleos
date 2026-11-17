@@ -493,6 +493,18 @@ pub struct RunStatusResponse {
     /// The pool account this run launched under; `null` before the launch picks one, and for any
     /// run that ran as today (no accounts).
     pub account_id: Option<String>,
+    /// The chain of runs this one belongs to, root to newest, itself included.
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub lineage: Vec<super::lineage::LineageLeg>,
+    /// True when a cycle or the cap cut the chain short.
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub lineage_truncated: bool,
+    /// The tree node or job item the chain belongs to; `null` for a loose run.
+    #[sqlx(skip)]
+    #[serde(default)]
+    pub part_of: Option<super::lineage::PartOf>,
 }
 
 impl RunStatusResponse {
@@ -802,7 +814,7 @@ pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<RunStatusResponse>, StatusCode> {
-    let run = sqlx::query_as::<_, RunStatusResponse>(
+    let mut run = sqlx::query_as::<_, RunStatusResponse>(
         // `cache_creation_tokens` and `authored_prompt_chars` are read and not answered: they are
         // the two inputs `with_prompt_budget` needs to derive the pair of estimates this response
         // does answer. Selecting them here rather than in a second query keeps the residual and the
@@ -819,6 +831,16 @@ pub async fn get_run(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
+
+    let (lineage, truncated) = super::lineage::load(&state.pool, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let chain_ids: Vec<i64> = lineage.iter().map(|leg| leg.id).collect();
+    run.part_of = super::lineage::part_of(&state.pool, id, &chain_ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    run.lineage = lineage;
+    run.lineage_truncated = truncated;
 
     Ok(Json(run.with_prompt_budget()))
 }

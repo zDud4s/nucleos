@@ -16,3 +16,25 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'test(/wake_signal/) | test(/wake_guard/)'
 test-group = 'wake'
+
+# Start the long tests first. Measured: these 45-166 s tests finished between test 5.5k and 10.9k
+# of 12.4k, i.e. they held the run's tail open; started first, they overlap the rest of the suite.
+# `priority` (-100..100, higher starts first) only orders the queue; it sets nothing else, so it
+# does not interact with the `wake` test-group override above.
+[[profile.default.overrides]]
+filter = '''
+test(/closed_master_hook/)
+| test(/^execution::git_exec::tests::a_publish_by_fast_forward_/)
+| test(/^execution::git_exec::tests::a_publish_by_update_ref_/)
+| test(/^execution::git_exec::tests::compute_merge_leaves_the_target_ref_alone/)
+| test(/^verify::postgate_worker::tests::/)
+| test(/^tree_job::nesting_e2e::/)
+| test(/^execution::job::tests::two_unhappy_events_do_not_make_the_parallel_walk_the_slower_one/)
+| test(/^execution::job::tests::the_parallel_walk_pays_for_its_conflict/)
+| test(/^execution::job::tests::the_same_queue_at_two_ceilings/)
+| test(/^execution::job::tests::a_conflict_over_a_file_nobody_declared/)
+| test(/^tree_job::driver::tests::a_dependent_branch_waits_for_its_base_to_merge/)
+| test(/^tree_job::driver::tests::a_final_verify_that_stays_red_asks_only_after_the_ladder/)
+| test(/^mcp_tools::tests::every_offered_tool_can_be_dispatched/)
+'''
+priority = 100

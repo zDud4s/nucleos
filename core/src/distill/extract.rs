@@ -81,7 +81,9 @@ fn break_dossier_markers(text: &str) -> String {
 /// Every raw text leaves redacted (`judge::redact_for_judge`: it goes to a cloud model by default)
 /// and with the dossier's markers broken.
 pub(crate) fn scrub(text: &str) -> String {
-    break_dossier_markers(&crate::judge::redact_for_judge(text))
+    break_dossier_markers(&crate::judge::redact_for_judge(
+        &crate::knowledge::strip_ansi(text),
+    ))
 }
 
 /// `inputs` with every text field scrubbed, so `blocks` formats only treated text.
@@ -280,12 +282,7 @@ pub fn dossier(inputs: &DossierInputs, ceiling: usize) -> Dossier {
     Dossier { text, runs }
 }
 
-const STANDING_HEAD: &str = "You read the dossier below, about one finished piece of work, and write \
-down what is worth remembering the next time. Answer with a JSON array and nothing else: 0 to 5 items, \
-each an object with `layer` (episodic, semantic or procedural), `title` (one line), `body` (short) and \
-`files` (repository paths it concerns). Prefer lessons that would still hold in another project, and say \
-in the body when one is specific to this repository. Never quote the owner context. Do not repeat the \
-known titles. `[]` is a good answer when nothing is worth keeping.";
+const STANDING_HEAD: &str = "You read the dossier below, about one finished piece of work, and write down what is worth remembering the next time: reusable gotchas, project conventions, and causes of failure WITH the remedy. Answer with a JSON array and nothing else: 0 to 5 items, each an object with `layer` (episodic, semantic or procedural), `title` (one line), `body` (short) and `files` (repository paths it concerns). The `body` of each item states the cause and what to do about it (or an alternative); a description of what was done is refused. Prefer lessons that would still hold in another project, and say in the body when one is specific to this repository. Never quote the owner context. Do not repeat the known titles. Answer `[]` when nothing has a cause and a remedy.";
 
 /// The standing instruction of an extraction call, by the cause that queued the work (spec B10).
 pub fn standing_for(cause: Cause) -> String {
@@ -296,6 +293,19 @@ pub fn standing_for(cause: Cause) -> String {
         }
         Cause::ChatExchanges => {
             " This dossier is a conversation between the owner and an assistant. Write down the preferences, decisions and corrections the owner stated that would still matter in a later session, never a summary of the conversation."
+        }
+        Cause::TreeLanded => " The tree landed: ask what let it land and what nearly blocked it.",
+        Cause::TreeFailed => {
+            " The tree failed: ask for the root cause and what the next agent must avoid."
+        }
+        Cause::TreeParked => {
+            " The tree was parked on a decision: ask what the owner's answer teaches."
+        }
+        Cause::BranchRecovered => {
+            " A branch went red and then green: ask what failed and what fixed it."
+        }
+        Cause::BranchLanded => {
+            " A branch was merged by hand: ask what the commit messages and the diff teach."
         }
         Cause::JobFailed
         | Cause::GateRecovered
@@ -411,20 +421,23 @@ pub fn parse_items(answer: &str) -> Result<Vec<Item>, ParseError> {
         .collect())
 }
 
-/// How a learning enters the store: recorded as it is, or proposed for a person to approve.
+/// How a learning enters the store: recorded as it is, recorded on trial, or proposed for a person
+/// to approve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Door {
     Record,
     Propose,
+    /// Recorded active on trial: reaches prompts at once and is withdrawn unless it earns its place.
+    Trial,
 }
 
 /// The model picks only the layer; kind and door follow from it.
 pub fn door(layer: Layer) -> (Kind, Door) {
     match layer {
         Layer::Episodic => (Kind::Memory, Door::Record),
-        Layer::Semantic => (Kind::Memory, Door::Propose),
-        Layer::Procedural => (Kind::Prompt, Door::Propose),
-        // The parser never lets `working` through; if one arrives it is proposed like a rule.
+        Layer::Semantic => (Kind::Memory, Door::Trial),
+        Layer::Procedural => (Kind::Prompt, Door::Trial),
+        // The parser never lets `working` through; if one arrives it is proposed.
         Layer::Working => (Kind::Memory, Door::Propose),
     }
 }

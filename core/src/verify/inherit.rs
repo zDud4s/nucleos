@@ -265,7 +265,7 @@ impl Classification {
         let clean = ticket
             .units
             .iter()
-            .all(|unit| !matches!(unit.status.as_str(), "errored" | "unknown"));
+            .all(|unit| !matches!(unit.status.as_str(), "errored" | "unknown" | "superseded"));
         if clean && only_inherited(&classes) {
             ticket.verdict = Some("inherited".to_owned());
             let ids: Vec<String> = inherited.iter().map(|id| format!("#{id}")).collect();
@@ -591,14 +591,29 @@ async fn contains(
     }
     let hex = (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit());
     let found = if hex {
-        resolve::is_ancestor(worktree, sha, "HEAD", deadline)
-            .await
-            .ok()?
+        ancestry(worktree, sha, deadline).await?
     } else {
         false
     };
     stored.contains.insert(sha.to_owned(), found);
     Some(found)
+}
+
+/// The least time one ancestry probe gets, whatever is left of the shared deadline: under load the
+/// earlier git reads of the same classification can eat the whole budget, and an unreadable answer
+/// is taken as "the branch predates the break", which blames the branch for master's red.
+const ANCESTRY_FLOOR: Duration = Duration::from_secs(15);
+
+/// `is_ancestor(sha, HEAD)` with its own time floor and one retry after a failed attempt (a git
+/// timeout on a loaded machine is transient). `None` only when both attempts failed.
+async fn ancestry(worktree: &Path, sha: &str, deadline: Instant) -> Option<bool> {
+    for _ in 0..2 {
+        let own = deadline.max(Instant::now() + ANCESTRY_FLOOR);
+        if let Ok(found) = resolve::is_ancestor(worktree, sha, "HEAD", own).await {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// A tree branch's gate (`tree_job::gate`): the note naming the live `master-red` incident when
@@ -631,7 +646,7 @@ fn failed_test_ids(ticket: &Ticket) -> Option<BTreeSet<String>> {
         || ticket
             .units
             .iter()
-            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown"))
+            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown" | "superseded"))
     {
         return None;
     }
@@ -653,7 +668,7 @@ async fn master_red_note(pool: &SqlitePool, ticket: &Ticket, now: DateTime<Utc>)
         || ticket.verdict.as_deref() != Some("failed")
         || units
             .iter()
-            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown"))
+            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown" | "superseded"))
     {
         return None;
     }
@@ -1149,6 +1164,13 @@ mod pure_tests {
         // The branch predates the break.
         let note = task_note(decide(&facts("core", &none, true), Some(&inc), Some(false)));
         assert!(note.contains("rebase"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_shared_deadline_still_gets_an_ancestry_answer() {
+        // The deadline is already spent (earlier git reads ate it): the probe still gets its floor.
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(ancestry(here, "HEAD", Instant::now()).await, Some(true));
     }
 
     #[test]

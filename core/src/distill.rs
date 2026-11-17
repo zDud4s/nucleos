@@ -11,6 +11,14 @@ pub mod origin;
 pub mod sources;
 mod week;
 
+mod known;
+mod tree;
+mod tree_dossier;
+mod tree_gather;
+mod tree_worker;
+pub use tree::*;
+pub use tree_dossier::*;
+
 mod extract;
 mod generalise;
 pub use extract::*;
@@ -32,9 +40,19 @@ pub enum Cause {
     /// A batch of exchanges of one chat; the row names its chat in `chat_id`.
     ChatExchanges,
     OwnerAnswered,
+    /// A tree that finished and landed (or ended with nothing to blame).
+    TreeLanded,
+    /// A tree that ended abandoned or with a failed landing.
+    TreeFailed,
+    /// A tree decision the owner answered.
+    TreeParked,
+    /// A tree branch whose gate went red and then green.
+    BranchRecovered,
+    /// A merge into a protected branch that is neither a job's nor a tree's own.
+    BranchLanded,
 }
 
-pub const CAUSES: [Cause; 8] = [
+pub const CAUSES: [Cause; 13] = [
     Cause::JobLanded,
     Cause::JobFailed,
     Cause::GateRecovered,
@@ -43,6 +61,11 @@ pub const CAUSES: [Cause; 8] = [
     Cause::CalendarWeek,
     Cause::ChatExchanges,
     Cause::OwnerAnswered,
+    Cause::TreeLanded,
+    Cause::TreeFailed,
+    Cause::TreeParked,
+    Cause::BranchRecovered,
+    Cause::BranchLanded,
 ];
 
 impl Cause {
@@ -56,6 +79,11 @@ impl Cause {
             Cause::CalendarWeek => "calendar_week",
             Cause::ChatExchanges => "chat_exchanges",
             Cause::OwnerAnswered => "owner_answered",
+            Cause::TreeLanded => "tree_landed",
+            Cause::TreeFailed => "tree_failed",
+            Cause::TreeParked => "tree_parked",
+            Cause::BranchRecovered => "branch_recovered",
+            Cause::BranchLanded => "branch_landed",
         }
     }
 
@@ -255,6 +283,10 @@ pub struct QueueRow {
     pub run_id: Option<i64>,
     pub chat_id: Option<String>,
     pub attempts: i64,
+    pub tree_id: Option<String>,
+    pub node_id: Option<String>,
+    pub request_id: Option<i64>,
+    pub decision_id: Option<String>,
 }
 
 /// Put every row a dead daemon left `running` back in line. Returns the rows changed.
@@ -270,6 +302,10 @@ pub async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
 /// Take the oldest due row, marking it `running` in the same statement. A row whose cause this
 /// build does not know is failed on the spot and the next one is tried.
 pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Option<QueueRow>> {
+    // The daily cap on model calls: the rows wait for the next UTC day.
+    if tree::model_calls_today(pool, now).await? >= DISTILL_MODEL_CALLS_PER_DAY {
+        return Ok(None);
+    }
     loop {
         // IMMEDIATE: the claim writes, and a deferred transaction that read first could fail to
         // upgrade to the write lock in WAL mode.
@@ -279,7 +315,8 @@ pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<O
               WHERE id = (SELECT q.id FROM distill_queue q
                            WHERE q.status = ? AND (q.not_before IS NULL OR q.not_before <= ?)
                            ORDER BY q.id LIMIT 1)
-             RETURNING id, cause, project_id, job_id, item_id, run_id, chat_id, attempts",
+             RETURNING id, cause, project_id, job_id, item_id, run_id, chat_id, attempts,
+                       tree_id, node_id, request_id, decision_id",
         )
         .bind(STATUS_RUNNING)
         .bind(STATUS_PENDING)
@@ -424,14 +461,7 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
         None
     };
 
-    let known_titles: Vec<String> = sqlx::query_scalar(
-        "SELECT title FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND status IN ('active', 'proposed')
-          ORDER BY id DESC LIMIT 50",
-    )
-    .bind(&row.project_id)
-    .fetch_all(pool)
-    .await?;
+    let known_titles: Vec<String> = known::titles(pool, &row.project_id).await?;
 
     let gate_rows: Vec<(i64, Option<String>)> = sqlx::query_as(
         "SELECT id, gate_output FROM runs WHERE job_id = ? AND gate_status = 'failed' ORDER BY id",
@@ -575,7 +605,7 @@ async fn write_items(
     let mut kept = 0usize;
     for (index, item) in items.iter().enumerate() {
         let vector = vectors.get(index).and_then(|v| v.as_deref());
-        match write_one_item(&mut tx, &subject, item, vector).await? {
+        match write_one_item_at(&mut tx, &subject, item, vector, now).await? {
             Written::Skipped => {}
             Written::Recorded => kept += 1,
             Written::Proposed => {
@@ -620,6 +650,95 @@ async fn write_one_item(
     item: &Item,
     vector: Option<&[f32]>,
 ) -> sqlx::Result<Written> {
+    write_one_item_at(tx, subject, item, vector, Utc::now()).await
+}
+
+/// Whether a retired lesson blocks a new one: a `reverted`, `rejected` or `superseded` row with
+/// the same fingerprint or a neighbour by embedding (>= `SIM_SAME`), or an `expired` one that
+/// ended less than `TRIAL_COOLOFF_DAYS` before `now`. On a hit a `skipped: tombstone` event lands
+/// on the matched row. Matching on the F2 `cause_key` waits for the rework writer; no distiller
+/// row carries one yet.
+async fn tombstoned_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: &str,
+    fingerprint: &str,
+    embedded: Option<(&[f32], &str)>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let cutoff = (now - chrono::Duration::days(crate::knowledge::TRIAL_COOLOFF_DAYS)).to_rfc3339();
+    let by_fingerprint: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM knowledge
+          WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?
+            AND (status IN ('reverted', 'rejected', 'superseded')
+                 OR (status = 'expired' AND ended_at > ?))
+          ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(fingerprint)
+    .bind(&cutoff)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let mut hit = by_fingerprint;
+    if hit.is_none()
+        && let Some((vector, model)) = embedded
+    {
+        let dead = crate::embed::nearest_in_scope(
+            tx,
+            "project",
+            Some(project_id),
+            &["reverted", "rejected", "superseded"],
+            model,
+            vector,
+            &[],
+        )
+        .await?;
+        if let Some((id, similarity)) = dead
+            && similarity >= SIM_SAME
+        {
+            hit = Some(id);
+        } else {
+            // Expired rows past the cool-off must not compete: an older neighbour would hide a
+            // newer one if only the single nearest expired row were checked.
+            let stale: Vec<i64> = sqlx::query_scalar(
+                "SELECT id FROM knowledge
+                  WHERE scope_kind = 'project' AND scope_id = ? AND status = 'expired'
+                    AND (ended_at IS NULL OR ended_at <= ?)",
+            )
+            .bind(project_id)
+            .bind(&cutoff)
+            .fetch_all(&mut **tx)
+            .await?;
+            if let Some((id, similarity)) = crate::embed::nearest_in_scope(
+                tx,
+                "project",
+                Some(project_id),
+                &["expired"],
+                model,
+                vector,
+                &stale,
+            )
+            .await?
+                && similarity >= SIM_SAME
+            {
+                hit = Some(id);
+            }
+        }
+    }
+    let Some(id) = hit else {
+        return Ok(false);
+    };
+    crate::knowledge::note_tombstone_skip_in(tx, id).await?;
+    Ok(true)
+}
+
+/// `write_one_item` with the clock the tombstone cool-off reads supplied by the caller.
+async fn write_one_item_at(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject: &Subject<'_>,
+    item: &Item,
+    vector: Option<&[f32]>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Written> {
     let Some(fingerprint) = crate::knowledge::title_fingerprint(&item.title) else {
         return Ok(Written::Skipped);
     };
@@ -645,6 +764,9 @@ async fn write_one_item(
             Dedup::Near(id) => near = Some(id),
             Dedup::New => {}
         }
+    }
+    if tombstoned_in(tx, subject.project_id, &fingerprint, embedded, now).await? {
+        return Ok(Written::Skipped);
     }
     let points_at = if item.files.is_empty() {
         None
@@ -680,6 +802,9 @@ async fn write_one_item(
     };
     let new_id = match how {
         Door::Record => crate::knowledge::record_distilled(tx, &declaration, &provenance).await?,
+        Door::Trial => {
+            crate::knowledge::record_distilled_trial(tx, &declaration, &provenance).await?
+        }
         Door::Propose => {
             crate::knowledge::propose_in_with(tx, declaration, &provenance)
                 .await
@@ -798,6 +923,11 @@ pub async fn process_one_with(
     // A chat batch reads no job: its own path, which never takes the `gone` branch below.
     if cause == Cause::ChatExchanges {
         chats::process(pool, asked, embedder, &row, now).await;
+        return;
+    }
+    // Trees, parked decisions and branch lands read no job either: their own worker.
+    if TREE_CAUSES.contains(&cause) {
+        tree_worker::process(pool, asked, embedder, &row, now).await;
         return;
     }
     let inputs = match gather(pool, &row).await {
@@ -943,6 +1073,12 @@ pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn
     .await
     {
         tracing::warn!(%error, "distillation: could not sweep the chats");
+    }
+    if let Err(error) = tree::sweep_trees(pool, Utc::now()).await {
+        tracing::warn!(%error, "distillation: could not sweep the finished trees");
+    }
+    if let Err(error) = crate::knowledge::sweep_rework(pool, Utc::now()).await {
+        tracing::warn!(%error, "distillation: could not sweep the rework records");
     }
     if let Err(error) = crate::knowledge::sweep_observations(pool, Utc::now()).await {
         tracing::warn!(%error, "distillation: could not sweep the observations");
@@ -1385,8 +1521,8 @@ mod tests {
 
         let spellings: std::collections::HashSet<&str> =
             CAUSES.iter().map(|c| c.as_str()).collect();
-        assert_eq!(CAUSES.len(), 8);
-        assert_eq!(spellings.len(), 8, "two causes share a spelling");
+        assert_eq!(CAUSES.len(), 13);
+        assert_eq!(spellings.len(), 13, "two causes share a spelling");
         for expected in [
             "job_landed",
             "job_failed",
@@ -1396,6 +1532,11 @@ mod tests {
             "calendar_week",
             "chat_exchanges",
             "owner_answered",
+            "tree_landed",
+            "tree_failed",
+            "tree_parked",
+            "branch_recovered",
+            "branch_landed",
         ] {
             assert!(spellings.contains(expected), "{expected} is not a cause");
         }
@@ -1862,8 +2003,10 @@ mod tests {
     #[test]
     fn the_layer_decides_kind_and_door() {
         assert_eq!(door(Layer::Episodic), (Kind::Memory, Door::Record));
-        assert_eq!(door(Layer::Semantic), (Kind::Memory, Door::Propose));
-        assert_eq!(door(Layer::Procedural), (Kind::Prompt, Door::Propose));
+        assert_eq!(door(Layer::Semantic), (Kind::Memory, Door::Trial));
+        assert_eq!(door(Layer::Procedural), (Kind::Prompt, Door::Trial));
+        // A stray `working` item is still proposed, as before.
+        assert_eq!(door(Layer::Working), (Kind::Memory, Door::Propose));
     }
 
     /// Table: the delay after the n-th failure is `BACKOFF_BASE * 2^n`, and the third failure ends
@@ -2074,17 +2217,265 @@ mod tests {
             "the review run whose text was read is evidence: {evidence:?}"
         );
 
-        let semantic: (String,) = sqlx::query_as(
-            "SELECT status FROM knowledge WHERE scope_id = 'alpha' AND layer = 'semantic'",
+        let semantic: (String, i64) = sqlx::query_as(
+            "SELECT status, trial FROM knowledge WHERE scope_id = 'alpha' AND layer = 'semantic'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
-            semantic.0, "proposed",
-            "a rule waits for a person to approve it"
+            semantic,
+            ("active".to_string(), 1),
+            "a rule enters active, on trial"
         );
         assert_eq!(learnings(&pool).await, 2);
+    }
+
+    /// The row `title` as the model sees it, read with every `Known` column.
+    async fn known_titled(pool: &SqlitePool, title: &str) -> crate::knowledge::Known {
+        // COLUMNS is a compile-time constant, so the formatted SQL carries no input.
+        sqlx::query_as::<_, crate::knowledge::Known>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM knowledge WHERE title = ?",
+            crate::knowledge::COLUMNS
+        )))
+        .bind(title)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_procedural_lesson_without_an_owner_quote_is_recorded_active_on_trial() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        process_answer(
+            &pool,
+            r#"[{"layer":"procedural","title":"Run the gate before pushing","body":"Green gate first."}]"#,
+        )
+        .await;
+
+        let row = known_titled(&pool, "Run the gate before pushing").await;
+        assert_eq!(row.status, "active");
+        assert_eq!(row.layer, "procedural");
+        assert_eq!(row.kind, "prompt");
+        assert_eq!(row.expires_after_runs, None, "a trial row has no run clock");
+        assert!(
+            crate::knowledge::approved(&row),
+            "an active trial row reaches prompts"
+        );
+        let (trial, started): (i64, Option<String>) =
+            sqlx::query_as("SELECT trial, trial_started_at FROM knowledge WHERE id = ?")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(trial, 1);
+        assert!(started.is_some(), "the trial clock starts at insert");
+        let created: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_events
+              WHERE knowledge_id = ? AND to_status = 'active' AND note = 'created'",
+        )
+        .bind(row.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(created, 1, "the created event is written");
+    }
+
+    #[tokio::test]
+    async fn a_semantic_lesson_quoting_the_owner_stays_proposed_and_off_trial() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        link_project_note(&pool, PROJECT_NOTE).await;
+        process_answer(
+            &pool,
+            r#"[{"layer":"semantic","title":"Scripts must be LF","body":"Windows line endings broke the gate on every shell script we ship."}]"#,
+        )
+        .await;
+
+        let row = known_titled(&pool, "Scripts must be LF").await;
+        assert_eq!(row.status, "proposed");
+        assert!(
+            !crate::knowledge::approved(&row),
+            "an owner quote needs the owner's yes"
+        );
+        let trial: i64 = sqlx::query_scalar("SELECT trial FROM knowledge WHERE id = ?")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(trial, 0);
+        assert_eq!(quoted_events(&pool).await, 1);
+    }
+
+    /// A dead row of project `alpha` with the fingerprint of `title`, for the tombstone tests.
+    async fn seed_dead_row(
+        pool: &SqlitePool,
+        title: &str,
+        status: &str,
+        ended_at: chrono::DateTime<chrono::Utc>,
+    ) -> i64 {
+        let fingerprint = crate::knowledge::title_fingerprint(title).unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, status,
+                created_at, ended_at)
+             VALUES ('semantic', 'project', 'alpha', 'distiller', 'memory', ?, 'old body', ?, ?,
+                     '2026-01-01T00:00:00+00:00', ?)",
+        )
+        .bind(title)
+        .bind(fingerprint)
+        .bind(status)
+        .bind(ended_at.to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    const SCRIPTS_RULE: &str =
+        r#"[{"layer":"semantic","title":"Scripts must be LF","body":"Keep shell scripts LF."}]"#;
+
+    #[tokio::test]
+    async fn a_lesson_with_the_fingerprint_of_a_reverted_row_is_not_inserted() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        seed_queue(&pool, "job_landed", 1, None, "pending", 0, None).await;
+        seed_dead_row(&pool, "scripts must be lf.", "reverted", noon()).await;
+
+        distil(&pool, SCRIPTS_RULE, None).await;
+        assert_eq!(learnings(&pool).await, 1, "only the reverted row exists");
+
+        distil(&pool, SCRIPTS_RULE, None).await;
+        assert_eq!(
+            learnings(&pool).await,
+            1,
+            "a second drain does not bring it back either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lesson_neighbouring_a_rejected_row_by_embedding_is_not_inserted() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        let rejected =
+            seed_dead_row(&pool, "Shell scripts keep LF endings", "rejected", noon()).await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::embed::store_in(&mut conn, rejected, "fake-model", &[1.0, 0.0])
+                .await
+                .unwrap();
+        }
+        // Every text maps to [1, 0]: cosine 1.0 against the rejected row, above SIM_SAME.
+        let embedder = FakeEmbedder::new("fake-model", Vec::new(), Some(vec![1.0, 0.0]));
+
+        distil(&pool, SCRIPTS_RULE, Some(&embedder as &dyn Embedder)).await;
+
+        assert_eq!(
+            learnings(&pool).await,
+            1,
+            "a paraphrase of a rejected row is not inserted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_row_blocks_its_fingerprint_for_30_days_then_lets_it_in() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        seed_dead_row(
+            &pool,
+            "Scripts must be LF",
+            "expired",
+            noon() - chrono::Duration::days(10),
+        )
+        .await;
+        distil(&pool, SCRIPTS_RULE, None).await;
+        assert_eq!(
+            learnings(&pool).await,
+            1,
+            "expired 10 days ago still blocks"
+        );
+
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        seed_dead_row(
+            &pool,
+            "Scripts must be LF",
+            "expired",
+            noon() - chrono::Duration::days(31),
+        )
+        .await;
+        distil(&pool, SCRIPTS_RULE, None).await;
+        assert_eq!(
+            learnings(&pool).await,
+            2,
+            "expired 31 days ago lets the lesson in"
+        );
+    }
+
+    /// The nearest expired neighbour is past the cool-off, but a slightly farther one (still within
+    /// `SIM_SAME`) ended recently: the older row must not hide the newer one.
+    #[tokio::test]
+    async fn an_old_expired_neighbour_does_not_hide_a_recent_one() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        let old = seed_dead_row(
+            &pool,
+            "Shell scripts keep LF endings",
+            "expired",
+            noon() - chrono::Duration::days(60),
+        )
+        .await;
+        let recent = seed_dead_row(
+            &pool,
+            "LF line endings for shell scripts",
+            "expired",
+            noon() - chrono::Duration::days(5),
+        )
+        .await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            // Cosine 1.0 (the nearest, but out of the cool-off) and 0.95 (within SIM_SAME, recent).
+            crate::embed::store_in(&mut conn, old, "fake-model", &[1.0, 0.0])
+                .await
+                .unwrap();
+            crate::embed::store_in(&mut conn, recent, "fake-model", &[0.95, 0.312_249_9])
+                .await
+                .unwrap();
+        }
+        let embedder = FakeEmbedder::new("fake-model", Vec::new(), Some(vec![1.0, 0.0]));
+
+        distil(&pool, SCRIPTS_RULE, Some(&embedder as &dyn Embedder)).await;
+
+        assert_eq!(
+            learnings(&pool).await,
+            2,
+            "a recently expired neighbour still blocks the lesson"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_skip_writes_a_skipped_tombstone_event() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        let dead = seed_dead_row(&pool, "Scripts must be LF", "reverted", noon()).await;
+
+        distil(&pool, SCRIPTS_RULE, None).await;
+
+        assert_eq!(learnings(&pool).await, 1, "no new knowledge row");
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT COALESCE(from_status, ''), to_status FROM knowledge_events
+              WHERE knowledge_id = ? AND note = 'skipped: tombstone'",
+        )
+        .bind(dead)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![("reverted".to_string(), "reverted".to_string())],
+            "a same-status event on the matched row"
+        );
     }
 
     #[tokio::test]
@@ -2832,7 +3223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_distilled_row_is_stored_with_its_vector() {
+    async fn a_stored_semantic_lesson_is_trial_active_not_proposed() {
         let pool = test_pool().await;
         seeded_cause(&pool, "job_failed").await;
         // Orthogonal vectors (cosine 0), keyed by the text prefix (the title): identical vectors
@@ -2849,12 +3240,22 @@ mod tests {
         distil(
             &pool,
             r#"[{"layer":"episodic","title":"Stored lesson","body":"Kept with a vector."},
-                {"layer":"semantic","title":"Stored rule","body":"A rule waits proposed."}]"#,
+                {"layer":"semantic","title":"Stored rule","body":"A rule enters on trial."}]"#,
             Some(&embedder as &dyn Embedder),
         )
         .await;
 
         assert_eq!(learnings(&pool).await, 2);
+        let rule: (String, i64) =
+            sqlx::query_as("SELECT status, trial FROM knowledge WHERE title = 'Stored rule'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rule,
+            ("active".to_string(), 1),
+            "a stored rule is active on trial, not proposed"
+        );
         let ids = [
             id_of(&pool, "Stored lesson").await,
             id_of(&pool, "Stored rule").await,
@@ -3081,7 +3482,8 @@ mod tests {
 
     async fn project_candidates(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND status = 'proposed'
+            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project'
+               AND (status = 'proposed' OR (status = 'active' AND trial = 1))
                AND distill_cause = 'chat_exchanges'",
         )
         .fetch_one(pool)
@@ -3090,27 +3492,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_single_project_batch_writes_proposed_candidates_and_observed_observations() {
+    async fn a_single_project_batch_writes_trial_candidates_and_observed_observations() {
         let pool = test_pool().await;
         let chat = fixtures::chat_with(&pool).await;
         let last = four_turns(&pool, &chat, Some("alpha")).await;
         chat_row(&pool, "alpha", &chat, last).await;
         distil(&pool, SEMANTIC_THREE, None).await;
 
-        type CandRow = (String, String, Option<String>, Option<String>, String);
+        type CandRow = (String, String, Option<String>, Option<String>, String, i64);
         let cands: Vec<CandRow> = sqlx::query_as(
-            "SELECT scope_kind, status, scope_id, about, evidence FROM knowledge
+            "SELECT scope_kind, status, scope_id, about, evidence, trial FROM knowledge
               WHERE distill_cause = 'chat_exchanges' AND scope_kind = 'project'",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
         assert_eq!(cands.len(), 2);
-        for (kind, status, scope_id, about, evidence) in cands {
+        for (kind, status, scope_id, about, evidence, trial) in cands {
             assert_eq!(
                 (kind.as_str(), status.as_str(), scope_id.as_deref(), about),
-                ("project", "proposed", Some("alpha"), None)
+                ("project", "active", Some("alpha"), None)
             );
+            assert_eq!(trial, 1, "an unquoted distilled lesson enters on trial");
             assert!(evidence.contains(r#""t":"chat""#) && evidence.contains(r#""t":"run""#));
         }
         let key = fixtures::chat_key(&pool, &chat).await;
@@ -3124,12 +3527,16 @@ mod tests {
             obs,
             vec![("observed".into(), format!("alpha:chat:{key}"), None)]
         );
-        let active: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE status = 'active'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(active, 0, "a conversation never writes active knowledge");
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge WHERE status = 'active' AND trial = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active, 0,
+            "a conversation never writes permanent (non-trial) active knowledge"
+        );
         let evidence: String =
             sqlx::query_scalar("SELECT evidence FROM knowledge WHERE scope_kind = 'observation'")
                 .fetch_one(&pool)
@@ -3332,5 +3739,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0, "the sweep needs no embedder");
+    }
+
+    /// W4 sweep: a rework stored with the plain `insert` (no hook, as when the daemon was down)
+    /// is turned into one knowledge row by the next tick, without asking the model, and a second
+    /// tick changes nothing.
+    #[tokio::test]
+    async fn tick_captures_unprocessed_rework_records() {
+        let pool = test_pool().await;
+        // No calendar row, so nothing in the tick has a reason to ask the runner.
+        super::sources::set(&pool, super::sources::CALENDAR_KEY, false)
+            .await
+            .unwrap();
+        crate::workflow_records::insert(
+            &pool,
+            &crate::workflow_records::NewRecord {
+                project_id: "alpha".to_owned(),
+                worktree: None,
+                kind: "rework".to_owned(),
+                task_id: "t-1".to_owned(),
+                phase: Some("execute".to_owned()),
+                caught_by: Some("gate".to_owned()),
+                payload: serde_json::json!({
+                    "root_cause": "the gate ran on a stale build",
+                    "fix": "rebuild before the gate",
+                })
+                .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let runner = fake_answering("[]");
+        super::tick(&pool, Extractor::Cli(&runner), None).await;
+        let rows: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, observations, layer FROM knowledge WHERE distill_cause = 'rework'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one rework record, one knowledge row");
+        assert!(
+            runner.last_prompt.lock().unwrap().is_none(),
+            "the rework path asks no model"
+        );
+
+        super::tick(&pool, Extractor::Cli(&runner), None).await;
+        let again: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, observations, layer FROM knowledge WHERE distill_cause = 'rework'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(again, rows, "a second tick neither duplicates nor recounts");
     }
 }

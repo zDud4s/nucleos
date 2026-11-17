@@ -23,6 +23,7 @@ pub mod assistant_types;
 pub mod assistants;
 pub mod attention;
 pub mod auth;
+pub mod automations;
 pub use nucleos_base::autostart;
 pub use nucleos_base::backup;
 pub mod brief;

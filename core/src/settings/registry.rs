@@ -1,5 +1,5 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the documents: the 18 fixed ones plus one `channels/<id>` row per channel manifest.
+//! and the table of the documents: the 20 fixed ones plus one `channels/<id>` row per channel manifest.
 
 use std::sync::LazyLock;
 
@@ -9,11 +9,12 @@ use serde_json::Value;
 
 use super::decode::{self, Erased, Prepared};
 use super::scope::Kind;
+use crate::automations::Automations;
 use crate::channels::registry::ChannelConfig;
 use crate::config::{
     AutopilotRules, BackgroundConfig, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig,
-    EmailConfig, GithubConfig, KeepAwakeConfig, MachineConfig, ModelsConfig, VerifyConfig,
-    VoiceConfig, WebConfig, validate_devtime, validate_rules,
+    EmailConfig, GitConfig, GithubConfig, KeepAwakeConfig, MachineConfig, ModelsConfig,
+    VerifyConfig, VoiceConfig, WebConfig, validate_devtime, validate_rules,
 };
 use crate::engines::agy::AgyDoc;
 use crate::machine_config as files;
@@ -174,6 +175,7 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         ),
         of::<KeepAwakeConfig>(files::KEEP_AWAKE_FILE, "when the daemon restarts"),
         of::<BackgroundConfig>(files::BACKGROUND_FILE, "when the daemon restarts"),
+        of::<GitConfig>(files::GIT_FILE, "from the next merge"),
         of::<DevtimeConfig>(
             files::DEVTIME_FILE,
             "when the daemon restarts — except that on a save or a reset the actions.* settings apply from the next ingest cycle, and the pending actions decided under other actions.* thresholds are voided at once (those the owner marked stay)",
@@ -185,6 +187,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         of::<Pins>(
             crate::project::state::PINS_FILE,
             "at the next run that resolves a workflow for that project",
+        ),
+        of::<Automations>(
+            crate::project::state::AUTOMATIONS_FILE,
+            "at the next event the project's automations see",
         ),
     ];
     // One machine document per channel manifest, listed after the fixed machine documents.
@@ -317,6 +323,11 @@ impl Document for BackgroundConfig {
     }
 }
 
+impl Document for GitConfig {
+    const NAME: &'static str = "git";
+    const KIND: Kind = Kind::Machine;
+}
+
 impl Document for DevtimeConfig {
     const NAME: &'static str = "devtime";
     const KIND: Kind = Kind::Machine;
@@ -344,6 +355,15 @@ impl Document for Pins {
     }
 }
 
+impl Document for Automations {
+    const NAME: &'static str = "automations";
+    const KIND: Kind = Kind::Project;
+    fn finish(self) -> Result<Self, String> {
+        self.validate()?;
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -359,23 +379,32 @@ mod tests {
     }
 
     #[test]
-    fn there_are_eighteen_documents_with_unique_names() {
-        // 18 fixed documents plus one `channels/<id>` per manifest.
+    fn there_are_twenty_documents_with_unique_names() {
+        // 20 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 18 + channels);
+        assert_eq!(docs.len(), 20 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 18 + channels);
+        assert_eq!(names.len(), 20 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            16 + channels
+            17 + channels
         );
         let project: Vec<_> = docs
             .iter()
             .filter(|doc| doc.kind == Kind::Project)
             .map(|doc| doc.name)
             .collect();
-        assert_eq!(project, vec!["autopilot", "workflow_pins"]);
+        assert_eq!(project, vec!["autopilot", "workflow_pins", "automations"]);
+    }
+
+    #[test]
+    fn the_automations_document_is_validated_on_the_way_in() {
+        let rule = json!({"name":"a","enabled":true,"on":{"event":"published_green"},"do":{"action":"push","remote":"origin"}});
+        assert!(prepared_text("automations", &json!({"rules":[rule.clone()]})).is_ok());
+        let error =
+            prepared_text("automations", &json!({"rules":[rule.clone(), rule]})).unwrap_err();
+        assert!(error.contains("twice"), "{error}");
     }
 
     #[test]
