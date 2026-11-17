@@ -821,16 +821,29 @@ impl NucleosTools {
                        answer is recorded with origin `conductor`. Owner-level: refused from a \
                        run of a tree job. Unknown id is 404, an already answered decision 409. \
                        Pass `drop: true` (the answer is then optional) to drop the branch parked \
-                       on the decision instead: nothing is relaunched."
+                       on the decision instead: nothing is relaunched. For a decision that is a \
+                       path-fence refusal, pass `widen: [paths…]` to add those paths to the \
+                       branch's fence (or start the answer with \"widen\"); an answer that does \
+                       neither leaves the fence unchanged and the result says so \
+                       (`widened: []` plus a `note`)."
     )]
     pub(super) async fn decision_answer(
         &self,
-        Parameters(DecisionAnswerParams { id, answer, drop }): Parameters<DecisionAnswerParams>,
+        Parameters(DecisionAnswerParams {
+            id,
+            answer,
+            drop,
+            widen,
+        }): Parameters<DecisionAnswerParams>,
     ) -> String {
         if let Some(refusal) = tree_run_decision_refusal(&self.served) {
             return json_result::<serde_json::Value>(Err(refusal));
         }
-        json_result(self.client.decision_answer(&id, &answer, drop).await)
+        json_result(
+            self.client
+                .decision_answer(&id, &answer, drop, widen.as_deref())
+                .await,
+        )
     }
 
     #[tool(

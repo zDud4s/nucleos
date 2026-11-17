@@ -28,12 +28,14 @@ impl DaemonClient {
 
     /// `POST /tree-decisions/{id}/answer`: body is `{answer}`. The answer goes through the shell's
     /// path (`answer_and_relaunch`) with the origin `conductor`; with `drop` the parked branch is
-    /// dropped instead and nothing is relaunched (`{answer, drop: true}`).
+    /// dropped instead and nothing is relaunched (`{answer, drop: true}`). A `widen` list is sent as
+    /// `widen_paths` and widens the path fence of a branch parked on a fence refusal.
     pub async fn decision_answer(
         &self,
         id: &str,
         answer: &str,
         drop: bool,
+        widen: Option<&[String]>,
     ) -> Result<Value, String> {
         let path = format!(
             "/tree-decisions/{}/answer",
@@ -41,7 +43,7 @@ impl DaemonClient {
         );
         let response = self
             .request(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({ "answer": answer, "drop": drop }))
+            .json(&decision_answer_body(answer, drop, widen))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -126,5 +128,43 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())?;
         json_or_refusal(response, "reading wait advice").await
+    }
+}
+
+/// The body of `POST /tree-decisions/{id}/answer`. `widen_paths` is present only when the caller
+/// sent a non-empty list, so an answer without one reads the same as before.
+fn decision_answer_body(answer: &str, drop: bool, widen: Option<&[String]>) -> Value {
+    let mut body = serde_json::json!({ "answer": answer, "drop": drop });
+    if let Some(paths) = widen.filter(|paths| !paths.is_empty()) {
+        body["widen_paths"] = serde_json::json!(paths);
+    }
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_widen_list_is_sent_as_widen_paths() {
+        let paths = vec!["core/src/hooks/pretool.rs".to_owned()];
+        let body = decision_answer_body("yes", false, Some(&paths));
+        assert_eq!(body["widen_paths"], serde_json::json!(paths));
+        assert_eq!(body["answer"], "yes");
+        assert_eq!(body["drop"], false);
+    }
+
+    #[test]
+    fn no_widen_list_leaves_widen_paths_out_of_the_body() {
+        assert!(
+            decision_answer_body("yes", false, None)
+                .get("widen_paths")
+                .is_none()
+        );
+        assert!(
+            decision_answer_body("yes", false, Some(&[]))
+                .get("widen_paths")
+                .is_none()
+        );
     }
 }

@@ -99,6 +99,11 @@ pub(super) struct DecisionAnswerParams {
     /// Drop the branch parked on the decision instead of resuming it (the answer is then optional).
     #[serde(default)]
     pub(super) drop: bool,
+    /// Paths to add to the `paths` of the branch parked on a path-fence refusal, so the merge is
+    /// retried with them allowed. Absent or empty widens nothing: then only an answer whose text
+    /// starts with `widen` widens, and any other answer leaves the fence unchanged.
+    #[serde(default)]
+    pub(super) widen: Option<Vec<String>>,
 }
 
 /// The query of `GET /tree-decisions`.
