@@ -275,14 +275,25 @@ async fn patch_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Result<Json<UpdateArgs>, JsonRejection>,
-) -> Result<Json<work_nodes::Node>, Refusal> {
+) -> Result<Json<Value>, Refusal> {
     let Json(args) = body.map_err(bad_body)?;
     let node = work_nodes::get(&state.pool, &id).await.map_err(refused)?;
     let limits = limits_for(&state, node.project_id.as_deref()).await;
-    work_nodes::update(&state.pool, &id, &limits, &args)
+    let updated = work_nodes::update(&state.pool, &id, &limits, &args)
         .await
-        .map(Json)
-        .map_err(refused)
+        .map_err(refused)?;
+    let mut body = serde_json::to_value(&updated)
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let widened = args.widen_paths.as_ref().is_some_and(|paths| !paths.is_empty());
+    if widened
+        && crate::tree_job::close::tree_job_of(&state.pool, &id)
+            .await
+            .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .is_some()
+    {
+        body["notice"] = Value::from(work_nodes::TREE_WIDEN_NOTICE);
+    }
+    Ok(Json(body))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1246,6 +1257,62 @@ mod tests {
             node["decisions"],
             json!(["widened owned_paths: +core/src/c/y.rs"])
         );
+    }
+
+    #[tokio::test]
+    async fn widen_paths_on_a_tree_job_node_carries_a_notice_that_the_fence_is_unchanged() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-widen-notice").await;
+        let (status, leaf) = open_leaf(&app, &root, "Leaf", &["core/src/a/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{leaf}");
+        let leaf_id = leaf["id"].as_str().unwrap().to_owned();
+        sqlx::query("UPDATE work_nodes SET tree_job_id = 'job-x' WHERE id = ?")
+            .bind(&leaf_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (status, node) = call(
+            &app,
+            "PATCH",
+            &format!("/nodes/{leaf_id}"),
+            Some(json!({ "widen_paths": ["core/src/c/y.rs"] })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{node}");
+        let notice = node["notice"].as_str().expect("a notice on a tree node");
+        assert!(notice.contains("owned_paths"), "{notice}");
+        assert!(notice.contains("decision"), "{notice}");
+
+        // Without widen_paths there is nothing to warn about.
+        let (_, plain) = call(
+            &app,
+            "PATCH",
+            &format!("/nodes/{leaf_id}"),
+            Some(json!({ "decision": "note" })),
+        )
+        .await;
+        assert!(plain.get("notice").is_none(), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn widen_paths_on_a_node_outside_a_tree_job_has_no_notice() {
+        let app = app().await;
+        let root = open_root(&app, "s-widen-no-notice").await;
+        let (_, leaf) = open_leaf(&app, &root, "Leaf", &["core/src/a/**"]).await;
+        let leaf_id = leaf["id"].as_str().unwrap().to_owned();
+
+        let (status, node) = call(
+            &app,
+            "PATCH",
+            &format!("/nodes/{leaf_id}"),
+            Some(json!({ "widen_paths": ["core/src/c/y.rs"] })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{node}");
+        assert!(node.get("notice").is_none(), "{node}");
     }
 
     /// Opens a root and one leaf owning `core/src/a/**`, and binds the leaf, running, to `session`.

@@ -661,6 +661,40 @@ pub struct Answered {
     pub decision: decisions::Decision,
     /// The run started for the node of the resumed branch, if one was.
     pub relaunched: Option<i64>,
+    /// The paths the answer added to the branch's fence, when the decision was a fence refusal
+    /// (`Some(vec![])` when it widened nothing); `None` for every other decision.
+    pub widened: Option<Vec<String>>,
+}
+
+/// Whether this open decision is the one a path-fence refusal parked a branch on, read before
+/// `answer` moves it (the refusal record is cleared once the branch resumes).
+async fn is_fence_refusal(pool: &SqlitePool, decision_id: &str) -> bool {
+    let Some(decision) = sqlx::query_as::<_, decisions::Decision>(sqlx::AssertSqlSafe(format!(
+        "{DECISION_COLUMNS} WHERE id = ?"
+    )))
+    .bind(decision_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten() else {
+        return false;
+    };
+    let Some(tree_id) = decision.tree_id else {
+        return false;
+    };
+    let Some(job) = store::load(pool, &tree_id).await.ok().flatten() else {
+        return false;
+    };
+    job.manifest.branches.values().any(|branch| {
+        branch.state == PARKED
+            && branch.extra.contains_key(super::path_fence::REFUSAL)
+            && branch
+                .park
+                .as_ref()
+                .and_then(|record| record.get("decision_id"))
+                .and_then(Value::as_str)
+                == Some(decision_id)
+    })
 }
 
 const DECISION_COLUMNS: &str =
@@ -729,24 +763,31 @@ pub async fn answer_and_relaunch_widening(
 ) -> Result<Answered, DecisionError> {
     let pool = &state.pool;
     let waiting = node_waiting_on(pool, decision_id).await;
+    let fenced = is_fence_refusal(pool, decision_id).await;
     let (decision, widened) =
         decisions::answer_widening(pool, decision_id, text, origin, widen).await?;
     if widened.is_some() {
         return Ok(Answered {
             decision,
             relaunched: None,
+            widened,
         });
     }
+    // A fence refusal answered without widening: say so, rather than leave the next refusal to
+    // reopen the same decision.
+    let widened = fenced.then(Vec::new);
     let Some(node) = waiting else {
         return Ok(Answered {
             decision,
             relaunched: None,
+            widened,
         });
     };
     let relaunched = relaunch_after_answer(state, &decision, &node, text).await;
     Ok(Answered {
         decision,
         relaunched,
+        widened,
     })
 }
 

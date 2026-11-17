@@ -414,6 +414,7 @@ async fn post_decision(
                 .map(|decision| crate::tree_job::open::Answered {
                     decision,
                     relaunched: None,
+                    widened: None,
                 })
         } else {
             crate::tree_job::open::answer_and_relaunch_widening(

@@ -52,7 +52,14 @@ struct AnswerBody {
     /// Drop the parked branch instead of resuming it (the answer is then optional).
     #[serde(default)]
     drop: bool,
+    /// Paths to add to the fenced branch's `paths`, when the decision is a path-fence refusal.
+    /// Without it only an answer starting with `widen` widens anything.
+    #[serde(default)]
+    widen_paths: Option<Vec<String>>,
 }
+
+/// What the answer to a fence refusal that widened nothing tells the caller.
+const FENCE_UNCHANGED_NOTE: &str = "The branch's path fence is unchanged: the answer neither started with \"widen\" nor carried a widen list, so the next refusal will reopen this decision. To widen it, answer again with `widen` (a list of paths) or text starting with \"widen\".";
 
 /// The branch a decision belongs to: the one parked on it, else the one its node runs behind.
 fn branch_of(job: &TreeJob, decision: &Decision) -> Option<String> {
@@ -147,17 +154,34 @@ async fn post_tree_decision_answer(
             .map(|decision| crate::tree_job::open::Answered {
                 decision,
                 relaunched: None,
+                widened: None,
             })
     } else {
-        crate::tree_job::open::answer_and_relaunch(&state, &id, answer, ORIGIN_CONDUCTOR).await
+        crate::tree_job::open::answer_and_relaunch_widening(
+            &state,
+            &id,
+            answer,
+            ORIGIN_CONDUCTOR,
+            body.widen_paths.as_deref(),
+        )
+        .await
     };
     match result {
-        Ok(answered) => Ok(Json(json!({
-            "id": answered.decision.id,
-            "question": answered.decision.question,
-            "origin": answered.decision.origin,
-            "relaunched": answered.relaunched,
-        }))),
+        Ok(answered) => {
+            let mut out = json!({
+                "id": answered.decision.id,
+                "question": answered.decision.question,
+                "origin": answered.decision.origin,
+                "relaunched": answered.relaunched,
+            });
+            if let Some(widened) = &answered.widened {
+                out["widened"] = json!(widened);
+                if widened.is_empty() {
+                    out["note"] = json!(FENCE_UNCHANGED_NOTE);
+                }
+            }
+            Ok(Json(out))
+        }
         Err(DecisionError::NotFound(_)) => Err(refuse(
             StatusCode::NOT_FOUND,
             format!("decision {id} not found"),
@@ -237,9 +261,107 @@ mod tests {
             Ok(Json(AnswerBody {
                 answer: text.to_owned(),
                 drop: false,
+                widen_paths: None,
             })),
         )
         .await
+    }
+
+    async fn answer_with_widen(
+        state: &AppState,
+        id: &str,
+        text: &str,
+        widen: &[&str],
+    ) -> Result<Json<Value>, Refusal> {
+        post_tree_decision_answer(
+            State(state.clone()),
+            Path(id.to_owned()),
+            Ok(Json(AnswerBody {
+                answer: text.to_owned(),
+                drop: false,
+                widen_paths: Some(widen.iter().map(|path| (*path).to_owned()).collect()),
+            })),
+        )
+        .await
+    }
+
+    const FENCE_REFUSAL: &str = "Branch api cannot merge into feat/tree: it changed files outside its declared paths [core/src/api/**]: core/src/hooks/pretool.rs. Move that change to the branch that owns those paths, or have the parent widen this branch's paths.";
+
+    /// A green branch the path fence refused, parked on a decision.
+    async fn seed_fence_park(state: &AppState) -> Decision {
+        seed_branch(state, "green").await;
+        let mut job = store::load(&state.pool, TREE).await.unwrap().unwrap();
+        job.manifest
+            .branches
+            .get_mut(BRANCH)
+            .unwrap()
+            .extra
+            .insert("fence_refusal".to_owned(), json!(FENCE_REFUSAL));
+        store::update(&state.pool, &job).await.unwrap();
+        decisions::park(&state.pool, TREE, NODE, FENCE_REFUSAL)
+            .await
+            .unwrap()
+    }
+
+    async fn branch_paths(state: &AppState) -> Vec<String> {
+        let job = store::load(&state.pool, TREE).await.unwrap().unwrap();
+        job.manifest.branches[BRANCH].paths.clone()
+    }
+
+    #[tokio::test]
+    async fn a_widen_list_on_the_http_body_widens_the_fenced_branch() {
+        let state = test_state().await;
+        let parked = seed_fence_park(&state).await;
+
+        let Json(done) = answer_with_widen(
+            &state,
+            &parked.id,
+            "yes, same change",
+            &["core/src/hooks/pretool.rs"],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(done["widened"], json!(["core/src/hooks/pretool.rs"]));
+        assert!(done.get("note").is_none(), "{done}");
+        let paths = branch_paths(&state).await;
+        assert!(
+            paths.contains(&"core/src/hooks/pretool.rs".to_owned()),
+            "{paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_fence_refusal_that_does_not_widen_says_the_fence_is_unchanged() {
+        let state = test_state().await;
+        let parked = seed_fence_park(&state).await;
+
+        let Json(done) = answer(&state, &parked.id, "split it up instead")
+            .await
+            .unwrap();
+
+        assert_eq!(done["widened"], json!([]));
+        let note = done["note"].as_str().expect("a note");
+        assert!(note.contains("unchanged"), "{note}");
+        assert!(note.contains("widen"), "{note}");
+        assert_eq!(
+            branch_paths(&state).await,
+            vec!["core/src/api/**".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_to_a_fence_refusal_carries_no_widen_fields() {
+        let state = test_state().await;
+        seed_branch(&state, "building").await;
+        let parked = decisions::park(&state.pool, TREE, NODE, QUESTION)
+            .await
+            .unwrap();
+
+        let Json(done) = answer(&state, &parked.id, "Pick A").await.unwrap();
+
+        assert!(done.get("widened").is_none(), "{done}");
+        assert!(done.get("note").is_none(), "{done}");
     }
 
     async fn list(state: &AppState, tree_id: Option<&str>, status: Option<&str>) -> Vec<Value> {
