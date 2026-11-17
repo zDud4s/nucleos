@@ -569,6 +569,12 @@ pub async fn update(
 // Widen
 // ---------------------------------------------------------------------------------------------
 
+/// Said back to a tree-job node that widened: its `owned_paths` is bookkeeping, the tree's path
+/// fence reads only the branch paths in the manifest.
+pub const TREE_WIDEN_NOTICE: &str = "owned_paths was updated, but the tree's path fence does not read owned_paths: \
+     the fence is unchanged. Your parent or the owner must widen the branch through the decision \
+     (decision_answer with a `widen` list).";
+
 /// The sentence a widen refused for a running sibling's path ends with.
 const WIDEN_SIBLING_TAIL: &str =
     "Report it instead with mcp__nucleos__task_report; the ticket goes to that sibling.";
