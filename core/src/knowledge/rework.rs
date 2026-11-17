@@ -811,6 +811,105 @@ mod tests {
         );
     }
 
+    /// m2: many recurrences keep the evidence bounded while every one still counts.
+    /// Proposes `propose::EVIDENCE_CAP` (newest kept).
+    #[tokio::test]
+    async fn rework_evidence_stays_bounded_while_observations_count_every_recurrence() {
+        let pool = pool().await;
+        let cap = super::super::propose::EVIDENCE_CAP;
+        let mut first = 0;
+        let mut last = 0;
+        let mut id = 0;
+        for n in 0..60 {
+            let record =
+                seed_rework(&pool, PROJECT, &format!("t{n}"), "a hot cause", "a fix", &[]).await;
+            if n == 0 {
+                first = record;
+            }
+            last = record;
+            match capture_rework(&pool, record).await.unwrap() {
+                Captured::Written(i) | Captured::Reinforced(i) | Captured::Promoted(i) => id = i,
+                Captured::Skipped => panic!("capture {n} must not be skipped"),
+            }
+        }
+        let (_, _, _, _, _, _, _, observations, _, evidence) = row(&pool, id).await;
+        assert_eq!(observations, Some(60), "every recurrence counts");
+        let evidence: Vec<Value> = serde_json::from_str(&evidence.unwrap()).unwrap();
+        assert!(evidence.len() <= cap, "bounded at {cap}: {}", evidence.len());
+        assert!(
+            evidence.iter().any(|e| e["id"] == json!(last)),
+            "the newest evidence is kept"
+        );
+        assert!(
+            !evidence.iter().any(|e| e["id"] == json!(first)),
+            "the oldest evidence is dropped"
+        );
+    }
+
+    /// m3: a lesson whose trial already ended (confirmed, `trial = 0`) still promotes from episodic.
+    #[tokio::test]
+    async fn a_confirmed_episodic_lesson_is_promoted_by_a_recurrence_from_another_task() {
+        let pool = pool().await;
+        let first = seed_rework(&pool, PROJECT, "t1", "a settled cause", "a fix", &[]).await;
+        let Captured::Written(id) = capture_rework(&pool, first).await.unwrap() else {
+            panic!("the first sighting is written");
+        };
+        sqlx::query("UPDATE knowledge SET trial = 0, trial_started_at = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let second = seed_rework(&pool, PROJECT, "t2", "a settled cause", "a fix", &[]).await;
+        assert_eq!(
+            capture_rework(&pool, second).await.unwrap(),
+            Captured::Promoted(id)
+        );
+        let (_, _, layer, status, _, _, _, observations, _, _) = row(&pool, id).await;
+        assert_eq!(layer, "procedural");
+        assert_eq!(status, "active");
+        assert_eq!(observations, Some(2));
+    }
+
+    /// m4: a live row wins over an older tombstone of the same cause.
+    #[tokio::test]
+    async fn a_live_row_is_reinforced_even_when_a_recent_tombstone_exists() {
+        let pool = pool().await;
+        let first = seed_rework(&pool, PROJECT, "t1", "a twice-seen cause", "a fix", &[]).await;
+        let Captured::Written(id) = capture_rework(&pool, first).await.unwrap() else {
+            panic!("the first sighting is written");
+        };
+        let recent = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        plant_dead(&pool, "a twice-seen cause", "expired", &recent).await;
+
+        let second = seed_rework(&pool, PROJECT, "t2", "a twice-seen cause", "a fix", &[]).await;
+        let outcome = capture_rework(&pool, second).await.unwrap();
+        assert!(
+            matches!(outcome, Captured::Reinforced(i) | Captured::Promoted(i) if i == id),
+            "the live row is reinforced, not skipped: {outcome:?}"
+        );
+        let (_, _, _, _, _, _, _, observations, _, _) = row(&pool, id).await;
+        assert_eq!(observations, Some(2));
+    }
+
+    /// m5: two concurrent first sightings from two tasks both succeed and share one row.
+    /// Uses the file-backed WAL pool (`fresh_shared_pool`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_captures_of_a_new_cause_yield_one_row_with_two_observations() {
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let a = seed_rework(&pool, PROJECT, "t1", "a racing cause", "a fix", &[]).await;
+        let b = seed_rework(&pool, PROJECT, "t2", "a racing cause", "a fix", &[]).await;
+        let (ra, rb) = tokio::join!(capture_rework(&pool, a), capture_rework(&pool, b));
+        ra.expect("first concurrent capture must not error");
+        rb.expect("second concurrent capture must not error");
+        assert_eq!(live_rows(&pool).await, 1);
+        let observations: i64 = sqlx::query_scalar("SELECT observations FROM knowledge")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(observations, 2);
+    }
+
     #[tokio::test]
     async fn inserting_the_same_cause_twice_does_not_violate_the_unique_index() {
         let pool = pool().await;
@@ -1011,5 +1110,154 @@ mod tests {
             "the counter is cleared once the record is skipped"
         );
         assert!(poison < good);
+    }
+
+    // ---- gate signature capture (finding m1) ----
+
+    /// A realistic failed cargo gate; its signature is made of the two `error` lines.
+    const CARGO_FAILURE: &str = "   Compiling nucleos-core v0.1.0 (C:\\w\\run-4\\core)\n\
+error[E0432]: unresolved import `crate::missing`\n \
+--> core/src/lib.rs:12:5\n\
+error: could not compile `nucleos-core` (lib) due to 1 previous error\n";
+
+    const WORKTREE: &str = "C:/w/run-4";
+
+    async fn seed_verify_run(
+        pool: &SqlitePool,
+        project: &str,
+        worktree: &str,
+        status: &str,
+        output_tail: &str,
+        started_at: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO verify_runs
+               (project_id, worktree, scope, origin, requested_by, argv, status, output_tail,
+                started_at, finished_at)
+             VALUES (?, ?, 'gate', 'test', 'test', '[]', ?, ?, ?, ?)",
+        )
+        .bind(project)
+        .bind(worktree)
+        .bind(status)
+        .bind(output_tail)
+        .bind(started_at)
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A rework record bound to `WORKTREE`, created now.
+    async fn seed_rework_in_worktree(pool: &SqlitePool, root_cause: &str) -> i64 {
+        crate::workflow_records::insert(
+            pool,
+            &NewRecord {
+                project_id: PROJECT.to_owned(),
+                worktree: Some(WORKTREE.to_owned()),
+                kind: "rework".to_owned(),
+                task_id: "t1".to_owned(),
+                phase: Some("implement".to_owned()),
+                caught_by: Some("review".to_owned()),
+                payload: json!({"root_cause": root_cause, "fix": "retry"}).to_string(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn gate_signature_of(pool: &SqlitePool, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT gate_signature FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rework_capture_stores_the_gate_signature_of_the_last_failed_verify_run() {
+        let pool = pool().await;
+        // An older failure with another signature, then the latest failure, then a pass.
+        seed_verify_run(
+            &pool,
+            PROJECT,
+            WORKTREE,
+            "failed",
+            "error: an older unrelated failure",
+            "2026-01-01T00:00:00+00:00",
+        )
+        .await;
+        seed_verify_run(
+            &pool,
+            PROJECT,
+            WORKTREE,
+            "failed",
+            CARGO_FAILURE,
+            "2026-01-02T00:00:00+00:00",
+        )
+        .await;
+        seed_verify_run(
+            &pool,
+            PROJECT,
+            WORKTREE,
+            "passed",
+            "all green",
+            "2026-01-03T00:00:00+00:00",
+        )
+        .await;
+        let record = seed_rework_in_worktree(&pool, "the import was missing").await;
+
+        let Captured::Written(id) = capture_rework(&pool, record).await.unwrap() else {
+            panic!("a rework with a cause and a fix is written");
+        };
+
+        let expected = crate::knowledge::failure_signature(CARGO_FAILURE).unwrap().fingerprint;
+        assert_eq!(gate_signature_of(&pool, id).await, Some(expected));
+        let (_, _, _, _, _, _, _, _, key, _) = row(&pool, id).await;
+        assert_eq!(
+            key.as_deref(),
+            Some(cause_key("the import was missing").as_str()),
+            "cause_key is still the hash of the root cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_capture_without_a_failed_verify_run_leaves_gate_signature_null() {
+        let pool = pool().await;
+        // A failure of another worktree and another project do not count.
+        seed_verify_run(
+            &pool,
+            PROJECT,
+            "C:/w/other",
+            "failed",
+            CARGO_FAILURE,
+            "2026-01-01T00:00:00+00:00",
+        )
+        .await;
+        seed_verify_run(
+            &pool,
+            "beta",
+            WORKTREE,
+            "failed",
+            CARGO_FAILURE,
+            "2026-01-01T00:00:00+00:00",
+        )
+        .await;
+        seed_verify_run(
+            &pool,
+            PROJECT,
+            WORKTREE,
+            "passed",
+            "all green",
+            "2026-01-01T00:00:00+00:00",
+        )
+        .await;
+        let record = seed_rework_in_worktree(&pool, "a cause with no gate behind it").await;
+
+        let Captured::Written(id) = capture_rework(&pool, record).await.unwrap() else {
+            panic!("a rework with a cause and a fix is written");
+        };
+
+        assert_eq!(gate_signature_of(&pool, id).await, None);
     }
 }

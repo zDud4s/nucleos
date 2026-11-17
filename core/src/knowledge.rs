@@ -1785,6 +1785,50 @@ mod tests {
         );
     }
 
+    /// The distiller points tree lessons at a `tree` and chat lessons at a `chat`; reconfirming
+    /// must keep both rather than drop them as unknown tags.
+    #[tokio::test]
+    async fn reconfirming_keeps_tree_and_chat_evidence() {
+        let pool = test_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let episode = record_distilled(
+            &mut tx,
+            &distilled("Tagged twice", "An episode.", Kind::Memory),
+            &Provenance {
+                distill_cause: Some("job_landed"),
+                evidence: Some(r#"[{"t":"job","id":7}]"#),
+                fingerprint: Some("title:tagged twice"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        reconfirm_in(
+            &mut tx,
+            "p",
+            "title:tagged twice",
+            r#"[{"t":"tree","id":"t-1"},{"t":"chat","id":"alpha:chat:5"}]"#,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch(&pool, episode).await.unwrap().unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_str(row.evidence.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!([
+                {"t":"job","id":7},
+                {"t":"tree","id":"t-1"},
+                {"t":"chat","id":"alpha:chat:5"},
+            ])
+        );
+    }
+
     async fn plant_observation(pool: &SqlitePool, status: &str) -> i64 {
         sqlx::query(
             "INSERT INTO knowledge

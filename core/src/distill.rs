@@ -2407,6 +2407,47 @@ mod tests {
         );
     }
 
+    /// The nearest expired neighbour is past the cool-off, but a slightly farther one (still within
+    /// `SIM_SAME`) ended recently: the older row must not hide the newer one.
+    #[tokio::test]
+    async fn an_old_expired_neighbour_does_not_hide_a_recent_one() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        let old = seed_dead_row(
+            &pool,
+            "Shell scripts keep LF endings",
+            "expired",
+            noon() - chrono::Duration::days(60),
+        )
+        .await;
+        let recent = seed_dead_row(
+            &pool,
+            "LF line endings for shell scripts",
+            "expired",
+            noon() - chrono::Duration::days(5),
+        )
+        .await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            // Cosine 1.0 (the nearest, but out of the cool-off) and 0.95 (within SIM_SAME, recent).
+            crate::embed::store_in(&mut conn, old, "fake-model", &[1.0, 0.0])
+                .await
+                .unwrap();
+            crate::embed::store_in(&mut conn, recent, "fake-model", &[0.95, 0.312_249_9])
+                .await
+                .unwrap();
+        }
+        let embedder = FakeEmbedder::new("fake-model", Vec::new(), Some(vec![1.0, 0.0]));
+
+        distil(&pool, SCRIPTS_RULE, Some(&embedder as &dyn Embedder)).await;
+
+        assert_eq!(
+            learnings(&pool).await,
+            2,
+            "a recently expired neighbour still blocks the lesson"
+        );
+    }
+
     #[tokio::test]
     async fn a_tombstone_skip_writes_a_skipped_tombstone_event() {
         let pool = test_pool().await;

@@ -860,6 +860,28 @@ mod tests {
             .map(|_| ())
     }
 
+    async fn set_gate_signature(pool: &SqlitePool, id: i64, signature: &str) {
+        sqlx::query("UPDATE knowledge SET gate_signature = ? WHERE id = ?")
+            .bind(signature)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The same failed cargo gate twice: only the volatile parts (compile line, line numbers,
+    /// durations, a truncation marker) differ, so both texts carry one fingerprint.
+    const CARGO_FAILURE_TAIL: &str = "   Compiling nucleos-core v0.1.0\n\
+error[E0432]: unresolved import `crate::missing`\n\
+ --> core/src/lib.rs:12:5\n\
+error: could not compile `nucleos-core` (lib) due to 1 previous error\n";
+    const CARGO_FAILURE_GATE: &str = "…[output truncated, 4096 bytes dropped]\n\
+   Compiling nucleos-core v0.1.0\n\
+error[E0432]: unresolved import `crate::missing`\n\
+ --> core/src/lib.rs:40:9\n\
+error: could not compile `nucleos-core` (lib) due to 1 previous error\n\
+Finished in 3.2s\n";
+
     async fn knowledge_count(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
             .fetch_one(pool)
@@ -1170,7 +1192,8 @@ mod tests {
 
     /// F2: a row with a cause is reinforced in place; the id never changes and nothing is inserted.
     #[tokio::test]
-    async fn a_repeated_gate_signature_with_a_cause_key_row_raises_observations_and_keeps_the_id() {
+    async fn a_repeated_gate_signature_with_a_gate_signature_row_raises_observations_and_keeps_the_id()
+     {
         let pool = test_pool().await;
         let cause = seed_knowledge(
             &pool,
@@ -1184,9 +1207,7 @@ mod tests {
             Some(1),
         )
         .await;
-        set_cause_key(&pool, cause, &raw_fingerprint(FAILURE))
-            .await
-            .unwrap();
+        set_gate_signature(&pool, cause, &raw_fingerprint(FAILURE)).await;
         // An owner row that was refused keeps its cause key but is dead: never reinforced.
         let other = seed_knowledge(
             &pool,
@@ -1200,9 +1221,7 @@ mod tests {
             Some(1),
         )
         .await;
-        set_cause_key(&pool, other, &raw_fingerprint(FAILURE))
-            .await
-            .unwrap();
+        set_gate_signature(&pool, other, &raw_fingerprint(FAILURE)).await;
         let owner_before = known(&pool, other).await;
         let first_run = seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
         seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
@@ -1230,6 +1249,169 @@ mod tests {
 
         assert_eq!(knowledge_count(&pool).await, 2);
         assert_eq!(known(&pool, other).await, owner_before);
+    }
+
+    /// Finding m1: a cause_key equal to the fingerprint is not a gate signature; only the
+    /// `gate_signature` column is matched.
+    #[tokio::test]
+    async fn a_row_whose_cause_key_matches_but_gate_signature_does_not_is_untouched() {
+        let pool = test_pool().await;
+        let row = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:cause key only",
+            "active",
+            Some(1),
+        )
+        .await;
+        set_cause_key(&pool, row, &raw_fingerprint(FAILURE))
+            .await
+            .unwrap();
+        set_gate_signature(&pool, row, "0123456789abcdef").await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        let before = known(&pool, row).await;
+
+        let report = run_pass(&pool, at(1)).await.unwrap();
+
+        assert_eq!(report.remeasured, 0);
+        assert_eq!(known(&pool, row).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_gate_signature_match_ignores_dead_and_other_project_rows() {
+        let pool = test_pool().await;
+        let signature = raw_fingerprint(FAILURE);
+        let mut untouched = Vec::new();
+        for (scope_id, status) in [
+            (PROJECT, "rejected"),
+            (PROJECT, "archived"),
+            (PROJECT, "expired"),
+            ("other-project", "active"),
+        ] {
+            let id = seed_knowledge(
+                &pool,
+                "semantic",
+                "project",
+                scope_id,
+                "distiller",
+                None,
+                &format!("title:{scope_id}:{status}"),
+                status,
+                Some(1),
+            )
+            .await;
+            set_gate_signature(&pool, id, &signature).await;
+            untouched.push((id, known(&pool, id).await));
+        }
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+
+        let report = run_pass(&pool, at(1)).await.unwrap();
+
+        assert_eq!(report.remeasured, 0);
+        for (id, before) in untouched {
+            assert_eq!(known(&pool, id).await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gate_signature_recurrence_promotes_an_episodic_lesson_to_procedural() {
+        let pool = test_pool().await;
+        let lesson = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:trial lesson",
+            "active",
+            Some(1),
+        )
+        .await;
+        sqlx::query("UPDATE knowledge SET trial = 1, trial_started_at = ? WHERE id = ?")
+            .bind("2026-09-29T00:00:00+00:00")
+            .bind(lesson)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_gate_signature(&pool, lesson, &raw_fingerprint(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(FAILURE)).await;
+
+        run_pass(&pool, at(1)).await.unwrap();
+
+        let row = known(&pool, lesson).await;
+        assert_eq!(row["observations"], 2);
+        assert_eq!(row["layer"], "procedural");
+        assert_eq!(row["status"], "active");
+        assert_eq!(knowledge_count(&pool).await, 1);
+    }
+
+    /// Finding m1 end to end: a lesson written by the rework capture (no hand-planted key) is
+    /// reinforced by a repeated gate failure.
+    #[tokio::test]
+    async fn a_repeated_gate_failure_reinforces_a_rework_written_lesson() {
+        let pool = test_pool().await;
+        assert_eq!(
+            raw_fingerprint(CARGO_FAILURE_TAIL),
+            raw_fingerprint(CARGO_FAILURE_GATE),
+            "the two fixtures describe one failure"
+        );
+        sqlx::query(
+            "INSERT INTO verify_runs
+               (project_id, worktree, scope, origin, requested_by, argv, status, output_tail,
+                started_at, finished_at)
+             VALUES (?, 'C:/w/run-4', 'gate', 'test', 'test', '[]', 'failed', ?,
+                     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(PROJECT)
+        .bind(CARGO_FAILURE_TAIL)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let record = crate::workflow_records::insert(
+            &pool,
+            &crate::workflow_records::NewRecord {
+                project_id: PROJECT.to_owned(),
+                worktree: Some("C:/w/run-4".to_owned()),
+                kind: "rework".to_owned(),
+                task_id: "t1".to_owned(),
+                phase: Some("implement".to_owned()),
+                caught_by: Some("review".to_owned()),
+                payload: serde_json::json!({
+                    "root_cause": "the import was missing",
+                    "fix": "add it",
+                })
+                .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::knowledge::Captured::Written(lesson) =
+            crate::knowledge::capture_rework(&pool, record).await.unwrap()
+        else {
+            panic!("a rework with a cause and a fix is written");
+        };
+        let first_run =
+            seed_run(&pool, PROJECT, "completed", Some("failed"), Some(CARGO_FAILURE_GATE)).await;
+        seed_run(&pool, PROJECT, "completed", Some("failed"), Some(CARGO_FAILURE_GATE)).await;
+
+        let report = run_pass(&pool, at(1)).await.unwrap();
+
+        assert_eq!(report.remeasured, 1);
+        let row = known(&pool, lesson).await;
+        assert_eq!(row["observations"], 2);
+        assert_eq!(row["last_confirmed_at"], at(1).to_rfc3339());
+        let evidence: Vec<Value> =
+            serde_json::from_str(row["evidence"].as_str().expect("evidence is written")).unwrap();
+        assert!(evidence.contains(&serde_json::json!({"t": "run", "id": first_run})));
+        assert_eq!(knowledge_count(&pool).await, 1, "the lesson keeps its id");
     }
 
     /// F3: a merge pass keeps the oldest id, so two passes never churn a new successor id.
@@ -1955,6 +2137,38 @@ mod tests {
         let settled = run_pass(&pool, at(2)).await.unwrap();
         assert_eq!(settled.remeasured, 1);
         assert_eq!(known(&pool, cause).await["observations"], 2);
+    }
+
+    /// Trial expiry is wall-clock and counter based, so a project that is always busy must not keep
+    /// its overdue trials alive: the pass skips the measurements but still expires trials.
+    #[tokio::test]
+    async fn a_busy_project_still_expires_its_overdue_trials() {
+        let pool = test_pool().await;
+        let now = at(12);
+        let old = seed_trial(
+            &pool,
+            PROJECT,
+            "procedural",
+            Some(now - chrono::Duration::days(61)),
+            (1, 0, 0),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO jobs
+               (project_id, project_root, status, max_items, created_at)
+             VALUES (?, 'C:/Projects/nucleos', 'running', 4,
+                     '2026-09-30T00:00:00+00:00')",
+        )
+        .bind(PROJECT)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let report = run_pass(&pool, now).await.unwrap();
+
+        assert_eq!(report.skipped_busy, 1);
+        assert_eq!(status_of(&pool, old).await, "expired");
+        assert_eq!(report.expired, 1);
     }
 
     /// An episodic measurement expires only after its full run window passes without confirmation.

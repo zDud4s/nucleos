@@ -20,6 +20,8 @@ use crate::tree_job::store::TreeJob;
 const MAX_SHAS: usize = 8;
 /// Deadline of each git read.
 const GIT_DEADLINE: Duration = Duration::from_secs(10);
+/// Most nodes of one tree read into its dossier.
+pub(super) const NODE_CAP: usize = 200;
 
 /// `(id, status, summary, handoff_path, run_id)` of a `work_nodes` row.
 type NodeRow = (
@@ -514,6 +516,32 @@ mod tests {
         // The rest of the blocks still came out.
         assert_eq!(blocks.node_reports.len(), 2);
         assert_eq!(blocks.decisions.len(), 1);
+    }
+
+    /// A tree with more nodes than `NODE_CAP` is read only up to the cap, so the node query and
+    /// the handoff reads stay bounded (the counts run over the nodes read).
+    #[tokio::test]
+    async fn gather_blocks_reads_at_most_node_cap_nodes() {
+        let pool = crate::testdb::fresh_pool().await;
+        let fx = fixture(&pool).await;
+        for i in 0..(super::NODE_CAP + 5) {
+            insert_node(
+                &pool,
+                &format!("n-extra-{i:04}"),
+                "failed",
+                std::path::Path::new(""),
+                None,
+            )
+            .await;
+        }
+        let blocks = gather_blocks(&pool, &fx.job, None, now()).await.unwrap();
+
+        assert!(
+            blocks.bad_nodes <= super::NODE_CAP,
+            "{} nodes counted, cap is {}",
+            blocks.bad_nodes,
+            super::NODE_CAP
+        );
     }
 
     #[tokio::test]

@@ -750,6 +750,36 @@ mod tests {
         assert_eq!(rows(&pool).await.len(), 2);
     }
 
+    /// A worktree path reused by a newer branch: a red run from before the tree existed is another
+    /// branch's history and must not pair with this branch's green run into a "recovered" lesson.
+    #[tokio::test]
+    async fn branch_recovered_ignores_verify_runs_older_than_the_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let created = Utc::now() - Duration::hours(1);
+        seed_tree_at(&pool, "job-1", Some("alpha"), "open", &[], created).await;
+
+        let old = (created - Duration::days(2)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO verify_runs (project_id, worktree, scope, origin, requested_by, argv,
+                                      status, duration_ms, started_at, finished_at)
+             VALUES ('alpha', 'wt-reused', 'full', 'job', 'gate', '[]', 'failed', 10, ?, ?)",
+        )
+        .bind(&old)
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_verify(&pool, "wt-reused", "passed").await;
+
+        assert!(
+            !enqueue_branch_recovered_in(&pool, "job-1", "node-a", "wt-reused")
+                .await
+                .unwrap(),
+            "a failure from before the tree existed is not this branch's"
+        );
+        assert!(rows(&pool).await.is_empty());
+    }
+
     #[tokio::test]
     async fn branch_recovered_needs_a_failed_then_passed_verify_run_of_the_branch_worktree() {
         let pool = crate::testdb::fresh_pool().await;

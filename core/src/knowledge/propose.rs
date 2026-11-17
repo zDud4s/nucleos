@@ -401,6 +401,8 @@ pub const TRIAL_IDLE_RUNS: i64 = 100;
 pub const TRIAL_MAX_DAYS: i64 = 60;
 /// Days an expired lesson keeps blocking its own fingerprint from coming back.
 pub const TRIAL_COOLOFF_DAYS: i64 = 30;
+/// Most evidence items a lesson keeps; the newest win.
+pub(super) const EVIDENCE_CAP: usize = 20;
 
 /// The note of an event that renews a row without changing its status.
 pub const NOTE_RECONFIRMED: &str = "reconfirmed";
@@ -885,6 +887,31 @@ mod rework_core_tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    /// m2: reconfirming with ever-new evidence keeps the stored array at `EVIDENCE_CAP`, newest kept.
+    #[tokio::test]
+    async fn reconfirm_row_in_bounds_the_evidence_array_keeping_the_newest() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = trial_row(&pool, "A hot lesson").await;
+        let mut stored: Option<String> = None;
+        for n in 1..=60 {
+            let evidence = serde_json::json!([{"t": "record", "id": n}]).to_string();
+            let mut tx = pool.begin().await.unwrap();
+            reconfirm_row_in(&mut tx, id, "episodic", "active", stored.clone(), &evidence)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            stored = sqlx::query_scalar("SELECT evidence FROM knowledge WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        }
+        let kept: Vec<serde_json::Value> = serde_json::from_str(&stored.unwrap()).unwrap();
+        assert!(kept.len() <= EVIDENCE_CAP, "bounded: {}", kept.len());
+        assert!(kept.iter().any(|e| e["id"] == 60), "the newest is kept");
+        assert!(!kept.iter().any(|e| e["id"] == 1), "the oldest is dropped");
     }
 
     async fn promote(pool: &sqlx::SqlitePool, id: i64) -> bool {
