@@ -47,7 +47,7 @@ const QUEUE_BUDGET: Duration = Duration::from_secs(240);
 /// Slack after the last unit's timeout for the executor to record the unit as ended.
 const SETTLE_GRACE: Duration = Duration::from_secs(30);
 const GIT_BUDGET: Duration = Duration::from_secs(30);
-const POLL: Duration = Duration::from_millis(250);
+const POLL: Duration = Duration::from_millis(if cfg!(test) { 25 } else { 250 });
 
 /// The tip of the project's integration branch, as a full sha.
 pub(super) async fn master_head(

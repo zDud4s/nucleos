@@ -460,8 +460,24 @@ fn the_test_step_inherits_only_the_check_ticket_of_the_same_head() {
         ticket: 3,
         head: "abc".to_owned(),
     };
-    assert_eq!(inherit_since(Some(&stored), "abc", Some(5)), Some(5));
-    assert_eq!(inherit_since(Some(&stored), "def", Some(5)), None);
-    assert_eq!(inherit_since(Some(&stored), "abc", None), None);
-    assert_eq!(inherit_since(None, "abc", Some(5)), None);
+    assert_eq!(inherit_since(Some(&stored), None, "abc", Some(5)), Some(5));
+    assert_eq!(inherit_since(Some(&stored), None, "def", Some(5)), None);
+    assert_eq!(inherit_since(Some(&stored), None, "abc", None), None);
+    assert_eq!(inherit_since(None, None, "abc", Some(5)), None);
+}
+
+#[test]
+fn the_test_step_inherits_the_check_queue_time_once_per_head() {
+    let stored = Stored {
+        ticket: 3,
+        head: "abc".to_owned(),
+    };
+    assert_eq!(
+        inherit_since(Some(&stored), Some("abc"), "abc", Some(5)),
+        None
+    );
+    assert_eq!(
+        inherit_since(Some(&stored), Some("old"), "abc", Some(5)),
+        Some(5)
+    );
 }

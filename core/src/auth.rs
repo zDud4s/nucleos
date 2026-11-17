@@ -5107,6 +5107,8 @@ mod tests {
             ("GET", "/runs/7"),
             ("GET", "/proposals"),
             ("GET", "/vcs/requests/7/wait"),
+            ("POST", "/hooks/agent-outcome"),
+            ("POST", "/hooks/agent-model"),
             ("POST", HOOK_ROUTE),
         ] {
             assert_eq!(

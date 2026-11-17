@@ -124,6 +124,9 @@ run() {
 #                               worktrees (see scripts/heavy.py `with_target_dir`).
 #   NUCLEOS_GATE_JOBS           cargo `-j` (build parallelism).
 #   NUCLEOS_GATE_TEST_THREADS   `--test-threads` for nextest / the libtest binaries.
+#   NUCLEOS_GATE_SKIP_CLIPPY    `1` skips the `core: clippy` step. Only the verify executor sets it,
+#                               on a test unit whose check unit passed for the same tree
+#                               (core/src/verify/skip_clippy.rs); every other caller keeps clippy.
 # gate_build_args sets `gate_args` (flags for a compiling subcommand), gate_threads sets `gate_tt`.
 # gate_seed_target: a cold warm target dir (no `debug/` yet) gets the registry crates' fingerprints
 # and artifacts from a recent sibling (scripts/gate_seed.py), so ~290 dependencies do not recompile
@@ -507,7 +510,13 @@ if [ "$target" = core ] || [ "$target" = all ]; then
   run "core: fmt"    . cargo fmt --all -- --check
   # `cargo fmt` compiles nothing and takes no --target-dir, so it needs no flag.
   gate_build_args
-  run "core: clippy" . cargo clippy ${gate_args[@]+"${gate_args[@]}"} ${gate_clippy_pkgs[@]+"${gate_clippy_pkgs[@]}"} --all-targets -- -D warnings
+  # NUCLEOS_GATE_SKIP_CLIPPY=1: the verify executor sets it on a test unit whose group's check unit
+  # (the same clippy) already passed for this very tree; running it again costs ~6.5 minutes twice.
+  if [ "${NUCLEOS_GATE_SKIP_CLIPPY:-}" = 1 ]; then
+    echo "core: clippy skipped: the check unit already passed for this tree"
+  else
+    run "core: clippy" . cargo clippy ${gate_args[@]+"${gate_args[@]}"} ${gate_clippy_pkgs[@]+"${gate_clippy_pkgs[@]}"} --all-targets -- -D warnings
+  fi
   # Every target (lib, bin, tests/): `--lib` alone would skip the binary's http.rs tests. And every
   # selected workspace crate under core/ (all four unless NUCLEOS_GATE_CRATES narrowed it, see
   # above): `-p nucleos-core` alone would skip the modules moved down to core/crates/nucleos-base,
@@ -647,8 +656,10 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
   else
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
     run "hooks: conductor" . "$py" scripts/test-conductor-hook.py
+    run "hooks: agent model" . "$py" scripts/test-agent-model-hook.py
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
+    run "gates: warm seed" . "$py" scripts/test-gate-seed.py
     run "gates: build slot" . "$py" scripts/test-build-slot.py
     run "daemon: from copy" . "$py" scripts/test-run-daemon.py
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this

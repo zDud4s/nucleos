@@ -25,6 +25,7 @@ pub mod probe;
 pub mod provision;
 pub mod render;
 pub mod runs;
+pub mod skip_clippy;
 pub mod store;
 pub mod supersede;
 

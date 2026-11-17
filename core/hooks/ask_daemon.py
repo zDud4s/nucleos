@@ -2323,6 +2323,65 @@ def scope_refusal(payload):
         return None
 
 
+AGENT_TOOLS = ("Agent", "Task")  # `Agent` on Claude Code 2.1.x, `Task` is the legacy alias
+AGENT_MODEL_TIMEOUT = 2.0
+AGENT_MODEL_PROMPT_CAP = 4000
+AGENT_MODEL_ALIASES = ("haiku", "sonnet", "opus")
+
+
+def rewrite_input(updated_input: dict) -> None:
+    """Rewrites the tool input and gives NO permission opinion.
+
+    Not `approve()`: that forces `allow`, which would skip the permission prompt of a spawn the
+    session would have asked about. Spike 2026-11-12: `updatedInput` alone sets `model` and the
+    session's own permissions still decide.
+    """
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": updated_input}}))
+    sys.exit(0)
+
+
+def agent_model_decision(payload: dict):
+    """Asks the daemon which model a subagent spawn gets. Returns the full `updatedInput` to emit,
+    or None for "no opinion".
+
+    The daemon records every ask (shadow included) and answers `model: null` unless the surface is
+    in apply mode, so in shadow this only asks. Interactive sessions only (a run's token has no
+    such route); a call that already names a `model` is not asked about. Fails open on everything,
+    bounded by `AGENT_MODEL_TIMEOUT`.
+    """
+    try:
+        if payload.get("tool_name") not in AGENT_TOOLS or os.environ.get("NUCLEOS_RUN_ID"):
+            return None
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, dict) or tool_input.get("model"):
+            return None
+        cwd = payload.get("cwd") or os.getcwd()
+        token, _why = read_control_token(cwd, total_timeout=1.0)
+        if not token:
+            return None
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        body = {
+            "session_id": str(payload.get("session_id") or ""),
+            "subagent_type": str(tool_input.get("subagent_type") or ""),
+            "description": str(tool_input.get("description") or ""),
+            "prompt": str(tool_input.get("prompt") or "")[:AGENT_MODEL_PROMPT_CAP],
+        }
+        request = urllib.request.Request(
+            f"{daemon_url}/hooks/agent-model",
+            data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=AGENT_MODEL_TIMEOUT) as response:
+            answer = json.loads(response.read())
+        model = answer.get("model") if isinstance(answer, dict) else None
+        if isinstance(model, str) and model in AGENT_MODEL_ALIASES:
+            return {**tool_input, "model": model}
+    except Exception:
+        pass
+    return None
+
+
 def interactive_session(payload: dict) -> None:
     """A session a person opened. Answers to the conductor policy first (`conductor_gate`), then
     refuses queue operations; may add context. The one thing it ever approves is a call to one of the
@@ -2340,6 +2399,10 @@ def interactive_session(payload: dict) -> None:
         reason = scope_refusal(payload)
         if reason:
             deny(reason)
+    if tool in AGENT_TOOLS:
+        updated = agent_model_decision(payload)
+        if updated is not None:
+            rewrite_input(updated)
     stamping = (
         tool in TASK_TOOLS
         and isinstance(session_id, str)
@@ -2505,6 +2568,46 @@ def with_context(outputs, event, extra):
     return outputs + [extra]
 
 
+AGENT_OUTCOME_TIMEOUT = 2.0
+
+
+def agent_outcome_body(payload: dict) -> dict:
+    """The `/hooks/agent-outcome` body for a `SubagentStop` payload."""
+    body = {
+        "session_id": str(payload.get("session_id") or ""),
+        "error": bool(payload.get("error") or payload.get("is_error")),
+    }
+    for key in ("agent_id", "agent_type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            body[key] = value
+    path = payload.get("agent_transcript_path") or payload.get("transcript_path")
+    if isinstance(path, str) and path:
+        body["transcript_path"] = path
+    return body
+
+
+def report_agent_outcome(payload: dict) -> None:
+    """Tells the daemon a subagent ended. Fails open: raises nothing, prints nothing, and is bounded
+    by `AGENT_OUTCOME_TIMEOUT` so it can neither delay nor alter the event's own output."""
+    try:
+        cwd = payload.get("cwd") or os.getcwd()
+        token, _why = read_control_token(cwd, total_timeout=1.0)
+        if not token:
+            return
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        request = urllib.request.Request(
+            f"{daemon_url}/hooks/agent-outcome",
+            data=json.dumps(agent_outcome_body(payload)).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=AGENT_OUTCOME_TIMEOUT) as response:
+            response.read()
+    except Exception:
+        pass
+
+
 def bundle_hooks(payload: dict, extra: str = "") -> None:
     """Runs the hooks the project's pinned workflow bundles declare for this session event.
 
@@ -2599,6 +2702,8 @@ def main() -> None:
             hint = conductor_context(payload)
             if hint:
                 extra = f"{extra}\n\n{hint}" if extra else hint
+        if event == "SubagentStop" and os.environ.get("NUCLEOS_RUN_ID") is None:
+            report_agent_outcome(payload)
         bundle_hooks(payload, extra)
 
     # Refused for a person's session and for a governed run alike, before either is asked
