@@ -84,8 +84,8 @@ describe("DistillerSources", () => {
     answer({ chat: true, calendar: true });
     renderWithQuery(<CaptureWait />);
 
-    const chat = (await screen.findByRole("switch", { name: "Conversations" })) as HTMLInputElement;
-    const calendar = screen.getByRole("switch", { name: "Calendar" }) as HTMLInputElement;
+    const chat = (await screen.findByRole("switch", { name: "Ingest: Conversations" })) as HTMLInputElement;
+    const calendar = screen.getByRole("switch", { name: "Ingest: Calendar" }) as HTMLInputElement;
     await waitFor(() => expect(chat.checked).toBe(true));
     expect(calendar.checked).toBe(true);
 
@@ -130,8 +130,10 @@ describe("DistillerSources", () => {
     expect(await screen.findByText("Turn conversations on to ingest them")).toBeTruthy();
     const button = screen.getByRole("button", { name: "Ingest past conversations" }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
+    // The helper sits behind the row's tip and shows only while asked for.
+    fireEvent.click(screen.getByRole("button", { name: "About project to ingest" }));
     expect(
-      screen.getByText("Sends up to 40 exchanges per chat to the distiller model, a few chats a day."),
+      await screen.findByText("Sends up to 40 exchanges per chat to the distiller model, a few chats a day."),
     ).toBeTruthy();
   });
 });

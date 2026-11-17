@@ -44,6 +44,7 @@ import {
   Tip,
   toastManager,
   usePaletteGroup,
+  Checkbox,
 } from "../ui";
 import { usePageKeys } from "../project/pageKeys";
 import { DAEMON_NAME } from "../copy";
@@ -743,8 +744,7 @@ function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: 
         <legend>Capabilities</legend>
         {AGENT_CAPABILITIES.map((capability) => (
           <label key={capability} style={{ display: "inline-flex", gap: 4, marginRight: 12 }}>
-            <input
-              type="checkbox"
+            <Checkbox
               checked={draft.capabilities.includes(capability)}
               onChange={(event) =>
                 onChange({

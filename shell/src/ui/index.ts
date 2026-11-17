@@ -150,6 +150,7 @@ export type { ListFilterProps, ListFilterChip } from "./ListFilter";
 export { Segmented, type SegmentedOption, type SegmentedProps } from "./Segmented";
 export { Select, type SelectProps } from "./Select";
 export { Switch, type SwitchProps } from "./Switch";
+export { Checkbox, Radio, type CheckboxProps, type RadioProps } from "./Checkbox";
 export { Callout, type CalloutProps } from "./Callout";
 export { ClampedText, type ClampedTextProps } from "./ClampedText";
 export { Drawer, type DrawerProps } from "./Drawer";

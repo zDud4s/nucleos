@@ -3,7 +3,7 @@ import { AGENT_CAPABILITIES, proposedCapabilities, sameCapabilities, type AgentE
 import type { Proposal } from "../../data/system";
 import { parseActionPayload, useHireRecruit } from "../../data/teams";
 import { useRejectProposal } from "../../data/waiting";
-import { Button, Callout, ConfirmButton, Field, RelativeTime, Row, Rows, Select, Tip } from "../../ui";
+import { Button, Callout, ConfirmButton, Field, RelativeTime, Row, Rows, Select, Tip, Checkbox } from "../../ui";
 import type { Reading } from "./reading";
 import { DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
 import { DepartmentContext, hasDepartmentContext } from "./TeamActions";
@@ -246,8 +246,7 @@ function RecruitmentCard({
   >
     {[...AGENT_CAPABILITIES, ...form.capabilities.filter((held) => !(AGENT_CAPABILITIES as readonly string[]).includes(held))].map((capability) => (
       <label key={capability} style={{ display: "inline-flex", gap: 4, marginRight: 12 }}>
-        <input
-          type="checkbox"
+        <Checkbox
           checked={form.capabilities.includes(capability)}
           onChange={(event) =>
             field(

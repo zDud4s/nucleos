@@ -3,7 +3,7 @@ import { isApiRefusal } from "../data/client";
 import { useForgetSecret, useMachineSecrets, useStoreSecret, type MachineSecret } from "../data/secrets";
 import { useSettingsIndex, type SettingIndexRow } from "../data/settings";
 import { SettingsForm } from "../settings/SettingsForm";
-import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, Skeleton, StateBadge, Tip } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, Rows, Skeleton, StateBadge, Tip } from "../ui";
 import { EngineOptIn } from "./EngineOptIn";
 import { DistillerModel } from "./DistillerModel";
 import { CaptureWait } from "./CaptureWait";
@@ -66,20 +66,23 @@ export function MachineSettings() {
   return (
     <>
       <Panel title="Brain">
-        <div className="sy-machine-prefs">
+        <Rows label="Brain settings">
           <DistillerModel />
           <CaptureWait />
           <EmbeddingModel />
-        </div>
+        </Rows>
       </Panel>
 
       <Panel title="Engines">
-        <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
+        <Rows label="Engines">
+          <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
+        </Rows>
       </Panel>
 
-      <Tip name="About machine settings" tip="These settings belong to the daemon rather than to any project. Each is checked before anything is written: a change that would not read is refused with the daemon's own words, and what is stored is left alone." />
-
-      {/* A list of the documents and one of them open, rather than nine forms stacked. */}
+      {/* A list of the documents and one of them open, rather than nine forms stacked. Drawn only when
+          there is a document to list: agy is left out above, so a machine with no other document had an
+          empty list, its legend and a lone tip floating on the page. */}
+      {rows.length > 0 && (
       <div className="sy-settings">
         <div className="sy-settings-nav">
         <ul className="sy-settings-list" aria-label="Settings documents">
@@ -126,14 +129,17 @@ export function MachineSettings() {
           })}
         </ul>
         {/* The marks are aria-hidden words-in-waiting; the legend says them to the eye. */}
-        <p className="sy-meta sy-settings-legend" aria-hidden="true">
-          <span className="sy-settings-legend-item">
-            <span className="sy-mark sy-mark-on" /> written
-          </span>
-          <span className="sy-settings-legend-item">
-            <span className="sy-mark sy-mark-key sy-mark-on" /> credential set
-          </span>
-        </p>
+        <div className="sy-settings-legend-row">
+          <p className="sy-meta sy-settings-legend" aria-hidden="true">
+            <span className="sy-settings-legend-item">
+              <span className="sy-mark sy-mark-on" /> written
+            </span>
+            <span className="sy-settings-legend-item">
+              <span className="sy-mark sy-mark-key sy-mark-on" /> credential set
+            </span>
+          </p>
+          <Tip name="About machine settings" tip="These settings belong to the daemon rather than to any project. Each is checked before anything is written: a change that would not read is refused with the daemon's own words, and what is stored is left alone." />
+        </div>
         </div>
 
         <div className="sy-settings-detail">
@@ -150,6 +156,7 @@ export function MachineSettings() {
             ))}
         </div>
       </div>
+      )}
     </>
   );
 }

@@ -18,6 +18,7 @@ import {
 import {
   Badge,
   Button,
+  Checkbox,
   ConfirmButton,
   Count,
   ErrorNote,
@@ -396,9 +397,8 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
   </span>
   <div id={idFor("capabilities")} role="group" aria-labelledby={idFor("capabilities-label")}>
     {[...AGENT_CAPABILITIES, ...form.capabilities.filter((held) => !(AGENT_CAPABILITIES as readonly string[]).includes(held))].map((capability) => (
-      <label key={capability} style={{ display: "inline-flex", gap: 4, marginRight: 12 }}>
-        <input
-          type="checkbox"
+      <label key={capability} className="decisions-capability">
+        <Checkbox
           checked={form.capabilities.includes(capability)}
           onChange={(event) =>
             field(

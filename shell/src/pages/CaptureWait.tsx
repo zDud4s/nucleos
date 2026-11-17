@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { isApiRefusal } from "../data/client";
 import { ingestChats, useDistillerSources, useSetDistillerSources } from "../data/knowledge";
 import { useProjects } from "../data/system";
 import { useCaptureConfig, useSetCaptureConfig, type CaptureConfigReading } from "../data/capture-config";
-import { Button, ErrorNote, Field, RefusalNote, Select, Switch } from "../ui";
+import { Button, ErrorNote, RefusalNote, Select, Switch } from "../ui";
+import { PrefRow } from "./PrefRow";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -19,7 +20,6 @@ export function CaptureWait() {
 
   return (
     <>
-    <div className="sy-pref">
       <ConfigNumber
         field="answer_days"
         id="sy-capture-days"
@@ -28,6 +28,13 @@ export function CaptureWait() {
         max={30}
         current={stored.data?.answer_days}
         set={set}
+        note={
+          refusal ? (
+            <RefusalNote refusal={refusal} />
+          ) : set.error ? (
+            <ErrorNote>the {DAEMON_NAME} is not responding: the capture settings were not changed</ErrorNote>
+          ) : null
+        }
       />
       <ConfigNumber
         field="digest_hour"
@@ -38,13 +45,7 @@ export function CaptureWait() {
         current={stored.data?.digest_hour}
         set={set}
       />
-      {refusal ? (
-        <RefusalNote refusal={refusal} />
-      ) : set.error ? (
-        <ErrorNote>the {DAEMON_NAME} is not responding: the capture settings were not changed</ErrorNote>
-      ) : null}
-    </div>
-    <DistillerSources />
+      <DistillerSources />
     </>
   );
 }
@@ -82,15 +83,44 @@ function DistillerSources() {
   }
 
   return (
-    <div className="sy-pref">
-      <Switch label="Conversations" checked={chatOn} disabled={set.isPending} onChange={(on) => set.mutate({ chat: on })} />
-      <Switch label="Calendar" checked={calendarOn} disabled={set.isPending} onChange={(on) => set.mutate({ calendar: on })} />
-      {refusal ? <RefusalNote refusal={refusal} /> : null}
-      <Field
+    <>
+      <PrefRow label="Ingest: Conversations" note={refusal ? <RefusalNote refusal={refusal} /> : null}>
+        <Switch
+          label="Ingest: Conversations"
+          labelHidden
+          checked={chatOn}
+          disabled={set.isPending}
+          onChange={(on) => set.mutate({ chat: on })}
+        />
+      </PrefRow>
+      <PrefRow label="Ingest: Calendar">
+        <Switch
+          label="Ingest: Calendar"
+          labelHidden
+          checked={calendarOn}
+          disabled={set.isPending}
+          onChange={(on) => set.mutate({ calendar: on })}
+        />
+      </PrefRow>
+      <PrefRow
         label="Project to ingest"
-        helper="Sends up to 40 exchanges per chat to the distiller model, a few chats a day."
+        htmlFor="sy-ingest-project"
+        tip="Sends up to 40 exchanges per chat to the distiller model, a few chats a day."
+        note={
+          <>
+            {!chatOn ? <p className="sy-meta">Turn conversations on to ingest them</p> : null}
+            {result ? (
+              <p className="sy-meta" role="status">
+                {result.seeded} conversations queued, {result.skipped} already ingested
+              </p>
+            ) : null}
+            {failed ? <ErrorNote>the daemon is not responding: nothing was ingested</ErrorNote> : null}
+          </>
+        }
       >
         <Select
+          id="sy-ingest-project"
+          block
           value={project}
           disabled={busy}
           onChange={(event) => setProject(event.target.value)}
@@ -102,18 +132,11 @@ function DistillerSources() {
             </option>
           ))}
         </Select>
-      </Field>
-      <Button disabled={!chatOn || busy} onClick={() => void ingest()}>
-        Ingest past conversations
-      </Button>
-      {!chatOn ? <p>Turn conversations on to ingest them</p> : null}
-      {result ? (
-        <p role="status">
-          {result.seeded} conversations queued, {result.skipped} already ingested
-        </p>
-      ) : null}
-      {failed ? <ErrorNote>the daemon is not responding: nothing was ingested</ErrorNote> : null}
-    </div>
+        <Button disabled={!chatOn || busy} onClick={() => void ingest()}>
+          Ingest past conversations
+        </Button>
+      </PrefRow>
+    </>
   );
 }
 
@@ -125,6 +148,7 @@ function ConfigNumber({
   max,
   current,
   set,
+  note,
 }: {
   field: keyof CaptureConfigReading;
   id: string;
@@ -133,6 +157,7 @@ function ConfigNumber({
   max: number;
   current: number | undefined;
   set: ReturnType<typeof useSetCaptureConfig>;
+  note?: ReactNode;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
   const sent = set.isPending ? set.variables?.[field] : undefined;
@@ -148,7 +173,7 @@ function ConfigNumber({
   }
 
   return (
-    <Field label={label} helper={helper}>
+    <PrefRow label={label} htmlFor={id} tip={helper} note={note}>
       <input
         id={id}
         className="sy-pref-input"
@@ -163,6 +188,6 @@ function ConfigNumber({
           if (event.key === "Enter") save();
         }}
       />
-    </Field>
+    </PrefRow>
   );
 }

@@ -1929,6 +1929,13 @@
   background: var(--border);
 }
 
+/* One capability tick on the decision form, replacing an inline style the CSP gate forbids. */
+.decisions-capability {
+  display: inline-flex;
+  gap: 4px;
+  margin-right: 12px;
+}
+
 .teams-check input {
   flex: none;
   accent-color: var(--text-muted);

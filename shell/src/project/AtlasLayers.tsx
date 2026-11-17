@@ -60,14 +60,9 @@ function Stack({
           {upward} upward imports ({upwardNew} new)
         </span>
         {upwardNew > 0 ? (
-          <button
-            type="button"
-            className="ml-2"
-            disabled={accept.isPending}
-            onClick={() => accept.mutate()}
-          >
+          <Button disabled={accept.isPending} onClick={() => accept.mutate()}>
             Accept today&apos;s graph
-          </button>
+          </Button>
         ) : null}
       </p>
 

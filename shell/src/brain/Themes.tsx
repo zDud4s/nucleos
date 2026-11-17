@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useThemes } from "../data/themes";
+import { Disclosure } from "../ui";
 import { ThemesAccepted } from "./ThemesAccepted";
 import { ThemesProposed } from "./ThemesProposed";
 import "./ThemesProposed.css";
@@ -19,20 +20,15 @@ export function Themes() {
   const summary = np > 0 ? `Themes ${na} · ${np} proposed` : `Themes ${na}`;
   return (
     <section className="themes-block" aria-label="Themes">
-      <button
-        type="button"
-        className="themes-toggle"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span aria-hidden="true">{open ? "▾" : "▸"}</span> {summary}
-      </button>
-      {open && (
-        <>
-          <ThemesProposed />
-          <ThemesAccepted />
-        </>
-      )}
+      {/* Controlled, with the rows mounted only while open: a hidden region would still fetch. */}
+      <Disclosure label={summary} open={open} onOpenChange={setOpen}>
+        {open && (
+          <>
+            <ThemesProposed />
+            <ThemesAccepted />
+          </>
+        )}
+      </Disclosure>
     </section>
   );
 }

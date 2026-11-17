@@ -55,7 +55,11 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     daemon.apiText.mockResolvedValue("");
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    // A Radix menu opens on pointerdown, not on click.
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for theme 3" }), {
+      pointerType: "mouse",
+      button: 0,
+    });
     fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     const input = screen.getByRole("textbox", { name: "New name for theme 3" }) as HTMLInputElement;
     const save = screen.getByRole("button", { name: "Save name of theme 3" }) as HTMLButtonElement;
@@ -78,7 +82,11 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     daemon.apiText.mockRejectedValue(new ApiRefusal(422, "bad_name", ""));
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    // A Radix menu opens on pointerdown, not on click.
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for theme 3" }), {
+      pointerType: "mouse",
+      button: 0,
+    });
     fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     fireEvent.change(screen.getByRole("textbox", { name: "New name for theme 3" }), { target: { value: "Sleep" } });
     fireEvent.click(screen.getByRole("button", { name: "Save name of theme 3" }));
@@ -89,7 +97,11 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     daemon.apiText.mockRejectedValue(new TypeError("network down"));
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    // A Radix menu opens on pointerdown, not on click.
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for theme 3" }), {
+      pointerType: "mouse",
+      button: 0,
+    });
     fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     fireEvent.change(screen.getByRole("textbox", { name: "New name for theme 3" }), { target: { value: "Sleep" } });
     fireEvent.click(screen.getByRole("button", { name: "Save name of theme 3" }));
@@ -100,7 +112,11 @@ describe("ThemesProposed", () => {
   it("cancels a rename on Escape without posting", async () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    // A Radix menu opens on pointerdown, not on click.
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for theme 3" }), {
+      pointerType: "mouse",
+      button: 0,
+    });
     fireEvent.click(screen.getByRole("menuitem", { name: "Rename theme 3" }));
     fireEvent.keyDown(screen.getByRole("textbox", { name: "New name for theme 3" }), { key: "Escape" });
     expect(screen.queryByRole("textbox")).toBeNull();
@@ -111,7 +127,11 @@ describe("ThemesProposed", () => {
     daemon.apiFetch.mockResolvedValue([row(3, "proposed"), row(4, "proposed")]);
     daemon.apiText.mockResolvedValue("");
     renderWithQuery(<ThemesProposed />);
-    fireEvent.click(await screen.findByRole("button", { name: "More actions for theme 3" }));
+    // A Radix menu opens on pointerdown, not on click.
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "More actions for theme 3" }), {
+      pointerType: "mouse",
+      button: 0,
+    });
     fireEvent.click(screen.getByRole("menuitem", { name: "Merge theme 3" }));
     const select = screen.getByRole("combobox", { name: "Merge theme 3 into" }) as HTMLSelectElement;
     const values = Array.from(select.options).map((o) => o.value);

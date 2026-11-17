@@ -4561,6 +4561,114 @@ span.ui-skeleton-card {
   }
 }
 
+/* -------------------------------------------------------- checkbox / radio -- */
+
+/*
+  A real checkbox or radio, redrawn. The box is the switch's size and feel: a hairline border,
+  the neutral ink when on, the shared focus ring and disabled opacity.
+*/
+.ui-check-field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+.ui-check-field:has(> .ui-check:disabled) {
+  cursor: default;
+}
+
+.ui-check-label {
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.ui-check {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  cursor: pointer;
+  transition: background-color var(--dur-quick) var(--ease), border-color var(--dur-quick) var(--ease);
+}
+
+.ui-check-radio {
+  border-radius: 50%;
+}
+
+.ui-check::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  background: var(--surface);
+}
+
+/* The tick, cut from the box with a mask so it takes the ink colour above. */
+.ui-check:checked::after,
+.ui-check:indeterminate::after {
+  opacity: 1;
+}
+
+.ui-check:checked::after {
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8.5l3 3 5-6' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 100% 100% no-repeat;
+}
+
+.ui-check:indeterminate::after {
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8h8' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E") center / 100% 100% no-repeat;
+}
+
+.ui-check-radio:checked::after {
+  inset: 3px;
+  border-radius: 50%;
+  mask: none;
+}
+
+.ui-check:checked,
+.ui-check:indeterminate {
+  border-color: var(--text);
+  background: var(--text);
+}
+
+.ui-check:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.ui-check:disabled {
+  cursor: default;
+  opacity: var(--opacity-disabled);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-check {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .ui-check {
+    forced-color-adjust: none;
+    border-color: ButtonText;
+    background: Canvas;
+  }
+
+  .ui-check::after {
+    background: HighlightText;
+  }
+
+  .ui-check:checked,
+  .ui-check:indeterminate {
+    border-color: Highlight;
+    background: Highlight;
+  }
+}
+
 /* --------------------------------------------------------------- callout -- */
 
 /*

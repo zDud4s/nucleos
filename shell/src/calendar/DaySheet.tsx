@@ -18,7 +18,7 @@ import { DAEMON_NAME } from "../copy";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
 import { formatSpan } from "../lib/when";
-import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, Select, TimeField, toastManager } from "../ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, Select, Switch, TimeField, toastManager } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
 /**
@@ -243,10 +243,7 @@ export function DraftEventForm({
           />
           <span>min</span>
         </label>
-        <label className="calendar-draft-inline calendar-draft-repeats">
-          <input type="checkbox" checked={repeats} onChange={(event) => setRepeats(event.target.checked)} />
-          <span>Repeats</span>
-        </label>
+        <Switch label="Repeats" checked={repeats} onChange={setRepeats} />
         {repeats && (
           <label className="calendar-draft-inline">
             <span>every</span>

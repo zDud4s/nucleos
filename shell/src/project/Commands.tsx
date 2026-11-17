@@ -19,6 +19,7 @@ import {
   Quiet,
   SHORTCUT_HINT,
   StaleNote,
+  Switch,
   usePaletteGroup,
   usePaletteOpen,
 } from "../ui";
@@ -276,22 +277,8 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
         </div>
 
         <div className="flex flex-col gap-2 text-sm text-text">
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={isGate}
-              onChange={(event) => setIsGate(event.target.checked)}
-            />
-            Its result says whether this project is green
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={agentMayRun}
-              onChange={(event) => setAgentMayRun(event.target.checked)}
-            />
-            An agent may run it on its own
-          </label>
+          <Switch label="Its result says whether this project is green" checked={isGate} onChange={setIsGate} />
+          <Switch label="An agent may run it on its own" checked={agentMayRun} onChange={setAgentMayRun} />
         </div>
 
         <div className="ws-dialog-actions items-center">

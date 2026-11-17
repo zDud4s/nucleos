@@ -1,4 +1,5 @@
-import { Panel, Quiet, Skeleton, Switch, Tip } from "../ui";
+import { Panel, Quiet, Rows, Skeleton, Switch, Tip } from "../ui";
+import { PrefRow } from "./PrefRow";
 import { useHiddenProviders } from "../app/notch-providers";
 import { useQuota } from "../data/quota";
 
@@ -19,8 +20,15 @@ export function NotchProviders() {
   const names = [...reported, ...hidden.filter((name) => !reported.includes(name))];
 
   return (
-    <Panel title="Quota notch">
-      <Tip name="About this preference" tip="A preference of this screen only: it is kept in this browser, not on the background service, and does not follow you to another machine. Each switch below decides whether the notch at the top of the window draws that subscription." />
+    <Panel
+      title="Quota notch"
+      aside={
+        <Tip
+          name="About the quota notch"
+          tip="A preference of this screen only: it is kept in this browser, not on the background service, and does not follow you to another machine. Each switch decides whether the notch at the top of the window draws that subscription. Saved as you switch; only what the notch draws changes, the quota brake is not affected."
+        />
+      }
+    >
       {quota.isPending && names.length === 0 ? (
         <Skeleton label="Reading the subscriptions" />
       ) : names.length === 0 ? (
@@ -28,15 +36,19 @@ export function NotchProviders() {
           No subscription has been read on this machine yet. Sign in to one and it will appear here.
         </Quiet>
       ) : (
-        <ul className="sy-notch-list" aria-label="Subscriptions">
+        <Rows label="Subscriptions">
           {names.map((name) => (
-            <li key={name}>
-              <Switch label={`Show ${name}`} checked={!hidden.includes(name)} onChange={(next) => setShown(name, next)} />
-            </li>
+            <PrefRow key={name} label={`Show ${name}`}>
+              <Switch
+                label={`Show ${name}`}
+                labelHidden
+                checked={!hidden.includes(name)}
+                onChange={(next) => setShown(name, next)}
+              />
+            </PrefRow>
           ))}
-        </ul>
+        </Rows>
       )}
-      <Tip name="About saving" tip="Saved as you switch. Only what the notch draws changes; the quota brake is not affected." />
     </Panel>
   );
 }

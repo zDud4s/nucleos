@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Proposal } from "../../data/system";
 import { useApproveProposal, useDeclineAction, useRejectProposal } from "../../data/waiting";
-import { Button, Callout, ConfirmButton, RelativeTime, Row, Rows } from "../../ui";
+import { Button, Callout, ConfirmButton, RelativeTime, Row, Rows, Checkbox } from "../../ui";
 import "./approval-card.css";
 import type { Reading } from "./reading";
 import { DecisionNotes, DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
@@ -127,14 +127,11 @@ export function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
           <div className={chosen.length > 0 ? "waiting-bulk waiting-bulk-live" : "waiting-bulk"}>
             <label className="waiting-bulk-all">
               <span className="waiting-select-hit">
-                <input
+                <Checkbox
                   className="waiting-select"
-                  type="checkbox"
                   checked={allChosen}
                   // Some but not all: the box says "part of it" and a click completes the set.
-                  ref={(box) => {
-                    if (box !== null) box.indeterminate = chosen.length > 0 && !allChosen;
-                  }}
+                  indeterminate={chosen.length > 0 && !allChosen}
                   disabled={busy}
                   onChange={(event) =>
                     setSelected(
@@ -195,9 +192,8 @@ export function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                         queue is worked through, so the label around it is what is clickable:
                         28 by 28 CSS pixels, with the box centred in it (`waiting.css`). */}
                     <label className="waiting-select-hit">
-                      <input
+                      <Checkbox
                         className="waiting-select"
-                        type="checkbox"
                         aria-label={`Select approval #${proposal.id}`}
                         checked={selected.has(proposal.id)}
                         disabled={busy}

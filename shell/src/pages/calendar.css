@@ -126,53 +126,6 @@
   margin-inline: calc(-1 * var(--space-1));
 }
 
-/* A segmented pair rather than two loose buttons: they are one choice, and the
-   shared border is what says so. Its frame, radius and metrics are `.ui-button`'s
-   — it sat in the same row as Prev, Today and Next on a thinner border, a smaller
-   radius and a shorter line, and read as a different kind of control. */
-.calendar-views {
-  display: flex;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  overflow: hidden;
-}
-
-/* `base.css` resets only `font` and `color` on a button and deliberately never
-   `background`, so every control here brings its own ground. */
-.calendar-view {
-  padding: 0.34rem var(--space-3);
-  border: 0;
-  background: var(--surface);
-  color: var(--text-muted);
-  font-family: var(--font-body);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  line-height: 1.4;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-quick) var(--ease),
-    color var(--dur-quick) var(--ease);
-}
-
-.calendar-view + .calendar-view {
-  border-left: 1px solid var(--border-strong);
-}
-
-.calendar-view:hover {
-  background: var(--surface-raised);
-  color: var(--text);
-}
-
-.calendar-view:focus-visible {
-  outline-offset: -2px;
-}
-
-.calendar-view-on,
-.calendar-view-on:hover {
-  background: var(--solid);
-  color: var(--solid-ink);
-}
-
 /* ============================================================ month grid == */
 
 .calendar-month {
@@ -907,12 +860,6 @@ span.calendar-skeleton-event {
 
 .calendar-draft-minutes {
   width: 4.5rem;
-}
-
-.calendar-draft-repeats input {
-  margin: 0;
-  /* Ink, as every other checkbox in the shell: cyan is reserved for links. */
-  accent-color: var(--text);
 }
 
 /*

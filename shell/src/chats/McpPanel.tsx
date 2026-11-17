@@ -9,6 +9,7 @@ import {
   type McpImportReport,
   type McpServerRow,
 } from "../data/mcp";
+import { Button, Switch } from "../ui";
 import { toastManager } from "../ui/toast";
 import {
   DropdownMenuCheckboxItem,
@@ -65,26 +66,24 @@ export function McpCardBody({ chatId, data }: { chatId: string; data: McpCardDat
       {current.engine_note != null && <p className="chats-tool-why">{current.engine_note}</p>}
       <ul>
         <li>
-          <label>
-            <input type="checkbox" checked={current.fixed.active} disabled readOnly />{" "}
-            {current.fixed.name}
-          </label>{" "}
+          <Switch label={current.fixed.name} checked={current.fixed.active} disabled onChange={() => undefined} />{" "}
           <span className="chats-tool-why">always on</span>
         </li>
         {current.servers.map((server) => {
           const why = rowWhy(server);
           return (
             <li key={server.name}>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={server.enabled}
-                  disabled={disabled}
-                  onChange={(event) => toggle(server.name, event.target.checked)}
-                />{" "}
-                {server.name} <code>{server.command}</code>
-                {server.env_names.length > 0 && ` env: ${server.env_names.join(", ")}`}
-              </label>
+              <Switch
+                label={
+                  <>
+                    {server.name} <code>{server.command}</code>
+                    {server.env_names.length > 0 && ` env: ${server.env_names.join(", ")}`}
+                  </>
+                }
+                checked={server.enabled}
+                disabled={disabled}
+                onChange={(next) => toggle(server.name, next)}
+              />
               {why != null && (
                 <>
                   {" "}
@@ -97,9 +96,9 @@ export function McpCardBody({ chatId, data }: { chatId: string; data: McpCardDat
       </ul>
       {current.servers.length === 0 && <p>No MCP servers in the registry</p>}
       {current.hint != null && <p>{current.hint}</p>}
-      <button type="button" disabled={importer.isPending} onClick={() => importer.mutate(undefined, { onError: importFailed })}>
+      <Button disabled={importer.isPending} onClick={() => importer.mutate(undefined, { onError: importFailed })}>
         Import
-      </button>
+      </Button>
       {importer.data !== undefined && <McpImportBody data={importer.data} />}
     </div>
   );

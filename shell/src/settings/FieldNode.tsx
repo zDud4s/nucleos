@@ -1,5 +1,5 @@
 import { useState, type ReactElement, type ReactNode } from "react";
-import { Button, ErrorNote, Field, Select, Tip, type FieldProps } from "../ui";
+import { Button, ErrorNote, Field, Select, Switch, Tip, type FieldProps } from "../ui";
 import {
   defaultFor,
   enumOptions,
@@ -320,15 +320,11 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
       return (
         <div data-field={path} className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={value === undefined || value === null ? inner.default === true : value === true}
-                aria-invalid={invalid}
-                onChange={(event) => { onChange(event.target.checked); }}
-              />
-              <span>{label}</span>
-            </label>
+            <Switch
+              label={label}
+              checked={value === undefined || value === null ? inner.default === true : value === true}
+              onChange={(next) => { onChange(next); }}
+            />
             {aboutTip(inner.description)}
           </div>
           {failure}

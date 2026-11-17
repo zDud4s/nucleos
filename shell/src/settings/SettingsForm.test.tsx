@@ -516,7 +516,7 @@ describe("SettingsForm: the git document", () => {
     renderWithQuery(<SettingsForm scope="machine" name="git" takesEffect="from the next merge" />);
 
     const box = (await screen.findByLabelText("Squash checkpoints")) as HTMLInputElement;
-    expect(box.type).toBe("checkbox");
+    expect(box.getAttribute("role")).toBe("switch");
     expect(box.checked).toBe(true);
     expect(screen.getByText(/commits collapse into one commit/)).toBeTruthy();
     expect(screen.getByText("Takes effect from the next merge.")).toBeTruthy();

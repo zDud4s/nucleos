@@ -53,15 +53,20 @@ export function Autostart() {
       {!autostart.isError && view === undefined && <AutostartSkeleton />}
       {view !== undefined && (
         <>
-          <p className="sy-note">
+          <p
+            className="sy-note"
+            title={
+              view.mode === "at-boot"
+                ? `The ${DAEMON_NAME} starts with this machine, before anyone logs in.`
+                : `The ${DAEMON_NAME} starts when you log in.`
+            }
+          >
             {view.mode === "at-boot" ? (
               <Badge tone="active">on</Badge>
             ) : (
               <Badge tone="off">off</Badge>
             )}{" "}
-            {view.mode === "at-boot"
-              ? `The ${DAEMON_NAME} starts with this machine, before anyone logs in.`
-              : `The ${DAEMON_NAME} starts when you log in.`}
+            {view.mode === "at-boot" ? "Starts at boot" : "Starts at login"}
           </p>
 
           {!view.at_boot && view.why_not !== null && <p className="sy-note">{view.why_not}</p>}

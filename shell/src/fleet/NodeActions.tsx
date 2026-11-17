@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { Pin } from "lucide-react";
 import { useCancelRun } from "../data/runs";
+import { Button } from "../ui";
 import { usePin } from "./pins";
 import { useFleetUi } from "./ui-context";
 import type { FleetNode as WireNode } from "./types";
@@ -119,19 +120,18 @@ function StopControl({ runId, label }: { runId: number; label: string }) {
       }}
     >
       <span>Stop this run?</span>
-      <button
-        type="button"
-        className="fleet-confirm-yes"
+      <Button
+        variant="danger"
         onClick={() => {
           cancel.mutate(runId);
           setArmed(false);
         }}
       >
         Yes
-      </button>
-      <button ref={noButton} type="button" onClick={() => setArmed(false)}>
+      </Button>
+      <Button ref={noButton} onClick={() => setArmed(false)}>
         No
-      </button>
+      </Button>
     </span>
   );
 }

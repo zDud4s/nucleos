@@ -84,9 +84,9 @@ beforeEach(() => {
 describe("McpCardBody", () => {
   it("shows one checkbox per server with its state, and nucleos fixed", () => {
     wrap(<McpCardBody chatId="c-1" data={card()} />);
-    expect((screen.getByRole("checkbox", { name: /gh/ }) as HTMLInputElement).checked).toBe(true);
-    expect((screen.getByRole("checkbox", { name: /fs/ }) as HTMLInputElement).checked).toBe(false);
-    const fixed = screen.getByRole("checkbox", { name: /nucleos/ }) as HTMLInputElement;
+    expect((screen.getByRole("switch", { name: /gh/ }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("switch", { name: /fs/ }) as HTMLInputElement).checked).toBe(false);
+    const fixed = screen.getByRole("switch", { name: /nucleos/ }) as HTMLInputElement;
     expect(fixed.checked).toBe(true);
     expect(fixed.disabled).toBe(true);
     expect(screen.getByText(/TOKEN/)).toBeTruthy();
@@ -94,13 +94,13 @@ describe("McpCardBody", () => {
 
   it("ticking a server sends PUT and unticking sends DELETE", async () => {
     wrap(<McpCardBody chatId="c-1" data={card()} />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /fs/ }));
+    fireEvent.click(screen.getByRole("switch", { name: /fs/ }));
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/mcp/fs", {
         method: "PUT",
       }),
     );
-    fireEvent.click(screen.getByRole("checkbox", { name: /gh/ }));
+    fireEvent.click(screen.getByRole("switch", { name: /gh/ }));
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1/mcp/gh", {
         method: "DELETE",
@@ -134,7 +134,7 @@ describe("McpCardBody", () => {
         })}
       />,
     );
-    for (const box of screen.getAllByRole("checkbox")) {
+    for (const box of screen.getAllByRole("switch")) {
       expect((box as HTMLInputElement).disabled).toBe(true);
     }
     expect(screen.getByText("not supported on this engine in v1")).toBeTruthy();
