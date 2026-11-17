@@ -115,6 +115,8 @@ tests:
     - scripts/check-landing-branch-literal.py
     - scripts/test-check-landing-branch-literal.py
     - scripts/stage-bundle-bins.sh
+    # Ticket queue helper run by hand; no gate calls it.
+    - scripts/queues.py
     # Run by hand (or by the release workflow) inside a clean ubuntu/fedora box against downloaded assets.
     - scripts/smoke-bundle.sh
     - scripts/css-contract.mjs
