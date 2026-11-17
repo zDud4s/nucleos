@@ -594,10 +594,23 @@ impl CommandRunner for ClaudeCliRunner {
                         open_tools.clear();
                         turn_ended = true;
                         // `line` is the `result` that ended the turn, which is all the 429 test reads.
+                        let reset = usage_limit_reset(&line, chrono::Utc::now());
+                        let rate_limited = failed_on_rate_limit(&line) || reset.is_some();
                         super::auth_watch::report(super::auth_watch::AuthSignal::TurnEnded {
-                            rate_limited: failed_on_rate_limit(&line)
-                                || usage_limit_reset(&line, chrono::Utc::now()).is_some(),
+                            rate_limited,
                         });
+                        // A pooled account that hit its limit mid-session is marked exhausted, so
+                        // the next pick skips it; the reset is the CLI's when it named one.
+                        if rate_limited
+                            && let Some(account) = crate::accounts::account_of(&request.env)
+                        {
+                            super::auth_watch::report(
+                                super::auth_watch::AuthSignal::AccountLimited {
+                                    account: account.to_owned(),
+                                    resets_at: reset.flatten(),
+                                },
+                            );
+                        }
                         usage = turn.usage;
                         if turn.cost_usd.is_some() {
                             cost_usd = Some(splitter.spent());
