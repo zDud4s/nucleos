@@ -19,6 +19,7 @@
 //! - A `bg_ref` is looked for by comparing short string values of a tool call's input against the
 //!   background task ids the session already holds. The values are compared, never stored.
 
+pub mod account;
 pub mod actions;
 pub mod lanes;
 pub mod map;
@@ -717,11 +718,14 @@ async fn set_status(pool: &SqlitePool, key: &str, status: &str) {
     }
 }
 
+// Eight arguments: the per-file identity (project, worktree, account) plus the cycle accumulators.
+#[allow(clippy::too_many_arguments)]
 async fn ingest_file(
     pool: &SqlitePool,
     file: &Found,
     project: &str,
     worktree: Option<&str>,
+    account_id: Option<&str>,
     vocab: &Arc<ParseVocab>,
     stats: &mut CycleStats,
     touched: &mut BTreeSet<String>,
@@ -805,7 +809,8 @@ async fn ingest_file(
         counters.lines_failed += chunk.lines_failed;
         counters.unknown_records += chunk.unknown;
         devtime_store::save_offset(&mut tx, &key, offset, size, Some(&mtime), &counters).await?;
-        devtime_store::set_file_identity(&mut tx, &key, &file.session, &file.lane).await?;
+        devtime_store::set_file_identity(&mut tx, &key, &file.session, &file.lane, account_id)
+            .await?;
         if needs_ok {
             devtime_store::mark_file_status(&mut tx, &key, "ok").await?;
         }
@@ -854,6 +859,10 @@ pub async fn ingest_cycle(
                 Vec::new()
             }
         };
+
+    // The scan root is `<config dir>/projects`; its parent stands for the default account's dir.
+    // A failed read leaves the account column NULL, never blocks the ingest.
+    let (accounts, default_dir) = account::load(pool, projects_dir).await;
 
     let dir = projects_dir.to_path_buf();
     let found = tokio::task::spawn_blocking(move || walk(&dir))
@@ -923,11 +932,13 @@ pub async fn ingest_cycle(
                 worktree,
                 ..
             }) if kind == "project" || kind == "worktree" || kind == "tree_node" => {
+                let account_id = account::resolve_account(&key, &default_dir, &accounts);
                 match ingest_file(
                     pool,
                     file,
                     project,
                     worktree.as_deref(),
+                    account_id.as_deref(),
                     &vocab,
                     &mut stats,
                     &mut touched,
