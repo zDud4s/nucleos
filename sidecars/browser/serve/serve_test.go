@@ -40,6 +40,7 @@ func testServer(t *testing.T, driver browser.Driver) *httptest.Server {
 	mux.HandleFunc("/snapshot", authorized(token, snapshotHandler(driver)))
 	mux.HandleFunc("/act", authorized(token, actHandler(driver)))
 	mux.HandleFunc("/screenshot", authorized(token, screenshotHandler(driver)))
+	mux.HandleFunc("/look", authorized(token, lookHandler(driver)))
 	mux.HandleFunc("/handoff", authorized(token, handoffHandler(driver)))
 	mux.HandleFunc("/close", authorized(token, closeHandler(driver)))
 	wheelhouse, _ := driver.(browser.Wheelhouse)
@@ -69,6 +70,44 @@ func post(t *testing.T, server *httptest.Server, path string, body any, auth boo
 	}
 	t.Cleanup(func() { response.Body.Close() })
 	return response
+}
+
+// TestLookCrossesTheWireAsBase64WithItsMime: /look answers JSON with the base64 JPEG, its mime, the
+// labels drawn and the picture's size, and refuses an unknown or missing session.
+func TestLookCrossesTheWireAsBase64WithItsMime(t *testing.T) {
+	driver := &browser.Fake{
+		FenceAttached: true,
+		Looked: browser.LookResult{
+			Image: "AAEC", MIME: "image/jpeg", Labels: []string{"e1", "e7"}, Width: 1024, Height: 768,
+		},
+	}
+	server := testServer(t, driver)
+
+	var session browser.Session
+	response := post(t, server, "/open", opening("https://example.org/"), true)
+	if err := json.NewDecoder(response.Body).Decode(&session); err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+
+	response = post(t, server, "/look", SessionRequest{SessionID: string(session.ID)}, true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("look: got %d", response.StatusCode)
+	}
+	var got browser.LookResult
+	if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
+		t.Fatalf("decode look: %v", err)
+	}
+	if got.Image != "AAEC" || got.MIME != "image/jpeg" || !slices.Equal(got.Labels, []string{"e1", "e7"}) ||
+		got.Width != 1024 || got.Height != 768 {
+		t.Fatalf("look = %+v, want what the driver returned", got)
+	}
+
+	if r := post(t, server, "/look", SessionRequest{}, true); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("look without a session: got %d, want 400", r.StatusCode)
+	}
+	if r := post(t, server, "/look", SessionRequest{SessionID: "nope"}, true); r.StatusCode != http.StatusNotFound {
+		t.Fatalf("look of an unknown session: got %d, want 404", r.StatusCode)
+	}
 }
 
 // TestEveryRouteNeedsTheToken. This process drives browsers holding the owner's logged-in sessions;
