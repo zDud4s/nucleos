@@ -73,6 +73,8 @@ pub fn yaml_to_body(name: &str, text: &str) -> Result<Value, String> {
         "account_pool" => Err("account_pool has no legacy file".into()),
         // Automations are new in the settings store too: no legacy file ever held them.
         "automations" => Err("automations has no legacy file".into()),
+        // The per-project browser origins are new in the settings store too.
+        "browser_project" => Err("browser_project has no legacy file".into()),
         "keep_awake" => to_json(config::parse_keep_awake_config(text)?),
         "git" => to_json(config::parse_git_config(text)?),
         "background" => to_json(config::parse_background_config(text)?),

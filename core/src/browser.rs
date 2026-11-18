@@ -27,6 +27,7 @@ pub mod embedded;
 mod embedded_close;
 pub mod embedded_owner;
 pub mod live;
+pub mod local_origins;
 pub mod panel;
 pub mod seat;
 pub mod wheel;
@@ -516,7 +517,7 @@ pub fn embedded_key(project: &str) -> &str {
 /// Stable on purpose: a per-run name would change the sidecar's fingerprint on every open and make
 /// `prepare` refuse while sessions are live.
 pub fn no_project_placement() -> Placement {
-    Placement::ephemeral("embedded-none")
+    local_origins::decorate(Placement::ephemeral("embedded-none"), NO_PROJECT)
 }
 
 /// Everything about one request to open a session, apart from where it will be sent.
@@ -732,7 +733,7 @@ fn placement_for(
     row_id: i64,
     sites: &Allowed,
 ) -> Placement {
-    match profile {
+    let placement = match profile {
         // Both lists, always together. A placement carrying the sites and not the write grants would
         // be a fence enforcing half a decision, and the half it dropped is the permissive one.
         Profile::Project => {
@@ -742,7 +743,9 @@ fn placement_for(
             Some(run) => Placement::ephemeral(&format!("r{run}")),
             None => Placement::ephemeral(&format!("s{row_id}")),
         },
-    }
+    };
+    // The project's loopback origins and the ports no agent browser may reach, on every placement.
+    local_origins::decorate(placement, project_id)
 }
 
 /// Insert the row BEFORE the sidecar is called.
@@ -817,9 +820,20 @@ async fn finish_session(
     .bind(row_id)
     .execute(pool)
     .await?;
-    session_row(pool, row_id)
+    let row = session_row(pool, row_id)
         .await?
-        .ok_or(sqlx::Error::RowNotFound)
+        .ok_or(sqlx::Error::RowNotFound)?;
+    // A loopback refusal for an origin the project has not allowed becomes an owner decision; the
+    // agent never lifts it itself.
+    if session
+        .refusal
+        .as_ref()
+        .is_some_and(|refusal| refusal.consequence == local_origins::LOOPBACK)
+    {
+        local_origins::ask_for_origin(pool, row.project_id.as_deref(), &session.requested_url)
+            .await;
+    }
+    Ok(row)
 }
 
 pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<SessionRow>> {

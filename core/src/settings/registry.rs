@@ -1,5 +1,5 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the documents: the 20 fixed ones plus one `channels/<id>` row per channel manifest.
+//! and the table of the documents: the 21 fixed ones plus one `channels/<id>` row per channel manifest.
 
 use std::sync::LazyLock;
 
@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::decode::{self, Erased, Prepared};
 use super::scope::Kind;
 use crate::automations::Automations;
+use crate::browser::local_origins::BrowserProject;
 use crate::channels::registry::ChannelConfig;
 use crate::config::{
     AutopilotRules, BackgroundConfig, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig,
@@ -192,6 +193,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
             crate::project::state::AUTOMATIONS_FILE,
             "at the next event the project's automations see",
         ),
+        of::<BrowserProject>(
+            crate::project::state::BROWSER_PROJECT_FILE,
+            "at the next browser session an agent opens for that project",
+        ),
     ];
     // One machine document per channel manifest, listed after the fixed machine documents.
     let machine_end = docs
@@ -364,6 +369,15 @@ impl Document for Automations {
     }
 }
 
+impl Document for BrowserProject {
+    const NAME: &'static str = "browser_project";
+    const KIND: Kind = Kind::Project;
+    fn finish(self) -> Result<Self, String> {
+        self.check()?;
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -380,12 +394,12 @@ mod tests {
 
     #[test]
     fn there_are_twenty_documents_with_unique_names() {
-        // 20 fixed documents plus one `channels/<id>` per manifest.
+        // 21 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 20 + channels);
+        assert_eq!(docs.len(), 21 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 20 + channels);
+        assert_eq!(names.len(), 21 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
             17 + channels
@@ -395,7 +409,24 @@ mod tests {
             .filter(|doc| doc.kind == Kind::Project)
             .map(|doc| doc.name)
             .collect();
-        assert_eq!(project, vec!["autopilot", "workflow_pins", "automations"]);
+        assert_eq!(
+            project,
+            vec!["autopilot", "workflow_pins", "automations", "browser_project"]
+        );
+    }
+
+    #[test]
+    fn the_browser_project_document_is_validated_on_the_way_in() {
+        let good = json!({"local_origins": ["http://localhost:5173"]});
+        assert!(prepared_text("browser_project", &good).is_ok());
+        for bad in [
+            json!({"local_origins": ["http://example.com:80"]}),
+            json!({"local_origins": ["http://localhost"]}),
+            json!({"local_origins": ["http://localhost:5173/app"]}),
+            json!({"local_origins": ["http://localhost:5173", "http://localhost:5173"]}),
+        ] {
+            assert!(prepared_text("browser_project", &bad).is_err(), "{bad} was accepted");
+        }
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The project's browser settings (`browser_project.yaml`).",
+  "properties": {
+    "local_origins": {
+      "default": [],
+      "description": "Loopback origins the project's agent browsers may open, e.g. `http://localhost:5173`: http or https, host `localhost`, `127.0.0.1` or `[::1]`, an explicit port, no path.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "title": "BrowserProject",
+  "type": "object"
+}
