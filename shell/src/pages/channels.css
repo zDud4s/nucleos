@@ -5,6 +5,31 @@
 .ui-skeleton-grid.ch-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr));
-  align-items: start;
   gap: var(--space-4);
+}
+
+/* Stretch comes from ui.css. The body and the card are columns that fill the panel, so the
+   identities footer link ("edit in Machine") sits at the bottom of every card. */
+.ch-grid > .ui-panel > .ui-panel-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.ch-grid .ch-card {
+  flex: 1 1 auto;
+}
+
+.ch-grid .identities-panel {
+  flex: 1 1 auto;
+}
+
+.ch-grid .identities-panel > .ui-section:last-child {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.ch-grid .identities-projects + a {
+  margin-top: auto;
 }

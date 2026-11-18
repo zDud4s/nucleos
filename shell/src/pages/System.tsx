@@ -213,18 +213,19 @@ export function System() {
           />
         )}
         {view === "settings" && (
-          <>
-            <Panel title="Daemon">
-              <Rows label="Daemon">
-                <Autostart />
-                <RestartDaemon />
-              </Rows>
-            </Panel>
-            <MachineSettings />
-            {/* A preference of this screen, not a limit: it lives with the machine's own settings,
-                as one more panel beside them rather than under a heading of its own. */}
-            <NotchProviders />
-          </>
+          <MachineSettings
+            lead={
+              <Panel title="Daemon">
+                <Rows label="Daemon">
+                  <Autostart />
+                  <RestartDaemon />
+                </Rows>
+              </Panel>
+            }
+            /* A preference of this screen, not a limit: it lives with the machine's own settings,
+               as one more panel beside them rather than under a heading of its own. */
+            trail={<NotchProviders />}
+          />
         )}
       </div>
     </>
@@ -1227,10 +1228,8 @@ function BudgetPanel() {
 function BackupsView() {
   return (
     <div className="sy-backups-layout">
-      <div className="sy-backups-main">
-        <SpacePanel />
-        <BackupsPanel />
-      </div>
+      <SpacePanel />
+      <BackupsPanel />
       <PiiObservations />
     </div>
   );
@@ -1416,9 +1415,16 @@ function BackupsPanel() {
     <Panel
       title="Backups"
       aside={
-        <Button variant="ghost" disabled={takeBackup.isPending} onClick={() => takeBackup.mutate()}>
-          {takeBackup.isPending ? "Taking a backup…" : "Take a backup now"}
-        </Button>
+        <>
+          {!noBackups && (
+            <PanelNote empty={false} says="no backup has been taken yet.">
+              Staging a restore changes nothing yet: the swap happens the next time the {DAEMON_NAME} starts.
+            </PanelNote>
+          )}
+          <Button variant="ghost" disabled={takeBackup.isPending} onClick={() => takeBackup.mutate()}>
+            {takeBackup.isPending ? "Taking a backup…" : "Take a backup now"}
+          </Button>
+        </>
       }
     >
       {!backups.isError && backups.data === undefined && (
@@ -1438,9 +1444,11 @@ function BackupsPanel() {
           )}
         </p>
       )}
-      <PanelNote empty={noBackups} says="no backup has been taken yet.">
-        Staging a restore changes nothing yet: the swap happens the next time the {DAEMON_NAME} starts.
-      </PanelNote>
+      {noBackups && (
+        <PanelNote empty says="no backup has been taken yet.">
+          Staging a restore changes nothing yet: the swap happens the next time the {DAEMON_NAME} starts.
+        </PanelNote>
+      )}
       {takeBackup.isError && (
         <ErrorNote>
           the backup was not taken: the {DAEMON_NAME} refused or is not responding

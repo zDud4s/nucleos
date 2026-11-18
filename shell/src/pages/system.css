@@ -448,7 +448,6 @@
   display: grid;
   /* min() lets the pair fall to one column narrower than 28rem instead of overflowing it. */
   grid-template-columns: repeat(auto-fit, minmax(min(28rem, 100%), 1fr));
-  align-items: start;
   gap: var(--space-4);
 }
 
@@ -491,12 +490,13 @@
   --sy-limit-tracks: minmax(0, 1fr) 8.5rem;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
-  align-items: stretch;
   gap: var(--space-4);
 }
 
-.sy-limits > .ui-panel {
-  min-width: 0;
+/* The body is a column so the Save footer can sit at the bottom of every card. */
+.sy-limits > .ui-panel > .ui-panel-body {
+  display: flex;
+  flex-direction: column;
 }
 
 .ui-rows-row.sy-limit-row {
@@ -613,6 +613,7 @@
 
 /* Panel footer: the Save button, right-aligned, only while the form is dirty. */
 .sy-limit-foot {
+  margin-top: auto;
   display: flex;
   justify-content: flex-end;
   padding-top: var(--space-3);
@@ -647,26 +648,33 @@
 
 /* ----------------------------------------------------------------- backups == */
 
-/* The backups beside the PII tally: the list needs the width, the tally is
-   three short columns. */
+/* Space above Backups in the wide left column; the PII tally spans both rows on the right, so its
+   bottom edge lines up with the Backups card. */
 .sy-backups-layout {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr);
-  align-items: start;
   gap: var(--space-4);
+}
+
+.sy-backups-layout > :nth-child(1),
+.sy-backups-layout > :nth-child(2) {
+  grid-column: 1;
+}
+
+.sy-backups-layout > :nth-child(3) {
+  grid-column: 2;
+  grid-row: 1 / span 2;
 }
 
 @media (max-width: 64rem) {
   .sy-backups-layout {
     grid-template-columns: minmax(0, 1fr);
   }
-}
 
-/* The Space panel sits above the list, in the same column. */
-.sy-backups-main {
-  display: grid;
-  gap: var(--space-4);
-  min-width: 0;
+  .sy-backups-layout > :nth-child(n) {
+    grid-column: auto;
+    grid-row: auto;
+  }
 }
 
 /* The four figures as one compact row of small cards, not four giant numerals: the panel is a
@@ -825,16 +833,11 @@
   color: var(--text-muted);
 }
 
-/* The running configurations packed as balanced columns: cards of very
-   different heights stack under each other instead of leaving row gaps. */
+/* The running configurations: equal-height cards per row (stretch comes from ui.css). */
 .sy-config-grid {
-  columns: 20rem;
-  column-gap: var(--space-4);
-}
-
-.sy-config-grid > * {
-  break-inside: avoid;
-  margin: 0 0 var(--space-4);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: var(--space-4);
 }
 
 /* Key on the left, value on the right, one per line under a hairline — a
@@ -866,11 +869,30 @@
 
 /* -- machine settings ------------------------------------------------------ */
 
-/* A settings list line: the label (and its tip) on the left, the control right-aligned in a column
-   of one shared width, so every row in every card lines up and has the same height. */
+/* The small panels of the Machine tab, two to a row. Cards in a row stretch to the tallest, and each
+   panel's body fills what is left, so neighbours align top and bottom whatever they hold. */
+.sy-machine-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(26rem, 1fr));
+  align-items: stretch;
+  gap: var(--space-4);
+}
+
+.sy-machine-grid > .ui-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sy-machine-grid > .ui-panel > .ui-panel-body {
+  flex: 1;
+}
+
+/* A settings list line: the label (and its tip) on the left, the control flush right at its natural
+   width, so there is no gap to read across inside a half-width card. */
 .sy-prefrow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
   min-height: 2.25rem;
@@ -889,6 +911,7 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: var(--space-2);
   min-width: 0;
 }
@@ -900,10 +923,12 @@
   height: 1.5rem;
 }
 
-/* A text or number box fills the control column; a Save or action button sits beside it. */
+/* A select or text box is capped, so it never stretches across the card; a Save or action button sits beside it. */
 .sy-prefrow-control > select,
 .sy-prefrow-control > .sy-pref-input {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
+  width: 16rem;
+  max-width: 100%;
   min-width: 0;
 }
 
@@ -939,13 +964,6 @@
 
 .sy-notch-note:last-child {
   margin-bottom: 0;
-}
-
-.sy-machine-intro {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
 }
 
 /* The files on the left, the chosen one on the right. */
