@@ -108,7 +108,7 @@ import { BackupRowsSkeleton, ConfigFactsSkeleton, PiiTableSkeleton, TokenRowsSke
 /**
  * System — the machine's own state, not a project's.
  *
- * Seven tabs. S1 and S2 built the health view (the daemon's own subsystem
+ * Tabs. S1 and S2 built the health view (the daemon's own subsystem
  * readout and the sidecars' own liveness) plus, on top of it, the project
  * brakes and the editable budget; and the whole backups view (snapshots,
  * staged restore and the PII tally). Health data is read off
@@ -131,7 +131,7 @@ import { BackupRowsSkeleton, ConfigFactsSkeleton, PiiTableSkeleton, TokenRowsSke
  * the sidecar obeys, so nothing on this page decides anything by itself.
  */
 
-/** The eight tabs, in the order they read. */
+/** The tabs, in the order they read. */
 const VIEWS = ["health", "limits", "backups", "tokens", "channels", "notifications", "accounts", "settings"] as const;
 export type SystemView = (typeof VIEWS)[number];
 
@@ -139,7 +139,8 @@ const VIEW_LABEL: Record<SystemView, string> = {
   health: "Health",
   limits: "Limits",
   backups: "Backups",
-  tokens: "Tokens",
+  // The slug stays `tokens`: routes and links elsewhere use /system/tokens.
+  tokens: "Access",
   channels: "Channels",
   notifications: "Notifications",
   accounts: "Accounts",
@@ -149,7 +150,7 @@ const VIEW_LABEL: Record<SystemView, string> = {
 };
 
 /**
- * A `$view` param as one of the seven.
+ * A `$view` param as one of the tabs.
  *
  * Falls back to `health` rather than refusing: a route parameter is a string,
  * anybody can type one, and a typo in a path is not a missing page.
@@ -179,10 +180,25 @@ export function System() {
         {view === "health" && (
           <HealthView health={health} sidecars={sidecars} />
         )}
-        {view === "limits" && <BudgetPanel />}
+        {view === "limits" && (
+          <>
+            <SpendBrakesPanel />
+            <BudgetPanel />
+          </>
+        )}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
-        {view === "channels" && <ChannelsView />}
+        {view === "channels" && (
+          <>
+            <ChannelsView />
+            <section className="sy-running-config" aria-labelledby="sy-running-config-title">
+              <h2 id="sy-running-config-title" className="sy-running-config-title">
+                Running config
+              </h2>
+              <ConfigIndex />
+            </section>
+          </>
+        )}
         {view === "accounts" && <AccountsView />}
         {view === "notifications" && (
           <NotificationsView
@@ -198,6 +214,12 @@ export function System() {
         )}
         {view === "settings" && (
           <>
+            <Panel title="Daemon">
+              <Rows label="Daemon">
+                <Autostart />
+                <RestartDaemon />
+              </Rows>
+            </Panel>
             <MachineSettings />
             {/* A preference of this screen, not a limit: it lives with the machine's own settings,
                 as one more panel beside them rather than under a heading of its own. */}
@@ -252,7 +274,7 @@ export function headlineNodeFor(readout: HealthReadout | undefined): ReactNode {
 }
 
 /**
- * The six views, as `LinkTabs`: routes rather than panels, so each tab is a real `<a href>` to
+ * The views, as `LinkTabs`: routes rather than panels, so each tab is a real `<a href>` to
  * `/system/<view>` marked with `aria-current="page"` (see `ui/LinkTabs`).
  */
 function ViewTabs({ view }: { view: SystemView }) {
@@ -285,51 +307,7 @@ function HealthView({
       <HealthReadoutPanel health={health} />
       <RouterReportPanel />
       <SidecarCardsPanel sidecars={sidecars} />
-      {/* Side by side when there is room: neither needs the page's full width,
-          and stacked they made the health view three screens long. */}
-      <div className="sy-health-pair">
-        <ScopedKillsPanel />
-        <SpendSummary />
-      </div>
     </>
-  );
-}
-
-/**
- * Spend at a glance, read-only. The forms that change the limits live in the Limits tab: Health
- * answers "is everything fine?", and a nine-field form is not part of that answer.
- */
-function SpendSummary() {
-  const budget = useBudget();
-  return (
-    <Panel
-      title="Budget"
-      aside={<Link to="/system/limits">Edit limits</Link>}
-    >
-      {budget.isError && budget.data === undefined && (
-        <SystemListError error={budget.error} what="the budget" />
-      )}
-      {!budget.isError && budget.data === undefined && (
-        <Skeleton label="Reading the budget" variant="cards" count={2} gridClassName="sy-spend-skeleton" height="1.75rem" />
-      )}
-      {budget.data !== undefined && budget.data.paused && (
-        <Notice tone="paused" role="status">
-          Autonomous work is currently held: {budget.data.reason}
-        </Notice>
-      )}
-      {budget.data !== undefined && (
-        <dl className="sy-budget-spend">
-          <div className="sy-fact">
-            <dt>window spend</dt>
-            <dd>${budget.data.window_spend_usd.toFixed(2)}</dd>
-          </div>
-          <div className="sy-fact">
-            <dt>hourly spend</dt>
-            <dd>${budget.data.hourly_spend_usd.toFixed(2)}</dd>
-          </div>
-        </dl>
-      )}
-    </Panel>
   );
 }
 
@@ -694,7 +672,8 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
  * footer on every page; a kill switch belongs in exactly one place, and
  * duplicating one here is the specific failure the design names.
  */
-function ScopedKillsPanel() {
+function SpendBrakesPanel() {
+  const budget = useBudget();
   const projects = useProjects();
   const kills = useScopedKills();
   const setKill = useSetScopedKill();
@@ -708,13 +687,7 @@ function ScopedKillsPanel() {
   const loaded = projects.data !== undefined;
   // Always drawn, disabled when there is nothing to list, so the header is one height for 0 projects too.
   const aside = (
-    <Button variant="quiet" aria-expanded={open} disabled={!loaded || list.length === 0} onClick={() => { setOpen(true); }}>
-      Details
-    </Button>
-  );
-
-  return (
-    <Panel title="Project brakes" aside={aside}>
+    <span className="sy-strip-tools">
       <Tip
         name="About project brakes"
         persist
@@ -726,28 +699,51 @@ function ScopedKillsPanel() {
           </>
         }
       />
+      <Button variant="quiet" aria-expanded={open} disabled={!loaded || list.length === 0} onClick={() => { setOpen(true); }}>
+        Details
+      </Button>
+    </span>
+  );
+  const dash = <span aria-hidden="true">—</span>;
+
+  return (
+    <Panel title="Spend & brakes" aside={aside}>
+      {budget.isError && budget.data === undefined && <SystemListError error={budget.error} what="the budget" />}
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
-      {!kills.isError && kills.data === undefined && <Skeleton label="Reading the project brakes" variant="row" count={1} />}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
-      {!projects.isError && projects.data === undefined && <Skeleton label="Reading the projects" variant="row" count={1} />}
-      {loaded && (
-        <div className="sy-glance" aria-label="Project brakes">
-          <p className="sy-glance-summary">
-            <span>{list.length} {list.length === 1 ? "project" : "projects"}</span>
-            {list.length > 0 && (
-              <span className="sy-count sy-count-active">{list.length - braked.length} running</span>
-            )}
-            {braked.length > 0 && <span className="sy-count sy-count-danger">{braked.length} braked</span>}
-          </p>
-          <p className="sy-attention">
-            {list.length === 0 ? (
-              <span className="sy-attention-ok">No project is registered</span>
+      {budget.data !== undefined && budget.data.paused && (
+        <Notice tone="paused" role="status">
+          Autonomous work is currently held: {budget.data.reason}
+        </Notice>
+      )}
+      <dl className="sy-strip" aria-label="Spend and brakes">
+        <div className="sy-fact">
+          <dt>Window spend</dt>
+          <dd>{budget.data === undefined ? dash : `$${budget.data.window_spend_usd.toFixed(2)}`}</dd>
+        </div>
+        <div className="sy-fact">
+          <dt>Hourly</dt>
+          <dd>{budget.data === undefined ? dash : `$${budget.data.hourly_spend_usd.toFixed(2)}`}</dd>
+        </div>
+        <div className="sy-fact">
+          <dt>Projects</dt>
+          <dd>{loaded ? list.length : dash}</dd>
+        </div>
+        <div className="sy-fact">
+          <dt>Running</dt>
+          <dd>{loaded ? list.length - braked.length : dash}</dd>
+        </div>
+        <div className="sy-fact">
+          <dt>Braked</dt>
+          <dd>
+            {!loaded || kills.data === undefined ? (
+              dash
             ) : attention.head.length === 0 ? (
-              <span className="sy-attention-ok">No project braked</span>
+              "None"
             ) : (
-              <>
+              <span className="sy-strip-braked">
                 {attention.head.map((project) => (
                   <span key={project.project_id} className="sy-attention-item" title={project.project_id}>
                     <span className="sy-dot sy-tone-danger" aria-hidden="true" />
@@ -755,11 +751,11 @@ function ScopedKillsPanel() {
                   </span>
                 ))}
                 {attention.more > 0 && <span className="sy-attention-more">+{attention.more} more</span>}
-              </>
+              </span>
             )}
-          </p>
+          </dd>
         </div>
-      )}
+      </dl>
       {open && loaded && (
         <Drawer title="Project brakes" onClose={() => { setOpen(false); }}>
           <table className="sy-dtable" aria-label="All project brakes">
@@ -964,7 +960,7 @@ function BudgetPanel() {
   }, [unsaved]);
 
   return (
-    <Panel title="Limits">
+    <>
       {budget.isError && budget.data === undefined && (
         <SystemListError error={budget.error} what="the budget" />
       )}
@@ -973,13 +969,12 @@ function BudgetPanel() {
           Autonomous work is currently held: {budget.data.reason}
         </Notice>
       )}
-      <div className="sy-budget-groups">
+      <div className="sy-limits">
         {form === null && !budget.isError && <LimitsSkeletonSpend />}
         {form !== null && (
-          <section className="sy-budget-group">
-            <h3 className="sy-budget-heading">Spend limits</h3>
-            <div className="sy-budget-fields">
-              <div className="sy-limit-row sy-unit-usd">
+          <Panel title="Spend limits">
+            <Rows label="Spend limits">
+              <Row dense className="sy-limit-row sy-unit-usd">
               <Field label="Window limit">
                 <input
                   type="text"
@@ -997,8 +992,8 @@ function BudgetPanel() {
               {budget.data !== undefined && (
                 <SpendCells spent={budget.data.window_spend_usd} ceiling={budget.data.limit_usd} what="Window spend" />
               )}
-              </div>
-              <div className="sy-limit-row sy-unit-usd">
+              </Row>
+              <Row dense className="sy-limit-row sy-unit-usd">
               <Field label="Hourly limit">
                 <input
                   type="text"
@@ -1016,8 +1011,8 @@ function BudgetPanel() {
               {budget.data !== undefined && (
                 <SpendCells spent={budget.data.hourly_spend_usd} ceiling={budget.data.hourly_limit_usd} what="Hourly spend" />
               )}
-              </div>
-              <div className="sy-limit-row">
+              </Row>
+              <Row dense className="sy-limit-row">
               <Field label="Period">
                 <Select
                   value={form.period}
@@ -1035,11 +1030,22 @@ function BudgetPanel() {
                   ))}
                 </Select>
               </Field>
-              </div>
-            </div>
-            <h3 className="sy-budget-heading sy-budget-heading-next">Run costs</h3>
-            <div className="sy-budget-fields">
-              <div className="sy-limit-row sy-unit-usd">
+              </Row>
+            </Rows>
+          </Panel>
+        )}
+        {form !== null && (
+          <Panel
+            title="Run costs"
+            aside={
+              <Tip
+                name="About the relay chain limit"
+                tip="The relay chain limit is what one chain of conversations handing work to each other may spend."
+              />
+            }
+          >
+            <Rows label="Run costs">
+              <Row dense className="sy-limit-row sy-unit-usd">
               <Field label="Per-run reserve">
                 <input
                   type="text"
@@ -1050,8 +1056,8 @@ function BudgetPanel() {
                   }
                 />
               </Field>
-              </div>
-              <div className="sy-limit-row sy-unit-usd">
+              </Row>
+              <Row dense className="sy-limit-row sy-unit-usd">
               <Field label="Time cost per hour">
                 <input
                   type="text"
@@ -1062,8 +1068,8 @@ function BudgetPanel() {
                   }
                 />
               </Field>
-              </div>
-              <div className="sy-limit-row sy-unit-usd">
+              </Row>
+              <Row dense className="sy-limit-row sy-unit-usd">
               <Field label="Relay chain limit">
                 <input
                   type="text"
@@ -1074,14 +1080,10 @@ function BudgetPanel() {
                   }
                 />
               </Field>
-              </div>
-            </div>
-            <div className="sy-group-foot">
-            <Tip
-              name="About the relay chain limit"
-              tip="The relay chain limit is what one chain of conversations handing work to each other may spend."
-            />
-            <div className="sy-save-row">
+              </Row>
+            </Rows>
+            {budgetDirty && (
+            <div className="sy-limit-foot">
             <ConfirmButton
               label="Save budget"
               confirmLabel="Send these six fields"
@@ -1110,7 +1112,7 @@ function BudgetPanel() {
               }}
             />
             </div>
-            </div>
+            )}
             {badCeilings.length > 0 && (
               <div id="sy-budget-error">
                 <ErrorNote>
@@ -1124,13 +1126,20 @@ function BudgetPanel() {
                 the budget was not changed: the {DAEMON_NAME} refused or is not responding
               </ErrorNote>
             )}
-          </section>
+          </Panel>
         )}
         {quotaBrakeForm !== null && quotaBrake.data !== undefined && (
-          <section className="sy-budget-group">
-            <h3 className="sy-budget-heading">Quota brake</h3>
-            <div className="sy-budget-fields">
-              <div className="sy-limit-row sy-limit-switch">
+          <Panel
+            title="Quota brake"
+            aside={
+              <Tip
+                name="About the quota brake"
+                tip={`When ${quotaBrake.data.provider}'s usage passes either level, new autonomous work waits until the window resets. Only ${quotaBrake.data.provider}'s windows count.`}
+              />
+            }
+          >
+            <Rows label="Quota brake">
+              <Row dense className="sy-limit-row sy-limit-switch">
                 <Switch
                   label="Enable quota brake"
                   checked={quotaBrakeForm.enabled}
@@ -1138,8 +1147,8 @@ function BudgetPanel() {
                     setQuotaBrakeForm({ ...quotaBrakeForm, enabled: next });
                   }}
                 />
-              </div>
-              <div className="sy-limit-row sy-unit-pct">
+              </Row>
+              <Row dense className="sy-limit-row sy-unit-pct">
               <Field label="Pause above 5h usage">
                 <input
                   type="text"
@@ -1153,8 +1162,8 @@ function BudgetPanel() {
                   }}
                 />
               </Field>
-              </div>
-              <div className="sy-limit-row sy-unit-pct">
+              </Row>
+              <Row dense className="sy-limit-row sy-unit-pct">
               <Field label="Pause above 7d usage">
                 <input
                   type="text"
@@ -1168,14 +1177,10 @@ function BudgetPanel() {
                   }}
                 />
               </Field>
-              </div>
-            </div>
-            <div className="sy-group-foot">
-            <Tip
-              name="About the quota brake"
-              tip={`When ${quotaBrake.data.provider}'s usage passes either level, new autonomous work waits until the window resets. Only ${quotaBrake.data.provider}'s windows count.`}
-            />
-            <div className="sy-save-row">
+              </Row>
+            </Rows>
+            {quotaDirty && (
+            <div className="sy-limit-foot">
             <ConfirmButton
               label="Save quota brake"
               confirmLabel="Save these three settings"
@@ -1200,7 +1205,7 @@ function BudgetPanel() {
               }}
             />
             </div>
-            </div>
+            )}
             {badQuotaBrake && (
               <div id="sy-quota-error">
                 <ErrorNote>the quota brake was not sent: usage must be an integer from 1 to 100</ErrorNote>
@@ -1209,11 +1214,11 @@ function BudgetPanel() {
             {setQuotaBrake.isError && (
               <ErrorNote>the quota brake was not changed: the {DAEMON_NAME} refused or is not responding</ErrorNote>
             )}
-          </section>
+          </Panel>
         )}
         {quotaBrakeForm === null && (form === null ? !budget.isError : !quotaBrake.isError) && <LimitsSkeletonQuota />}
       </div>
-    </Panel>
+    </>
   );
 }
 
@@ -1588,10 +1593,6 @@ function TokensView() {
         <TokensPanel />
         <RemoteDevices />
       </div>
-      <ConfigIndex>
-        <Autostart />
-        <RestartDaemon />
-      </ConfigIndex>
     </>
   );
 }
@@ -1815,10 +1816,9 @@ function RevokeError({ error }: { error: unknown }) {
  * `models` as areas with no configuration route is gone, because that is no
  * longer true of any of them.
  */
-function ConfigIndex({ children }: { children?: ReactNode }) {
+function ConfigIndex() {
   return (
     <div className="sy-config-grid">
-      {children}
       <EmailConfigPanel />
       <VoiceConfigPanel />
       <CalendarConfigPanel />
@@ -2052,70 +2052,45 @@ function SystemListError({ error, what }: { error: unknown; what: string }) {
 /** One ruled row of the loaded Limits form: a label bar and a control bar on its tracks. */
 function LimitsSkeletonRow() {
   return (
-    <div className="sy-limit-row sy-skel-row" aria-hidden="true">
+    <Row dense className="sy-limit-row sy-skel-row">
       <span className="ui-skeleton-bar sy-skel-label" />
       <span className="ui-skeleton-bar sy-skel-control" />
-    </div>
+    </Row>
   );
 }
 
-/** The group footer of the loaded form: footnote lines and the Save button, in the same slots. */
-function LimitsSkeletonFoot({ hint, save }: { hint: string; save: string }) {
+/** A Limits panel with its real title and bars in the row slots, while its data is read. */
+function LimitsSkeletonPanel({ title, rows }: { title: string; rows: number }) {
   return (
-    <div className="sy-group-foot" aria-hidden="true">
-      <p className="sy-field-hint sy-skel-text">{hint}</p>
-      <div className="sy-save-row">
-        <div className="sy-skel-save">
-          <div className="sy-skel-ghost">
-            <ConfirmButton label={save} confirmLabel={save} variant="ghost" disabled onConfirm={() => {}} />
-          </div>
-          <span className="ui-skeleton-bar sy-skel-save-bar" />
-        </div>
+    <Panel title={title}>
+      <div aria-hidden="true">
+        <Rows label={title}>
+          {Array.from({ length: rows }, (_, index) => (
+            <LimitsSkeletonRow key={index} />
+          ))}
+        </Rows>
       </div>
-    </div>
+    </Panel>
   );
 }
 
-/** Spend limits and Run costs, with the real headings, while the budget is read. */
+/** Spend limits and Run costs, while the budget is read. */
 function LimitsSkeletonSpend() {
   return (
-    <section className="sy-budget-group" role="status" aria-busy="true">
-      <span className="sr-only">Reading the budget</span>
-      <h3 aria-hidden="true" className="sy-budget-heading">Spend limits</h3>
-      <div className="sy-budget-fields">
-        <LimitsSkeletonRow />
-        <LimitsSkeletonRow />
-        <LimitsSkeletonRow />
-      </div>
-      <h3 aria-hidden="true" className="sy-budget-heading sy-budget-heading-next">Run costs</h3>
-      <div className="sy-budget-fields">
-        <LimitsSkeletonRow />
-        <LimitsSkeletonRow />
-        <LimitsSkeletonRow />
-      </div>
-      <LimitsSkeletonFoot
-        hint="The relay chain limit is what one chain of conversations handing work to each other may spend."
-        save="Send these six fields"
-      />
-    </section>
+    <>
+      <span className="sr-only" role="status">Reading the budget</span>
+      <LimitsSkeletonPanel title="Spend limits" rows={3} />
+      <LimitsSkeletonPanel title="Run costs" rows={3} />
+    </>
   );
 }
 
-/** Quota brake, with its real heading, while the brake is read. */
+/** Quota brake, while the brake is read. */
 function LimitsSkeletonQuota() {
   return (
-    <section className="sy-budget-group" role="status" aria-busy="true">
-      <span className="sr-only">Reading the quota brake</span>
-      <h3 aria-hidden="true" className="sy-budget-heading">Quota brake</h3>
-      <div className="sy-budget-fields">
-        <LimitsSkeletonRow />
-        <LimitsSkeletonRow />
-        <LimitsSkeletonRow />
-      </div>
-      <LimitsSkeletonFoot
-        hint="When the provider's usage passes either level, new autonomous work waits until the window resets. Only the provider's windows count."
-        save="Save these three settings"
-      />
-    </section>
+    <>
+      <span className="sr-only" role="status">Reading the quota brake</span>
+      <LimitsSkeletonPanel title="Quota brake" rows={3} />
+    </>
   );
 }

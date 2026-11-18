@@ -7,7 +7,8 @@ import {
   type UpdateReadiness,
 } from "../data/client";
 import { DAEMON_NAME } from "../copy";
-import { Button, ConfirmButton, ErrorNote, Panel, Tip } from "../ui";
+import { Button, ConfirmButton, ErrorNote } from "../ui";
+import { PrefRow } from "../pages/PrefRow";
 
 /** Where a restart is: nothing asked, waiting for running work, waiting for the new daemon, done. */
 type Stage =
@@ -136,30 +137,8 @@ export function RestartDaemon({
   }, [kind, restartDeadlineMs]);
 
   const waiting = stage.kind === "waiting";
-  return (
-    <Panel title="Restart the daemon">
-      <div className="sy-actions">
-        <Button
-          variant="ghost"
-          disabled={asking || waiting || stage.kind === "restarting"}
-          onClick={() => void ask(false)}
-        >
-          Restart when idle
-        </Button>
-        <ConfirmButton
-          label="Restart now"
-          confirmLabel="Really restart — running work is cut"
-          sayAs="Restart the daemon now; the runs still working are cut and settled when it starts again"
-          variant="ghost"
-          disabled={asking || stage.kind === "restarting"}
-          onConfirm={() => void ask(true)}
-        />
-        <Tip
-          name="About restarting"
-          persist
-          tip="Restarting waits for running work to finish, so no turn is cut. New work is refused while it waits."
-        />
-      </div>
+  const note = (
+    <>
       {already && stage.kind === "idle" && (
         <p className="sy-note" role="status">
           A stop is already waiting for running work. Wait for it, or restart now.
@@ -202,6 +181,30 @@ export function RestartDaemon({
           {isApiUnavailable(failure) ? `the ${DAEMON_NAME} is not responding` : String(failure)}
         </ErrorNote>
       )}
-    </Panel>
+    </>
+  );
+  return (
+    <PrefRow
+      label="Restart daemon"
+      tipName="About restarting"
+      tip="Restarting waits for running work to finish, so no turn is cut. New work is refused while it waits."
+      note={note}
+    >
+        <Button
+          variant="ghost"
+          disabled={asking || waiting || stage.kind === "restarting"}
+          onClick={() => void ask(false)}
+        >
+          Restart when idle
+        </Button>
+        <ConfirmButton
+          label="Restart now"
+          confirmLabel="Really restart — running work is cut"
+          sayAs="Restart the daemon now; the runs still working are cut and settled when it starts again"
+          variant="ghost"
+          disabled={asking || stage.kind === "restarting"}
+          onConfirm={() => void ask(true)}
+        />
+    </PrefRow>
   );
 }

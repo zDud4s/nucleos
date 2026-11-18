@@ -436,7 +436,7 @@ async function openDetails(heading: string, tableName: string): Promise<HTMLElem
 }
 
 const openSubsystems = () => openDetails("Subsystems", "All subsystems");
-const openBrakes = () => openDetails("Project brakes", "All project brakes");
+const openBrakes = () => openDetails("Spend & brakes", "All project brakes");
 
 /* ---------------------------------------------------------------- health -- */
 
@@ -826,18 +826,53 @@ describe("System - appearance", () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Quota notch" })).toBeDefined();
     expect(screen.queryByRole("region", { name: "Appearance" })).toBeNull();
   });
+
+  it("puts the daemon's start-up and restart rows on the Machine tab, not on Access", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+    await renderSystemAt("/system/settings");
+    expect(await screen.findByRole("heading", { level: 2, name: "Daemon" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Restart when idle" })).toBeDefined();
+    expect(screen.getByText("Start with Windows")).toBeDefined();
+  });
 });
 
 /* ---------------------------------------------------------- project brakes -- */
 
 describe("System - project brakes", () => {
+  it("reads spend and brakes as one strip with Details in its header, on the Limits tab only", async () => {
+    const world = systemWorld({ projects: [project({ project_id: "alpha" })] });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/limits");
+
+    const panel = (await screen.findByRole("heading", { level: 2, name: "Spend & brakes" })).closest(
+      "section",
+    ) as HTMLElement;
+    await waitFor(() => {
+      expect(within(panel).getByText("None")).toBeDefined();
+    });
+    expect(within(panel).getByText("Window spend")).toBeDefined();
+    expect(within(panel).getByText("Running")).toBeDefined();
+    expect(within(panel).queryByRole("link", { name: "Edit limits" })).toBeNull();
+    expect(within(panel).getAllByRole("button", { name: "Details" })).toHaveLength(1);
+  });
+
+  it("leaves spend and brakes off the Health tab", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+
+    await renderSystem();
+
+    await screen.findByRole("heading", { level: 2, name: "Subsystems" });
+    expect(screen.queryByRole("heading", { level: 2, name: "Spend & brakes" })).toBeNull();
+  });
+
   it("holds and releases one project's brake without touching the trigger brakes", async () => {
     const world = systemWorld({
       projects: [project({ project_id: "alpha" }), project({ project_id: "beta" })],
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
-    await renderSystem();
+    await renderSystemAt("/system/limits");
 
     const list = await openBrakes();
     const alphaRow = rowFor(list, "alpha");
@@ -1043,10 +1078,10 @@ describe("System - quota brake", () => {
 
     await renderSystemAt("/system/limits");
 
-    const quotaBrake = await screen.findByRole("heading", { level: 3, name: "Quota brake" });
-    const block = quotaBrake.closest("section");
+    // The loading skeleton carries the same panel titles, so wait for the real switch first.
+    const enabled = (await screen.findByRole("switch", { name: "Enable quota brake" })) as HTMLInputElement;
+    const block = enabled.closest("section");
     if (block === null) throw new Error("no quota brake block");
-    const enabled = within(block).getByRole("switch", { name: "Enable quota brake" }) as HTMLInputElement;
     const fiveHour = within(block).getByLabelText("Pause above 5h usage") as HTMLInputElement;
     const sevenDay = within(block).getByLabelText("Pause above 7d usage") as HTMLInputElement;
     expect(enabled.checked).toBe(false);
@@ -1411,7 +1446,7 @@ describe("System - config index", () => {
     const world = systemWorld();
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
-    await renderSystemAt("/system/tokens");
+    await renderSystemAt("/system/channels");
 
     // The three routes that serve the daemon's PARSED view are still read. They
     // are not what the settings tab shows, and neither replaces the other.
@@ -1668,7 +1703,7 @@ describe("System - map-authored readings", () => {
   it("a project brake reads held or released, and neither is Acting Green", async () => {
     const world = systemWorld({ projects: [project({ project_id: "alpha" })] });
     daemon.apiFetch.mockImplementation(systemFetch(world));
-    await renderSystem();
+    await renderSystemAt("/system/limits");
     const alphaRow = rowFor(await openBrakes(), "alpha");
     const released = within(alphaRow).getByText("released");
     expect(released.className).toContain("ui-badge-off");
@@ -1683,7 +1718,7 @@ describe("System - map-authored readings", () => {
 
   it("an enabled mailbox and an armed one are facts, not work in flight", async () => {
     daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
-    await renderSystemAt("/system/tokens");
+    await renderSystemAt("/system/channels");
     const panel = (await screen.findByRole("heading", { level: 2, name: "Email configuration" })).closest("section");
     if (panel === null) throw new Error("no email configuration panel");
     for (const label of ["enabled", "armed"]) {
@@ -1810,7 +1845,7 @@ describe("System - the channels tab", () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Telegram" })).toBeDefined();
   });
 
-  it("reads the tabs in order, Channels between Tokens and Notifications", async () => {
+  it("reads the tabs in order, Channels between Access and Notifications", async () => {
     serveChannelsTab();
     await renderSystemAt("/system/channels");
     const nav = await screen.findByRole("navigation", { name: "System views" });
@@ -1818,7 +1853,7 @@ describe("System - the channels tab", () => {
       "Health",
       "Limits",
       "Backups",
-      "Tokens",
+      "Access",
       "Channels",
       "Notifications",
       "Accounts",

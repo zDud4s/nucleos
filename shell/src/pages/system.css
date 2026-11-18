@@ -133,9 +133,6 @@
   grid-template-columns: repeat(5, minmax(0, 1fr));
   margin-bottom: var(--space-2);
 }
-.ui-skeleton-grid.sy-spend-skeleton {
-  grid-template-columns: minmax(0, 1fr);
-}
 .ui-skeleton-grid.sy-space-cards {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-2);
@@ -155,50 +152,33 @@
 
 /* ------------------------------------------------------------------ health == */
 
-/* -------------------------------------------------- glance: summary, strip, slot == */
-
-/* The shape Subsystems and Project brakes share: one summary line, (a strip), one reserved
-   attention line. Every part has a fixed height, so no count of rows ever moves the page. */
-.sy-glance {
-  display: grid;
-  gap: var(--space-2);
-  min-width: 0;
-}
-
-.sy-glance-summary {
+/* Spend & brakes: one row of label-over-value facts, wrapping when narrow. */
+.sy-strip {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-1) var(--space-3);
+  gap: var(--space-2) var(--space-6, 2rem);
   margin: 0;
-  min-height: 1.5rem;
-  font-size: var(--text-sm);
-  color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
 
-.sy-count {
-  font-weight: var(--weight-medium, 500);
+.sy-strip .sy-fact {
+  min-width: 0;
 }
 
-.sy-count-active { color: var(--tone-active-fg); }
-.sy-count-paused { color: var(--tone-paused-fg); }
-.sy-count-danger { color: var(--tone-danger-fg); }
-.sy-count-off { color: var(--tone-off-fg); }
+.sy-strip-braked {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+}
 
-/* The reserved line: the same height whether it says "all healthy" or names three culprits. */
-.sy-attention {
-  display: flex;
+/* The header corner of that panel: the tip, Details and Edit limits on one line. */
+.sy-strip-tools {
+  display: inline-flex;
   align-items: center;
   gap: var(--space-3);
-  height: 1.5rem;
-  margin: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  font-size: var(--text-sm);
 }
 
-.sy-attention-ok,
 .sy-attention-more {
   color: var(--text-muted);
 }
@@ -463,7 +443,7 @@
   justify-content: flex-end;
 }
 
-/* Project brakes and the budget share a row when the page is wide enough. */
+/* Two panels share a row when the page is wide enough. */
 .sy-health-pair {
   display: grid;
   /* min() lets the pair fall to one column narrower than 28rem instead of overflowing it. */
@@ -505,52 +485,26 @@
   gap: var(--space-3);
 }
 
-/* Limits: a settings form. Every row is label (1fr) | info | control (10rem); the control column
-   is pinned to the card's right content edge, and the group footer's Save button ends on it. */
-.sy-budget-groups {
-  --sy-limit-tracks: minmax(0, 1fr) minmax(0, 16rem) 10rem;
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-6);
+/* Limits: three panels side by side. Every row is label (1fr) | narrow control; the spend meta
+   sits under the label, and a dirty form's Save ends the panel on the right. */
+.sy-limits {
+  --sy-limit-tracks: minmax(0, 1fr) 8.5rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  align-items: stretch;
+  gap: var(--space-4);
 }
 
-.sy-budget-group {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: var(--space-2);
+.sy-limits > .ui-panel {
   min-width: 0;
 }
 
-.sy-budget-heading {
-  margin: 0;
-  padding-bottom: var(--space-2);
-  border-bottom: 1px solid var(--border);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-semibold);
-  color: var(--text);
-}
-
-.sy-budget-heading-next {
-  margin-top: var(--space-4);
-}
-
-.sy-budget-fields {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-}
-
-.sy-limit-row {
+.ui-rows-row.sy-limit-row {
   position: relative;
   display: grid;
   grid-template-columns: var(--sy-limit-tracks);
   align-items: center;
-  column-gap: var(--space-4);
-  min-height: 2.75rem;
-  padding: var(--space-1) 0;
-  border-bottom: 1px solid var(--border);
+  column-gap: var(--space-3);
 }
 
 .sy-limit-row > .ui-field {
@@ -573,7 +527,7 @@
 
 .sy-limit-row .ui-field input,
 .sy-limit-row .ui-field .ui-select {
-  grid-column: 3;
+  grid-column: 2;
   grid-row: 1;
   box-sizing: border-box;
   min-width: 0;
@@ -590,7 +544,7 @@
 /* Unit adornments sit inside the input's box, in the control column. */
 .sy-unit-usd::before,
 .sy-unit-pct::after {
-  grid-column: 3;
+  grid-column: 2;
   grid-row: 1;
   z-index: 1;
   pointer-events: none;
@@ -618,10 +572,10 @@
   padding-right: var(--space-5);
 }
 
-/* The info cell: spent and usage in one, on the spend rows only. */
+/* The spend meta, under the label, on the spend rows only. */
 .sy-limit-info {
-  grid-column: 2;
-  grid-row: 1;
+  grid-column: 1;
+  grid-row: 2;
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
@@ -652,46 +606,16 @@
 }
 
 .sy-limit-switch .ui-switch-check {
-  grid-column: 3;
+  grid-column: 2;
   grid-row: 1;
   justify-self: end;
 }
 
-/* Group footer: the footnote on the left, Save ending on the control column's right edge. */
-.sy-group-foot {
+/* Panel footer: the Save button, right-aligned, only while the form is dirty. */
+.sy-limit-foot {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding-top: var(--space-2);
-}
-
-.sy-group-foot > .sy-field-hint {
-  flex: 1 1 auto;
-  min-width: 0;
-  color: var(--text-muted);
-  font-size: var(--text-sm);
-}
-
-.sy-group-foot > .sy-save-row {
-  flex: none;
-  flex-wrap: nowrap;
   justify-content: flex-end;
-}
-
-.sy-group-foot .ui-confirm {
-  display: block;
-  flex: none;
-  width: 15rem;
-}
-
-.sy-group-foot .ui-confirm > button {
-  width: 100%;
-}
-
-/* Both labels share one cell (the armed one is reserved, hidden); if either wraps, the button grows. */
-.sy-group-foot .ui-confirm-stack > * {
-  white-space: nowrap;
+  padding-top: var(--space-3);
 }
 
 /* Limits loading skeleton: the loaded form's own classes, bars in the slots. */
@@ -701,71 +625,8 @@
 }
 
 .sy-skel-control {
-  grid-column: 3;
+  grid-column: 2;
   height: 1.75rem;
-}
-
-.sy-skel-text {
-  color: transparent;
-  background: var(--surface-raised, var(--surface-sunken));
-  border-radius: var(--radius-sm);
-  user-select: none;
-}
-
-.sy-skel-save {
-  position: relative;
-  width: 15rem;
-}
-
-.sy-skel-ghost {
-  visibility: hidden;
-}
-
-.sy-skel-save-bar {
-  position: absolute;
-  inset: 0;
-  height: auto;
-  border-radius: var(--radius-md);
-}
-
-.sy-skel-save .ui-confirm {
-  display: block;
-  width: 15rem;
-}
-
-.sy-skel-save .ui-confirm > button {
-  width: 100%;
-}
-
-.sy-skel-save .ui-confirm-stack > * {
-  white-space: nowrap;
-}
-
-@media (max-width: 40rem) {
-  .sy-skel-control {
-    grid-column: 2;
-  }
-
-  .sy-budget-groups {
-    --sy-limit-tracks: minmax(0, 1fr) 10rem;
-  }
-
-  .sy-limit-row .ui-field input,
-  .sy-limit-row .ui-field .ui-select,
-  .sy-unit-usd::before,
-  .sy-unit-pct::after,
-  .sy-limit-switch .ui-switch-check {
-    grid-column: 2;
-  }
-
-  .sy-limit-info {
-    grid-column: 1 / -1;
-    grid-row: 2;
-  }
-
-  .sy-group-foot {
-    flex-wrap: wrap;
-  }
 }
 
 /* A failed read keeps the height its skeleton had. */
@@ -956,6 +817,14 @@
   margin: 0 0 var(--space-3);
 }
 
+/* The small heading over the running configurations on the Channels tab. */
+.sy-running-config-title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
 /* The running configurations packed as balanced columns: cards of very
    different heights stack under each other instead of leaving row gaps. */
 .sy-config-grid {
@@ -1022,6 +891,13 @@
   justify-content: flex-end;
   gap: var(--space-2);
   min-width: 0;
+}
+
+/* The loading bar of a row whose control has not arrived yet. */
+.sy-pref-skeleton {
+  display: block;
+  width: 8rem;
+  height: 1.5rem;
 }
 
 /* A text or number box fills the control column; a Save or action button sits beside it. */
