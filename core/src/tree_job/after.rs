@@ -94,11 +94,10 @@ pub fn evaluate(pred: &TreeJob, successor_branch: Option<&str>) -> Verdict {
         Some("held") => {
             // Q3: an empty tree has nothing to wait for. Q2: held work is on its feature branch, so
             // only a successor on that same branch builds on it.
-            if extra.get("empty").and_then(Value::as_bool) == Some(true) {
-                Verdict::Satisfied
-            } else if successor_branch.is_some()
-                && successor_branch == pred.feature_branch.as_deref()
-            {
+            let empty = extra.get("empty").and_then(Value::as_bool) == Some(true);
+            let same_branch =
+                successor_branch.is_some() && successor_branch == pred.feature_branch.as_deref();
+            if empty || same_branch {
                 Verdict::Satisfied
             } else {
                 Verdict::Refused(format!(
