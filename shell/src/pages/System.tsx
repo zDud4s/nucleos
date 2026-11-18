@@ -86,7 +86,7 @@ import { RemoteDevices } from "../system/RemoteDevices";
 import { Autostart } from "../system/Autostart";
 import { RestartDaemon } from "../system/RestartDaemon";
 import { MachineSettings } from "./MachineSettings";
-import { ChannelsView } from "./ChannelsView";
+import { ChannelsView, type ChannelConfigEntry } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
 import { NotificationsView } from "./NotificationsView";
 import { AccountsView } from "./systemAccounts/AccountsView";
@@ -188,17 +188,7 @@ export function System() {
         )}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
-        {view === "channels" && (
-          <>
-            <ChannelsView />
-            <section className="sy-running-config" aria-labelledby="sy-running-config-title">
-              <h2 id="sy-running-config-title" className="sy-running-config-title">
-                Running config
-              </h2>
-              <ConfigIndex />
-            </section>
-          </>
-        )}
+        {view === "channels" && <ChannelsView configs={RUNNING_CONFIGS} />}
         {view === "accounts" && <AccountsView />}
         {view === "notifications" && (
           <NotificationsView
@@ -1824,15 +1814,11 @@ function RevokeError({ error }: { error: unknown }) {
  * `models` as areas with no configuration route is gone, because that is no
  * longer true of any of them.
  */
-function ConfigIndex() {
-  return (
-    <div className="sy-config-grid">
-      <EmailConfigPanel />
-      <VoiceConfigPanel />
-      <CalendarConfigPanel />
-    </div>
-  );
-}
+const RUNNING_CONFIGS: ChannelConfigEntry[] = [
+  { id: "email", label: "Email", badge: <EmailStateBadge />, detail: <EmailConfigDetail /> },
+  { id: "voice", label: "Voice", badge: <VoiceStateBadge />, detail: <VoiceConfigDetail /> },
+  { id: "calendar", label: "Calendar", detail: <CalendarConfigDetail /> },
+];
 
 function ConfigFact({ term, value }: { term: string; value: string }) {
   return (
@@ -1843,10 +1829,17 @@ function ConfigFact({ term, value }: { term: string; value: string }) {
   );
 }
 
-function EmailConfigPanel() {
+/** The list row's reading of the mailbox: armed beats enabled, and nothing is drawn until it is read. */
+function EmailStateBadge() {
+  const email = useEmailConfig();
+  if (email.data === undefined) return null;
+  return <StateBadge domain="setting" state={email.data.armed ? "armed" : email.data.enabled ? "enabled" : "disabled"} />;
+}
+
+function EmailConfigDetail() {
   const email = useEmailConfig();
   return (
-    <Panel title="Email configuration">
+    <>
       {email.isError && email.data === undefined && (
         <SystemListError error={email.error} what="the e-mail configuration" />
       )}
@@ -1854,7 +1847,7 @@ function EmailConfigPanel() {
         <ConfigFactsSkeleton label="Reading the e-mail configuration" flags={2} facts={8} note />
       )}
       {email.data !== undefined && <EmailConfigFacts config={email.data} />}
-    </Panel>
+    </>
   );
 }
 
@@ -1907,10 +1900,16 @@ function EmailConfigFacts({ config }: { config: EmailConfig }) {
   );
 }
 
-function VoiceConfigPanel() {
+function VoiceStateBadge() {
+  const voice = useVoiceConfig();
+  if (voice.data === undefined) return null;
+  return <StateBadge domain="setting" state={voice.data.armed ? "armed" : "unarmed"} />;
+}
+
+function VoiceConfigDetail() {
   const voice = useVoiceConfig();
   return (
-    <Panel title="Voice configuration">
+    <>
       {voice.isError && voice.data === undefined && (
         <SystemListError error={voice.error} what="the voice configuration" />
       )}
@@ -1918,7 +1917,7 @@ function VoiceConfigPanel() {
         <ConfigFactsSkeleton label="Reading the voice configuration" flags={1} facts={7} />
       )}
       {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
-    </Panel>
+    </>
   );
 }
 
@@ -1953,10 +1952,10 @@ function VoiceConfigFacts({ config }: { config: VoiceConfig }) {
   );
 }
 
-function CalendarConfigPanel() {
+function CalendarConfigDetail() {
   const calendar = useCalendarConfig();
   return (
-    <Panel title="Calendar configuration">
+    <>
       {calendar.isError && calendar.data === undefined && (
         <SystemListError
           error={calendar.error}
@@ -1969,7 +1968,7 @@ function CalendarConfigPanel() {
       {calendar.data !== undefined && (
         <CalendarConfigFacts config={calendar.data} />
       )}
-    </Panel>
+    </>
   );
 }
 

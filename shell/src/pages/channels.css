@@ -1,35 +1,44 @@
-/* Channels page: the card grid. No colour of its own beyond the shared tokens. */
+/* Channels page: a list on the left, the selected entry's detail on the right. Tokens only. */
 .ch-page { display: flex; flex-direction: column; gap: var(--space-4); }
-/* `auto-fit` so two channels share the row instead of leaving a blank third of it. */
-.ch-grid,
-.ui-skeleton-grid.ch-grid {
+
+/* The list keeps its own width and the detail takes the rest; both start at the top, so neither
+   stretches to the other's height. Under 52rem they stack. */
+.ch-layout,
+.ui-skeleton-grid.ch-layout {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr));
+  grid-template-columns: minmax(13rem, 17rem) minmax(0, 1fr);
   gap: var(--space-4);
+  align-items: start;
+}
+@media (max-width: 52rem) {
+  .ch-layout,
+  .ui-skeleton-grid.ch-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
-/* Stretch comes from ui.css. The body and the card are columns that fill the panel, so the
-   identities footer link ("edit in Machine") sits at the bottom of every card. */
-.ch-grid > .ui-panel > .ui-panel-body {
+.ch-detail { min-width: 0; }
+/* The header carries the state, the links and the actions: it wraps rather than overflow. */
+.ch-detail > .ui-panel > .ui-panel-head { flex-wrap: wrap; }
+.ch-detail .ui-panel-aside { flex-wrap: wrap; justify-content: flex-end; }
+
+/* One line of the list: the whole row is the button. */
+.ch-pick {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
-
-.ch-grid .ch-card {
-  flex: 1 1 auto;
+.ch-pick:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
-
-.ch-grid .identities-panel {
-  flex: 1 1 auto;
-}
-
-.ch-grid .identities-panel > .ui-section:last-child {
-  flex: 1 1 auto;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-}
-
-.ch-grid .identities-projects + a {
-  margin-top: auto;
-}
+.ch-pick-name { margin-right: auto; font-weight: var(--weight-medium); }

@@ -1,55 +1,24 @@
-/* Channel card (System > Channels): the body inside a `Panel`. Tokens only. */
+/* A channel's detail (System > Channels): the body inside a `Panel`. Tokens only. */
 .ch-card {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: var(--space-3);
+  gap: var(--space-4);
   min-width: 0;
 }
 .ch-card > * { max-width: 100%; }
-/* The state word keeps the ink; a small dot beside it carries the tone, so colour only reinforces. */
 .ch-card-meta {
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
-.ch-card-facts {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
+/* The facts keep one line of their own however many the daemon sends. */
+.ch-facts { row-gap: var(--space-3); }
 .ch-card-missing { margin: 0 0 var(--space-2); padding-left: var(--space-4); }
-.ch-card-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  width: 100%;
-}
-/* The way out to Health sits at the row's far edge, away from the two buttons. */
-.ch-card-health {
-  margin-left: auto;
-  font-size: var(--text-sm);
-  overflow-wrap: anywhere;
-}
 .ch-primary {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: var(--space-2);
 }
-.ch-caps {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-.ch-caps strong { color: var(--text); font-weight: var(--weight-semibold); }
+/* The answer to Make primary / Clear primary drops under the buttons, full width of the control. */
+.ch-primary-note { flex: 1 1 100%; }
+.ch-cap strong { color: var(--text); font-weight: var(--weight-semibold); }

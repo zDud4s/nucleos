@@ -108,7 +108,7 @@ export function Autostart() {
           onChange={choose}
         />
       ) : (
-        <span>{view.mode === "at-boot" ? "At boot" : "At login"}</span>
+        <span className="sy-prefrow-value">{view.mode === "at-boot" ? "At boot" : "At login"}</span>
       )}
     </PrefRow>
   );

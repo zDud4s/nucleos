@@ -15,6 +15,7 @@ export function PrefRow({
   tip,
   tipName,
   note,
+  stacked = false,
   children,
 }: {
   label: string;
@@ -23,11 +24,13 @@ export function PrefRow({
   tip?: ReactNode;
   tipName?: string;
   note?: ReactNode;
+  /** The label takes the first line and the control the full width of a second, for a wide control. */
+  stacked?: boolean;
   children: ReactNode;
 }) {
   return (
-    <Row>
-      <div className="sy-prefrow">
+    <Row dense>
+      <div className={stacked ? "sy-prefrow sy-prefrow-stacked" : "sy-prefrow"}>
         <span className="sy-prefrow-label">
           {htmlFor === undefined ? <span>{label}</span> : <label htmlFor={htmlFor}>{label}</label>}
           {tip === undefined ? null : <Tip tip={tip} name={tipName ?? `About ${label.toLowerCase()}`} />}

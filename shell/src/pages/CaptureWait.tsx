@@ -105,6 +105,7 @@ function DistillerSources() {
       <PrefRow
         label="Project to ingest"
         htmlFor="sy-ingest-project"
+        stacked
         tip="Sends up to 40 exchanges per chat to the distiller model, a few chats a day."
         note={
           <>

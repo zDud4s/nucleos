@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Channel, ChannelState } from "../data/channels";
 import { sidecarKeyOf } from "../data/system";
@@ -11,7 +11,7 @@ import { PrimaryChannelControl } from "./PrimaryChannelControl";
 import { RestartSidecar } from "./RestartSidecar";
 import "./card.css";
 
-/** The short line shown beside each state; the sentence below opens from its tip. */
+/** The word shown in the Status fact; the sentence below opens from its tip. */
 const LABEL: Record<ChannelState, string> = {
   not_configured: "Not configured",
   starting: "Starting",
@@ -30,7 +30,20 @@ const SENTENCE: Record<ChannelState, string> = {
     "the adapter spoke a contract the background service refused (409 contract_version): update the adapter, then restart it",
 };
 
-/** One messaging channel: its state, what it can do, what is queued or dropped, and the primary choice. */
+/** One labelled value of the facts strip. */
+function Fact({ term, children }: { term: string; children: ReactNode }) {
+  return (
+    <div className="sy-fact">
+      <dt>{term}</dt>
+      <dd>{children}</dd>
+    </div>
+  );
+}
+
+/**
+ * One messaging channel's detail: a header with its state and its actions, a strip of facts
+ * (status, outbox, drops), the capabilities it lacks, and who is paired where.
+ */
 export function ChannelCard({ channel, primary }: { channel: Channel; primary: string | null }) {
   const key = sidecarKeyOf(channel.health_row);
   const { outbox, drops } = channel;
@@ -45,15 +58,57 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
           <StateBadge domain="channel" state={channel.state} />
           {channel.since !== null && configured ? <RelativeTime at={channel.since} /> : null}
           {channel.adapter !== null ? (
-            <span className="ch-card-meta">contract {channel.adapter.contract_version}</span>
+            <Tip name="Adapter contract" persist tip={`contract ${channel.adapter.contract_version}`} />
           ) : null}
+          <Link to="/system/$view" params={{ view: "health" }} title={`${channel.health_row} in health`}>
+            Health
+          </Link>
+          {configured ? (
+            <Button variant="ghost" onClick={() => setPairing(true)}>
+              Pair
+            </Button>
+          ) : null}
+          {key !== null && configured ? <RestartSidecar name={key} /> : null}
+          {configured ? <PrimaryChannelControl channel={channel} primary={primary} /> : null}
         </>
       }
     >
       <div className="ch-card">
-        <Quiet compact says={LABEL[channel.state]}>
-          <Tip name={`About ${channel.state.replace("_", " ")}`} persist tip={SENTENCE[channel.state]} />
-        </Quiet>
+        <dl className="sy-strip ch-facts" aria-label="Channel facts">
+          <Fact term="Status">
+            {LABEL[channel.state]}{" "}
+            <Tip name={`About ${channel.state.replace("_", " ")}`} persist tip={SENTENCE[channel.state]} />
+          </Fact>
+          {configured ? (
+            <>
+              <Fact term="Pending">{outbox.pending}</Fact>
+              <Fact term="Leased">{outbox.leased}</Fact>
+              <Fact term="Failed">{outbox.failed}</Fact>
+              {outbox.stale_acks !== undefined ? <Fact term="Stale acks">{outbox.stale_acks}</Fact> : null}
+              {outbox.stale_renews !== undefined ? <Fact term="Stale renews">{outbox.stale_renews}</Fact> : null}
+              {outbox.pending > 0 && outbox.oldest_due_at !== null ? (
+                <Fact term="Oldest waiting">
+                  <RelativeTime at={outbox.oldest_due_at} />
+                </Fact>
+              ) : null}
+              <Fact term="Unknown senders">
+                {drops.unknown_sender}{" "}
+                <span className="ch-card-meta">
+                  since <RelativeTime at={drops.counted_since} />
+                </span>
+              </Fact>
+              {drops.unknown_sender_limited !== undefined ? (
+                <Fact term="Rate-limited">{drops.unknown_sender_limited}</Fact>
+              ) : null}
+              {drops.pairing_failures > 0 ? <Fact term="Failed pairings">{drops.pairing_failures}</Fact> : null}
+            </>
+          ) : null}
+        </dl>
+
+        {configured && channel.pairing !== null ? (
+          // Only the existence of the code is shown; the code itself lives in the dialog.
+          <Quiet compact says="a pairing code is waiting" />
+        ) : null}
 
         {!configured ? (
           <Callout tone="pending" title="Missing secrets">
@@ -67,54 +122,9 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
             </Link>
           </Callout>
         ) : (
-          <>
-            <CapabilityList capabilities={channel.capabilities} />
-            <ul className="ch-card-facts">
-              <li>
-                outbox: {outbox.pending} pending, {outbox.leased} leased, {outbox.failed} failed
-              </li>
-              {outbox.stale_acks !== undefined || outbox.stale_renews !== undefined ? (
-                <li>
-                  stale: {outbox.stale_acks ?? 0} acks, {outbox.stale_renews ?? 0} renews
-                </li>
-              ) : null}
-              {outbox.pending > 0 && outbox.oldest_due_at !== null ? (
-                <li>
-                  oldest waiting <RelativeTime at={outbox.oldest_due_at} />
-                </li>
-              ) : null}
-              <li>
-                {drops.unknown_sender} from unknown senders since <RelativeTime at={drops.counted_since} />
-              </li>
-              {drops.unknown_sender_limited !== undefined ? (
-                <li>
-                  {drops.unknown_sender_limited} rate-limited unknown senders since{" "}
-                  <RelativeTime at={drops.counted_since} />
-                </li>
-              ) : null}
-              {drops.pairing_failures > 0 ? <li>{drops.pairing_failures} failed pairing attempts</li> : null}
-            </ul>
-          </>
+          <CapabilityList capabilities={channel.capabilities} />
         )}
 
-        <div className="ch-card-actions">
-          {configured ? (
-            <Button variant="ghost" onClick={() => setPairing(true)}>
-              Pair
-            </Button>
-          ) : null}
-          {key !== null && configured ? <RestartSidecar name={key} /> : null}
-          <span className="ch-card-health">
-            <Link to="/system/$view" params={{ view: "health" }}>
-              {channel.health_row} in health
-            </Link>
-          </span>
-        </div>
-        {configured && channel.pairing !== null ? (
-          // Only the existence of the code is shown; the code itself lives in the dialog.
-          <Quiet compact says="a pairing code is waiting" />
-        ) : null}
-        {configured ? <PrimaryChannelControl channel={channel} primary={primary} /> : null}
         {configured ? <IdentitiesPanel channel={channel} primary={channel.id === primary} /> : null}
         {configured ? <PairingDialog channel={channel} open={pairing} onOpenChange={setPairing} /> : null}
       </div>

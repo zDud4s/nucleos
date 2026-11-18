@@ -80,7 +80,7 @@ describe("RestartDaemon", () => {
       expect.anything(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Really restart — running work is cut" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cut work and restart" }));
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/system/restart?force=true", {
         method: "POST",

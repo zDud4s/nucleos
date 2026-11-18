@@ -91,7 +91,7 @@ describe("IdentitiesPanel", () => {
     answer({ ...example, home: null, identities: [] });
     await renderWithRouter(<IdentitiesPanel channel={channel} />);
 
-    expect(await screen.findByText("nobody is paired on this channel yet")).toBeTruthy();
+    expect(await screen.findByText("Nobody paired")).toBeTruthy();
     expect(screen.getByText("alpha")).toBeTruthy();
   });
 
@@ -159,14 +159,26 @@ describe("IdentitiesPanel", () => {
       await screen.findByText("Duarte");
       return screen.getAllByTestId("identity-conversation").find((r) => r.getAttribute("data-ref") === ref)!;
     };
+    // A Radix menu opens on pointerdown, not on click; its items live in a portal.
+    const openMenu = async (ref: string) =>
+      fireEvent.pointerDown(
+        within(await row(ref)).getByRole("button", { name: `More actions for conversation ${ref}` }),
+        { pointerType: "mouse", button: 0 },
+      );
+    const pick = (name: string) => fireEvent.click(screen.getByRole("menuitem", { name }));
     const NO_OWNER =
       "this channel will have no owner: nobody will be able to talk to the bot until someone is paired again";
 
     it("offers Make home on every conversation but the home, and sends the PUT", async () => {
       route(example, () => ({ home: "4242", previous: "-100123:5" }));
+      const home = await renderWithRouter(<IdentitiesPanel channel={channel} />);
+      await openMenu("-100123:5");
+      expect(screen.queryByRole("menuitem", { name: "Make home" })).toBeNull();
+      expect(screen.getByRole("menuitem", { name: "Remove conversation" })).toBeTruthy();
+      home.unmount();
       await renderWithRouter(<IdentitiesPanel channel={channel} />);
-      expect(within(await row("-100123:5")).queryByRole("button", { name: "Make home" })).toBeNull();
-      fireEvent.click(within(await row("4242")).getByRole("button", { name: "Make home" }));
+      await openMenu("4242");
+      pick("Make home");
 
       await waitFor(() => expect(mutations()).toHaveLength(1));
       const [path, init] = mutations()[0]!;
@@ -180,14 +192,16 @@ describe("IdentitiesPanel", () => {
     it("explains unknown_conversation on Make home", async () => {
       route(example, () => new ApiRefusal(404, "unknown_conversation", ""));
       await renderWithRouter(<IdentitiesPanel channel={channel} />);
-      fireEvent.click(within(await row("4242")).getByRole("button", { name: "Make home" }));
+      await openMenu("4242");
+      pick("Make home");
       expect(await screen.findByText("that conversation is no longer listed for this sender")).toBeTruthy();
     });
 
     it("removes a conversation only after the confirmation, with the ref encoded", async () => {
       route(twoSenders, () => ({ removed: 1, home_cleared: false }));
       await renderWithRouter(<IdentitiesPanel channel={channel} />);
-      fireEvent.click(within(await row("-100123:5")).getByRole("button", { name: "Remove conversation" }));
+      await openMenu("-100123:5");
+      pick("Remove conversation");
       await screen.findByRole("button", { name: "Remove" });
       expect(mutations()).toHaveLength(0);
       fireEvent.click(screen.getByRole("button", { name: "Remove" }));
@@ -202,21 +216,24 @@ describe("IdentitiesPanel", () => {
     it("warns that removing the home leaves no home, and for the primary that notifications stop", async () => {
       route(twoSenders, () => ({ removed: 1, home_cleared: true }));
       const first = await renderWithRouter(<IdentitiesPanel channel={channel} />);
-      fireEvent.click(within(await row("-100123:5")).getByRole("button", { name: "Remove conversation" }));
+      await openMenu("-100123:5");
+      pick("Remove conversation");
       expect(await screen.findByText("this channel will have no home conversation")).toBeTruthy();
       expect(screen.queryByText("notifications will stop until you pick a new home")).toBeNull();
       expect(screen.queryByText(/this channel will have no owner/)).toBeNull();
       first.unmount();
 
       await renderWithRouter(<IdentitiesPanel channel={channel} primary />);
-      fireEvent.click(within(await row("-100123:5")).getByRole("button", { name: "Remove conversation" }));
+      await openMenu("-100123:5");
+      pick("Remove conversation");
       expect(await screen.findByText("notifications will stop until you pick a new home")).toBeTruthy();
     });
 
     it("does not warn about the home when the conversation is not the home", async () => {
       route(twoSenders, () => ({ removed: 1, home_cleared: false }));
       await renderWithRouter(<IdentitiesPanel channel={channel} primary />);
-      fireEvent.click(within(await row("4242")).getByRole("button", { name: "Remove conversation" }));
+      await openMenu("4242");
+      pick("Remove conversation");
       await screen.findByRole("button", { name: "Remove" });
       expect(screen.queryByText(/no home conversation/)).toBeNull();
     });
@@ -249,7 +266,8 @@ describe("IdentitiesPanel", () => {
       route(single("4242", false), () => ({ removed: 1, home_cleared: false }));
       await renderWithRouter(<IdentitiesPanel channel={channel} />);
       await screen.findByText("Duarte");
-      fireEvent.click(screen.getByRole("button", { name: "Remove conversation" }));
+      await openMenu("4242");
+      pick("Remove conversation");
       expect(await screen.findByText(NO_OWNER)).toBeTruthy();
       expect(screen.queryByText(/no home conversation/)).toBeNull();
     });
@@ -257,7 +275,8 @@ describe("IdentitiesPanel", () => {
     it("does not warn of no owner when another conversation or sender remains", async () => {
       route(example, () => ({ removed: 1, home_cleared: false }));
       const first = await renderWithRouter(<IdentitiesPanel channel={channel} />);
-      fireEvent.click(within(await row("4242")).getByRole("button", { name: "Remove conversation" }));
+      await openMenu("4242");
+      pick("Remove conversation");
       await screen.findByRole("button", { name: "Remove" });
       expect(screen.queryByText(NO_OWNER)).toBeNull();
       first.unmount();
@@ -273,7 +292,8 @@ describe("IdentitiesPanel", () => {
     it("sends nothing when the confirmation is cancelled", async () => {
       route(twoSenders, () => ({ removed: 1, home_cleared: false }));
       await renderWithRouter(<IdentitiesPanel channel={channel} />);
-      fireEvent.click(within(await row("4242")).getByRole("button", { name: "Remove conversation" }));
+      await openMenu("4242");
+      pick("Remove conversation");
       fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
       await waitFor(() => expect(screen.queryByRole("button", { name: "Remove" })).toBeNull());
       expect(mutations()).toHaveLength(0);
@@ -297,9 +317,10 @@ describe("IdentitiesPanel", () => {
         init?.method === undefined ? Promise.resolve(twoSenders) : new Promise(() => {}),
       );
       await renderWithRouter(<IdentitiesPanel channel={channel} />);
-      fireEvent.click(within(await row("4242")).getByRole("button", { name: "Make home" }));
+      await openMenu("4242");
+      pick("Make home");
       await waitFor(() =>
-        expect((screen.getAllByRole("button", { name: "Make home" })[0] as HTMLButtonElement).disabled).toBe(true),
+        expect((screen.getAllByRole("button", { name: /More actions for conversation/ })[0] as HTMLButtonElement).disabled).toBe(true),
       );
       expect((screen.getAllByRole("button", { name: "Remove sender" })[0] as HTMLButtonElement).disabled).toBe(true);
     });
