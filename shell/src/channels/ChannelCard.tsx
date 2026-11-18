@@ -31,11 +31,19 @@ const SENTENCE: Record<ChannelState, string> = {
 };
 
 /** One labelled value of the facts strip. */
-function Fact({ term, children }: { term: string; children: ReactNode }) {
+function Fact({ term, tip, children }: { term: string; tip?: ReactNode; children: ReactNode }) {
   return (
     <div className="sy-fact">
       <dt>{term}</dt>
-      <dd>{children}</dd>
+      <dd>
+        {children}
+        {tip === undefined ? null : (
+          <>
+            {" "}
+            <Tip name={`About ${term.toLowerCase()}`} persist tip={tip} />
+          </>
+        )}
+      </dd>
     </div>
   );
 }
@@ -55,26 +63,44 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
       title={channel.label}
       aside={
         <>
-          <StateBadge domain="channel" state={channel.state} />
-          {channel.since !== null && configured ? <RelativeTime at={channel.since} /> : null}
-          {channel.adapter !== null ? (
-            <Tip name="Adapter contract" persist tip={`contract ${channel.adapter.contract_version}`} />
-          ) : null}
-          <Link to="/system/$view" params={{ view: "health" }} title={`${channel.health_row} in health`}>
-            Health
-          </Link>
+          <span className="ch-state">
+            <StateBadge domain="channel" state={channel.state} />
+            {channel.since !== null && configured ? (
+              <span className="ch-card-meta">
+                <RelativeTime at={channel.since} />
+              </span>
+            ) : null}
+            {/* The contract and the two places this channel is read elsewhere, behind one mark. */}
+            <Tip
+              name="About this channel"
+              persist
+              tip={
+                <span className="ch-about">
+                  {channel.adapter !== null ? <span>contract {channel.adapter.contract_version}</span> : null}
+                  <Link to="/system/$view" params={{ view: "health" }} title={`${channel.health_row} in health`}>
+                    Health
+                  </Link>
+                  <Link to="/system/$view" params={{ view: "settings" }} title={`channels/${channel.id}`}>
+                    Edit in Machine
+                  </Link>
+                </span>
+              }
+            />
+          </span>
           {configured ? (
-            <Button variant="ghost" onClick={() => setPairing(true)}>
-              Pair
-            </Button>
+            <span className="ch-actions">
+              <Button variant="ghost" onClick={() => setPairing(true)}>
+                Pair
+              </Button>
+              {key !== null ? <RestartSidecar name={key} /> : null}
+              <PrimaryChannelControl channel={channel} primary={primary} />
+            </span>
           ) : null}
-          {key !== null && configured ? <RestartSidecar name={key} /> : null}
-          {configured ? <PrimaryChannelControl channel={channel} primary={primary} /> : null}
         </>
       }
     >
       <div className="ch-card">
-        <dl className="sy-strip ch-facts" aria-label="Channel facts">
+        <dl className="sy-strip ch-facts ch-card-wide" aria-label="Channel facts">
           <Fact term="Status">
             {LABEL[channel.state]}{" "}
             <Tip name={`About ${channel.state.replace("_", " ")}`} persist tip={SENTENCE[channel.state]} />
@@ -83,7 +109,7 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
             <>
               <Fact term="Pending">{outbox.pending}</Fact>
               <Fact term="Leased">{outbox.leased}</Fact>
-              <Fact term="Failed">{outbox.failed}</Fact>
+              <Fact term="Failed">{outbox.failed > 0 ? <span className="ch-count-bad">{outbox.failed}</span> : outbox.failed}</Fact>
               {outbox.stale_acks !== undefined ? <Fact term="Stale acks">{outbox.stale_acks}</Fact> : null}
               {outbox.stale_renews !== undefined ? <Fact term="Stale renews">{outbox.stale_renews}</Fact> : null}
               {outbox.pending > 0 && outbox.oldest_due_at !== null ? (
@@ -91,11 +117,15 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
                   <RelativeTime at={outbox.oldest_due_at} />
                 </Fact>
               ) : null}
-              <Fact term="Unknown senders">
-                {drops.unknown_sender}{" "}
-                <span className="ch-card-meta">
-                  since <RelativeTime at={drops.counted_since} />
-                </span>
+              <Fact
+                term="Unknown senders"
+                tip={
+                  <>
+                    counted since <RelativeTime at={drops.counted_since} />
+                  </>
+                }
+              >
+                {drops.unknown_sender}
               </Fact>
               {drops.unknown_sender_limited !== undefined ? (
                 <Fact term="Rate-limited">{drops.unknown_sender_limited}</Fact>
@@ -107,25 +137,29 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
 
         {configured && channel.pairing !== null ? (
           // Only the existence of the code is shown; the code itself lives in the dialog.
-          <Quiet compact says="a pairing code is waiting" />
+          <div className="ch-card-wide">
+            <Quiet compact says="a pairing code is waiting" />
+          </div>
         ) : null}
 
         {!configured ? (
-          <Callout tone="pending" title="Missing secrets">
-            <ul className="ch-card-missing">
-              {channel.missing_secrets.map((s) => (
-                <li key={s}>{s}</li>
-              ))}
-            </ul>
-            <Link to="/system/$view" params={{ view: "settings" }}>
-              Machine settings: {channel.settings_area}
-            </Link>
-          </Callout>
-        ) : (
-          <CapabilityList capabilities={channel.capabilities} />
-        )}
+          <div className="ch-card-wide">
+            <Callout tone="pending" title="Missing secrets">
+              <ul className="ch-card-missing">
+                {channel.missing_secrets.map((s) => (
+                  <li key={s}>{s}</li>
+                ))}
+              </ul>
+              <Link to="/system/$view" params={{ view: "settings" }}>
+                Machine settings: {channel.settings_area}
+              </Link>
+            </Callout>
+          </div>
+        ) : null}
 
+        {/* Two columns when the detail is wide: who is paired on the left, what the channel lacks on the right. */}
         {configured ? <IdentitiesPanel channel={channel} primary={channel.id === primary} /> : null}
+        {configured ? <CapabilityList capabilities={channel.capabilities} /> : null}
         {configured ? <PairingDialog channel={channel} open={pairing} onOpenChange={setPairing} /> : null}
       </div>
     </Panel>

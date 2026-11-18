@@ -16,7 +16,7 @@ export function RestartSidecar({ name }: { name: string }) {
         /* No `subject`: the tile already names the sidecar, and the subject drawn into the
            armed label made the control wider than the tile it sits in. */
         confirmLabel="Start it again"
-        variant="quiet"
+        variant="ghost"
         disabled={restart.isPending}
         onConfirm={() => {
           restart.mutate(name);

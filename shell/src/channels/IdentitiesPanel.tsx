@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "@tanstack/react-router";
+import { MoreHorizontal } from "lucide-react";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import {
@@ -13,6 +13,7 @@ import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { Callout } from "../ui/Callout";
 import { ErrorNote } from "../ui/ErrorNote";
+import { IconButton } from "../ui/IconButton";
 import { Modal } from "../ui/Modal";
 import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
@@ -201,10 +202,7 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
           </Rows>
         </Section>
       )}
-      {/* Read-only here: the mapping lives in channels/<id>.yaml, edited in Machine. */}
-      <Link to="/system/$view" params={{ view: "settings" }} title={`channels/${channel.id}`} className="identities-edit">
-        Edit in Machine
-      </Link>
+      {/* Read-only here: the mapping lives in channels/<id>.yaml; the card's header links to Machine. */}
     </div>
   );
 }
@@ -227,7 +225,7 @@ function SenderGroup({
         <span className="identities-sender-name">{named ? sender.sender_name : sender.sender_ref}</span>
         {named && <span className="identities-sender-ref">{sender.sender_ref}</span>}
         <span className="identities-actions">
-          <Button variant="quiet" disabled={busy} onClick={() => onRemove(null)}>
+          <Button variant="ghost" disabled={busy} onClick={() => onRemove(null)}>
             Remove sender
           </Button>
         </span>
@@ -243,9 +241,11 @@ function SenderGroup({
               <span className="identities-actions">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button variant="quiet" disabled={busy} aria-label={`More actions for conversation ${c.conversation_ref}`}>
-                      ⋯
-                    </Button>
+                    <IconButton
+                      icon={MoreHorizontal}
+                      disabled={busy}
+                      label={`More actions for conversation ${c.conversation_ref}`}
+                    />
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
                     {!c.home && <DropdownMenuItem onSelect={() => onMakeHome(c.conversation_ref)}>Make home</DropdownMenuItem>}

@@ -90,9 +90,11 @@ describe("ChannelCard", () => {
     expect(screen.getByRole("button", { name: "Clear primary" })).toBeTruthy();
     expect(within(fact("Failed")).getByText("1")).toBeTruthy();
     expect(fact("Unknown senders").textContent).toMatch(/3/);
-    const link = screen.getByRole("link", { name: /health/i });
+    // The links live in the about mark's tip, which stays in the document while closed.
+    const link = screen.getByRole("link", { name: /health/i, hidden: true });
     expect(link.getAttribute("href")).toBe("/system/health");
     expect(link.getAttribute("title")).toBe("telegram_sidecar in health");
+    expect(screen.getByRole("link", { name: "Edit in Machine", hidden: true }).getAttribute("title")).toBe("channels/telegram");
   });
 
   it("shows stale acks, stale renews and rate-limited senders only when the daemon sends them", async () => {
@@ -155,7 +157,7 @@ describe("ChannelCard", () => {
   it("omits Restart for a health row with no sidecar key but keeps the health link", async () => {
     await renderWithRouter(<ChannelCard channel={{ ...telegram, health_row: "weird_row" }} primary={null} />);
     expect(screen.queryByRole("button", { name: "Restart" })).toBeNull();
-    expect(screen.getByRole("link", { name: /health/i }).getAttribute("href")).toBe("/system/health");
+    expect(screen.getByRole("link", { name: /health/i, hidden: true }).getAttribute("href")).toBe("/system/health");
   });
 
   it("shows an offline channel with the lacking capabilities and Make primary, and no gaps list when none lacks", async () => {

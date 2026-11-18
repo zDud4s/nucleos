@@ -221,7 +221,7 @@ function SettingPanel({
  * the input is cleared the moment it is accepted, and `present` is the only
  * thing this ever renders about a stored credential.
  */
-function SecretControl({ secret }: { secret: MachineSecret }) {
+export function SecretControl({ secret }: { secret: MachineSecret }) {
   const store = useStoreSecret();
   const forget = useForgetSecret();
   const [value, setValue] = useState("");

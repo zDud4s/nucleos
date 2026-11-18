@@ -97,18 +97,18 @@ export function Autostart() {
             <span className="ui-skeleton-bar sy-pref-skeleton" aria-hidden="true" />
           </div>
         )
-      ) : view.at_boot ? (
+      ) : (
+        // Both modes are always drawn; where the platform cannot start at boot, that segment is
+        // disabled and the row's note says why.
         <Segmented
           label="Start with Windows"
           value={view.mode}
           options={[
             { value: "at-login", label: "At login", disabled: change.isPending },
-            { value: "at-boot", label: "At boot", disabled: change.isPending },
+            { value: "at-boot", label: "At boot", disabled: change.isPending || !view.at_boot },
           ]}
           onChange={choose}
         />
-      ) : (
-        <span className="sy-prefrow-value">{view.mode === "at-boot" ? "At boot" : "At login"}</span>
       )}
     </PrefRow>
   );
