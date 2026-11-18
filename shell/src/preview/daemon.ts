@@ -46,6 +46,7 @@ import type {
   StorageReport,
 } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
+import type { SchemaNode } from "../settings/schema";
 import type {
   NoteDetail,
   NoteLink,
@@ -3312,6 +3313,88 @@ const EMAIL_CONFIG = {
   local_triage_disabled: null,
 } satisfies EmailConfigView;
 
+const STRING_LIST_SCHEMA: SchemaNode = { type: "array", items: { type: "string" } };
+
+/**
+ * The machine settings documents the Settings tab and the Channels details edit, with the schema the
+ * núcleo would serve beside each. A PUT stores the body and bumps the version, so a save in the preview
+ * reads back; nothing survives a reload.
+ */
+const PREVIEW_SETTINGS: Record<string, { schema: SchemaNode; body: Record<string, unknown>; version: number }> = {
+  email: {
+    version: 3,
+    body: {
+      enabled: EMAIL_CONFIG.enabled,
+      host: EMAIL_CONFIG.host,
+      username: EMAIL_CONFIG.username,
+      mailbox: EMAIL_CONFIG.mailbox,
+      sent_mailbox: EMAIL_CONFIG.sent_mailbox,
+      poll_interval_secs: EMAIL_CONFIG.poll_interval_secs,
+      notify_classes: EMAIL_CONFIG.notify_classes,
+      digest_hour_utc: EMAIL_CONFIG.digest_hour_utc,
+      retain_bodies_days: EMAIL_CONFIG.retain_bodies_days,
+    },
+    schema: {
+      type: "object",
+      properties: {
+        enabled: { type: "boolean", title: "Enabled" },
+        host: { type: "string", title: "Host" },
+        username: { type: "string", title: "Username" },
+        mailbox: { type: "string", title: "Mailbox" },
+        sent_mailbox: { type: ["string", "null"], title: "Sent mailbox" },
+        poll_interval_secs: { type: "integer", title: "Poll interval (s)", minimum: 30 },
+        notify_classes: { ...STRING_LIST_SCHEMA, title: "Notify classes" },
+        digest_hour_utc: { type: "integer", title: "Digest hour (UTC)", minimum: 0, maximum: 23 },
+        retain_bodies_days: { type: "integer", title: "Retain bodies (days)", minimum: 0 },
+      },
+    },
+  },
+  voice: {
+    version: 2,
+    body: {
+      hotkey: "Ctrl+Shift+D",
+      memo_hotkey: "Ctrl+Shift+M",
+      cleanup_model: "local/whisper-cleanup",
+      cleanup_prompt: "Tidy the transcript. Keep the words; drop the ums.",
+      retain_dictations_days: 30,
+      max_capture_seconds: 120,
+      max_body_bytes: 8 * 1024 * 1024,
+      hints: ["NucleOS", "núcleo", "worktree", "autopilot", "sidecar"],
+    },
+    schema: {
+      type: "object",
+      properties: {
+        hotkey: { type: "string", title: "Hotkey" },
+        memo_hotkey: { type: "string", title: "Memo hotkey" },
+        cleanup_model: { type: ["string", "null"], title: "Cleanup model" },
+        cleanup_prompt: { type: "string", title: "Cleanup prompt" },
+        retain_dictations_days: { type: "integer", title: "Retain dictations (days)", minimum: 0 },
+        max_capture_seconds: { type: "integer", title: "Max capture (s)", minimum: 1 },
+        max_body_bytes: { type: "integer", title: "Max body (bytes)", minimum: 1 },
+        hints: { ...STRING_LIST_SCHEMA, title: "Hints" },
+      },
+    },
+  },
+  calendar: {
+    version: 1,
+    body: {
+      default_tz: "Europe/Lisbon",
+      working_hours_start: "09:00",
+      working_hours_end: "18:00",
+      working_weekdays: ["mon", "tue", "wed", "thu", "fri"],
+    },
+    schema: {
+      type: "object",
+      properties: {
+        default_tz: { type: "string", title: "Default timezone" },
+        working_hours_start: { type: "string", title: "Working hours start" },
+        working_hours_end: { type: "string", title: "Working hours end" },
+        working_weekdays: { ...STRING_LIST_SCHEMA, title: "Working weekdays" },
+      },
+    },
+  },
+};
+
 /**
  * Every supervised sidecar, and the second half of `/health/readout`'s story above.
  *
@@ -4056,7 +4139,30 @@ export function answer(path: string, init?: RequestInit): unknown {
     ];
   }
   if (path === "/system/autostart" && init?.method === undefined) {
-    return { mode: "at-login", at_boot: false, needs_password: true, why_not: null };
+    return { mode: "at-login", at_boot: true, needs_password: true, why_not: null };
+  }
+  if (path === "/settings") {
+    return Object.entries(PREVIEW_SETTINGS).map(([name, doc]) => ({
+      scope: "machine",
+      name,
+      kind: "machine",
+      takes_effect: "when the daemon restarts",
+      present: true,
+      unreadable: false,
+      version: doc.version,
+    }));
+  }
+  const settingsDoc = /^\/settings\/machine\/([^/]+)(\/history)?$/.exec(path);
+  if (settingsDoc !== null && Object.prototype.hasOwnProperty.call(PREVIEW_SETTINGS, settingsDoc[1])) {
+    const doc = PREVIEW_SETTINGS[settingsDoc[1]];
+    if (settingsDoc[2] !== undefined) return [];
+    if (init?.method === "PUT") {
+      const sent = JSON.parse(String(init.body)) as { body: Record<string, unknown> };
+      doc.body = sent.body;
+      doc.version += 1;
+      return { version: doc.version };
+    }
+    return { body: doc.body, version: doc.version, schema: doc.schema };
   }
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;
   if (path === "/config/distiller" && init?.method === undefined) return { model: "cloud" };

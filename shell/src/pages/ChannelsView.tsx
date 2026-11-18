@@ -24,6 +24,8 @@ export interface ChannelConfigEntry {
   badge?: ReactNode;
   /** The detail drawn when the row is selected. */
   detail: ReactNode;
+  /** Drawn beside the detail's title, e.g. a `Tip`. */
+  aside?: ReactNode;
 }
 
 /** One selectable line of the list, whichever kind of entry it stands for. */
@@ -117,7 +119,7 @@ export function ChannelsView({ configs = [] }: { configs?: ChannelConfigEntry[] 
           {channel !== undefined ? (
             <ChannelCard key={channel.id} channel={channel} primary={primary} />
           ) : config !== undefined ? (
-            <Panel title={config.label}>{config.detail}</Panel>
+            <Panel title={config.label} aside={config.aside}>{config.detail}</Panel>
           ) : null}
         </div>
       </div>

@@ -85,7 +85,7 @@ describe("Autostart", () => {
     expect(screen.queryByDisplayValue("wrong")).toBeNull();
   });
 
-  it("explains macOS instead of offering a switch it cannot honour", async () => {
+  it("explains macOS and disables the At boot segment it cannot honour", async () => {
     daemon.apiFetch.mockResolvedValue({
       mode: "at-login",
       at_boot: false,
@@ -94,7 +94,9 @@ describe("Autostart", () => {
     } satisfies AutostartView);
     renderPanel();
     expect(await screen.findByText(/Turn on automatic login/)).toBeDefined();
-    expect(screen.queryByRole("button", { name: "At boot" })).toBeNull();
+    expect((screen.getByRole("button", { name: "At boot" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "At login" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByRole("button", { name: "At login" }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("turns on at once where no password is needed", async () => {

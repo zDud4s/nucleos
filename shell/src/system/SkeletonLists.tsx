@@ -2,8 +2,8 @@ import type { CSSProperties, ReactNode } from "react";
 import { Row, Rows, Table, Td, Th } from "../ui";
 
 /*
-  Loading shapes for the System tab's lists and fact columns, drawn on the loaded rows' own
-  classes (`sy-backup-row`, `sy-token-row`, `sy-config-facts`), so a row has the same grid, pitch
+  Loading shapes for the System tab's lists, drawn on the loaded rows' own
+  classes (`sy-backup-row`, `sy-token-row`), so a row has the same grid, pitch
   and insets whether it is a bar or a snapshot. Everything here is `aria-hidden` under a
   `role="status"` wrapper with a visually hidden label, like `ui/Skeleton`.
 */
@@ -14,9 +14,6 @@ const bar = (width: string, style?: CSSProperties) => (
 
 /** A control's height (a ghost or danger `Button`), so a row is as tall as one with its button. */
 const BUTTON_HEIGHT = "2rem";
-
-/** One text line's height (a fact's `dd` is `--text-sm`), the bar centred in it. */
-const LINE: CSSProperties = { display: "flex", alignItems: "center", minHeight: "1lh", fontSize: "var(--text-sm)" };
 
 function Shell({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -66,40 +63,6 @@ export function TokenRowsSkeleton({ label, count = 3 }: { label: string; count?:
           ))}
         </Rows>
       </div>
-    </Shell>
-  );
-}
-
-/** A configuration panel: optional state badges, `facts` key/value lines, optional closing note. */
-export function ConfigFactsSkeleton({
-  label,
-  facts,
-  flags = 0,
-  note = false,
-}: {
-  label: string;
-  facts: number;
-  flags?: number;
-  note?: boolean;
-}) {
-  return (
-    <Shell label={label}>
-      {flags > 0 && (
-        <div className="sy-config-flags">
-          {Array.from({ length: flags }, (_, i) => (
-            <span key={i} className="ui-skeleton-bar" style={{ width: "4.5rem", height: "1.25rem" }} />
-          ))}
-        </div>
-      )}
-      <div className="sy-config-facts">
-        {Array.from({ length: facts }, (_, i) => (
-          <div key={i} className="sy-fact">
-            <span style={{ ...LINE, flex: "none" }}>{bar("6rem")}</span>
-            <span style={{ ...LINE, flex: 1, minWidth: 0, justifyContent: "flex-end" }}>{bar("45%")}</span>
-          </div>
-        ))}
-      </div>
-      {note && <p className="sy-note" style={LINE}>{bar("60%")}</p>}
     </Shell>
   );
 }

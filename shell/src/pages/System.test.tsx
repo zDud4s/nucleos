@@ -1742,6 +1742,41 @@ describe("System - map-authored readings", () => {
       expect(badge.className).not.toContain("ui-badge-active");
     }
   });
+
+  it("the Email detail edits the machine document in place, with the password beside it", async () => {
+    const world = systemWorld({
+      settings: settingsDouble(
+        machineSeeds().map((seed) =>
+          seed.name === "email" ? { ...seed, body: { host: "imap.example.com" }, version: 1 } : seed,
+        ),
+      ),
+      secrets: [{ key: "email-password", area: "email", what: "the IMAP password", present: true }],
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+    await renderSystemAt("/system/channels");
+    const pick = (await screen.findAllByRole("button", { name: /^Email/ })).find((b) =>
+      b.className.includes("ch-pick"),
+    );
+    if (pick === undefined) throw new Error("no Email entry in the list");
+    fireEvent.click(pick);
+    const panel = (await screen.findByRole("heading", { level: 2, name: "Email" })).closest("section");
+    if (panel === null) throw new Error("no email configuration panel");
+
+    // The badges stay, and the values live in the form rather than in a second read-only list.
+    expect(within(panel).getByText("enabled")).toBeDefined();
+    expect(within(panel).getByText("armed")).toBeDefined();
+    const host = (await within(panel).findByLabelText("Host")) as HTMLInputElement;
+    expect(host.value).toBe("imap.example.com");
+    expect(within(panel).getByLabelText("email-password")).toBeDefined();
+
+    fireEvent.change(host, { target: { value: "imap.other.example.com" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(world.settings.writes).toEqual([
+        { scope: "machine", name: "email", body: { host: "imap.other.example.com" }, version: 1 },
+      ]);
+    });
+  });
 });
 
 describe("System - the channel search param", () => {

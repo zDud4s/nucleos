@@ -65,7 +65,7 @@ describe("ConfirmButton variant grammar", () => {
       ["Archive", "quiet"],
       ["Requeue for triage", "quiet"],
       ["Revert", "quiet"],
-      ["Restart", "quiet"],
+      ["Restart", "ghost"],
     ]);
 
     for (const file of tsxFiles(shellSource)) {

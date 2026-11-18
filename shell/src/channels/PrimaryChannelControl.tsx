@@ -44,12 +44,12 @@ export function PrimaryChannelControl({ channel, primary }: { channel: Channel; 
         <ConfirmButton
           label="Clear primary"
           confirmLabel="Clear: notifications will have no destination"
-          variant="quiet"
+          variant="ghost"
           disabled={setPrimary.isPending}
           onConfirm={() => setPrimary.mutate(null)}
         />
       ) : (
-        <Button variant="approve" disabled={setPrimary.isPending} onClick={() => setPrimary.mutate(channel.id)}>
+        <Button variant="ghost" disabled={setPrimary.isPending} onClick={() => setPrimary.mutate(channel.id)}>
           Make primary
         </Button>
       )}

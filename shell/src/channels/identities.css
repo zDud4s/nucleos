@@ -10,7 +10,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
-  align-items: baseline;
+  align-items: center;
 }
 .identities-sender-name { font-weight: var(--weight-semibold); overflow-wrap: anywhere; }
 .identities-sender-ref {
@@ -18,8 +18,15 @@
   font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
 }
-/* The sender's conversations are a list of their own under the sender's line. */
-.identities-conversations { margin-top: var(--space-2); }
+/* The sender's conversations are indented dense rows under the sender's line, on the same hairlines. */
+.identities-conversations { margin: var(--space-2) 0 0 var(--space-4); }
+/* Flat sections: the lists carry hairlines between rows, no frame of their own. */
+.identities-panel .ui-rows {
+  border: none;
+  border-radius: 0;
+  overflow: visible;
+}
+.identities-panel .ui-rows-row { padding-inline: 0; }
 .identities-conversation {
   display: flex;
   flex-wrap: wrap;
@@ -42,6 +49,5 @@
   margin-left: auto;
   white-space: nowrap;
 }
-.identities-edit { align-self: flex-start; font-size: var(--text-sm); }
 .identities-warnings { display: flex; flex-direction: column; gap: var(--space-2); margin: 0 0 var(--space-2); }
 .identities-outcome { margin: 0 0 var(--space-2); }

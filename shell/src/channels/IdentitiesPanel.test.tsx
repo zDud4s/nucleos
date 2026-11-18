@@ -65,14 +65,14 @@ describe("IdentitiesPanel", () => {
     expect(daemon.apiFetch.mock.calls[0]![0]).toBe("/channels/telegram/identities");
   });
 
-  it("lists the projects read-only with a link to Machine settings", async () => {
+  // The "Edit in Machine" link now lives in the channel card's about tip (ChannelCard.test).
+  it("lists the projects read-only", async () => {
     answer(example);
     await renderWithRouter(<IdentitiesPanel channel={channel} />);
 
     expect(await screen.findByText("alpha")).toBeTruthy();
     expect(screen.getByText("-100123:7")).toBeTruthy();
-    const link = screen.getByRole("link", { name: /edit in Machine/i });
-    expect(link.getAttribute("href")).toMatch(/\/system\/settings$/);
+    expect(screen.queryByRole("link", { name: /edit in Machine/i })).toBeNull();
   });
 
   it("falls back to the sender ref when the name is null", async () => {

@@ -40,15 +40,12 @@ import {
   type BackupInfo,
   type BudgetChange,
   type BudgetView,
-  type CalendarConfig,
   type CreatedApiToken,
-  type EmailConfig,
   type HealthReadout,
   type PiiTallyRow,
   type QuotaBrakeView,
   type SidecarState,
   type SubsystemReadout,
-  type VoiceConfig,
 } from "../data/system";
 import {
   Badge,
@@ -85,7 +82,9 @@ import {
 import { RemoteDevices } from "../system/RemoteDevices";
 import { Autostart } from "../system/Autostart";
 import { RestartDaemon } from "../system/RestartDaemon";
-import { MachineSettings } from "./MachineSettings";
+import { MachineSettings, SecretControl } from "./MachineSettings";
+import { useMachineSecrets } from "../data/secrets";
+import { SettingsForm } from "../settings/SettingsForm";
 import { ChannelsView, type ChannelConfigEntry } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
 import { NotificationsView } from "./NotificationsView";
@@ -103,7 +102,7 @@ registerPrefetcher("/system", (qc) =>
 import { DAEMON_NAME } from "../copy";
 import { percentText } from "../lib/format";
 import { plural } from "../lib/plural";
-import { BackupRowsSkeleton, ConfigFactsSkeleton, PiiTableSkeleton, TokenRowsSkeleton } from "../system/SkeletonLists";
+import { BackupRowsSkeleton, PiiTableSkeleton, TokenRowsSkeleton } from "../system/SkeletonLists";
 
 /**
  * System — the machine's own state, not a project's.
@@ -1800,33 +1799,19 @@ function RevokeError({ error }: { error: unknown }) {
 /* ------------------------------------------------------------------- config -- */
 
 /**
- * What the pillars are actually DOING, as the daemon has them in memory.
- *
- * These three stay here, and stay read-only, now that the Settings tab can
- * write the files they come from. They are not the same reading and neither
- * replaces the other: this is the parsed and running view — clamps applied,
- * `armed` computed, a malformed file already fallen back to defaults — where
- * the Settings tab shows the bytes on disk. The two disagree exactly when
- * somebody has edited a file and not restarted, and that gap is the thing
- * worth being able to see rather than the thing to design away.
- *
- * The panel that used to sit here naming `web`, `browser`, `council` and
- * `models` as areas with no configuration route is gone, because that is no
- * longer true of any of them.
+ * The pillars Email, Voice and Calendar beside the channels: their state badges come from the daemon's
+ * parsed, running view (`armed` is computed there and stays read-only), and the values are the machine
+ * settings document, edited in place. A saved change applies when the daemon restarts.
  */
 const RUNNING_CONFIGS: ChannelConfigEntry[] = [
-  { id: "email", label: "Email", badge: <EmailStateBadge />, detail: <EmailConfigDetail /> },
-  { id: "voice", label: "Voice", badge: <VoiceStateBadge />, detail: <VoiceConfigDetail /> },
-  { id: "calendar", label: "Calendar", detail: <CalendarConfigDetail /> },
+  { id: "email", label: "Email", badge: <EmailStateBadge />, detail: <EmailConfigDetail />, aside: <RestartTip /> },
+  { id: "voice", label: "Voice", badge: <VoiceStateBadge />, detail: <VoiceConfigDetail />, aside: <RestartTip /> },
+  { id: "calendar", label: "Calendar", detail: <CalendarConfigDetail />, aside: <RestartTip /> },
 ];
 
-function ConfigFact({ term, value }: { term: string; value: string }) {
-  return (
-    <div className="sy-fact">
-      <dt>{term}</dt>
-      <dd>{value}</dd>
-    </div>
-  );
+/** Beside each config title: what a saved change waits for. */
+function RestartTip() {
+  return <Tip name="When changes apply" tip="Applies when the daemon restarts." />;
 }
 
 /** The list row's reading of the mailbox: armed beats enabled, and nothing is drawn until it is read. */
@@ -1836,67 +1821,53 @@ function EmailStateBadge() {
   return <StateBadge domain="setting" state={email.data.armed ? "armed" : email.data.enabled ? "enabled" : "disabled"} />;
 }
 
-function EmailConfigDetail() {
-  const email = useEmailConfig();
+/**
+ * The editable document under the running view's badges. The form is the only place the values are
+ * drawn: the badges and notes come from the daemon's parsed reading (`armed` is computed there), the
+ * fields from the file on disk, which is what a save writes.
+ */
+function ConfigDetail({ name, flags, children }: { name: string; flags: ReactNode; children?: ReactNode }) {
   return (
-    <>
-      {email.isError && email.data === undefined && (
-        <SystemListError error={email.error} what="the e-mail configuration" />
-      )}
-      {!email.isError && email.data === undefined && (
-        <ConfigFactsSkeleton label="Reading the e-mail configuration" flags={2} facts={8} note />
-      )}
-      {email.data !== undefined && <EmailConfigFacts config={email.data} />}
-    </>
+    <div className="flex flex-col gap-3">
+      {flags}
+      <SettingsForm scope="machine" name={name} />
+      {children}
+    </div>
   );
 }
 
 /**
- * `enabled` and `armed` are rendered as two separate facts on purpose — the
- * daemon's own comment says an enabled-but-unarmed mailbox is a real state:
- * the pillar keeps its retention either way, and triage can be held while
- * mail keeps arriving. `local_triage_disabled` is a reason string when local
- * triage was configured and could not be trusted; `null` means nothing is
- * wrong, not that it is off.
+ * `enabled` and `armed` are two separate badges on purpose — the daemon's own comment says an
+ * enabled-but-unarmed mailbox is a real state: the pillar keeps its retention either way, and triage
+ * can be held while mail keeps arriving. `local_triage_disabled` is a reason string when local triage
+ * was configured and could not be trusted; `null` means nothing is wrong, not that it is off.
  */
-function EmailConfigFacts({ config }: { config: EmailConfig }) {
+function EmailConfigDetail() {
+  const email = useEmailConfig();
+  const secrets = useMachineSecrets();
+  const config = email.data;
+  const own = (secrets.data?.secrets ?? []).filter((secret) => secret.area === "email");
   return (
-    <>
-      <div className="sy-config-flags">
-        <StateBadge domain="setting" state={config.enabled ? "enabled" : "disabled"} />
-        <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
-      </div>
-      <dl className="sy-config-facts">
-        <ConfigFact term="host" value={config.host} />
-        <ConfigFact term="username" value={config.username} />
-        <ConfigFact term="mailbox" value={config.mailbox} />
-        <ConfigFact
-          term="sent mailbox"
-          value={config.sent_mailbox ?? "not set"}
-        />
-        <ConfigFact
-          term="poll interval"
-          value={`${String(config.poll_interval_secs)}s`}
-        />
-        <ConfigFact
-          term="notify classes"
-          value={config.notify_classes.join(", ") || "none"}
-        />
-        <ConfigFact
-          term="digest hour (UTC)"
-          value={String(config.digest_hour_utc)}
-        />
-        <ConfigFact
-          term="retain bodies (days)"
-          value={String(config.retain_bodies_days)}
-        />
-      </dl>
-      <p className="sy-note">
-        {config.local_triage_disabled === null
-          ? "local triage: no problem reported."
-          : `local triage disabled: ${config.local_triage_disabled}`}
-      </p>
-    </>
+    <ConfigDetail
+      name="email"
+      flags={
+        config !== undefined ? (
+          <div className="sy-config-flags">
+            <StateBadge domain="setting" state={config.enabled ? "enabled" : "disabled"} />
+            <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
+          </div>
+        ) : email.isError ? (
+          <SystemListError error={email.error} what="the e-mail configuration" />
+        ) : null
+      }
+    >
+      {own.map((secret) => (
+        <SecretControl key={secret.key} secret={secret} />
+      ))}
+      {config?.local_triage_disabled != null && (
+        <p className="sy-note">local triage disabled: {config.local_triage_disabled}</p>
+      )}
+    </ConfigDetail>
   );
 }
 
@@ -1909,82 +1880,28 @@ function VoiceStateBadge() {
 function VoiceConfigDetail() {
   const voice = useVoiceConfig();
   return (
-    <>
-      {voice.isError && voice.data === undefined && (
-        <SystemListError error={voice.error} what="the voice configuration" />
-      )}
-      {!voice.isError && voice.data === undefined && (
-        <ConfigFactsSkeleton label="Reading the voice configuration" flags={1} facts={7} />
-      )}
-      {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
-    </>
-  );
-}
-
-function VoiceConfigFacts({ config }: { config: VoiceConfig }) {
-  return (
-    <>
-      <div className="sy-config-flags">
-        <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
-      </div>
-      <dl className="sy-config-facts">
-        <ConfigFact term="hotkey" value={config.hotkey} />
-        <ConfigFact term="memo hotkey" value={config.memo_hotkey} />
-        <ConfigFact
-          term="cleanup model"
-          value={config.cleanup_model ?? "none configured"}
-        />
-        <ConfigFact
-          term="retain dictations (days)"
-          value={String(config.retain_dictations_days)}
-        />
-        <ConfigFact
-          term="max capture (s)"
-          value={String(config.max_capture_seconds)}
-        />
-        <ConfigFact
-          term="max body (bytes)"
-          value={String(config.max_body_bytes)}
-        />
-        <ConfigFact term="hints" value={config.hints.join(", ") || "none"} />
-      </dl>
-    </>
+    <ConfigDetail
+      name="voice"
+      flags={
+        voice.data !== undefined ? (
+          <div className="sy-config-flags">
+            <StateBadge domain="setting" state={voice.data.armed ? "armed" : "unarmed"} />
+          </div>
+        ) : voice.isError ? (
+          <SystemListError error={voice.error} what="the voice configuration" />
+        ) : null
+      }
+    />
   );
 }
 
 function CalendarConfigDetail() {
   const calendar = useCalendarConfig();
   return (
-    <>
-      {calendar.isError && calendar.data === undefined && (
-        <SystemListError
-          error={calendar.error}
-          what="the calendar configuration"
-        />
-      )}
-      {!calendar.isError && calendar.data === undefined && (
-        <ConfigFactsSkeleton label="Reading the calendar configuration" facts={3} />
-      )}
-      {calendar.data !== undefined && (
-        <CalendarConfigFacts config={calendar.data} />
-      )}
-    </>
-  );
-}
-
-function CalendarConfigFacts({ config }: { config: CalendarConfig }) {
-  return (
-    <dl className="sy-config-facts">
-      <ConfigFact term="default timezone" value={config.default_tz} />
-      <ConfigFact
-        term="working hours"
-        value={`${config.working_hours_start}–${config.working_hours_end}`}
-      />
-      <ConfigFact
-        term="working weekdays"
-        value={config.working_weekdays.join(", ")}
-      />
-    </dl>
+    <ConfigDetail
+      name="calendar"
+      flags={calendar.isError && calendar.data === undefined ? <SystemListError error={calendar.error} what="the calendar configuration" /> : null}
+    />
   );
 }
 

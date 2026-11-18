@@ -822,34 +822,6 @@
 .sy-config-flags {
   display: flex;
   gap: var(--space-2);
-  margin: 0 0 var(--space-3);
-}
-
-/* Key on the left, value on the right, one per line under a hairline — a
-   column you run down, rather than a grid of label-over-value boxes. */
-.sy-config-facts {
-  display: flex;
-  flex-direction: column;
-  margin: 0 0 var(--space-3);
-}
-
-.sy-config-facts .sy-fact {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-2) 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.sy-config-facts .sy-fact:last-child {
-  border-bottom: none;
-}
-
-.sy-config-facts .sy-fact dd {
-  margin: 0;
-  min-width: 0;
-  text-align: right;
 }
 
 /* -- machine settings ------------------------------------------------------ */
@@ -914,13 +886,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-/* A read-only value: the same size as the labels, muted. */
-.sy-prefrow-value {
-  font-size: var(--text-sm);
-  font-weight: var(--weight-regular);
-  color: var(--text-muted);
 }
 
 /* Label on the first line; the control takes the whole second line, its field growing and any
