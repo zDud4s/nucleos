@@ -18,9 +18,9 @@ import { Modal } from "../ui/Modal";
 import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
 import { Row, Rows } from "../ui/Rows";
-import { Section } from "../ui/Section";
 import { Skeleton } from "../ui/Skeleton";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "../ui/vendor/dropdown-menu";
+import { ChannelCardBox } from "./ChannelDetail";
 import "./identities.css";
 
 const SENTENCES: Record<string, string> = {
@@ -39,6 +39,9 @@ interface Removal {
 
 /**
  * Who is paired on a channel and where (annex E.5, E.8).
+ *
+ * Drawn as cards ("Paired", then "Projects" when there are any) that are direct grid items of the
+ * detail's `ChannelCards`: the wrapper is `display: contents`.
  *
  * Grouped by sender, conversations in the order the daemon sends them. A
  * `group` conversation covers every topic in it, which is what "all topics"
@@ -63,15 +66,24 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
   const busy = setHome.isPending || remove.isPending;
 
   if (identities.isPending) {
-    return <Skeleton label="Reading the identities" lines={3} />;
+    return (
+      <ChannelCardBox title="Paired">
+        <Skeleton label="Reading the identities" lines={3} />
+      </ChannelCardBox>
+    );
   }
   if (identities.isError) {
     const error = identities.error;
-    if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
     return (
-      <ErrorNote onRetry={() => void identities.refetch()}>
-        Could not reach the {DAEMON_NAME}: the paired identities are not known
-      </ErrorNote>
+      <ChannelCardBox title="Paired">
+        {isApiRefusal(error) ? (
+          <RefusalNote refusal={error} />
+        ) : (
+          <ErrorNote onRetry={() => void identities.refetch()}>
+            Could not reach the {DAEMON_NAME}: the paired identities are not known
+          </ErrorNote>
+        )}
+      </ChannelCardBox>
     );
   }
 
@@ -166,7 +178,7 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
             <ErrorNote>Could not reach the {DAEMON_NAME}: nothing was removed</ErrorNote>
           ))}
       </Modal>
-      <Section label="Paired" level={3}>
+      <ChannelCardBox title="Paired">
         {senders.length === 0 ? (
           <Quiet compact says="Nobody paired" />
         ) : (
@@ -189,9 +201,9 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
             ))}
           </Rows>
         )}
-      </Section>
+      </ChannelCardBox>
       {projects.length > 0 && (
-        <Section label="Projects" level={3}>
+        <ChannelCardBox title="Projects">
           <Rows label="Project conversations">
             {projects.map((p) => (
               <Row key={p.project_id} layout="line" dense>
@@ -200,7 +212,7 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
               </Row>
             ))}
           </Rows>
-        </Section>
+        </ChannelCardBox>
       )}
       {/* Read-only here: the mapping lives in channels/<id>.yaml; the card's header links to Machine. */}
     </div>

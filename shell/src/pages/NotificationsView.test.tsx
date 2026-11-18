@@ -65,8 +65,8 @@ describe("the notifications view", () => {
 
     // Both sentences are on screen rather than discovered by experiment: that
     // governance is never silenced, and that nothing needs restarting.
-    expect(await screen.findByText(/never silenced/i)).toBeDefined();
-    fireEvent.click(screen.getByRole("button", { name: "About families" }));
+    fireEvent.click(await screen.findByRole("button", { name: "About notification switches" }));
+    expect(screen.getByText(/never silenced/i)).toBeDefined();
     expect(screen.getByText(/nothing needs restarting/i)).toBeDefined();
   });
 

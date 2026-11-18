@@ -85,6 +85,8 @@ import { RestartDaemon } from "../system/RestartDaemon";
 import { MachineSettings, SecretControl } from "./MachineSettings";
 import { useMachineSecrets } from "../data/secrets";
 import { SettingsForm } from "../settings/SettingsForm";
+import type { SettingsGroup } from "../settings/FieldNode";
+import { ChannelTiles, type ChannelTile } from "../channels/ChannelDetail";
 import { ChannelsView, type ChannelConfigEntry } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
 import { NotificationsView } from "./NotificationsView";
@@ -663,7 +665,6 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
  * duplicating one here is the specific failure the design names.
  */
 function SpendBrakesPanel() {
-  const budget = useBudget();
   const projects = useProjects();
   const kills = useScopedKills();
   const setKill = useSetScopedKill();
@@ -675,9 +676,9 @@ function SpendBrakesPanel() {
     .sort((a, b) => (a.project_id < b.project_id ? -1 : a.project_id > b.project_id ? 1 : 0));
   const attention = attentionNames(braked, 3);
   const loaded = projects.data !== undefined;
-  // Always drawn, disabled when there is nothing to list, so the header is one height for 0 projects too.
-  const aside = (
-    <span className="sy-strip-tools">
+  // Always drawn, disabled when there is nothing to list, so the tile is one height for 0 projects too.
+  const tools = (
+    <span className="sy-kpi-tools">
       <Tip
         name="About project brakes"
         persist
@@ -697,55 +698,49 @@ function SpendBrakesPanel() {
   const dash = <span aria-hidden="true">—</span>;
 
   return (
-    <Panel title="Spend & brakes" aside={aside}>
-      {budget.isError && budget.data === undefined && <SystemListError error={budget.error} what="the budget" />}
+    <section aria-label="Spend & brakes" className="sy-kpi-section">
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
-      {budget.data !== undefined && budget.data.paused && (
-        <Notice tone="paused" role="status">
-          Autonomous work is currently held: {budget.data.reason}
-        </Notice>
-      )}
-      <dl className="sy-strip" aria-label="Spend and brakes">
-        <div className="sy-fact">
-          <dt>Window spend</dt>
-          <dd>{budget.data === undefined ? dash : `$${budget.data.window_spend_usd.toFixed(2)}`}</dd>
+      {/* Same column template as `.sy-limits`, so each tile sits above one limits panel. */}
+      <div className="sy-kpis">
+        <div className="sy-kpi">
+          <dl>
+            <dt>Projects</dt>
+            <dd>{loaded ? list.length : dash}</dd>
+          </dl>
         </div>
-        <div className="sy-fact">
-          <dt>Hourly</dt>
-          <dd>{budget.data === undefined ? dash : `$${budget.data.hourly_spend_usd.toFixed(2)}`}</dd>
+        <div className="sy-kpi">
+          <dl>
+            <dt>Running</dt>
+            <dd>{loaded ? list.length - braked.length : dash}</dd>
+          </dl>
         </div>
-        <div className="sy-fact">
-          <dt>Projects</dt>
-          <dd>{loaded ? list.length : dash}</dd>
+        <div className="sy-kpi">
+          <dl>
+            <dt>Braked</dt>
+            <dd>
+              {!loaded || kills.data === undefined ? (
+                dash
+              ) : attention.head.length === 0 ? (
+                "None"
+              ) : (
+                <span className="sy-strip-braked">
+                  {attention.head.map((project) => (
+                    <span key={project.project_id} className="sy-attention-item" title={project.project_id}>
+                      <span className="sy-dot sy-tone-danger" aria-hidden="true" />
+                      {project.project_id}
+                    </span>
+                  ))}
+                  {attention.more > 0 && <span className="sy-attention-more">+{attention.more} more</span>}
+                </span>
+              )}
+            </dd>
+          </dl>
+          {tools}
         </div>
-        <div className="sy-fact">
-          <dt>Running</dt>
-          <dd>{loaded ? list.length - braked.length : dash}</dd>
-        </div>
-        <div className="sy-fact">
-          <dt>Braked</dt>
-          <dd>
-            {!loaded || kills.data === undefined ? (
-              dash
-            ) : attention.head.length === 0 ? (
-              "None"
-            ) : (
-              <span className="sy-strip-braked">
-                {attention.head.map((project) => (
-                  <span key={project.project_id} className="sy-attention-item" title={project.project_id}>
-                    <span className="sy-dot sy-tone-danger" aria-hidden="true" />
-                    {project.project_id}
-                  </span>
-                ))}
-                {attention.more > 0 && <span className="sy-attention-more">+{attention.more} more</span>}
-              </span>
-            )}
-          </dd>
-        </div>
-      </dl>
+      </div>
       {open && loaded && (
         <Drawer title="Project brakes" onClose={() => { setOpen(false); }}>
           <table className="sy-dtable" aria-label="All project brakes">
@@ -797,7 +792,7 @@ function SpendBrakesPanel() {
           that brake was not changed: the {DAEMON_NAME} refused or is not responding
         </ErrorNote>
       )}
-    </Panel>
+    </section>
   );
 }
 
@@ -1633,7 +1628,18 @@ function TokensPanel() {
   }
 
   return (
-    <Panel title="API tokens">
+    <Panel
+      title="API tokens"
+      aside={
+        <span id="sy-token-hint">
+          <Tip
+            name="About token names and levels"
+            persist
+            tip={`1–64 characters: letters, digits, hyphen or underscore. The ${level} level ${TOKEN_LEVEL_HINT[level]} A read-only token cannot read the budget or the kill switch, since both sit outside its read allowlist.`}
+          />
+        </span>
+      }
+    >
       {minted !== null && (
         <CopyOnce
           value={minted.token}
@@ -1687,13 +1693,6 @@ function TokensPanel() {
         >
           {adminAsked ? "Mint an admin token" : "Mint token"}
         </Button>
-        <span id="sy-token-hint">
-          <Tip
-            name="About token names and levels"
-            persist
-            tip={`1–64 characters: letters, digits, hyphen or underscore. The ${level} level ${TOKEN_LEVEL_HINT[level]} A read-only token cannot read the budget or the kill switch, since both sit outside its read allowlist.`}
-          />
-        </span>
       </form>
       {adminAsked && (
         <Notice tone="pending" role="status">
@@ -1804,8 +1803,16 @@ function RevokeError({ error }: { error: unknown }) {
  * settings document, edited in place. A saved change applies when the daemon restarts.
  */
 const RUNNING_CONFIGS: ChannelConfigEntry[] = [
-  { id: "email", label: "Email", badge: <EmailStateBadge />, detail: <EmailConfigDetail />, aside: <RestartTip /> },
+  {
+    id: "email",
+    label: "Email",
+    badge: <EmailStateBadge />,
+    headerBadge: <EmailHeaderBadges />,
+    detail: <EmailConfigDetail />,
+    aside: <RestartTip />,
+  },
   { id: "voice", label: "Voice", badge: <VoiceStateBadge />, detail: <VoiceConfigDetail />, aside: <RestartTip /> },
+  // Calendar has no state badge of its own: the header shows the name and the about mark only.
   { id: "calendar", label: "Calendar", detail: <CalendarConfigDetail />, aside: <RestartTip /> },
 ];
 
@@ -1821,18 +1828,49 @@ function EmailStateBadge() {
   return <StateBadge domain="setting" state={email.data.armed ? "armed" : email.data.enabled ? "enabled" : "disabled"} />;
 }
 
-/**
- * The editable document under the running view's badges. The form is the only place the values are
- * drawn: the badges and notes come from the daemon's parsed reading (`armed` is computed there), the
- * fields from the file on disk, which is what a save writes.
- */
-function ConfigDetail({ name, flags, children }: { name: string; flags: ReactNode; children?: ReactNode }) {
+/** The header's two mailbox badges: `enabled` and `armed` are separate facts (see `EmailConfigDetail`). */
+function EmailHeaderBadges() {
+  const email = useEmailConfig();
+  if (email.data === undefined) return null;
   return (
-    <div className="flex flex-col gap-3">
-      {flags}
-      <SettingsForm scope="machine" name={name} />
-      {children}
-    </div>
+    <>
+      <StateBadge domain="setting" state={email.data.enabled ? "enabled" : "disabled"} />
+      <StateBadge domain="setting" state={email.data.armed ? "armed" : "unarmed"} />
+    </>
+  );
+}
+
+/** A tile value that is read from the daemon: a dash while it is unknown or empty. */
+function tileText(value: string | number | null | undefined): string {
+  return value === undefined || value === null || value === "" ? "—" : String(value);
+}
+
+/**
+ * The body of a running configuration inside the shared `ChannelDetail` frame (the frame, with the
+ * state badges and the about mark, is drawn by `ChannelsView`): a row of tiles, then the editable
+ * machine document as rows in cards. The form is the only place the values are edited: the tiles
+ * come from the daemon's parsed reading (`armed` is computed there), the fields from the file on
+ * disk, which is what a save writes.
+ */
+function ConfigDetail({
+  name,
+  notice,
+  tiles,
+  groups,
+}: {
+  name: string;
+  /** A read error or a standing note, above the tiles. */
+  notice?: ReactNode;
+  tiles: readonly ChannelTile[];
+  /** How the document's fields split into cards (`SettingsGroup`). */
+  groups: readonly SettingsGroup[];
+}) {
+  return (
+    <>
+      {notice}
+      <ChannelTiles label={`${name} facts`} tiles={tiles} />
+      <SettingsForm scope="machine" name={name} layout="rows" groups={groups} />
+    </>
   );
 }
 
@@ -1847,27 +1885,35 @@ function EmailConfigDetail() {
   const secrets = useMachineSecrets();
   const config = email.data;
   const own = (secrets.data?.secrets ?? []).filter((secret) => secret.area === "email");
+  const state = config === undefined ? undefined : config.armed ? "Armed" : config.enabled ? "Enabled" : "Disabled";
   return (
     <ConfigDetail
       name="email"
-      flags={
-        config !== undefined ? (
-          <div className="sy-config-flags">
-            <StateBadge domain="setting" state={config.enabled ? "enabled" : "disabled"} />
-            <StateBadge domain="setting" state={config.armed ? "armed" : "unarmed"} />
-          </div>
-        ) : email.isError ? (
+      notice={
+        config === undefined && email.isError ? (
           <SystemListError error={email.error} what="the e-mail configuration" />
+        ) : config?.local_triage_disabled != null ? (
+          <p className="sy-note">local triage disabled: {config.local_triage_disabled}</p>
         ) : null
       }
-    >
-      {own.map((secret) => (
-        <SecretControl key={secret.key} secret={secret} />
-      ))}
-      {config?.local_triage_disabled != null && (
-        <p className="sy-note">local triage disabled: {config.local_triage_disabled}</p>
-      )}
-    </ConfigDetail>
+      tiles={[
+        { term: "State", value: tileText(state) },
+        { term: "Host", value: tileText(config?.host) },
+        { term: "Account", value: tileText(config?.username) },
+      ]}
+      groups={[
+        {
+          title: "Account",
+          fields: ["host", "username", "mailbox", "sent_mailbox"],
+          // The password is not part of the document: it is one more row of this card.
+          extra: own.map((secret) => <SecretControl key={secret.key} secret={secret} />),
+        },
+        {
+          title: "Behaviour",
+          fields: ["enabled", "poll_interval_secs", "digest_hour_utc", "retain_bodies_days", "notify_classes"],
+        },
+      ]}
+    />
   );
 }
 
@@ -1879,28 +1925,51 @@ function VoiceStateBadge() {
 
 function VoiceConfigDetail() {
   const voice = useVoiceConfig();
+  const config = voice.data;
   return (
     <ConfigDetail
       name="voice"
-      flags={
-        voice.data !== undefined ? (
-          <div className="sy-config-flags">
-            <StateBadge domain="setting" state={voice.data.armed ? "armed" : "unarmed"} />
-          </div>
-        ) : voice.isError ? (
+      notice={
+        config === undefined && voice.isError ? (
           <SystemListError error={voice.error} what="the voice configuration" />
         ) : null
       }
+      tiles={[
+        { term: "State", value: tileText(config === undefined ? undefined : config.armed ? "Armed" : "Unarmed") },
+        { term: "Hotkey", value: tileText(config?.hotkey) },
+        { term: "Cleanup model", value: tileText(config?.cleanup_model) },
+      ]}
+      groups={[
+        { title: "Hotkeys", fields: ["hotkey", "memo_hotkey", "conversation_hotkey", "capture_hotkey"] },
+        { title: "Cleanup", fields: ["cleanup_model", "cleanup_prompt", "hints"] },
+        { title: "Limits", fields: ["retain_dictations_days", "max_capture_seconds", "max_body_bytes"] },
+      ]}
     />
   );
 }
 
 function CalendarConfigDetail() {
   const calendar = useCalendarConfig();
+  const config = calendar.data;
   return (
     <ConfigDetail
       name="calendar"
-      flags={calendar.isError && calendar.data === undefined ? <SystemListError error={calendar.error} what="the calendar configuration" /> : null}
+      notice={
+        calendar.isError && config === undefined ? (
+          <SystemListError error={calendar.error} what="the calendar configuration" />
+        ) : null
+      }
+      tiles={[
+        { term: "Timezone", value: tileText(config?.default_tz) },
+        {
+          term: "Working hours",
+          value: config === undefined ? "—" : `${config.working_hours_start}–${config.working_hours_end}`,
+        },
+      ]}
+      groups={[
+        { title: "Timezone", fields: ["default_tz", "working_weekdays"] },
+        { title: "Working hours", fields: ["working_hours_start", "working_hours_end"] },
+      ]}
     />
   );
 }

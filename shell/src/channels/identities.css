@@ -1,11 +1,8 @@
 /* Paired identities in a channel's detail. Tokens only. */
-.identities-panel {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  width: 100%;
-  min-width: 0;
-}
+/* No box of its own: the cards inside are direct items of the detail's card grid, and anything else
+   (an outcome, a refusal) takes a full row above them. */
+.identities-panel { display: contents; }
+.identities-panel > :not(.chd-card) { grid-column: 1 / -1; }
 .identities-sender-head {
   display: flex;
   flex-wrap: wrap;

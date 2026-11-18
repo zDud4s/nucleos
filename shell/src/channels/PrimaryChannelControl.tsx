@@ -43,7 +43,8 @@ export function PrimaryChannelControl({ channel, primary }: { channel: Channel; 
       {isPrimary ? (
         <ConfirmButton
           label="Clear primary"
-          confirmLabel="Clear: notifications will have no destination"
+          /* Short, because the control reserves the width of its longer label: the consequence is in the tip. */
+          confirmLabel="Clear it"
           variant="ghost"
           disabled={setPrimary.isPending}
           onConfirm={() => setPrimary.mutate(null)}
@@ -53,6 +54,9 @@ export function PrimaryChannelControl({ channel, primary }: { channel: Channel; 
           Make primary
         </Button>
       )}
+      {isPrimary ? (
+        <Tip name="About clearing the primary" persist tip="clearing it leaves the notifications with no destination" />
+      ) : null}
       {channel.state === "offline" ? (
         <Tip name="About an offline channel" persist tip="the outbox keeps the notifications and delivers them when the adapter is back" />
       ) : null}

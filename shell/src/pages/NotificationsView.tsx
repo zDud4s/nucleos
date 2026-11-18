@@ -22,7 +22,7 @@ import {
   useSetChannelNotifyPolicy,
   useSetNotifyPolicy,
 } from "../data/system";
-import { Button, Callout, ErrorNote, Panel, Quiet, RefusalNote, Section, Select, Skeleton, Switch, Tip } from "../ui";
+import { Button, Callout, ErrorNote, Panel, Quiet, RefusalNote, Select, Skeleton, Switch, Tip } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 
@@ -256,6 +256,18 @@ function PolicyEditor({
             {onChannelChange && (
               <ChannelScopeSelector channel={channel} onChannelChange={onChannelChange} />
             )}
+            <Tip
+              name="About notification switches"
+              tip={
+                <>
+                  Proposals, the kill switch and budget alerts are never silenced by these switches,
+                  whatever you set here. A family is a prefix, and a kind can override its family.
+                  Anything no rule claims is sent, so a machine nobody has configured behaves exactly as
+                  it did before this screen existed. The adapter picks this up on its next round:
+                  nothing needs restarting.
+                </>
+              }
+            />
             {dirty && <span className="sy-meta">unsaved changes</span>}
             <span className="sy-meta" role="status">
               {saved && !dirty ? "saved" : null}
@@ -272,13 +284,6 @@ function PolicyEditor({
           </div>
         }
       >
-        <div className="sy-notify-never">
-          <Callout tone="info">
-            Proposals, the kill switch and budget alerts are never silenced by these switches,
-            whatever you set here.
-          </Callout>
-        </div>
-        <Tip name="About families" tip="A family is a prefix, and a kind can override its family. Anything no rule claims is sent, so a machine nobody has configured behaves exactly as it did before this screen existed. The adapter picks this up on its next round: nothing needs restarting." />
         {base && primary === false && (
           <div className="sy-notify-never">
             <Callout tone="pending">
@@ -315,8 +320,11 @@ function PolicyEditor({
         </ul>
 
         {loose.length > 0 && (
-          <Section label="On their own" level={3}>
-            <Tip name="About loose kinds" tip="Kinds no family prefix claims. Each is silenced on its own; there is no group switch because there is no group: the grouping here is presentation, not a rule." />
+          <section aria-label="On their own" className="ui-section">
+            <div className="sy-notify-heading">
+              <h3 className="ui-section-title">On their own</h3>
+              <Tip name="About loose kinds" tip="Kinds no family prefix claims. Each is silenced on its own; there is no group switch because there is no group: the grouping here is presentation, not a rule." />
+            </div>
             <ul className="sy-notify-kinds sy-notify-loose">
               {loose.map((row) => (
                 <KindItem
@@ -329,7 +337,7 @@ function PolicyEditor({
                 />
               ))}
             </ul>
-          </Section>
+          </section>
         )}
       </Panel>
     </>
@@ -390,7 +398,19 @@ function DesktopSwitch() {
   const [on, setOn] = useDesktopNotify();
   const [browser, setBrowser] = useState(browserNotificationState);
   return (
-    <Panel title="Desktop notifications">
+    <Panel
+      title="Desktop notifications"
+      aside={
+        <Tip
+          name="About desktop notices"
+          tip={`Waiting approvals, conversations that answered, and the feed lines the choices below allow (the same ones your channels get).${
+            browser === "unsupported"
+              ? ""
+              : " They appear only while this tab is open. With no tab open, your channels carry the notice."
+          }`}
+        />
+      }
+    >
       <Switch
         label="Also show these on this computer's desktop when the window is not in front"
         checked={on}
@@ -412,17 +432,6 @@ function DesktopSwitch() {
           />
         </p>
       )}
-      <p className="sy-note sy-notify-lead">
-        Desktop notices
-        <Tip
-          name="About desktop notices"
-          tip={`Waiting approvals, conversations that answered, and the feed lines the choices below allow (the same ones your channels get).${
-            browser === "unsupported"
-              ? ""
-              : " They appear only while this tab is open. With no tab open, your channels carry the notice."
-          }`}
-        />
-      </p>
     </Panel>
   );
 }

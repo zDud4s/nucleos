@@ -436,7 +436,15 @@ async function openDetails(heading: string, tableName: string): Promise<HTMLElem
 }
 
 const openSubsystems = () => openDetails("Subsystems", "All subsystems");
-const openBrakes = () => openDetails("Spend & brakes", "All project brakes");
+const openBrakes = async (): Promise<HTMLElement> => {
+  const tiles = await screen.findByRole("region", { name: "Spend & brakes" });
+  const button = await within(tiles).findByRole("button", { name: "Details" });
+  await waitFor(() => {
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+  });
+  fireEvent.click(button);
+  return screen.findByRole("table", { name: "All project brakes" });
+};
 
 /* ---------------------------------------------------------------- health -- */
 
@@ -839,20 +847,19 @@ describe("System - appearance", () => {
 /* ---------------------------------------------------------- project brakes -- */
 
 describe("System - project brakes", () => {
-  it("reads spend and brakes as one strip with Details in its header, on the Limits tab only", async () => {
+  it("reads projects, running and braked as KPI tiles with Details in one, on the Limits tab only", async () => {
     const world = systemWorld({ projects: [project({ project_id: "alpha" })] });
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
     await renderSystemAt("/system/limits");
 
-    const panel = (await screen.findByRole("heading", { level: 2, name: "Spend & brakes" })).closest(
-      "section",
-    ) as HTMLElement;
+    const panel = await screen.findByRole("region", { name: "Spend & brakes" });
     await waitFor(() => {
       expect(within(panel).getByText("None")).toBeDefined();
     });
-    expect(within(panel).getByText("Window spend")).toBeDefined();
+    expect(within(panel).getByText("Projects")).toBeDefined();
     expect(within(panel).getByText("Running")).toBeDefined();
+    expect(within(panel).queryByText("Window spend")).toBeNull();
     expect(within(panel).queryByRole("link", { name: "Edit limits" })).toBeNull();
     expect(within(panel).getAllByRole("button", { name: "Details" })).toHaveLength(1);
   });
@@ -863,7 +870,7 @@ describe("System - project brakes", () => {
     await renderSystem();
 
     await screen.findByRole("heading", { level: 2, name: "Subsystems" });
-    expect(screen.queryByRole("heading", { level: 2, name: "Spend & brakes" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Spend & brakes" })).toBeNull();
   });
 
   it("holds and releases one project's brake without touching the trigger brakes", async () => {
