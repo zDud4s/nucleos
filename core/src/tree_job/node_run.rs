@@ -1546,6 +1546,20 @@ mod tests {
     }
 
     #[test]
+    fn agents_block_quotes_the_real_headless_preamble_opening() {
+        let block = include_str!("../../assets/nucleos-dev/agents-block.md");
+        let opening = HEADLESS_PREAMBLE
+            .split(':')
+            .next()
+            .expect("preamble has an opening");
+        assert!(opening.starts_with("You are a headless node of a tree"));
+        assert!(
+            block.contains(opening),
+            "agents-block.md must quote {opening:?}"
+        );
+    }
+
+    #[test]
     fn the_ticket_rules_never_wait_and_close_blocked_naming_the_ticket() {
         assert!(TICKET_RULES.contains("never wait"), "{TICKET_RULES}");
         assert!(TICKET_RULES.contains("`blocked`"), "{TICKET_RULES}");

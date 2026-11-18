@@ -1,6 +1,6 @@
 # >>> AI WORKFLOW MANAGED BLOCK >>>
 
-**Headless node rule (`NODE_PROMPT_HEADER`).** If your prompt starts with "You are the agent for NucleOS tree node ", you are a headless node of a tree: ignore the conductor routing, `manual:`, `/compact` and `wait_advice`; that prompt and your cockpit are your instructions.
+**Headless node rule (`NODE_PROMPT_HEADER`).** If your prompt starts with "You are a headless node of a tree", you are a headless node of a tree: ignore the conductor routing, `manual:`, `/compact` and `wait_advice`; that prompt and your cockpit are your instructions.
 
 ## AI workflow integration
 
