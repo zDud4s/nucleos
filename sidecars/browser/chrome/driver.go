@@ -609,7 +609,7 @@ func (d *Driver) arm(ctx context.Context, targetID string, cdpSession cdp.Sessio
 				ID:           id,
 				Mode:         entry.mode,
 				RequestedURL: entry.requested,
-				Refusal:      &browser.Refusal{Consequence: refused.Consequence, Detail: refused.Detail},
+				Refusal:      &browser.Refusal{Consequence: refused.Consequence, Detail: refused.Detail, Origin: refused.Origin},
 			}, nil
 		}
 		return browser.Session{}, fmt.Errorf("navigating to %s: %s", url, outcome.ErrorText)

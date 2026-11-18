@@ -218,6 +218,8 @@ type recordedRefusal struct {
 	Session     browser.SessionID
 	Consequence browser.Consequence
 	Detail      string
+	// Origin is the loopback origin of a ConsequenceLoopback refusal, "" otherwise.
+	Origin string
 }
 
 // refusalCap bounds the record for the same reason the proxy's does: a page in a loop generates
@@ -269,7 +271,7 @@ func (d *Driver) recordRefusal(session cdp.SessionID, verdict fence.Verdict) {
 	d.mu.Lock()
 	owner := d.cdpToSession[session]
 	d.mu.Unlock()
-	d.recordSessionRefusal(owner, verdict.Consequence, verdict.Detail)
+	d.recordOriginRefusal(owner, verdict.Consequence, verdict.Detail, verdict.Origin)
 }
 
 // recordSessionRefusal is the one place a refusal is written down, so refusalTotal and the ring can
@@ -277,9 +279,14 @@ func (d *Driver) recordRefusal(session cdp.SessionID, verdict fence.Verdict) {
 // because the ring forgets: an act that started before an old refusal aged out must not be told that
 // the count went backwards.
 func (d *Driver) recordSessionRefusal(id browser.SessionID, consequence browser.Consequence, detail string) {
+	d.recordOriginRefusal(id, consequence, detail, "")
+}
+
+// recordOriginRefusal is recordSessionRefusal for a refusal that names a loopback origin.
+func (d *Driver) recordOriginRefusal(id browser.SessionID, consequence browser.Consequence, detail, origin string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.refusals = append(d.refusals, recordedRefusal{Session: id, Consequence: consequence, Detail: detail})
+	d.refusals = append(d.refusals, recordedRefusal{Session: id, Consequence: consequence, Detail: detail, Origin: origin})
 	d.refusalTotal++
 	if len(d.refusals) > refusalCap {
 		d.refusals = d.refusals[len(d.refusals)-refusalCap:]

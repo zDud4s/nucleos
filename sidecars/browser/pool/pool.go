@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -623,7 +624,24 @@ func (p *Pool) lookup(id browser.SessionID) (placed, error) {
 // two sites and write to neither must not fingerprint the same as one that may read one and write to
 // the other, and concatenating the two lists into one bag is exactly how it would.
 func fingerprintOf(placement browser.Placement) string {
-	return normalisedList(placement.Origins) + " | " + normalisedList(placement.Writable)
+	return normalisedList(placement.Origins) + " | " + normalisedList(placement.Writable) +
+		" | " + sortedStrings(placement.LocalOrigins) + " | " + sortedInts(placement.ForbiddenPorts)
+}
+
+func sortedStrings(values []string) string {
+	sorted := append([]string(nil), values...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, " ")
+}
+
+func sortedInts(values []int) string {
+	sorted := append([]int(nil), values...)
+	sort.Ints(sorted)
+	parts := make([]string, len(sorted))
+	for i, value := range sorted {
+		parts[i] = strconv.Itoa(value)
+	}
+	return strings.Join(parts, " ")
 }
 
 func normalisedList(origins []string) string {
