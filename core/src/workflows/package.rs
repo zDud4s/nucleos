@@ -235,6 +235,17 @@ const CLAUDE_SKILLS: &str = ".claude/skills";
 /// The skills mirror a Codex controller reads. Generated, never authored: two authored copies of
 /// one skill are two skills free to disagree.
 const AGENTS_SKILLS: &str = ".agents/skills";
+
+/// Where `rel` (a bundle-relative path, forward slashes) lands in the Codex mirror: `Some` for a
+/// file under `.claude/skills/<skill>/`, `None` for anything else. The one spelling of the mirror
+/// rule, shared by packaging ([`mirror_skills`] copies the same way) and by materialization, which
+/// regenerates the mirror in a synced tree when the bundle does not carry it.
+pub(crate) fn mirror_path(rel: &str) -> Option<String> {
+    let rest = rel.strip_prefix(CLAUDE_SKILLS)?.strip_prefix('/')?;
+    // `<skill>/<file>`: a skill is a directory, a loose file under the root is not one.
+    rest.contains('/')
+        .then(|| format!("{AGENTS_SKILLS}/{rest}"))
+}
 /// The phase cockpits. Only `wf-*.md` here is a cockpit; anything else is not this check's.
 const COCKPITS: &str = ".claude/agents";
 /// How many offending lines a refusal lists before it stops: enough to fix a batch, short enough

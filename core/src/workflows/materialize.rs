@@ -652,18 +652,30 @@ pub fn materialize(
     };
 
     let mut offered = BTreeMap::new();
+    // Where each offered file is read from in the bundle, when that is not its own path: the
+    // Codex mirror (`.agents/skills/`) generated from the bundle's `.claude/skills/`.
+    let mut source_of_path: BTreeMap<String, String> = BTreeMap::new();
     if !entries.is_empty() {
-        for (path, hash) in workflows::file_hashes(bundle_dir).map_err(io)? {
-            if !provided(&entries, &path) || path == AGENTS_BLOCK_KEY {
+        let hashes = workflows::file_hashes(bundle_dir).map_err(io)?;
+        for (path, hash) in &hashes {
+            if !provided(&entries, path) || path == AGENTS_BLOCK_KEY {
                 continue;
             }
             // With a block, `AGENTS.md` is the project's file with one region of ours in it, and
             // a whole-file copy would overwrite the project's part.
-            if reserved(&path) || (block.is_some() && path == AGENTS_FILE) {
-                report.reserved.push(path);
+            if reserved(path) || (block.is_some() && path == AGENTS_FILE) {
+                report.reserved.push(path.clone());
                 continue;
             }
-            offered.insert(path, hash);
+            offered.insert(path.clone(), hash.clone());
+            // The same mirror packaging generates, for a bundle that was packaged without it
+            // (`package` from a project, an ejected copy): a file the bundle carries itself wins.
+            if let Some(mirror) = crate::workflows::package::mirror_path(path)
+                && !hashes.contains_key(&mirror)
+            {
+                offered.insert(mirror.clone(), hash.clone());
+                source_of_path.insert(mirror, path.clone());
+            }
         }
     }
 
@@ -672,13 +684,14 @@ pub fn materialize(
 
     for (path, bundle_hash) in &offered {
         let recorded = previous.get(path).cloned();
+        let from = source_of_path.get(path).unwrap_or(path);
         let conflict = |kind, local: Option<String>| Conflict {
             path: path.clone(),
             kind,
             local_hash: local,
             recorded_hash: recorded.clone(),
             bundle_hash: Some(bundle_hash.clone()),
-            bundle_file: Some(bundle_dir.join(path).to_string_lossy().into_owned()),
+            bundle_file: Some(bundle_dir.join(from).to_string_lossy().into_owned()),
         };
         let Ok(target) = crate::inspect::safe_write_target(checkout, path) else {
             report.conflicts.push(conflict(ConflictKind::Unsafe, None));
@@ -733,7 +746,7 @@ pub fn materialize(
             continue;
         }
         let written = if outcome.is_ok() {
-            std::fs::read(bundle_dir.join(path))
+            std::fs::read(bundle_dir.join(from))
                 .and_then(|bytes| {
                     // Hashed again from the bytes actually written: the bundle could change between
                     // the walk and the copy, and the record must describe the file on disk.
@@ -1396,6 +1409,59 @@ mod tests {
             workflows::hash_of(b"the pipeline")
         );
         assert!(read(&record).starts_with("# Written by NucleOS."));
+    }
+
+    /// A bundle packaged without the Codex mirror still gets it in the synced tree, whole per skill.
+    #[test]
+    fn a_sync_generates_the_agents_skills_mirror_from_the_claude_skills() {
+        let (temp, checkout, record) = setup(
+            &[
+                (".claude/skills/planner/SKILL.md", "plan things"),
+                (".claude/skills/planner/ref/notes.md", "notes"),
+                (".claude/skills/loose.md", "not a skill"),
+            ],
+            &[".claude/skills/"],
+        );
+        let report =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+
+        assert!(report.conflicts.is_empty());
+        assert_eq!(
+            read(&checkout.join(".agents/skills/planner/SKILL.md")),
+            "plan things"
+        );
+        assert_eq!(
+            read(&checkout.join(".agents/skills/planner/ref/notes.md")),
+            "notes"
+        );
+        assert!(!checkout.join(".agents/skills/loose.md").exists());
+        // Recorded like any file this module wrote, so a second sync is a no-op.
+        let recorded = read_record(&record).unwrap();
+        assert!(
+            recorded.bundles["dev"]
+                .files
+                .contains_key(".agents/skills/planner/SKILL.md")
+        );
+        let again =
+            materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert!(again.written.is_empty() && again.conflicts.is_empty());
+    }
+
+    /// A mirror the bundle carries itself (packaged by `package_source`) is not overridden.
+    #[test]
+    fn a_mirror_the_bundle_carries_wins_over_the_generated_one() {
+        let (temp, checkout, record) = setup(
+            &[
+                (".claude/skills/planner/SKILL.md", "claude copy"),
+                (".agents/skills/planner/SKILL.md", "packaged copy"),
+            ],
+            &[".claude/skills/", ".agents/skills/"],
+        );
+        materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
+        assert_eq!(
+            read(&checkout.join(".agents/skills/planner/SKILL.md")),
+            "packaged copy"
+        );
     }
 
     /// The 2026-09-19 loss, as a test: an edited file survives a new version, and says so.
