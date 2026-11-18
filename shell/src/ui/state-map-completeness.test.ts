@@ -131,9 +131,12 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   // `start` appends the line for a root run that did not start under `feed_kind_for(ROOT_START_FAILED_KIND, ..)`,
   // which keeps that kind or holds it.
   "tree_job/http.rs": { kind: ["work_tree_root_start_failed"] },
+  "tree_job/after.rs": { kind: ["work_tree_waiting_after", "work_tree_after_released"] },
 };
 
 const EMAIL_CLASS_KINDS = ["email_urgent"];
+// Written by core's `tree_job/after.rs` (sibling node); drop once that lands on master.
+const PENDING_CORE_KINDS = ["work_tree_waiting_after", "work_tree_after_released"];
 
 function stringConstants(body: string): Map<string, string> {
   return new Map([...body.matchAll(/const (\w+): &str = "([^"]+)";/g)].map(([, key, value]) => [key, value]));
@@ -386,7 +389,7 @@ describe("state-map completeness", () => {
     expect(kinds.size).toBeGreaterThanOrEqual(60);
     const mapped = new Set(statesOf("feed"));
     expect([...kinds].filter((kind) => !mapped.has(kind)).sort()).toEqual([]);
-    expect([...mapped].filter((kind) => !kinds.has(kind) && !EMAIL_CLASS_KINDS.includes(kind)).sort()).toEqual([]);
+    expect([...mapped].filter((kind) => !kinds.has(kind) && !EMAIL_CLASS_KINDS.includes(kind) && !PENDING_CORE_KINDS.includes(kind)).sort()).toEqual([]);
   });
 
   it("a feed kind the scan cannot read is named, not dropped", () => {
