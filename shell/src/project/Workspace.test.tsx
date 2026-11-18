@@ -284,6 +284,7 @@ describe("the project workspace", () => {
       "Commands",
       "Autopilot rules",
       "Gate targets",
+      "Browser origins",
       "Automations",
       "Test map",
     ]);
@@ -396,6 +397,7 @@ describe("the project workspace", () => {
       "Commands",
       "Autopilot rules",
       "Gate targets",
+      "Browser origins",
       "Automations",
       "Test map",
     ]);
