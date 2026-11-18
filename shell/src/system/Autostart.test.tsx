@@ -44,6 +44,7 @@ describe("Autostart", () => {
     });
     renderPanel();
 
+    fireEvent.click(await screen.findByRole("button", { name: "At boot" }));
     const turnOn = await screen.findByRole("button", { name: "Turn on" });
     expect((turnOn as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(screen.getByLabelText("Windows password"), { target: { value: "s3cret" } });
@@ -52,10 +53,12 @@ describe("Autostart", () => {
     await waitFor(() => {
       expect(puts).toEqual([{ mode: "at-boot", password: "s3cret" }]);
     });
-    expect(await screen.findByRole("button", { name: "Turn off" })).toBeDefined();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "At boot" }).getAttribute("aria-pressed")).toBe("true");
+    });
     expect(screen.queryByDisplayValue("s3cret")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Turn off" }));
+    fireEvent.click(screen.getByRole("button", { name: "At login" }));
     await waitFor(() => {
       expect(puts[1]).toEqual({ mode: "at-login" });
     });
@@ -73,6 +76,7 @@ describe("Autostart", () => {
       return windowsOff;
     });
     renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "At boot" }));
     fireEvent.change(await screen.findByLabelText("Windows password"), {
       target: { value: "wrong" },
     });
@@ -90,7 +94,7 @@ describe("Autostart", () => {
     } satisfies AutostartView);
     renderPanel();
     expect(await screen.findByText(/Turn on automatic login/)).toBeDefined();
-    expect(screen.queryByRole("button", { name: "Turn on" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "At boot" })).toBeNull();
   });
 
   it("turns on at once where no password is needed", async () => {
@@ -103,7 +107,7 @@ describe("Autostart", () => {
       return { mode: "at-login", at_boot: true, needs_password: false, why_not: null };
     });
     renderPanel();
-    fireEvent.click(await screen.findByRole("button", { name: "Turn on" }));
+    fireEvent.click(await screen.findByRole("button", { name: "At boot" }));
     await waitFor(() => {
       expect(puts).toEqual([{ mode: "at-boot" }]);
     });
