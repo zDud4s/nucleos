@@ -131,6 +131,7 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   // `start` appends the line for a root run that did not start under `feed_kind_for(ROOT_START_FAILED_KIND, ..)`,
   // which keeps that kind or holds it.
   "tree_job/http.rs": { kind: ["work_tree_root_start_failed"] },
+  "tree_job/after.rs": { kind: ["work_tree_waiting_after", "work_tree_after_released"] },
 };
 
 const EMAIL_CLASS_KINDS = ["email_urgent"];
