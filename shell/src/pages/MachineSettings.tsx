@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 import { isApiRefusal } from "../data/client";
 import { useForgetSecret, useMachineSecrets, useStoreSecret, type MachineSecret } from "../data/secrets";
 import { useSettingsIndex, type SettingIndexRow } from "../data/settings";
@@ -24,7 +24,7 @@ import { plural } from "../lib/plural";
  * opened, so opening this screen does not cost a request per pillar. Once opened a panel stays mounted and is only
  * hidden, so a half-written document survives a look at another one.
  */
-export function MachineSettings() {
+export function MachineSettings({ lead, trail }: { lead?: ReactNode; trail?: ReactNode } = {}) {
   const index = useSettingsIndex();
   const secrets = useMachineSecrets();
   const [chosen, setChosen] = useState<string | null>(null);
@@ -43,15 +43,9 @@ export function MachineSettings() {
     });
   }, []);
 
-  if (index.isPending) return <Skeleton label="Reading this machine's settings" lines={6} />;
-  if (index.error) {
-    if (isApiRefusal(index.error)) return <RefusalNote refusal={index.error} />;
-    return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about this machine's settings</ErrorNote>;
-  }
-
   // agy's own panel below shows the daemon's warning before anything is turned on; the generic form would enable it
   // without that. The daemon's acknowledgement check stays as the guard for scripted writes.
-  const rows = index.data.filter((row) => row.scope === "machine" && row.name !== "agy");
+  const rows = index.data === undefined ? [] : index.data.filter((row) => row.scope === "machine" && row.name !== "agy");
   const area = chosen ?? rows[0]?.name ?? null;
   const choose = (name: string) => {
     setOpened((previous) => {
@@ -65,19 +59,32 @@ export function MachineSettings() {
 
   return (
     <>
-      <Panel title="Brain">
-        <Rows label="Brain settings">
-          <DistillerModel />
-          <CaptureWait />
-          <EmbeddingModel />
-        </Rows>
-      </Panel>
+      {/* The small panels side by side, equal height per row. `lead` and `trail` are the panels the screen
+          owns (Daemon, Quota notch): they sit in the same grid so the four pair up. */}
+      <div className="sy-machine-grid">
+        {lead}
+        <Panel title="Engines">
+          <Rows label="Engines">
+            <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
+          </Rows>
+        </Panel>
+        <Panel title="Brain">
+          <Rows label="Brain settings">
+            <DistillerModel />
+            <CaptureWait />
+            <EmbeddingModel />
+          </Rows>
+        </Panel>
+        {trail}
+      </div>
 
-      <Panel title="Engines">
-        <Rows label="Engines">
-          <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
-        </Rows>
-      </Panel>
+      {index.isPending && <Skeleton label="Reading this machine's settings" lines={6} />}
+      {index.error != null &&
+        (isApiRefusal(index.error) ? (
+          <RefusalNote refusal={index.error} />
+        ) : (
+          <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about this machine's settings</ErrorNote>
+        ))}
 
       {/* A list of the documents and one of them open, rather than nine forms stacked. Drawn only when
           there is a document to list: agy is left out above, so a machine with no other document had an

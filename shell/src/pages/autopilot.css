@@ -193,25 +193,13 @@
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(18rem, 100%), 1fr));
   gap: var(--space-4);
-  align-items: stretch;
 }
 
-/* Every card fills its cell, so the row is as tall as its tallest and the headings start together.
-   Centred heads keep an aside (the project name) from pushing one card's rule lower than its
-   neighbours'. */
-.ap-panel-pair > .ui-panel {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
+/* Stretching and the filling body come from the shared rule in ui.css. Centred heads keep an aside
+   (the project name) from pushing one card's rule lower than its neighbours'. */
 .ap-panel-pair > .ui-panel > .ui-panel-head {
   align-items: center;
   min-height: 3.25rem;
-}
-
-.ap-panel-pair > .ui-panel > .ui-panel-body {
-  flex: 1 1 auto;
 }
 
 /* The judge's switch and the reason a segment is shut, kept together. */

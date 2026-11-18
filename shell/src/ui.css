@@ -76,6 +76,42 @@
   padding-right: 0;
 }
 
+/* Panels side by side line up on both edges: a layout container that holds panels in a row
+   stretches them, so each fills its grid cell, and the body takes the slack so the empty space
+   falls inside the card at the bottom. A card's height never comes from its own content alone.
+   Page layouts opt in with `.ui-panel-grid` or by joining this list. */
+.ui-panel-grid,
+.ap-panel-pair,
+.sy-health-pair,
+.sy-config-grid,
+.sy-limits,
+.sy-backups-layout,
+.ch-grid {
+  align-items: stretch;
+}
+
+.ui-panel-grid > .ui-panel,
+.ap-panel-pair > .ui-panel,
+.sy-health-pair > .ui-panel,
+.sy-config-grid > .ui-panel,
+.sy-limits > .ui-panel,
+.sy-backups-layout > .ui-panel,
+.ch-grid > .ui-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ui-panel-grid > .ui-panel > .ui-panel-body,
+.ap-panel-pair > .ui-panel > .ui-panel-body,
+.sy-health-pair > .ui-panel > .ui-panel-body,
+.sy-config-grid > .ui-panel > .ui-panel-body,
+.sy-limits > .ui-panel > .ui-panel-body,
+.sy-backups-layout > .ui-panel > .ui-panel-body,
+.ch-grid > .ui-panel > .ui-panel-body {
+  flex: 1 1 auto;
+}
+
 /**
  * A teach block is already inside the panel's padding; it must not add its own.
  *
