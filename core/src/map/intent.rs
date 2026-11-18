@@ -516,6 +516,7 @@ pub async fn ask_once_with_model(
         // Empty, and not a belt for the policy's braces: `ToolPolicy::None` already denies every
         // built-in, and naming some of them here would read as though the rest were allowed.
         denied_tools: Vec::new(),
+        schema_diet: Vec::new(),
         session_name: None,
         context_window: None,
         // Only ever read beside an `mcp_config`, and there is none.

@@ -1156,6 +1156,7 @@ pub mod agy_test_support {
             agents: Vec::new(),
             append_system_prompt: None,
             denied_tools: Vec::new(),
+            schema_diet: Vec::new(),
             session_name: None,
             context_window: None,
             messages: None,

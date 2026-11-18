@@ -515,6 +515,7 @@ pub(super) async fn spawn_agent(
             agents: Vec::new(),
             append_system_prompt: None,
             denied_tools: Vec::new(),
+            schema_diet: Vec::new(),
             session_name: None,
             context_window: None,
             // The loadout's effective set: the box's base plus what the owner approved for this agent
