@@ -96,7 +96,8 @@ pub fn evaluate(pred: &TreeJob, successor_branch: Option<&str>) -> Verdict {
             // only a successor on that same branch builds on it.
             if extra.get("empty").and_then(Value::as_bool) == Some(true) {
                 Verdict::Satisfied
-            } else if successor_branch.is_some() && successor_branch == pred.feature_branch.as_deref()
+            } else if successor_branch.is_some()
+                && successor_branch == pred.feature_branch.as_deref()
             {
                 Verdict::Satisfied
             } else {
@@ -244,7 +245,10 @@ mod tests {
         let pred = finished(
             "a",
             "feat/a",
-            &[("landing", json!("integration")), ("land_sha", json!("abc"))],
+            &[
+                ("landing", json!("integration")),
+                ("land_sha", json!("abc")),
+            ],
         );
         assert_eq!(evaluate(&pred, Some("feat/b")), Verdict::Satisfied);
     }
@@ -269,7 +273,10 @@ mod tests {
     fn a_held_predecessor_with_work_satisfies_only_on_the_same_branch() {
         let pred = finished("a", "feat/a", &[("landing", json!("held"))]);
         assert_eq!(evaluate(&pred, Some("feat/a")), Verdict::Satisfied);
-        assert!(matches!(evaluate(&pred, Some("feat/b")), Verdict::Refused(_)));
+        assert!(matches!(
+            evaluate(&pred, Some("feat/b")),
+            Verdict::Refused(_)
+        ));
     }
 
     #[test]
@@ -279,7 +286,10 @@ mod tests {
             "feat/a",
             &[("finish", json!({"status": "abandoned", "reason": "x"}))],
         );
-        assert!(matches!(evaluate(&pred, Some("feat/a")), Verdict::Refused(_)));
+        assert!(matches!(
+            evaluate(&pred, Some("feat/a")),
+            Verdict::Refused(_)
+        ));
     }
 
     #[test]

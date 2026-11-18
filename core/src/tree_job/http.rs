@@ -330,8 +330,8 @@ struct TreeBody {
 const LAND_MODES: [&str; 2] = ["hold", "integration"];
 
 fn summary(job: &TreeJob, replayed: bool) -> Value {
-    if let Some(after) = crate::tree_job::after::is_waiting(job)
-        .then(|| crate::tree_job::after::view(job))
+    if let Some(after) =
+        crate::tree_job::after::is_waiting(job).then(|| crate::tree_job::after::view(job))
     {
         return json!({
             "id": job.id,
@@ -529,8 +529,15 @@ async fn post_tree(
     // A job that waits for another tree starts no root: the driver releases it once that tree lands.
     if let Some((pred_id, reason)) = &waiting_reason {
         let line = format!("tree job {id} waits for tree {pred_id}: {reason}");
-        let _ = crate::feed::append(&state.pool, None, "work_tree_waiting_after", &line, None, None)
-            .await;
+        let _ = crate::feed::append(
+            &state.pool,
+            None,
+            "work_tree_waiting_after",
+            &line,
+            None,
+            None,
+        )
+        .await;
         return Ok(Json(summary(&job, false)));
     }
     // A root that cannot start never fails the request: the job exists and stays open, the answer
@@ -2525,13 +2532,21 @@ mod tests {
         let response = post(&app, "/trees", after_body(JOB, "pred")).await;
 
         assert_first_call(&response);
-        assert_eq!(response.1["state"], json!("waiting_after"), "{:?}", response.1);
+        assert_eq!(
+            response.1["state"],
+            json!("waiting_after"),
+            "{:?}",
+            response.1
+        );
         assert_eq!(response.1["after"], json!("pred"));
         assert!(response.1["reason"].is_string(), "{:?}", response.1);
         assert_eq!(run_rows(&state.pool).await, 0);
         let job = loaded(&state.pool, JOB).await;
         assert_eq!(job.state, "open");
-        assert!(job.manifest.branches.is_empty(), "a waiting job holds no branch");
+        assert!(
+            job.manifest.branches.is_empty(),
+            "a waiting job holds no branch"
+        );
         assert!(is_waiting_after(&state.pool, JOB).await);
         let lines = feed_lines_naming(&state.pool, "waits for tree").await;
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -2567,7 +2582,12 @@ mod tests {
         let response = post(&app(&state), "/trees", after_body(JOB, "   ")).await;
 
         assert_first_call(&response);
-        assert_ne!(response.1["state"], json!("waiting_after"), "{:?}", response.1);
+        assert_ne!(
+            response.1["state"],
+            json!("waiting_after"),
+            "{:?}",
+            response.1
+        );
         assert!(!is_waiting_after(&state.pool, JOB).await);
     }
 
@@ -2626,7 +2646,12 @@ mod tests {
         let response = post(&app(&state), "/trees", after_body(JOB, "pred")).await;
 
         assert_first_call(&response);
-        assert_ne!(response.1["state"], json!("waiting_after"), "{:?}", response.1);
+        assert_ne!(
+            response.1["state"],
+            json!("waiting_after"),
+            "{:?}",
+            response.1
+        );
         assert!(!is_waiting_after(&state.pool, JOB).await);
     }
 
@@ -2687,7 +2712,9 @@ mod tests {
         body["after"] = json!("pred");
         assert_first_call(&post(&app, "/trees", body).await);
         assert!(
-            repo.git(&["branch", "--list", "feat/tree"]).trim().is_empty(),
+            repo.git(&["branch", "--list", "feat/tree"])
+                .trim()
+                .is_empty(),
             "the feature branch was cut while the job waits"
         );
 
@@ -2695,7 +2722,8 @@ mod tests {
         crate::tree_job::driver::advance_job(&state, JOB).await;
 
         assert!(
-            repo.git(&["branch", "--list", "feat/tree"]).contains("feat/tree"),
+            repo.git(&["branch", "--list", "feat/tree"])
+                .contains("feat/tree"),
             "the feature branch was not cut at the release"
         );
     }
@@ -2720,7 +2748,9 @@ mod tests {
         let root = loaded(&state.pool, JOB).await.root_node_id;
         assert_eq!(decisions_on(&state.pool, &root).await, 0);
         let (_, shown) = get(&app, &format!("/trees/{JOB}")).await;
-        let reason = shown["waiting_after"]["reason"].as_str().unwrap_or_default();
+        let reason = shown["waiting_after"]["reason"]
+            .as_str()
+            .unwrap_or_default();
         assert!(reason.contains("the gate is red"), "{shown:?}");
     }
 
@@ -2873,10 +2903,15 @@ mod tests {
             .unwrap();
 
         assert!(
-            feed_lines_naming(&state.pool, "has not moved").await.is_empty(),
+            feed_lines_naming(&state.pool, "has not moved")
+                .await
+                .is_empty(),
             "a waiting job was reported as stalled"
         );
-        assert_eq!(decisions_on(&state.pool, &loaded(&state.pool, JOB).await.root_node_id).await, 0);
+        assert_eq!(
+            decisions_on(&state.pool, &loaded(&state.pool, JOB).await.root_node_id).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2891,7 +2926,10 @@ mod tests {
         let (_, shown) = get(&restarted, &format!("/trees/{JOB}")).await;
 
         assert_eq!(shown["waiting_after"]["tree"], json!("pred"), "{shown:?}");
-        assert_eq!(loaded(&state.pool, JOB).await.manifest.extra["after"], before);
+        assert_eq!(
+            loaded(&state.pool, JOB).await.manifest.extra["after"],
+            before
+        );
         end_job(&state.pool, "pred", &landed_extra()).await;
         crate::tree_job::driver::advance_job(&state, JOB).await;
         assert!(!is_waiting_after(&state.pool, JOB).await);
