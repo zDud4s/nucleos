@@ -1271,6 +1271,7 @@ mod tests {
             agents: Vec::new(),
             append_system_prompt: Some("sys".into()),
             denied_tools: Vec::new(),
+            schema_diet: Vec::new(),
             session_name: None,
             context_window: None,
             messages: None,

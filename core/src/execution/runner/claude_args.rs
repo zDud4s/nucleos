@@ -301,12 +301,26 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
     // have been silent: `--disallowedTools` is variadic, so a second occurrence REPLACES the first
     // rather than adding to it. Written twice, a conversation asking not to run `Bash` would have
     // taken `ToolPolicy::McpOnly` down with it and come back with the whole built-in tool set.
-    let denied = denied_tools(&request.tool_policy, &request.denied_tools);
+    // The schema diet is a hint the Claude CLI can apply, so it rides in the same flag, after the
+    // run's own denials (a name in both lists is denied once).
+    let denied = flag_denials(request);
     if !denied.is_empty() {
         args.push("--disallowedTools".to_string());
         args.push(denied.join(","));
     }
     args
+}
+
+/// Everything the Claude CLI is told to deny for this request: the policy's denials, the run's own
+/// `denied_tools` and its `schema_diet` hint, as `--disallowedTools` carries them.
+pub(super) fn flag_denials(request: &RunRequest) -> Vec<String> {
+    let asked: Vec<String> = request
+        .denied_tools
+        .iter()
+        .chain(&request.schema_diet)
+        .cloned()
+        .collect();
+    denied_tools(&request.tool_policy, &asked)
 }
 
 /// Everything one run must be denied: what its policy denies, plus what it asked to be denied.

@@ -618,6 +618,7 @@ pub(super) fn chat_run_request(
         // ever narrow: the allow-listing flag beside it grants rather than restricts, so there
         // is no widening version of this to get wrong.
         denied_tools: answering.denied_tools.clone(),
+        schema_diet: Vec::new(),
         // The wildcard, on purpose: an orchestrator turn acts for the person watching
         // the chat and carries the control token, so narrowing what it is offered would
         // only take away tools it is entitled to call.
