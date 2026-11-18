@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { ChannelCard } from "../channels/ChannelCard";
+import { ChannelDetail } from "../channels/ChannelDetail";
 import { useChannels, type RoutingState } from "../data/channels";
 import { isApiRefusal } from "../data/client";
 import { DAEMON_NAME } from "../copy";
@@ -22,9 +23,11 @@ export interface ChannelConfigEntry {
   label: string;
   /** What the row shows after the name: a state badge, or nothing. */
   badge?: ReactNode;
-  /** The detail drawn when the row is selected. */
+  /** The state badges in the detail's header; the row's `badge` when omitted. */
+  headerBadge?: ReactNode;
+  /** The detail's body (tiles and cards), drawn inside the shared `ChannelDetail` frame. */
   detail: ReactNode;
-  /** Drawn beside the detail's title, e.g. a `Tip`. */
+  /** Drawn in the detail's header after the state, e.g. a `Tip`. */
   aside?: ReactNode;
 }
 
@@ -119,7 +122,14 @@ export function ChannelsView({ configs = [] }: { configs?: ChannelConfigEntry[] 
           {channel !== undefined ? (
             <ChannelCard key={channel.id} channel={channel} primary={primary} />
           ) : config !== undefined ? (
-            <Panel title={config.label} aside={config.aside}>{config.detail}</Panel>
+            <ChannelDetail
+              key={config.id}
+              title={config.label}
+              state={config.headerBadge ?? config.badge}
+              about={config.aside}
+            >
+              {config.detail}
+            </ChannelDetail>
           ) : null}
         </div>
       </div>

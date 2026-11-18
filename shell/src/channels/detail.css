@@ -1,0 +1,100 @@
+/* The frame of a channel's detail (System > Channels): header, tiles, cards. Tokens only. */
+
+/* The header: identity on the left (name, state, age, about mark), actions on the right. */
+.chd-head {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.chd-id,
+.chd-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.chd-id { gap: var(--space-2); }
+/* Actions keep the width of their label: no button grows to fill the row. */
+.chd-actions { gap: var(--space-2); margin-left: auto; justify-content: flex-end; }
+.chd-actions > *,
+.chd-actions .ch-primary,
+.chd-actions .ui-confirm { flex: 0 0 auto; }
+.chd-meta {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chd-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.chd-body > * { min-width: 0; max-width: 100%; }
+
+/* Equal-width tiles across the full width; auto-fit drops the empty tracks, so a few tiles still fill it. */
+.chd-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(8rem, 100%), 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.chd-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.chd-tile dt {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.chd-tile dd {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.chd-count-bad { color: var(--tone-danger-fg); }
+
+/* The cards: two columns once the detail is wide enough, one below. Cards of a row share both edges. */
+.chd-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+  gap: var(--space-4);
+  align-items: stretch;
+  min-width: 0;
+}
+.chd-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.chd-card-wide { grid-column: 1 / -1; }
+.chd-card-title {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+/* Flat lists inside a card: hairlines between rows, no frame of their own. */
+.chd-card .ui-rows {
+  border: none;
+  border-radius: 0;
+  overflow: visible;
+}
+.chd-card .ui-rows-row { padding-inline: 0; }

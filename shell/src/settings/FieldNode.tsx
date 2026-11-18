@@ -1,4 +1,5 @@
 import { useState, type ReactElement, type ReactNode } from "react";
+import { ChannelCardBox, ChannelCards } from "../channels/ChannelDetail";
 import { Button, ErrorNote, Field, Select, Switch, Tip, type FieldProps } from "../ui";
 import {
   defaultFor,
@@ -12,6 +13,7 @@ import {
   type SchemaNode,
 } from "./schema";
 import { widgetFor } from "./widgets";
+import "./rows.css";
 
 /**
  * Draws one schema node and recurses into its children.
@@ -38,6 +40,52 @@ export interface FieldNodeProps {
   depth?: number;
   /** JSON pointers of fields not drawn. Their values stay in the body, so a save writes them back unchanged. */
   hide?: readonly string[];
+  /**
+   * `"stack"` (default): each field is a label over a full-width input. `"rows"`: each field is one compact
+   * row, label on the left and control on the right, and the document root is drawn as a grid of cards.
+   */
+  layout?: FieldLayout;
+  /** Rows layout only: how the root's fields split into cards (see `SettingsGroup`). */
+  groups?: readonly SettingsGroup[];
+}
+
+export type FieldLayout = "stack" | "rows";
+
+/**
+ * One card of a rows-layout document. `fields` are top-level property names, in the order drawn. A property
+ * no group names joins the LAST card, so an edit never loses a field it did not know to place; names the
+ * schema does not have are skipped, and a card with nothing in it is not drawn. `extra` is drawn as a last
+ * row of the card (the e-mail password, which is not part of the document).
+ *
+ * Without any group, a root of more than four fields is split into two untitled halves, otherwise one card.
+ */
+export interface SettingsGroup {
+  title: string;
+  fields: readonly string[];
+  extra?: ReactNode;
+}
+
+interface CardPlan {
+  title: string | undefined;
+  nodes: ReactNode[];
+  extra: ReactNode;
+}
+
+function planCards(keys: readonly string[], nodes: Map<string, ReactNode>, groups: readonly SettingsGroup[] | undefined): CardPlan[] {
+  if (groups === undefined || groups.length === 0) {
+    const split = keys.length > 4 ? Math.ceil(keys.length / 2) : keys.length;
+    const halves = split < keys.length ? [keys.slice(0, split), keys.slice(split)] : [keys];
+    return halves.map((half) => ({ title: undefined, nodes: half.map((key) => nodes.get(key)), extra: null }));
+  }
+  const placed = new Set<string>();
+  const plans: CardPlan[] = groups.map((group) => {
+    const mine = group.fields.filter((key) => nodes.has(key) && !placed.has(key));
+    mine.forEach((key) => placed.add(key));
+    return { title: group.title, nodes: mine.map((key) => nodes.get(key)), extra: group.extra ?? null };
+  });
+  const rest = keys.filter((key) => !placed.has(key));
+  if (rest.length > 0) plans[plans.length - 1].nodes.push(...rest.map((key) => nodes.get(key)));
+  return plans.filter((plan) => plan.nodes.length > 0 || plan.extra !== null);
 }
 
 /** A schema that refers to itself would otherwise draw forever; past this depth a node is a JSON box. */
@@ -127,6 +175,8 @@ function aboutTip(description: string | undefined): ReactElement | undefined {
 
 export function FieldNode(props: FieldNodeProps): ReactElement {
   const { node, root, value, onChange, path, label, errors, required = false, bare = false, depth = 0, hide } = props;
+  const { layout = "stack", groups } = props;
+  const rows = layout === "rows";
   const { node: inner, nullable } = unwrapNullable(node, root);
   const optional = nullable || !required;
   const kind = depth > MAX_FIELD_DEPTH ? "raw" : nodeKind(inner);
@@ -135,7 +185,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
   const failure = message !== undefined ? <ErrorNote>{message}</ErrorNote> : null;
 
   const leaf = (control: FieldProps["children"]): ReactElement => (
-    <div data-field={path} className="flex flex-col gap-1">
+    <div data-field={path} className={rows ? "set-row" : "flex flex-col gap-1"}>
       <Field label={label} helper={aboutTip(inner.description)}>
         {control}
       </Field>
@@ -176,6 +226,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
       required={childRequired}
       depth={depth + 1}
       hide={hide}
+      layout={layout}
     />
   );
 
@@ -184,9 +235,8 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
       const properties = inner.properties ?? {};
       const record = isRecord(value) ? value : {};
       const requiredKeys = inner.required ?? [];
-      const fields = Object.keys(properties)
-        .filter((key) => !(hide?.includes(pointerJoin(path, key)) ?? false))
-        .map((key) =>
+      const drawn = Object.keys(properties).filter((key) => !(hide?.includes(pointerJoin(path, key)) ?? false));
+      const fields = drawn.map((key) =>
         child(
           properties[key],
           key,
@@ -196,6 +246,23 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
           requiredKeys.includes(key),
         ),
       );
+      if (bare && rows) {
+        const byKey = new Map<string, ReactNode>(drawn.map((key, at) => [key, fields[at]]));
+        const plans = planCards(drawn, byKey, groups);
+        // The `extra` of a group is drawn even when the schema has no field for it.
+        return (
+          <ChannelCards className="set-cards">
+            {plans.map((plan, at) => (
+              <ChannelCardBox key={plan.title ?? at} title={plan.title}>
+                <div className="set-rows">
+                  {plan.nodes}
+                  {plan.extra}
+                </div>
+              </ChannelCardBox>
+            ))}
+          </ChannelCards>
+        );
+      }
       if (bare) {
         return (
           <div data-field={path} className="flex flex-col gap-3">
@@ -318,7 +385,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
 
     case "boolean": {
       return (
-        <div data-field={path} className="flex flex-col gap-1">
+        <div data-field={path} className={rows ? "set-row set-row-switch" : "flex flex-col gap-1"}>
           <div className="flex items-center gap-2">
             <Switch
               label={label}

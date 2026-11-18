@@ -152,7 +152,7 @@
 
 /* ------------------------------------------------------------------ health == */
 
-/* Spend & brakes: one row of label-over-value facts, wrapping when narrow. */
+/* A row of label-over-value facts, wrapping when narrow (channel cards). */
 .sy-strip {
   display: flex;
   flex-wrap: wrap;
@@ -172,8 +172,60 @@
   gap: var(--space-1) var(--space-3);
 }
 
-/* The header corner of that panel: the tip, Details and Edit limits on one line. */
-.sy-strip-tools {
+/* Spend & brakes: three KPI tiles on the same grid as `.sy-limits` below, so each one sits above a
+   limits panel. The tiles wear the panel's own surface, border and radius. */
+.sy-kpi-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.sy-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: var(--space-4);
+}
+
+.sy-kpi {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4) var(--space-5);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.sy-kpi dl {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  margin: 0;
+}
+
+.sy-kpi dt {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.sy-kpi dd {
+  margin: 0;
+  font-size: var(--text-xl, 1.5rem);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-snug);
+  color: var(--text);
+}
+
+/* The tip and Details sit in the tile's corner. */
+.sy-kpi-tools {
   display: inline-flex;
   align-items: center;
   gap: var(--space-3);
@@ -464,7 +516,9 @@
 }
 
 .sy-mint-name {
-  flex: 0 1 16rem;
+  /* Grows into the free width so the button stays on this row beside the level. */
+  flex: 1 1 8rem;
+  min-inline-size: 0;
 }
 
 /* A visible label over a `Segmented`, which names its group for a screen reader but draws no
@@ -796,7 +850,8 @@
 /* One token per line: name, level, when it was minted, Revoke. */
 .ui-rows-row.sy-token-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 8rem 9rem 9rem;
+  /* Fixed badge and time tracks so every row's columns line up. */
+  grid-template-columns: minmax(0, 1fr) 7.5rem 7rem auto;
   align-items: center;
   column-gap: var(--space-4);
 }
@@ -1173,9 +1228,10 @@
 
 /* The families as a grid of cards, so a dozen switches fit on one screen. A
    card that is opened grows on its own; its neighbours keep their height. */
-.sy-notify-families {
+.sy-notify-families,
+.sy-notify-kinds.sy-notify-loose {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: start;
   gap: var(--space-2);
   margin: 0;
@@ -1222,9 +1278,15 @@
   margin-bottom: var(--space-3);
 }
 
-/* A line under a switch, closer to it than a paragraph is to its neighbour. */
-.sy-notify-lead {
-  margin: var(--space-2) 0 0;
+/* A section heading with its tip right after the words. */
+.sy-notify-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sy-notify-heading > .ui-section-title {
+  margin: 0;
 }
 
 /* The families and the "On their own" section sit a section apart. */
@@ -1277,12 +1339,23 @@ p.sy-notify-pop {
 
 /* The kinds no family claims: the same cards, one kind each. */
 .sy-notify-kinds.sy-notify-loose {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr));
-  gap: var(--space-2);
-  margin: var(--space-2) 0 0;
+  margin: 0;
   padding: 0;
   border-top: none;
+}
+
+@media (max-width: 60rem) {
+  .sy-notify-families,
+  .sy-notify-kinds.sy-notify-loose {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 40rem) {
+  .sy-notify-families,
+  .sy-notify-kinds.sy-notify-loose {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .sy-notify-loose > .sy-notify-kind {

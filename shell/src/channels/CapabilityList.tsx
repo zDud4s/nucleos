@@ -1,5 +1,6 @@
 import type { ChannelCapabilities } from "../data/channels";
-import { Quiet, Row, Rows, Section } from "../ui";
+import { Quiet, Row, Rows } from "../ui";
+import { ChannelCardBox } from "./ChannelDetail";
 
 type MediaKind = "image" | "file" | "audio";
 const MEDIA_OUT: MediaKind[] = ["image", "file", "audio"];
@@ -37,16 +38,18 @@ function missingOf(c: ChannelCapabilities): Missing[] {
 export function CapabilityList({ capabilities }: { capabilities: ChannelCapabilities | null }) {
   if (capabilities === null) {
     return (
-      <Quiet
-        compact
-        says="Capabilities are not known yet: the adapter has not said hello since the daemon started."
-      />
+      <ChannelCardBox title="Capabilities" wide>
+        <Quiet
+          compact
+          says="Capabilities are not known yet: the adapter has not said hello since the daemon started."
+        />
+      </ChannelCardBox>
     );
   }
   const missing = missingOf(capabilities);
   if (missing.length === 0) return null;
   return (
-    <Section label="Capability gaps" level={3}>
+    <ChannelCardBox title="Capability gaps" wide>
       <Rows label="Lacking capabilities">
         {missing.map((m) => (
           <Row key={m.key} layout="line" dense className="ch-cap">
@@ -55,6 +58,6 @@ export function CapabilityList({ capabilities }: { capabilities: ChannelCapabili
           </Row>
         ))}
       </Rows>
-    </Section>
+    </ChannelCardBox>
   );
 }

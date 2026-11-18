@@ -54,7 +54,7 @@ describe("PrimaryChannelControl", () => {
     fireEvent.click(screen.getByRole("button", { name: "Clear primary" }));
     expect(putCalls()).toHaveLength(0);
     await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: "Clear: notifications will have no destination" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Clear it" }));
     await waitFor(() => expect(putCalls()).toHaveLength(1));
     expect(putCalls()[0][1]).toEqual({ method: "PUT", body: JSON.stringify({ channel: null }) });
   });

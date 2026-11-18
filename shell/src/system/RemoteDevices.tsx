@@ -82,7 +82,15 @@ export function RemoteDevices() {
   }
 
   return (
-    <Panel title="Remote devices">
+    <Panel
+      title="Remote devices"
+      aside={
+        <Tip
+          name="About pairing a device"
+          tip={`Pair a browser on another device. Create a code here, then enter it on that device. The ${level === "owner" ? "Owner" : level} level ${LEVEL_HINT[level]}`}
+        />
+      }
+    >
       {setup.data !== undefined && <SetupWizard setup={setup.data} />}
       {setup.data === undefined && !setup.isError && (<div className="sy-note" aria-hidden="true">
           <p style={{ display: "flex", alignItems: "center", minHeight: "1lh" }}>
@@ -151,10 +159,6 @@ export function RemoteDevices() {
         >
           Create code
         </Button>
-        <Tip
-          name="About pairing a device"
-          tip={`Pair a browser on another device. Create a code here, then enter it on that device. The ${level === "owner" ? "Owner" : level} level ${LEVEL_HINT[level]}`}
-        />
       </form>
       {createCode.isError && <CreateError error={createCode.error} />}
 

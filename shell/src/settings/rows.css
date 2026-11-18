@@ -1,0 +1,60 @@
+/* SettingsForm `layout="rows"`: compact label-left, control-right rows inside the channel detail's cards.
+   The same shape as the Limits page's `.sy-limit-row`. Tokens only. */
+.set-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.set-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+/* Label | control | about mark. The third track is fixed so controls line up whether or not a row has a mark. */
+.set-row .ui-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(7rem, 13rem) 1.25rem;
+  align-items: center;
+  column-gap: var(--space-3);
+}
+.set-row .ui-field-label {
+  grid-column: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text);
+}
+.set-row .ui-field input,
+.set-row .ui-field textarea,
+.set-row .ui-field select,
+.set-row .ui-field .ui-select {
+  grid-column: 2;
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+}
+.set-row .ui-field input[type="number"] { text-align: right; font-variant-numeric: tabular-nums; }
+.set-row .ui-field .ui-field-helper { grid-column: 3; justify-self: end; }
+.set-row-switch > div { justify-content: space-between; }
+
+/* The e-mail password sits in its card as one more row: the name and state left, the box and buttons right. */
+.set-rows .sy-secret {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  border-top: none;
+}
+.set-rows .sy-secret > .sy-secret-head { grid-column: 1; }
+.set-rows .sy-secret > .sy-setting-controls { grid-column: 2; margin-top: 0; justify-content: flex-end; }
+.set-rows .sy-secret > :not(.sy-secret-head):not(.sy-setting-controls) { grid-column: 1 / -1; }

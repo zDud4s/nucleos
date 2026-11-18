@@ -71,8 +71,8 @@ const discord: Channel = {
   drops: { unknown_sender: 0, pairing_failures: 0, counted_since: "2026-10-18T10:00:00Z" },
 };
 
-/** The `Fact` of the strip whose term is `term`. */
-const fact = (term: string) => screen.getByText(term, { selector: "dt" }).closest(".sy-fact") as HTMLElement;
+/** The tile of the row whose term is `term`. */
+const fact = (term: string) => screen.getByText(term, { selector: "dt" }).closest(".chd-tile") as HTMLElement;
 
 const afterDwell = () => new Promise<void>((resolve) => setTimeout(resolve, 350));
 const restartCalls = () => daemon.apiFetch.mock.calls.filter(([p]) => String(p).includes("/restart"));
@@ -95,6 +95,21 @@ describe("ChannelCard", () => {
     expect(link.getAttribute("href")).toBe("/system/health");
     expect(link.getAttribute("title")).toBe("telegram_sidecar in health");
     expect(screen.getByRole("link", { name: "Edit in Machine", hidden: true }).getAttribute("title")).toBe("channels/telegram");
+  });
+
+  it("puts the state, the age and the actions in the header and the outbox counts in tiles", async () => {
+    const { container } = await renderWithRouter(<ChannelCard channel={telegram} primary="discord" />);
+    const head = container.querySelector(".chd-head") as HTMLElement;
+    expect(within(head).getByRole("heading", { level: 2, name: "Telegram" })).toBeTruthy();
+    expect(within(head).getByText("online")).toBeTruthy();
+    expect(within(head).getByText("2min ago")).toBeTruthy();
+    for (const name of ["Pair", "Restart", "Make primary"]) {
+      expect(within(head).getByRole("button", { name })).toBeTruthy();
+    }
+    const terms = within(container.querySelector(".chd-tiles") as HTMLElement)
+      .getAllByText(/.+/, { selector: "dt" })
+      .map((dt) => dt.textContent);
+    expect(terms).toEqual(["Status", "Pending", "Leased", "Failed", "Unknown senders"]);
   });
 
   it("shows stale acks, stale renews and rate-limited senders only when the daemon sends them", async () => {

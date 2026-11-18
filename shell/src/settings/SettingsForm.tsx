@@ -9,8 +9,8 @@ import {
   type SettingDoc,
   type WriteFailure,
 } from "../data/settings";
-import { Button, ErrorNote, Field, RefusalNote, Skeleton } from "../ui";
-import { FieldNode } from "./FieldNode";
+import { Button, ErrorNote, Field, RefusalNote, Skeleton, Tip } from "../ui";
+import { FieldNode, type FieldLayout, type SettingsGroup } from "./FieldNode";
 import { SettingHistory } from "./SettingHistory";
 import { hasField, type SchemaNode } from "./schema";
 
@@ -23,6 +23,14 @@ export interface SettingsFormProps {
   onDirty?: (dirty: boolean) => void;
   /** JSON pointers (`"/gate_targets"`) of fields another editor owns; not drawn, but kept in the body. */
   hide?: readonly string[];
+  /**
+   * `"stack"` (default) draws each field as a label over a full-width input. `"rows"` draws compact rows,
+   * label left and control right, in a grid of titled cards: see `SettingsGroup` for how fields split.
+   * In rows the schema's description moves behind an about mark by the controls.
+   */
+  layout?: FieldLayout;
+  /** Rows layout only: the cards. Without it a long root is split into two halves. */
+  groups?: readonly SettingsGroup[];
 }
 
 type Mode = "form" | "raw";
@@ -109,7 +117,7 @@ function noticeWords(notice: Notice | null, phrase: string | null): string | nul
  * document its draft started from, and the newer version waits until the save that would have clobbered
  * it answers 409.
  */
-export function SettingsForm({ scope, name, takesEffect, onDirty, hide }: SettingsFormProps) {
+export function SettingsForm({ scope, name, takesEffect, onDirty, hide, layout = "stack", groups }: SettingsFormProps) {
   const doc = useSettingDoc(scope, name);
   const write = useWriteSetting(scope, name);
   const rollback = useRollbackSetting(scope, name);
@@ -162,6 +170,8 @@ export function SettingsForm({ scope, name, takesEffect, onDirty, hide }: Settin
         notice={notice}
         takesEffect={takesEffect}
         hide={hide}
+        layout={layout}
+        groups={groups}
         saving={write.isPending}
         busy={write.isPending || rollback.isPending || doc.isFetching}
         onEdit={() => setNotice(null)}
@@ -214,6 +224,8 @@ interface EditorProps {
   notice: Notice | null;
   takesEffect?: string;
   hide?: readonly string[];
+  layout: FieldLayout;
+  groups?: readonly SettingsGroup[];
   saving: boolean;
   busy: boolean;
   onEdit: () => void;
@@ -228,6 +240,8 @@ function Editor({
   notice,
   takesEffect,
   hide,
+  layout,
+  groups,
   saving,
   busy,
   onEdit,
@@ -295,7 +309,7 @@ function Editor({
 
   return (
     <div className="flex flex-col gap-3" onKeyDown={onKeyDown}>
-      {doc.schema.description !== undefined && <p className="sy-note">{doc.schema.description}</p>}
+      {doc.schema.description !== undefined && layout !== "rows" && <p className="sy-note">{doc.schema.description}</p>}
       {doc.version === 0 && <p className="sy-meta">Never written: these are the defaults.</p>}
       {phrase !== null && <p className="sy-meta">Takes effect {phrase}.</p>}
 
@@ -313,6 +327,8 @@ function Editor({
           errors={errors}
           bare
           hide={hide}
+          layout={layout}
+          groups={groups}
         />
       ) : (
         <Field label="Raw JSON">
@@ -350,6 +366,9 @@ function Editor({
           {mode === "raw" ? "Form" : "Raw JSON"}
         </Button>
         {dirty && !saving && <span className="sy-meta">unsaved changes</span>}
+        {layout === "rows" && doc.schema.description !== undefined ? (
+          <Tip name="About this document" persist tip={doc.schema.description} />
+        ) : null}
         <span className="sy-meta" role="status">
           {noticeWords(notice, phrase)}
         </span>

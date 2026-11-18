@@ -530,3 +530,58 @@ describe("SettingsForm: the git document", () => {
     expect(double.writes[0].body).toEqual({ squash_checkpoints: false });
   });
 });
+
+describe("SettingsForm rows layout", () => {
+  const ROWS_SCHEMA: SchemaNode = {
+    type: "object",
+    description: "The mailbox this machine reads.",
+    properties: {
+      host: { type: "string" },
+      username: { type: "string" },
+      poll_interval_secs: { type: "integer" },
+      mailbox: { type: "string" },
+    },
+  };
+
+  function openRows(groups?: Parameters<typeof SettingsForm>[0]["groups"]) {
+    const double = world({ schema: ROWS_SCHEMA, body: { host: "a.example" } });
+    renderWithQuery(<SettingsForm scope="machine" name="email" layout="rows" groups={groups} />);
+    return double;
+  }
+
+  it("draws the groups as titled cards of one-row fields and puts a field no group names in the last card", async () => {
+    openRows([
+      { title: "Account", fields: ["host", "username"], extra: <p>extra row</p> },
+      { title: "Behaviour", fields: ["poll_interval_secs"] },
+    ]);
+
+    await hostBox();
+    const cards = screen.getAllByRole("heading", { level: 3 }).map((h) => h.closest("section") as HTMLElement);
+    expect(cards.map((c) => c.querySelector("h3")?.textContent)).toEqual(["Account", "Behaviour"]);
+    expect(cards[0].querySelectorAll(".set-row")).toHaveLength(2);
+    expect(cards[0].textContent).toContain("extra row");
+    // `mailbox` is in no group, so it joins the last card rather than disappearing.
+    expect(cards[1].querySelectorAll(".set-row")).toHaveLength(2);
+    expect(cards[1].contains(screen.getByLabelText("Mailbox"))).toBe(true);
+  });
+
+  it("moves the description behind an about mark and still saves", async () => {
+    const double = openRows([{ title: "Account", fields: ["host"] }]);
+
+    fireEvent.change(await hostBox(), { target: { value: "b.example" } });
+    expect(document.querySelector("p.sy-note")).toBeNull();
+    clickSave();
+    await waitFor(() => {
+      expect(double.writes.length).toBe(1);
+    });
+    expect(double.writes[0].body).toEqual({ host: "b.example" });
+  });
+
+  it("draws a short root as one untitled card when no groups are given", async () => {
+    openRows();
+
+    await hostBox();
+    expect(document.querySelectorAll(".chd-card")).toHaveLength(1);
+    expect(screen.queryByRole("heading", { level: 3 })).toBeNull();
+  });
+});

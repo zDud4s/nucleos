@@ -1,42 +1,6 @@
-/* A channel's detail (System > Channels): the body inside a `Panel`. Tokens only. */
-.ch-card {
-  display: grid;
-  /* Two columns once the detail is 2 x 22rem wide, one below; a lone section takes the row. */
-  grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr));
-  gap: var(--space-5, var(--space-4)) var(--space-6, var(--space-4));
-  align-items: start;
-  min-width: 0;
-}
-.ch-card > * { max-width: 100%; min-width: 0; }
-/* The facts, the pairing note and the missing-secrets notice span the whole row. */
-.ch-card-wide { grid-column: 1 / -1; }
-.ch-card-meta {
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-/* The header: state, age and the about mark on the left of the group, the actions after them, tight. */
-.ch-state,
-.ch-actions {
-  display: inline-flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-.ch-actions { gap: var(--space-1); }
+/* Pieces of a sidecar channel's detail (System > Channels); the frame itself is `detail.css`. Tokens only. */
 /* The content of the about mark: one fact and two links, one per line. */
 .ch-about { display: flex; flex-direction: column; gap: var(--space-1); }
-/* The facts keep one line of their own however many the daemon sends. Values are plain text,
-   never a link colour; only a failure count takes the danger tone. */
-.ch-facts { row-gap: var(--space-3); }
-.ch-facts dd { color: var(--text); font-variant-numeric: tabular-nums; }
-.ch-count-bad { color: var(--tone-danger-fg); }
-/* Flat lists inside the card: hairlines between rows, no frame. */
-.ch-card .ui-rows {
-  border: none;
-  border-radius: 0;
-  overflow: visible;
-}
-.ch-card .ui-rows-row { padding-inline: 0; }
 .ch-card-missing { margin: 0 0 var(--space-2); padding-left: var(--space-4); }
 .ch-primary {
   display: flex;
