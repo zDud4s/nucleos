@@ -701,3 +701,23 @@ func TestSnapshotLeavesOutThePanel(t *testing.T) {
 		}
 	}
 }
+
+// TestOnlyValueHoldingControlsEarnARefWithoutAName pins the line between the two classes directly.
+// A link, a menuitem and a tab go somewhere, and where they go is what a name would have said, so
+// they stay excluded on purpose; a box that holds a value does not need one.
+func TestOnlyValueHoldingControlsEarnARefWithoutAName(t *testing.T) {
+	for _, role := range []string{"textbox", "searchbox", "combobox", "listbox", "checkbox",
+		"radio", "switch", "slider", "spinbutton"} {
+		if !interesting(role, "") {
+			t.Errorf("an unnamed %s holds a value and earned no ref", role)
+		}
+	}
+	for _, role := range []string{"button", "link", "menuitem", "tab", "heading"} {
+		if interesting(role, "") {
+			t.Errorf("an unnamed %s earned a ref; it only acts, and its name is all that could say what", role)
+		}
+	}
+	if !interesting("link", "Docs") {
+		t.Error("a named link must still earn a ref")
+	}
+}
