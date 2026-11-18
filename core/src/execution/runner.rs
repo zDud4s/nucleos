@@ -442,6 +442,35 @@ mod tests {
         assert_eq!(args[at + 1], "Bash,Edit");
     }
 
+    /// A tree leaf's schema diet reaches the Claude CLI exactly as its denied list used to: in the
+    /// one `--disallowedTools` flag, beside the run's own denials.
+    #[test]
+    fn a_schema_diet_rides_in_the_one_disallowed_tools_flag() {
+        let mut request = baseline_run_request();
+        request.tool_policy = ToolPolicy::Unrestricted;
+        request.schema_diet = ["PowerShell", "Workflow", "ScheduleWakeup", "Agent"]
+            .map(String::from)
+            .to_vec();
+
+        let args = cli_args(&request, "sonnet");
+
+        assert_eq!(
+            args.iter().filter(|a| *a == "--disallowedTools").count(),
+            1,
+            "a second flag would replace the first"
+        );
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert_eq!(args[at + 1], "PowerShell,Workflow,ScheduleWakeup,Agent");
+
+        request.denied_tools = vec!["Bash".to_string()];
+        let args = cli_args(&request, "sonnet");
+        let at = args.iter().position(|a| a == "--disallowedTools").unwrap();
+        assert_eq!(
+            args[at + 1],
+            "Bash,PowerShell,Workflow,ScheduleWakeup,Agent"
+        );
+    }
+
     /// And the wildcard stands alone. Naming individual tools beside `*` would add stderr lines
     /// about rules matching nothing, on top of a denial that already covers everything.
     #[test]
@@ -925,6 +954,7 @@ mod tests {
             agents: Vec::new(),
             append_system_prompt: None,
             denied_tools: Vec::new(),
+            schema_diet: Vec::new(),
             session_name: None,
             context_window: None,
             messages: None,
@@ -1161,6 +1191,7 @@ mod tests {
             agents: Vec::new(),
             append_system_prompt: None,
             denied_tools: Vec::new(),
+            schema_diet: Vec::new(),
             session_name: None,
             context_window: None,
             messages: None,

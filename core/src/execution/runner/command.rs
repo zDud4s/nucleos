@@ -240,7 +240,7 @@ pub(super) fn schemas_are_deferred(request: &RunRequest) -> bool {
     // Deferral is a CAPABILITY, so the question is whether the run still has it: `ToolSearch` on
     // the denied list is the CLI being unable to fetch a schema on demand, which is the shipped
     // regime. Reading the same list the flag is built from is the whole point of asking here.
-    !denied_tools(&request.tool_policy, &request.denied_tools)
+    !flag_denials(request)
         .iter()
         .any(|name| name == "ToolSearch")
 }
