@@ -23,9 +23,7 @@ const DECISION_PREFIX: &str = "loopback:";
 pub const LOOPBACK: &str = "loopback";
 
 /// The project's browser settings (`browser_project.yaml`).
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct BrowserProject {
     /// Loopback origins the project's agent browsers may open, e.g. `http://localhost:5173`: http or https, host `localhost`, `127.0.0.1` or `[::1]`, an explicit port, no path.
@@ -59,7 +57,9 @@ pub fn normalise_origin(raw: &str) -> Result<String, String> {
         return Err(format!("`{raw}`: the scheme must be http or https"));
     }
     if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
-        return Err(format!("`{raw}` must be only scheme, host and port, with no path"));
+        return Err(format!(
+            "`{raw}` must be only scheme, host and port, with no path"
+        ));
     }
     let (host, port) = if rest.starts_with('[') {
         let end = rest
@@ -71,7 +71,9 @@ pub fn normalise_origin(raw: &str) -> Result<String, String> {
             .ok_or_else(|| format!("`{raw}` needs an explicit port"))?
     };
     if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
-        return Err(format!("`{raw}`: the host must be localhost, 127.0.0.1 or [::1]"));
+        return Err(format!(
+            "`{raw}`: the host must be localhost, 127.0.0.1 or [::1]"
+        ));
     }
     let port: u16 = port
         .parse()
@@ -171,7 +173,8 @@ fn decision_id(project_id: &str, origin: &str) -> String {
 /// on the list, or for a forbidden port: those are not the owner's to allow. Returns whether a decision
 /// is now open (a repeat of an open one counts).
 pub async fn ask_for_origin(pool: &SqlitePool, project_id: Option<&str>, url: &str) -> bool {
-    let Some(project_id) = project_id.filter(|id| !id.is_empty() && *id != super::NO_PROJECT) else {
+    let Some(project_id) = project_id.filter(|id| !id.is_empty() && *id != super::NO_PROJECT)
+    else {
         return false;
     };
     let Some(origin) = origin_of_url(url) else {
@@ -183,9 +186,14 @@ pub async fn ask_for_origin(pool: &SqlitePool, project_id: Option<&str>, url: &s
     if origins_of(project_id).contains(&origin) {
         return false;
     }
-    let question = format!("Allow {origin} in this project? [Allow {origin} in this project] [Refuse]");
-    match crate::tree_job::decisions::ask_ownerless(pool, &decision_id(project_id, &origin), &question)
-        .await
+    let question =
+        format!("Allow {origin} in this project? [Allow {origin} in this project] [Refuse]");
+    match crate::tree_job::decisions::ask_ownerless(
+        pool,
+        &decision_id(project_id, &origin),
+        &question,
+    )
+    .await
     {
         Ok(_) => true,
         Err(error) => {
@@ -203,7 +211,10 @@ fn approves(answer: &str) -> bool {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches!(word.as_str(), "allow" | "approve" | "approved" | "yes" | "sim" | "permitir")
+    matches!(
+        word.as_str(),
+        "allow" | "approve" | "approved" | "yes" | "sim" | "permitir"
+    )
 }
 
 /// What an answered decision does when it is a loopback one: an approval appends the origin to the
@@ -248,10 +259,22 @@ mod tests {
 
     #[test]
     fn origins_are_normalised_and_the_rest_refused() {
-        assert_eq!(normalise_origin("http://localhost:5173").unwrap(), "http://localhost:5173");
-        assert_eq!(normalise_origin(" HTTPS://LocalHost:8443 ").unwrap(), "https://localhost:8443");
-        assert_eq!(normalise_origin("http://127.0.0.1:3000").unwrap(), "http://127.0.0.1:3000");
-        assert_eq!(normalise_origin("http://[::1]:3000").unwrap(), "http://[::1]:3000");
+        assert_eq!(
+            normalise_origin("http://localhost:5173").unwrap(),
+            "http://localhost:5173"
+        );
+        assert_eq!(
+            normalise_origin(" HTTPS://LocalHost:8443 ").unwrap(),
+            "https://localhost:8443"
+        );
+        assert_eq!(
+            normalise_origin("http://127.0.0.1:3000").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            normalise_origin("http://[::1]:3000").unwrap(),
+            "http://[::1]:3000"
+        );
         for bad in [
             "localhost:5173",
             "ftp://localhost:21",
@@ -275,8 +298,16 @@ mod tests {
             local_origins: origins.iter().map(|o| (*o).to_owned()).collect(),
         };
         assert!(doc(&[]).check().is_ok());
-        assert!(doc(&["http://localhost:5173", "http://localhost:3000"]).check().is_ok());
-        assert!(doc(&["http://localhost:5173", "http://localhost:5173"]).check().is_err());
+        assert!(
+            doc(&["http://localhost:5173", "http://localhost:3000"])
+                .check()
+                .is_ok()
+        );
+        assert!(
+            doc(&["http://localhost:5173", "http://localhost:5173"])
+                .check()
+                .is_err()
+        );
         assert!(doc(&["http://example.com:80"]).check().is_err());
         assert!(doc(&["HTTP://localhost:5173"]).check().is_err());
     }
@@ -299,7 +330,10 @@ mod tests {
         for port in [8793, 8794, 8795, 8796, 8797, 41_234] {
             assert!(ports.contains(&port), "{port} missing from {ports:?}");
         }
-        assert!(ports.windows(2).all(|pair| pair[0] < pair[1]), "not sorted and unique");
+        assert!(
+            ports.windows(2).all(|pair| pair[0] < pair[1]),
+            "not sorted and unique"
+        );
     }
 
     #[test]
@@ -311,12 +345,21 @@ mod tests {
             crate::settings::Snapshot::default().with_document(&Scope::project("alpha"), doc),
         ));
         let placement = decorate(Placement::project("alpha", Vec::new()), "alpha");
-        assert_eq!(placement.local_origins, vec!["http://localhost:5173".to_owned()]);
+        assert_eq!(
+            placement.local_origins,
+            vec!["http://localhost:5173".to_owned()]
+        );
         assert!(placement.forbidden_ports.contains(&8795));
 
-        let none = decorate(Placement::ephemeral("embedded-none"), super::super::NO_PROJECT);
+        let none = decorate(
+            Placement::ephemeral("embedded-none"),
+            super::super::NO_PROJECT,
+        );
         assert!(none.local_origins.is_empty());
-        assert!(none.forbidden_ports.contains(&8795), "the fence ports go out with no project too");
+        assert!(
+            none.forbidden_ports.contains(&8795),
+            "the fence ports go out with no project too"
+        );
     }
 
     async fn open_decisions(pool: &SqlitePool) -> Vec<(String, String)> {
@@ -337,7 +380,11 @@ mod tests {
         let open = open_decisions(&pool).await;
         assert_eq!(open.len(), 1, "asking twice is one decision: {open:?}");
         assert_eq!(open[0].0, "loopback:alpha:http://localhost:5173");
-        assert!(open[0].1.contains("Allow http://localhost:5173 in this project"));
+        assert!(
+            open[0]
+                .1
+                .contains("Allow http://localhost:5173 in this project")
+        );
         assert!(open[0].1.contains("[Refuse]"));
     }
 
@@ -370,19 +417,38 @@ mod tests {
         ask_for_origin(&pool, Some("alpha"), "http://localhost:5173").await;
         ask_for_origin(&pool, Some("alpha"), "http://localhost:3000").await;
 
-        decisions::answer(&pool, "loopback:alpha:http://localhost:3000", "Refuse", "owner")
-            .await
-            .unwrap();
-        assert!(origins_of("alpha").is_empty(), "a refusal must change nothing");
+        decisions::answer(
+            &pool,
+            "loopback:alpha:http://localhost:3000",
+            "Refuse",
+            "owner",
+        )
+        .await
+        .unwrap();
+        assert!(
+            origins_of("alpha").is_empty(),
+            "a refusal must change nothing"
+        );
 
-        decisions::answer(&pool, "loopback:alpha:http://localhost:5173", "Allow", "owner")
-            .await
-            .unwrap();
-        assert_eq!(origins_of("alpha"), vec!["http://localhost:5173".to_owned()]);
+        decisions::answer(
+            &pool,
+            "loopback:alpha:http://localhost:5173",
+            "Allow",
+            "owner",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            origins_of("alpha"),
+            vec!["http://localhost:5173".to_owned()]
+        );
 
         // The same approval arriving again (a second decision row for the origin) adds nothing.
         on_answered(&pool, "loopback:alpha:http://localhost:5173", "Allow").await;
-        assert_eq!(origins_of("alpha"), vec!["http://localhost:5173".to_owned()]);
+        assert_eq!(
+            origins_of("alpha"),
+            vec!["http://localhost:5173".to_owned()]
+        );
     }
 
     #[tokio::test]

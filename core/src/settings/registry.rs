@@ -411,7 +411,12 @@ mod tests {
             .collect();
         assert_eq!(
             project,
-            vec!["autopilot", "workflow_pins", "automations", "browser_project"]
+            vec![
+                "autopilot",
+                "workflow_pins",
+                "automations",
+                "browser_project"
+            ]
         );
     }
 
@@ -425,7 +430,10 @@ mod tests {
             json!({"local_origins": ["http://localhost:5173/app"]}),
             json!({"local_origins": ["http://localhost:5173", "http://localhost:5173"]}),
         ] {
-            assert!(prepared_text("browser_project", &bad).is_err(), "{bad} was accepted");
+            assert!(
+                prepared_text("browser_project", &bad).is_err(),
+                "{bad} was accepted"
+            );
         }
     }
 
