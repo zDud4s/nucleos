@@ -46,10 +46,11 @@ describe("PrimaryChannelControl", () => {
     );
   });
 
-  it("shows the badge on the primary and clears it only after confirmation", async () => {
+  it("offers Clear primary on the primary, with no marker of its own, and clears only after confirmation", async () => {
     daemon.apiFetch.mockResolvedValue({ primary: null, reseeded: false });
     renderWithQuery(<PrimaryChannelControl channel={channel()} primary="discord" />);
-    expect(screen.getByText("primary")).toBeTruthy();
+    expect(screen.queryByText("primary")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Make primary" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Clear primary" }));
     expect(putCalls()).toHaveLength(0);
     await afterDwell();

@@ -1,5 +1,5 @@
 import type { ChannelCapabilities } from "../data/channels";
-import { Quiet } from "../ui";
+import { Quiet, Row, Rows, Section } from "../ui";
 
 type MediaKind = "image" | "file" | "audio";
 const MEDIA_OUT: MediaKind[] = ["image", "file", "audio"];
@@ -33,7 +33,7 @@ function missingOf(c: ChannelCapabilities): Missing[] {
   return out;
 }
 
-/** The capabilities a channel lacks and what the núcleo does instead of each. */
+/** The capabilities a channel lacks and what the núcleo does instead of each; nothing when none is lacking. */
 export function CapabilityList({ capabilities }: { capabilities: ChannelCapabilities | null }) {
   if (capabilities === null) {
     return (
@@ -44,14 +44,17 @@ export function CapabilityList({ capabilities }: { capabilities: ChannelCapabili
     );
   }
   const missing = missingOf(capabilities);
-  if (missing.length === 0) return <Quiet compact says="All capabilities present." />;
+  if (missing.length === 0) return null;
   return (
-    <ul className="ch-caps">
-      {missing.map((m) => (
-        <li key={m.key}>
-          <strong>{m.label}</strong>: {m.text}
-        </li>
-      ))}
-    </ul>
+    <Section label="Capability gaps" level={3}>
+      <Rows label="Lacking capabilities">
+        {missing.map((m) => (
+          <Row key={m.key} layout="line" dense className="ch-cap">
+            <strong>{m.label}</strong>
+            <span>{m.text}</span>
+          </Row>
+        ))}
+      </Rows>
+    </Section>
   );
 }

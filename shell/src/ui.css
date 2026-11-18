@@ -83,20 +83,16 @@
 .ui-panel-grid,
 .ap-panel-pair,
 .sy-health-pair,
-.sy-config-grid,
 .sy-limits,
-.sy-backups-layout,
-.ch-grid {
+.sy-backups-layout {
   align-items: stretch;
 }
 
 .ui-panel-grid > .ui-panel,
 .ap-panel-pair > .ui-panel,
 .sy-health-pair > .ui-panel,
-.sy-config-grid > .ui-panel,
 .sy-limits > .ui-panel,
-.sy-backups-layout > .ui-panel,
-.ch-grid > .ui-panel {
+.sy-backups-layout > .ui-panel {
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -105,10 +101,8 @@
 .ui-panel-grid > .ui-panel > .ui-panel-body,
 .ap-panel-pair > .ui-panel > .ui-panel-body,
 .sy-health-pair > .ui-panel > .ui-panel-body,
-.sy-config-grid > .ui-panel > .ui-panel-body,
 .sy-limits > .ui-panel > .ui-panel-body,
-.sy-backups-layout > .ui-panel > .ui-panel-body,
-.ch-grid > .ui-panel > .ui-panel-body {
+.sy-backups-layout > .ui-panel > .ui-panel-body {
   flex: 1 1 auto;
 }
 

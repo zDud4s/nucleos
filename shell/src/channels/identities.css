@@ -1,4 +1,4 @@
-/* Paired identities inside a channel card. Tokens only. */
+/* Paired identities in a channel's detail. Tokens only. */
 .identities-panel {
   display: flex;
   flex-direction: column;
@@ -6,12 +6,6 @@
   width: 100%;
   min-width: 0;
 }
-.identities-sender {
-  margin-bottom: var(--space-3);
-  padding-bottom: var(--space-3);
-  border-bottom: 1px solid var(--border);
-}
-.identities-sender:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
 .identities-sender-head {
   display: flex;
   flex-wrap: wrap;
@@ -24,14 +18,8 @@
   font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
 }
-.identities-conversations {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  list-style: none;
-  margin: var(--space-2) 0 0;
-  padding: 0;
-}
+/* The sender's conversations are a list of their own under the sender's line. */
+.identities-conversations { margin-top: var(--space-2); }
 .identities-conversation {
   display: flex;
   flex-wrap: wrap;
@@ -46,7 +34,7 @@
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
-/* Row actions sit at the right edge and wrap as a pair, never one word per line. */
+/* Row actions sit at the right edge, never one word per line. */
 .identities-actions {
   display: inline-flex;
   flex-wrap: wrap;
@@ -54,15 +42,6 @@
   margin-left: auto;
   white-space: nowrap;
 }
-.identities-projects {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  list-style: none;
-  margin: 0 0 var(--space-2);
-  padding: 0;
-  font-size: var(--text-sm);
-}
-.identities-project { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: baseline; }
+.identities-edit { align-self: flex-start; font-size: var(--text-sm); }
 .identities-warnings { display: flex; flex-direction: column; gap: var(--space-2); margin: 0 0 var(--space-2); }
 .identities-outcome { margin: 0 0 var(--space-2); }

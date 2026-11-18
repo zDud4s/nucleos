@@ -199,7 +199,7 @@ export function RestartDaemon({
         </Button>
         <ConfirmButton
           label="Restart now"
-          confirmLabel="Really restart — running work is cut"
+          confirmLabel="Cut work and restart"
           sayAs="Restart the daemon now; the runs still working are cut and settled when it starts again"
           variant="ghost"
           disabled={asking || stage.kind === "restarting"}

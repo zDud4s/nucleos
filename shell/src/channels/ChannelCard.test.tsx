@@ -71,6 +71,9 @@ const discord: Channel = {
   drops: { unknown_sender: 0, pairing_failures: 0, counted_since: "2026-10-18T10:00:00Z" },
 };
 
+/** The `Fact` of the strip whose term is `term`. */
+const fact = (term: string) => screen.getByText(term, { selector: "dt" }).closest(".sy-fact") as HTMLElement;
+
 const afterDwell = () => new Promise<void>((resolve) => setTimeout(resolve, 350));
 const restartCalls = () => daemon.apiFetch.mock.calls.filter(([p]) => String(p).includes("/restart"));
 
@@ -82,17 +85,20 @@ describe("ChannelCard", () => {
     expect(screen.getByText(/contract 1/)).toBeTruthy();
     expect(screen.queryByText(/adapter_version/)).toBeNull();
     expect(screen.queryByText(/adapter version/i)).toBeNull();
-    expect(screen.getByText("primary")).toBeTruthy();
-    expect(screen.getByText(/1 failed/)).toBeTruthy();
-    expect(screen.getByText(/3 from unknown senders/)).toBeTruthy();
+    // The primary marker belongs to the list; the detail offers to clear it.
+    expect(screen.queryByText("primary")).toBeNull();
+    expect(screen.getByRole("button", { name: "Clear primary" })).toBeTruthy();
+    expect(within(fact("Failed")).getByText("1")).toBeTruthy();
+    expect(fact("Unknown senders").textContent).toMatch(/3/);
     const link = screen.getByRole("link", { name: /health/i });
     expect(link.getAttribute("href")).toBe("/system/health");
+    expect(link.getAttribute("title")).toBe("telegram_sidecar in health");
   });
 
   it("shows stale acks, stale renews and rate-limited senders only when the daemon sends them", async () => {
     const first = await renderWithRouter(<ChannelCard channel={telegram} primary={null} />);
-    expect(screen.queryByText(/stale:/)).toBeNull();
-    expect(screen.queryByText(/rate-limited/)).toBeNull();
+    expect(screen.queryByText("Stale acks")).toBeNull();
+    expect(screen.queryByText("Rate-limited")).toBeNull();
     first.unmount();
     await renderWithRouter(
       <ChannelCard
@@ -104,8 +110,9 @@ describe("ChannelCard", () => {
         primary={null}
       />,
     );
-    expect(screen.getByText("stale: 2 acks, 5 renews")).toBeTruthy();
-    expect(screen.getByText(/7 rate-limited unknown senders since/)).toBeTruthy();
+    expect(within(fact("Stale acks")).getByText("2")).toBeTruthy();
+    expect(within(fact("Stale renews")).getByText("5")).toBeTruthy();
+    expect(within(fact("Rate-limited")).getByText("7")).toBeTruthy();
   });
 
   it("restarts the sidecar behind a confirmation", async () => {
@@ -122,27 +129,27 @@ describe("ChannelCard", () => {
     const first = await renderWithRouter(
       <ChannelCard channel={{ ...telegram, drops: { ...telegram.drops, pairing_failures: 4 } }} primary={null} />,
     );
-    expect(screen.getByText("4 failed pairing attempts")).toBeTruthy();
+    expect(within(fact("Failed pairings")).getByText("4")).toBeTruthy();
     first.unmount();
     await renderWithRouter(<ChannelCard channel={telegram} primary={null} />);
-    expect(screen.queryByText(/failed pairing attempts/)).toBeNull();
+    expect(screen.queryByText("Failed pairings")).toBeNull();
   });
 
   it("shows the oldest waiting message only with pending messages and a due date", async () => {
     const waiting = { pending: 2, leased: 0, failed: 0, oldest_due_at: ago(3 * HOUR) };
     const first = await renderWithRouter(<ChannelCard channel={{ ...telegram, outbox: waiting }} primary={null} />);
-    expect(screen.getByText(/oldest waiting/)).toBeTruthy();
+    expect(screen.getByText("Oldest waiting")).toBeTruthy();
     expect(screen.getByText("3h ago")).toBeTruthy();
     first.unmount();
     const second = await renderWithRouter(
       <ChannelCard channel={{ ...telegram, outbox: { ...waiting, pending: 0 } }} primary={null} />,
     );
-    expect(screen.queryByText(/oldest waiting/)).toBeNull();
+    expect(screen.queryByText("Oldest waiting")).toBeNull();
     second.unmount();
     await renderWithRouter(
       <ChannelCard channel={{ ...telegram, outbox: { ...waiting, oldest_due_at: null } }} primary={null} />,
     );
-    expect(screen.queryByText(/oldest waiting/)).toBeNull();
+    expect(screen.queryByText("Oldest waiting")).toBeNull();
   });
 
   it("omits Restart for a health row with no sidecar key but keeps the health link", async () => {
@@ -151,13 +158,17 @@ describe("ChannelCard", () => {
     expect(screen.getByRole("link", { name: /health/i }).getAttribute("href")).toBe("/system/health");
   });
 
-  it("shows an offline channel with the lacking capabilities and Make primary", async () => {
-    await renderWithRouter(<ChannelCard channel={discord} primary="telegram" />);
+  it("shows an offline channel with the lacking capabilities and Make primary, and no gaps list when none lacks", async () => {
+    const first = await renderWithRouter(<ChannelCard channel={discord} primary="telegram" />);
     expect(screen.getByText("offline")).toBeTruthy();
     expect(screen.getByText("2h ago")).toBeTruthy();
     expect(screen.getByText("buttons")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Make primary" })).toBeTruthy();
     expect(screen.queryByText("primary")).toBeNull();
+    first.unmount();
+    await renderWithRouter(<ChannelCard channel={telegram} primary="telegram" />);
+    expect(screen.queryByText("Capability gaps")).toBeNull();
+    expect(screen.queryByText(/all capabilities present/i)).toBeNull();
   });
 
   it("gives every state a label and a sentence", async () => {
@@ -212,7 +223,7 @@ describe("ChannelCard", () => {
     expect(await screen.findByText(/Duarte/)).toBeTruthy();
     first.unmount();
     await renderWithRouter(<ChannelCard channel={discord} primary="telegram" />);
-    expect(await screen.findByText("nobody is paired on this channel yet")).toBeTruthy();
+    expect(await screen.findByText("Nobody paired")).toBeTruthy();
   });
 
   it("passes primary to the identities panel only for the primary channel", async () => {

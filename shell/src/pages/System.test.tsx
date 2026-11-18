@@ -1450,11 +1450,21 @@ describe("System - config index", () => {
 
     // The three routes that serve the daemon's PARSED view are still read. They
     // are not what the settings tab shows, and neither replaces the other.
-    await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/config/email");
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/voice/config");
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/calendar/config");
-    });
+    // The master-detail list reads each entry's route once its detail is selected.
+    for (const [label, path] of [
+      ["Email", "/config/email"],
+      ["Voice", "/voice/config"],
+      ["Calendar", "/calendar/config"],
+    ]) {
+      const pick = (await screen.findAllByRole("button", { name: new RegExp(`^${label}`) })).find((b) =>
+        b.className.includes("ch-pick"),
+      );
+      if (pick === undefined) throw new Error(`no ${label} entry in the list`);
+      fireEvent.click(pick);
+      await waitFor(() => {
+        expect(daemon.apiFetch).toHaveBeenCalledWith(path);
+      });
+    }
 
     // The confession is gone, because it stopped being true.
     expect(screen.queryByRole("list", { name: "Areas with no configuration route" })).toBeNull();
@@ -1719,7 +1729,12 @@ describe("System - map-authored readings", () => {
   it("an enabled mailbox and an armed one are facts, not work in flight", async () => {
     daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
     await renderSystemAt("/system/channels");
-    const panel = (await screen.findByRole("heading", { level: 2, name: "Email configuration" })).closest("section");
+    const pick = (await screen.findAllByRole("button", { name: /^Email/ })).find((b) =>
+      b.className.includes("ch-pick"),
+    );
+    if (pick === undefined) throw new Error("no Email entry in the list");
+    fireEvent.click(pick);
+    const panel = (await screen.findByRole("heading", { level: 2, name: "Email" })).closest("section");
     if (panel === null) throw new Error("no email configuration panel");
     for (const label of ["enabled", "armed"]) {
       const badge = within(panel).getByText(label);

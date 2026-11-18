@@ -1,6 +1,5 @@
 import { isApiRefusal } from "../data/client";
 import { useSetPrimaryChannel, type Channel } from "../data/channels";
-import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { ConfirmButton } from "../ui/ConfirmButton";
 import { ErrorNote } from "../ui/ErrorNote";
@@ -23,7 +22,7 @@ const SENTENCES: Record<string, string> = {
 /**
  * Make a channel the primary one, or clear the choice.
  *
- * Clearing is behind a `ConfirmButton` because it leaves the notifications
+ * The "primary" marker itself is drawn by the channel list, not here. Clearing is behind a `ConfirmButton` because it leaves the notifications
  * without a destination. Choosing is a plain button: it is reversible with one
  * more press. An `offline` channel may still be chosen: the outbox keeps the
  * notifications and delivers them once the adapter is back, so refusing here
@@ -42,37 +41,37 @@ export function PrimaryChannelControl({ channel, primary }: { channel: Channel; 
   return (
     <div className="ch-primary">
       {isPrimary ? (
-        <>
-          <Badge tone="info">primary</Badge>
-          <ConfirmButton
-            label="Clear primary"
-            confirmLabel="Clear: notifications will have no destination"
-            variant="quiet"
-            disabled={setPrimary.isPending}
-            onConfirm={() => setPrimary.mutate(null)}
-          />
-        </>
+        <ConfirmButton
+          label="Clear primary"
+          confirmLabel="Clear: notifications will have no destination"
+          variant="quiet"
+          disabled={setPrimary.isPending}
+          onConfirm={() => setPrimary.mutate(null)}
+        />
       ) : (
         <Button variant="approve" disabled={setPrimary.isPending} onClick={() => setPrimary.mutate(channel.id)}>
           Make primary
         </Button>
       )}
       {channel.state === "offline" ? (
-        <Quiet compact says="Offline: held in the outbox">
-          <Tip name="About an offline channel" persist tip="the outbox keeps the notifications and delivers them when the adapter is back" />
-        </Quiet>
+        <Tip name="About an offline channel" persist tip="the outbox keeps the notifications and delivers them when the adapter is back" />
       ) : null}
+      {/* The answers take a line of their own under the buttons, wherever the control sits. */}
       {setPrimary.isSuccess && reseeded ? (
-        <Quiet compact announce says="New channel">
-          <Tip name="About a new channel" persist tip="new channel: it starts from now, without replaying what it missed" />
-        </Quiet>
+        <div className="ch-primary-note">
+          <Quiet compact announce says="New channel">
+            <Tip name="About a new channel" persist tip="new channel: it starts from now, without replaying what it missed" />
+          </Quiet>
+        </div>
       ) : null}
       {error ? (
-        isApiRefusal(error) ? (
-          <RefusalNote refusal={error} sentences={SENTENCES} />
-        ) : (
-          <ErrorNote>could not change the primary channel</ErrorNote>
-        )
+        <div className="ch-primary-note">
+          {isApiRefusal(error) ? (
+            <RefusalNote refusal={error} sentences={SENTENCES} />
+          ) : (
+            <ErrorNote>could not change the primary channel</ErrorNote>
+          )}
+        </div>
       ) : null}
     </div>
   );

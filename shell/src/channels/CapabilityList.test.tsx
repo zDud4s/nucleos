@@ -9,9 +9,9 @@ const telegram: ChannelCapabilities = {
 };
 
 describe("CapabilityList", () => {
-  it("reports nothing missing for full capabilities", () => {
-    render(<CapabilityList capabilities={telegram} />);
-    expect(screen.getByText(/all capabilities present/i)).toBeTruthy();
+  it("draws nothing for full capabilities", () => {
+    const { container } = render(<CapabilityList capabilities={telegram} />);
+    expect(container.textContent).toBe("");
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);
   });
 

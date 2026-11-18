@@ -16,8 +16,10 @@ import { ErrorNote } from "../ui/ErrorNote";
 import { Modal } from "../ui/Modal";
 import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
+import { Row, Rows } from "../ui/Rows";
 import { Section } from "../ui/Section";
 import { Skeleton } from "../ui/Skeleton";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "../ui/vendor/dropdown-menu";
 import "./identities.css";
 
 const SENTENCES: Record<string, string> = {
@@ -165,42 +167,44 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
       </Modal>
       <Section label="Paired" level={3}>
         {senders.length === 0 ? (
-          <Quiet compact says="nobody is paired on this channel yet" />
+          <Quiet compact says="Nobody paired" />
         ) : (
-          senders.map((sender) => (
-            <SenderGroup
-              key={sender.sender_ref}
-              sender={sender}
-              busy={busy}
-              onMakeHome={(conversation_ref) => {
-                setOutcome(null);
-                setHome.mutate({ sender: sender.sender_ref, conversation_ref });
-              }}
-              onRemove={(conversation) => {
-                setOutcome(null);
-                remove.reset();
-                setRemoval({ sender, conversation });
-              }}
-            />
-          ))
+          <Rows label="Paired senders">
+            {senders.map((sender) => (
+              <SenderGroup
+                key={sender.sender_ref}
+                sender={sender}
+                busy={busy}
+                onMakeHome={(conversation_ref) => {
+                  setOutcome(null);
+                  setHome.mutate({ sender: sender.sender_ref, conversation_ref });
+                }}
+                onRemove={(conversation) => {
+                  setOutcome(null);
+                  remove.reset();
+                  setRemoval({ sender, conversation });
+                }}
+              />
+            ))}
+          </Rows>
         )}
       </Section>
       {projects.length > 0 && (
         <Section label="Projects" level={3}>
-          <ul className="identities-projects">
+          <Rows label="Project conversations">
             {projects.map((p) => (
-              <li key={p.project_id} className="identities-project">
+              <Row key={p.project_id} layout="line" dense>
                 <span>{p.project_id}</span>
                 <span className="identities-conversation-ref">{p.conversation_ref}</span>
-              </li>
+              </Row>
             ))}
-          </ul>
-          {/* Read-only: the mapping lives in channels/<id>.yaml, edited in Machine. */}
-          <Link to="/system/$view" params={{ view: "settings" }}>
-            {`edit in Machine › channels/${channel.id}`}
-          </Link>
+          </Rows>
         </Section>
       )}
+      {/* Read-only here: the mapping lives in channels/<id>.yaml, edited in Machine. */}
+      <Link to="/system/$view" params={{ view: "settings" }} title={`channels/${channel.id}`} className="identities-edit">
+        Edit in Machine
+      </Link>
     </div>
   );
 }
@@ -218,7 +222,7 @@ function SenderGroup({
 }) {
   const named = sender.sender_name !== null;
   return (
-    <div className="identities-sender">
+    <Row>
       <div className="identities-sender-head">
         <span className="identities-sender-name">{named ? sender.sender_name : sender.sender_ref}</span>
         {named && <span className="identities-sender-ref">{sender.sender_ref}</span>}
@@ -228,31 +232,31 @@ function SenderGroup({
           </Button>
         </span>
       </div>
-      <ul className="identities-conversations">
+      <Rows label={`Conversations of ${named ? sender.sender_name : sender.sender_ref}`} className="identities-conversations">
         {sender.conversations.map((c) => (
-          <li
-            key={c.conversation_ref}
-            className="identities-conversation"
-            data-testid="identity-conversation"
-            data-ref={c.conversation_ref}
-          >
-            <span className="identities-conversation-kind">{c.kind}</span>
-            <span className="identities-conversation-ref">{c.conversation_ref}</span>
-            {c.home && <Badge tone="active">home</Badge>}
-            {c.covers_threads && <Badge tone="info">all topics</Badge>}
-            <span className="identities-actions">
-              {!c.home && (
-                <Button variant="quiet" disabled={busy} onClick={() => onMakeHome(c.conversation_ref)}>
-                  Make home
-                </Button>
-              )}
-              <Button variant="quiet" disabled={busy} onClick={() => onRemove(c)}>
-                Remove conversation
-              </Button>
-            </span>
-          </li>
+          <Row key={c.conversation_ref} dense>
+            <div className="identities-conversation" data-testid="identity-conversation" data-ref={c.conversation_ref}>
+              <span className="identities-conversation-kind">{c.kind}</span>
+              <span className="identities-conversation-ref">{c.conversation_ref}</span>
+              {c.home && <Badge tone="active">home</Badge>}
+              {c.covers_threads && <Badge tone="info">all topics</Badge>}
+              <span className="identities-actions">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="quiet" disabled={busy} aria-label={`More actions for conversation ${c.conversation_ref}`}>
+                      ⋯
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {!c.home && <DropdownMenuItem onSelect={() => onMakeHome(c.conversation_ref)}>Make home</DropdownMenuItem>}
+                    <DropdownMenuItem onSelect={() => onRemove(c)}>Remove conversation</DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </span>
+            </div>
+          </Row>
         ))}
-      </ul>
-    </div>
+      </Rows>
+    </Row>
   );
 }

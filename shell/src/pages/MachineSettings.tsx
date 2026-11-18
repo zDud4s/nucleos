@@ -59,15 +59,9 @@ export function MachineSettings({ lead, trail }: { lead?: ReactNode; trail?: Rea
 
   return (
     <>
-      {/* The small panels side by side, equal height per row. `lead` and `trail` are the panels the screen
-          owns (Daemon, Quota notch): they sit in the same grid so the four pair up. */}
+      {/* Two balanced columns: Brain, the tall panel, on its own; the short ones stacked beside it. `lead`
+          and `trail` are the panels the screen owns (Daemon, Quota notch), which sit around Engines. */}
       <div className="sy-machine-grid">
-        {lead}
-        <Panel title="Engines">
-          <Rows label="Engines">
-            <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
-          </Rows>
-        </Panel>
         <Panel title="Brain">
           <Rows label="Brain settings">
             <DistillerModel />
@@ -75,7 +69,15 @@ export function MachineSettings({ lead, trail }: { lead?: ReactNode; trail?: Rea
             <EmbeddingModel />
           </Rows>
         </Panel>
-        {trail}
+        <div className="sy-machine-side">
+          {lead}
+          <Panel title="Engines">
+            <Rows label="Engines">
+              <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
+            </Rows>
+          </Panel>
+          {trail}
+        </div>
       </div>
 
       {index.isPending && <Skeleton label="Reading this machine's settings" lines={6} />}

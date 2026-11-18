@@ -825,21 +825,6 @@
   margin: 0 0 var(--space-3);
 }
 
-/* The small heading over the running configurations on the Channels tab. */
-.sy-running-config-title {
-  margin: 0 0 var(--space-3);
-  font-size: var(--text-sm);
-  font-weight: 600;
-  color: var(--text-muted);
-}
-
-/* The running configurations: equal-height cards per row (stretch comes from ui.css). */
-.sy-config-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
-  gap: var(--space-4);
-}
-
 /* Key on the left, value on the right, one per line under a hairline — a
    column you run down, rather than a grid of label-over-value boxes. */
 .sy-config-facts {
@@ -869,23 +854,39 @@
 
 /* -- machine settings ------------------------------------------------------ */
 
-/* The small panels of the Machine tab, two to a row. Cards in a row stretch to the tallest, and each
-   panel's body fills what is left, so neighbours align top and bottom whatever they hold. */
+/* The Machine tab in two balanced columns: Brain, the tall panel, on the left; the short ones stacked
+   on the right. Panels keep their own height; only the last one on the right absorbs any difference so
+   the two columns end together. One column under 52rem. */
 .sy-machine-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(26rem, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: stretch;
   gap: var(--space-4);
 }
 
+@media (max-width: 52rem) {
+  .sy-machine-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .sy-machine-grid > .ui-panel {
-  display: flex;
-  flex-direction: column;
   min-width: 0;
 }
 
-.sy-machine-grid > .ui-panel > .ui-panel-body {
-  flex: 1;
+.sy-machine-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.sy-machine-side > .ui-panel {
+  min-width: 0;
+}
+
+.sy-machine-side > .ui-panel:last-child {
+  flex: 1 1 auto;
 }
 
 /* A settings list line: the label (and its tip) on the left, the control flush right at its natural
@@ -895,7 +896,7 @@
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
-  min-height: 2.25rem;
+  min-height: 1.75rem;
 }
 
 .sy-prefrow-label {
@@ -905,6 +906,43 @@
   min-width: 0;
   font-size: var(--text-sm);
   color: var(--text);
+}
+
+/* A label stays on one line; a long one is cut with an ellipsis rather than wrapped. */
+.sy-prefrow-label > :first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A read-only value: the same size as the labels, muted. */
+.sy-prefrow-value {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  color: var(--text-muted);
+}
+
+/* Label on the first line; the control takes the whole second line, its field growing and any
+   button staying its natural size. */
+.sy-prefrow-stacked {
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.sy-prefrow-stacked > .sy-prefrow-control {
+  flex-wrap: nowrap;
+  justify-content: flex-start;
+}
+
+.sy-prefrow-stacked > .sy-prefrow-control > select,
+.sy-prefrow-stacked > .sy-prefrow-control > .sy-pref-input {
+  flex: 1 1 0;
+  width: auto;
+}
+
+.sy-prefrow-stacked > .sy-prefrow-control > .ui-button {
+  flex: 0 0 auto;
 }
 
 .sy-prefrow-control {
