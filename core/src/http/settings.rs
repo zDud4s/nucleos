@@ -569,7 +569,12 @@ mod tests {
             let (status, rows) = call(&state, "GET", "/settings?scope=project:7", None).await;
             assert_eq!(status, StatusCode::OK, "{rows}");
             assert_eq!(rows.as_array().map(Vec::len), Some(4), "{rows}");
-            for name in ["autopilot", "workflow_pins", "automations", "browser_project"] {
+            for name in [
+                "autopilot",
+                "workflow_pins",
+                "automations",
+                "browser_project",
+            ] {
                 let document = row(&rows, name);
                 assert_eq!(document["scope"], "project:7");
                 assert_eq!(document["kind"], "project");
