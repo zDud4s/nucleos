@@ -25,6 +25,8 @@ pub(super) struct TreeLaunchParams {
     /// `integration` (the default here) lands the finished work into the project's integration
     /// branch; `hold` leaves it on `feature_branch` for the owner to land.
     pub(super) land: Option<String>,
+    /// id of the tree that must land before this one starts
+    pub(super) after: Option<String>,
     /// Filled in by the NucleOS hook. Leave empty.
     pub(super) session_id: Option<String>,
 }
@@ -50,6 +52,7 @@ impl TreeLaunchParams {
             "contract": self.contract,
             "dirty_owner_files": self.dirty_owner_files,
             "land": land,
+            "after": self.after,
             "launching_session_id": self.session_id,
         })
     }

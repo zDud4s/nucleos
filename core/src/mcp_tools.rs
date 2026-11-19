@@ -3201,6 +3201,24 @@ mod tests {
         assert!(body["project_id"].is_null(), "{body}");
     }
 
+    /// `after` is forwarded as the JSON key `after` when given, and is null when left out.
+    #[test]
+    fn tree_launch_sends_after() {
+        let mut args = serde_json::json!({
+            "id": "tree-2",
+            "goal": "Ship it",
+            "feature_branch": "feat/tree",
+            "project_root": "C:/repo",
+            "after": "tree-1",
+        });
+        let params: TreeLaunchParams =
+            serde_json::from_value(args.clone()).expect("the arguments deserialise");
+        assert_eq!(params.into_body()["after"], serde_json::json!("tree-1"));
+        args.as_object_mut().unwrap().remove("after");
+        let params: TreeLaunchParams = serde_json::from_value(args).expect("after is optional");
+        assert!(params.into_body()["after"].is_null());
+    }
+
     #[test]
     fn tree_abandon_is_acts_and_served_in_the_worktree_box() {
         assert_eq!(tool_effect("tree_abandon"), ToolEffect::Acts);
