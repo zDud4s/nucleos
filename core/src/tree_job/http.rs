@@ -330,17 +330,8 @@ struct TreeBody {
 const LAND_MODES: [&str; 2] = ["hold", "integration"];
 
 fn summary(job: &TreeJob, replayed: bool) -> Value {
-    if let Some(after) =
-        crate::tree_job::after::is_waiting(job).then(|| crate::tree_job::after::view(job))
-    {
-        return json!({
-            "id": job.id,
-            "root_node_id": job.root_node_id,
-            "state": "waiting_after",
-            "after": after["tree"],
-            "reason": after["reason"],
-            "replayed": replayed,
-        });
+    if let Some(waiting) = crate::tree_job::after::summary(job, replayed) {
+        return waiting;
     }
     if let Some(reason) = crate::tree_job::root_pending::reason_of(job) {
         return json!({
@@ -387,46 +378,6 @@ async fn project_of_root(state: &AppState, root: &str) -> Result<String, Refusal
     }
 }
 
-/// The D5 rules of `after` at launch: `Ok(Some(reason))` when the job must wait, `Ok(None)` when the
-/// predecessor is already satisfied (the root starts at once, no mark), a refusal otherwise.
-async fn check_after(
-    state: &AppState,
-    id: &str,
-    pred_id: &str,
-    project_id: &str,
-    feature_branch: &str,
-) -> Result<Option<String>, Refusal> {
-    if pred_id == id {
-        return Err(refuse(
-            StatusCode::BAD_REQUEST,
-            format!("tree {id} cannot wait for itself"),
-        ));
-    }
-    let Some(pred) = store::load(&state.pool, pred_id)
-        .await
-        .map_err(store_refusal)?
-    else {
-        return Err(refuse(
-            StatusCode::NOT_FOUND,
-            format!("after: tree {pred_id} does not exist"),
-        ));
-    };
-    if pred.project_id.as_deref() != Some(project_id) {
-        return Err(refuse(
-            StatusCode::BAD_REQUEST,
-            format!("after: tree {pred_id} belongs to another project than {project_id}"),
-        ));
-    }
-    match crate::tree_job::after::evaluate(&pred, Some(feature_branch)) {
-        crate::tree_job::after::Verdict::Satisfied => Ok(None),
-        crate::tree_job::after::Verdict::Waiting(reason) => Ok(Some(reason)),
-        crate::tree_job::after::Verdict::Refused(reason) => Err(refuse(
-            StatusCode::CONFLICT,
-            format!("after: {reason}, so tree {id} would wait for ever"),
-        )),
-    }
-}
-
 /// `POST /trees`: opens a root node, stores the job and links the two. A repeated id answers with
 /// the stored job and opens nothing. A root run that cannot start (the disk floor, git) answers
 /// `state: "root_pending"` with the `reason`; the job stays open and the driver retries the start.
@@ -463,17 +414,14 @@ async fn post_tree(
     if let Some(job) = store::load(&state.pool, &id).await.map_err(store_refusal)? {
         return Ok(Json(summary(&job, true)));
     }
-    let waiting_reason = match body
-        .after
-        .as_deref()
-        .map(str::trim)
-        .filter(|after| !after.is_empty())
-    {
-        Some(pred_id) => check_after(&state, &id, pred_id, &project_id, &feature_branch)
-            .await?
-            .map(|reason| (pred_id.to_owned(), reason)),
-        None => None,
-    };
+    let waiting_reason = crate::tree_job::after::at_launch(
+        &state,
+        &id,
+        body.after.as_deref(),
+        &project_id,
+        &feature_branch,
+    )
+    .await?;
 
     let opened = work_nodes::open(
         &state.pool,
@@ -528,16 +476,7 @@ async fn post_tree(
     drop(guard);
     // A job that waits for another tree starts no root: the driver releases it once that tree lands.
     if let Some((pred_id, reason)) = &waiting_reason {
-        let line = format!("tree job {id} waits for tree {pred_id}: {reason}");
-        let _ = crate::feed::append(
-            &state.pool,
-            None,
-            "work_tree_waiting_after",
-            &line,
-            None,
-            None,
-        )
-        .await;
+        crate::tree_job::after::announce_waiting(&state, &id, pred_id, reason).await;
         return Ok(Json(summary(&job, false)));
     }
     // A root that cannot start never fails the request: the job exists and stays open, the answer
@@ -2497,7 +2436,14 @@ mod tests {
         let mut job = loaded(pool, id).await;
         job.project_id = Some("project-0".to_owned());
         job.feature_branch = Some(branch.to_owned());
-        store::update(pool, &job).await.unwrap();
+        // `store::update` writes only state and manifest, so the two columns go in directly.
+        sqlx::query("UPDATE tree_jobs SET project_id = ?, feature_branch = ? WHERE id = ?")
+            .bind(&job.project_id)
+            .bind(&job.feature_branch)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     /// Ends a stored job the way the driver or `abandon` would, with `extra` on its manifest.

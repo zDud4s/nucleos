@@ -9,10 +9,12 @@
 //! landing) never starts the job and never cascades: the owner is asked once on the waiting root.
 
 use chrono::{SecondsFormat, Utc};
+use axum::Json;
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::decisions;
-use super::http::job_lock;
+use super::http::{job_lock, refuse};
 use super::model::JOB_TERMINAL_STATE;
 use super::store::{self, TreeJob};
 use crate::state::AppState;
@@ -209,6 +211,75 @@ async fn note_reason(state: &AppState, job_id: &str, reason: &str) -> Result<(),
     store::update(&state.pool, &job)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The refusal `POST /trees` answers with: a status and an `{error}` body.
+pub(super) type Refusal = (StatusCode, Json<Value>);
+
+/// The D5 rules of `after` at launch. `Ok(Some((tree, reason)))` when the job must wait,
+/// `Ok(None)` when no `after` was asked (blank counts as absent) or the predecessor is already
+/// satisfied (the root starts at once, no mark), a refusal otherwise.
+pub(super) async fn at_launch(
+    state: &AppState,
+    id: &str,
+    requested: Option<&str>,
+    project_id: &str,
+    feature_branch: &str,
+) -> Result<Option<(String, String)>, Refusal> {
+    let Some(pred_id) = requested.map(str::trim).filter(|after| !after.is_empty()) else {
+        return Ok(None);
+    };
+    if pred_id == id {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            format!("tree {id} cannot wait for itself"),
+        ));
+    }
+    let pred = store::load(&state.pool, pred_id)
+        .await
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let Some(pred) = pred else {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!("after: tree {pred_id} does not exist"),
+        ));
+    };
+    if pred.project_id.as_deref() != Some(project_id) {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            format!("after: tree {pred_id} belongs to another project than {project_id}"),
+        ));
+    }
+    match evaluate(&pred, Some(feature_branch)) {
+        Verdict::Satisfied => Ok(None),
+        Verdict::Waiting(reason) => Ok(Some((pred_id.to_owned(), reason))),
+        Verdict::Refused(reason) => Err(refuse(
+            StatusCode::CONFLICT,
+            format!("after: {reason}, so tree {id} would wait for ever"),
+        )),
+    }
+}
+
+/// Says in the feed that job `id` was stored waiting for `pred_id` (one line per transition).
+pub(super) async fn announce_waiting(state: &AppState, id: &str, pred_id: &str, reason: &str) {
+    let line = format!("tree job {id} waits for tree {pred_id}: {reason}");
+    let _ = crate::feed::append(&state.pool, None, "work_tree_waiting_after", &line, None, None)
+        .await;
+}
+
+/// The `POST /trees` answer of a waiting job, `None` when the job does not wait.
+pub(super) fn summary(job: &TreeJob, replayed: bool) -> Option<Value> {
+    is_waiting(job).then(|| {
+        let mark = view(job);
+        json!({
+            "id": job.id,
+            "root_node_id": job.root_node_id,
+            "state": "waiting_after",
+            "after": mark["tree"],
+            "reason": mark["reason"],
+            "replayed": replayed,
+        })
+    })
 }
 
 #[cfg(test)]
