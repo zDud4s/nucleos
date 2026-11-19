@@ -23,15 +23,14 @@ import (
 // document, because `captureBeyondViewport` renders a page nobody has scrolled to and produces an
 // image whose height nothing bounds.
 //
-// There is deliberately no scaling ceiling here, and the reason is worth stating rather than
-// leaving as an absence: agent mode is `--headless=new` with no `--window-size` (see launch/args.go),
-// so the viewport is Chromium's headless default and every picture this produces is that size. A
-// ceiling would be a second, silent bound on top of one that is already fixed — and if the launch
-// ever does set a window size, Width and Height below report it, which is the honest way for that
-// change to become visible.
+// The longest side is capped at lookMaxSide pixels: a larger viewport (a window the person resized,
+// a launch that later sets --window-size) is scaled down to it rather than sent whole. Width and
+// Height in the result report the picture after the reduction.
 const (
 	lookMIME    = "image/jpeg"
 	lookQuality = 55
+	// lookMaxSide is the ceiling on the longer side of the picture, in pixels.
+	lookMaxSide = 1280
 	// lookLabels caps how many refs are drawn. Past this the picture is unreadable anyway, and the
 	// labels start costing more to draw than the picture costs to send.
 	lookLabels = 120
@@ -260,13 +259,35 @@ func (d *Driver) erase(ctx context.Context, on cdp.SessionID) {
 // and the labels above are drawn only for what is on screen, so the extra pixels would be a picture
 // of things the agent was told it cannot see.
 func (d *Driver) capture(ctx context.Context, on cdp.SessionID) (browser.LookResult, error) {
-	raw, err := d.conn.Call(ctx, on, "Page.captureScreenshot", map[string]any{
-		"format":  "jpeg",
-		"quality": lookQuality,
-		// Chromium reduces the whole capture, labels included, so a shrunk picture is a smaller
-		// picture of the same thing rather than a picture missing its annotations.
+	params := map[string]any{
+		"format":                "jpeg",
+		"quality":               lookQuality,
 		"captureBeyondViewport": false,
-	})
+	}
+	// Chromium reduces the whole capture, labels included, so a shrunk picture is a smaller picture
+	// of the same thing rather than a picture missing its annotations. A clip of exactly the
+	// viewport with a scale is how the capture is asked to shrink; failing open (no clip) keeps the
+	// unscaled viewport when the metrics cannot be read.
+	if metrics, err := d.conn.Call(ctx, on, "Page.getLayoutMetrics", map[string]any{}); err == nil {
+		var m struct {
+			Visual struct {
+				PageX        float64
+				PageY        float64
+				ClientWidth  float64
+				ClientHeight float64
+			} `json:"cssVisualViewport"`
+		}
+		if json.Unmarshal(metrics, &m) == nil {
+			v := m.Visual
+			if scale := lookScale(v.ClientWidth, v.ClientHeight); scale < 1 {
+				params["clip"] = map[string]any{
+					"x": v.PageX, "y": v.PageY, "width": v.ClientWidth, "height": v.ClientHeight,
+					"scale": scale,
+				}
+			}
+		}
+	}
+	raw, err := d.conn.Call(ctx, on, "Page.captureScreenshot", params)
 	if err != nil {
 		return browser.LookResult{}, err
 	}
@@ -287,6 +308,19 @@ func (d *Driver) capture(ctx context.Context, on cdp.SessionID) (browser.LookRes
 		Width:  width,
 		Height: height,
 	}, nil
+}
+
+// lookScale is the factor that brings a viewport's longer side under lookMaxSide; 1 when it
+// already fits or the size is unknown.
+func lookScale(width, height float64) float64 {
+	longest := width
+	if height > longest {
+		longest = height
+	}
+	if longest <= lookMaxSide {
+		return 1
+	}
+	return lookMaxSide / longest
 }
 
 // documentOrder puts the top document first and the frames after it, in a stable order.
