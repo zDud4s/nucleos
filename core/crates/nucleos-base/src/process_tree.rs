@@ -86,8 +86,29 @@ impl TreeKiller {
         }
     }
 
-    pub fn disarm(&mut self) {
+    /// The direct child has exited and its output is drained: terminates whatever is still in its
+    /// tree (Windows: `TerminateJobObject` on the job; Unix: SIGTERM then SIGKILL to the process
+    /// group) and disarms the killer. This is what a call site wants by default after reaping.
+    ///
+    /// Why this exists: the Windows job is made WITHOUT `KILL_ON_JOB_CLOSE`, so merely dropping a
+    /// disarmed killer leaves a background child of the command (a gate step's `&` job, say) alive
+    /// for ever. Call it only AFTER the child's pipes were drained, or output still in flight is
+    /// lost with the processes that were writing it. A no-op when already disarmed or killed.
+    pub fn reap(&mut self) {
+        self.kill_now();
+    }
+
+    /// Disarms WITHOUT killing: whatever is left in the tree is deliberately allowed to outlive the
+    /// child (a daemon the command was meant to start, say). The opt-out from [`Self::reap`]; a
+    /// call site that has no such intent should call `reap` instead.
+    pub fn release(&mut self) {
         self.armed = false;
+    }
+
+    /// Historical name of [`Self::release`], kept so existing call sites compile. New code should
+    /// say what it means with `reap` or `release`.
+    pub fn disarm(&mut self) {
+        self.release();
     }
 
     /// Kills now rather than at drop, for the call sites that must take the tree down *before* they
@@ -646,6 +667,63 @@ mod tests {
             "a disarmed killer must not have killed anything"
         );
         let _ = child.kill().await;
+    }
+
+    /// `sh` that leaves a background `sleep` holding the pipe and exits 0 at once.
+    async fn exited_child_with_a_stray() -> (
+        tokio::process::Child,
+        tokio::process::ChildStdout,
+        TreeKiller,
+    ) {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & echo started")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        spawn_in_own_group(&mut command);
+        let mut child = command.spawn().expect("`sh` must be on PATH");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let killer = TreeKiller::new(child.id().expect("a live child has a pid"));
+        // The direct child exits cleanly; the stray outlives it.
+        let status = child.wait().await.expect("wait for the shell");
+        assert!(status.success());
+        (child, stdout, killer)
+    }
+
+    /// Reaping after the direct child exited 0 takes the leftover grandchild down. Observed through
+    /// the pipe, as the tree test below is: EOF means every holder of the write end is gone.
+    #[tokio::test]
+    async fn reaping_an_exited_child_terminates_what_it_left_behind() {
+        let (_child, mut stdout, mut killer) = exited_child_with_a_stray().await;
+
+        killer.reap();
+
+        let mut sink = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_to_end(&mut sink))
+            .await
+            .expect("the grandchild survived the reap")
+            .expect("reading the pipe to EOF must succeed");
+    }
+
+    /// The opt-out: `release` must leave the stray alone, or the test above proves nothing.
+    #[tokio::test]
+    async fn releasing_an_exited_child_leaves_what_it_left_behind() {
+        let (_child, mut stdout, mut killer) = exited_child_with_a_stray().await;
+
+        killer.release();
+        drop(killer);
+
+        let mut sink = Vec::new();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), stdout.read_to_end(&mut sink))
+                .await
+                .is_err(),
+            "release must not kill the stray"
+        );
+        // Cleanup is the `sleep`'s own 30 s; nothing here may kill a group.
     }
 
     /// **The assertion that distinguishes killing a TREE from killing a child, which is the entire

@@ -433,7 +433,9 @@ pub async fn run_argv(
     match tokio::time::timeout(drain_budget, drain).await {
         Ok(Ok(())) => {
             if let Some(killer) = tree_killer.as_mut() {
-                killer.disarm();
+                // The child exited and the pipes are drained: whatever is still in its tree (a
+                // background process that closed its pipes) must not outlive the gate step.
+                killer.reap();
             }
         }
         Ok(Err(reason)) => return failed(reason),
@@ -627,6 +629,38 @@ mod tests {
         assert!(outcome.tail.contains("git version"), "tail was: {}", outcome.tail);
         assert!(!outcome.timed_out);
         assert!(outcome.error.is_none());
+    }
+
+    /// A gate step that backgrounds a process with its pipes redirected exits 0 and drains cleanly,
+    /// so the old `disarm` path left the stray running. The run must reap it before returning.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_process_left_by_a_gate_step_is_reaped() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let outcome = run_argv(&argv(&["sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!"]), cwd.path(), &[], Duration::from_secs(30)).await;
+        assert_eq!(outcome.exit_code, Some(0), "tail was: {}", outcome.tail);
+        let pid: u32 = outcome.tail.trim().parse().expect("the tail is the stray's pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::process_tree::pid_alive(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!crate::process_tree::pid_alive(pid), "the stray {pid} outlived the gate step");
+    }
+
+    /// Windows: MSYS `$!` is not a Windows pid, so the stray is observed through a file it holds
+    /// open; Windows refuses to delete an open file until the holder is gone.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_background_process_left_by_a_gate_step_is_reaped() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let outcome = run_argv(&argv(&["sh", "-c", "sleep 30 >hold.txt 2>&1 &"]), cwd.path(), &[], Duration::from_secs(30)).await;
+        assert_eq!(outcome.exit_code, Some(0), "tail was: {}", outcome.tail);
+        let hold = cwd.path().join("hold.txt");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::remove_file(&hold).is_err() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!hold.exists(), "the stray still holds its file after the gate step");
     }
 
     #[tokio::test]
