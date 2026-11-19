@@ -129,9 +129,9 @@
 }
 
 /* Loading skeletons that reuse a real grid's tracks (see `ui/Skeleton`). */
-.ui-skeleton-grid.sy-stats-skeleton {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  margin-bottom: var(--space-2);
+.ui-skeleton-grid.sy-kpis-skeleton {
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: var(--space-2);
 }
 .ui-skeleton-grid.sy-space-cards {
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -222,6 +222,38 @@
   font-weight: var(--weight-semibold);
   line-height: var(--leading-snug);
   color: var(--text);
+}
+
+/* Tiles inside a panel body (Health): narrower tracks and a tighter tile, same surface. */
+.sy-kpis.sy-kpis-compact {
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.sy-kpis-compact .sy-kpi {
+  padding: var(--space-2) var(--space-3);
+}
+
+.sy-kpis-compact .sy-kpi dd {
+  font-size: var(--text-lg, 1.25rem);
+}
+
+.sy-kpi dd.sy-stat-warn { color: var(--tone-paused-fg); }
+.sy-kpi dd.sy-stat-danger { color: var(--tone-danger-fg); }
+
+/* Subsystems and Router side by side; each panel keeps its own height (no stretching). */
+.sy-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: var(--space-4);
+}
+
+@media (max-width: 64rem) {
+  .sy-health-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* The tip and Details sit in the tile's corner. */
@@ -322,7 +354,7 @@
   /* name | state | started | restarts | last output | tools. Fixed tracks for everything but the
      output, so every row puts every column at the same x. */
   grid-template-columns:
-    minmax(0, 7rem) 6.5rem minmax(0, 11rem) minmax(0, 7rem) minmax(0, 1fr) 11rem;
+    minmax(0, 7rem) 6.5rem minmax(0, 11rem) minmax(0, 7rem) minmax(0, 1fr) auto;
   align-items: center;
   column-gap: var(--space-4);
 }
@@ -426,49 +458,13 @@
   color: var(--text-faint);
 }
 
-/* The router report: its totals as label-above-value pairs, then a compact pairs
-   table. The totals follow the Runs page's `.runs-facts` so a count reads the same
-   way on both. */
-.sy-router-totals {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
-  gap: var(--space-3);
-  margin: 0 0 var(--space-4);
-}
 
-.sy-router-total dt {
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-.sy-router-total dd {
-  margin: var(--space-1) 0 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums;
-  color: var(--text);
-}
-
-/* Subsystems: five equal stat columns (the router's label-above-value pairs), the value toned
-   only when it is non-zero and not ok. */
-.sy-router-totals.sy-stats {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  margin-bottom: var(--space-2);
-}
-
-.sy-stats dd.sy-stat-warn { color: var(--tone-paused-fg); }
-.sy-stats dd.sy-stat-danger { color: var(--tone-danger-fg); }
-
-/* The attention table: exactly three slots of one fixed height, in the sidecar rows' language. */
+/* The attention rows: only the subsystems that are not ok, in the sidecar rows' language. */
 .ui-rows-row.sy-attn-row {
   display: grid;
-  grid-template-columns: minmax(0, 11rem) 6.5rem minmax(0, 1fr) 11rem;
+  grid-template-columns: minmax(0, 10rem) 6.5rem minmax(0, 1fr);
   align-items: center;
   column-gap: var(--space-4);
-  height: 2.5rem;
-  box-sizing: border-box;
 }
 
 .ui-rows-row.sy-attn-row > * {
@@ -483,16 +479,10 @@
   color: var(--text-muted);
 }
 
-.sy-attn-ok,
 .sy-attn-more {
-  grid-column: 1 / 4;
+  grid-column: 1 / -1;
   font-size: var(--text-sm);
   color: var(--text-muted);
-}
-
-.sy-attn-tools {
-  display: flex;
-  justify-content: flex-end;
 }
 
 /* Two panels share a row when the page is wide enough. */
@@ -1446,8 +1436,7 @@ p.sy-notify-pop {
 .sy-backup-when,
 .sy-subsystem-counts,
 .sy-token-meta,
-.sy-backup-meta,
-.sy-router-total dd {
+.sy-backup-meta {
   font-variant-numeric: tabular-nums;
 }
 

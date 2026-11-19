@@ -498,10 +498,11 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    // The attention table lists the not-ok ones (down first), capped at three slots.
+    // The attention rows list only the not-ok ones the Sidecars panel does not report.
     const strip = await screen.findByRole("list", { name: "Subsystems" });
-    expect(within(strip).getAllByRole("listitem")).toHaveLength(3);
-    expect(within(strip).getByText("+3 more")).toBeDefined();
+    expect(within(strip).getAllByRole("listitem")).toHaveLength(2);
+    expect(within(strip).queryByText("email_sidecar")).toBeNull();
+    expect(within(strip).getByText("Low disk space")).toBeDefined();
     const expectedOrder = world.readout.subsystems.map((subsystem) => subsystem.name).sort();
 
     // The drawer's table lists the same names in the same order, with reasons.
@@ -510,9 +511,9 @@ describe("System - health readout", () => {
     expect(names).toEqual(expectedOrder);
 
     // Reasons render for the rows that have one.
-    expect(within(list).getByText(/low-disk-space/)).toBeDefined();
-    expect(within(list).getByText(/not-running/)).toBeDefined();
-    expect(within(list).getByText(/unreachable/)).toBeDefined();
+    expect(within(list).getByText(/Low disk space/)).toBeDefined();
+    expect(within(list).getByText(/Not running/)).toBeDefined();
+    expect(within(list).getByText(/Unreachable/)).toBeDefined();
 
     // A disabled subsystem reads as "not configured", never as "down" — and a
     // down one reads as "down", never as merely "not configured".
@@ -527,7 +528,7 @@ describe("System - health readout", () => {
     expect(emailSidecar.textContent).toMatch(/down/i);
   });
 
-  it.each([0, 1, 3, 10])("keeps exactly three attention slots with %i not-ok subsystems", async (n) => {
+  it.each([0, 1, 4, 10])("draws one attention row per problem with %i not-ok subsystems", async (n) => {
     const bad = Array.from({ length: n }, (_, i) => ({ name: `bad_${String(i)}`, status: "down" as const }));
     daemon.apiFetch.mockImplementation(
       systemFetch(
@@ -535,13 +536,21 @@ describe("System - health readout", () => {
       ),
     );
     await renderSystem();
-    const list = await screen.findByRole("list", { name: "Subsystems" });
-    expect(within(list).getAllByRole("listitem", { hidden: true })).toHaveLength(3);
-    expect(within(list).queryAllByText("All subsystems ok")).toHaveLength(n === 0 ? 1 : 0);
-    if (n > 3) {
-      expect(within(list).getByText(`+${String(n - 2)} more`)).toBeDefined();
-      expect(within(list).queryByText("bad_2")).toBeNull();
+    await screen.findByRole("heading", { level: 2, name: "Subsystems" });
+    if (n === 0) {
+      expect(await screen.findByText("All ok")).toBeDefined();
+      expect(screen.queryByRole("list", { name: "Subsystems" })).toBeNull();
+      return;
     }
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    expect(screen.queryByText("All ok")).toBeNull();
+    const rows = n > 4 ? 4 : n;
+    expect(within(list).getAllByRole("listitem")).toHaveLength(rows);
+    if (n > 4) {
+      expect(within(list).getByText(`+${String(n - 3)} more`)).toBeDefined();
+      expect(within(list).queryByText("bad_3")).toBeNull();
+    }
+    expect(within(list).queryByRole("button", { name: /Details/ })).toBeNull();
   });
 
   it("renders an aggregate timeout as one collapsed readout, not nine missing subsystems", async () => {
@@ -558,7 +567,7 @@ describe("System - health readout", () => {
     // "timed out" and a bare `findByText` would throw on two matches. Both halves still hold;
     // what changed is that `ConfirmButton` now renders a polite region of its own — empty at
     // rest — so "the only status on the page" is no longer a way to name anything.
-    const notice = await screen.findByText(/^The readout timed out before it could measure/);
+    const notice = await screen.findByText(/^The readout timed out\.$/);
     expect(notice.closest("[role=status]")).not.toBeNull();
     expect(notice.textContent).toMatch(/timed out/i);
     expect(screen.queryByText(/missing/i)).toBeNull();
@@ -721,30 +730,32 @@ describe("System - router report", () => {
     await renderSystem();
 
     await screen.findByRole("heading", { name: "Router (last 30 days)" });
-    expect(totalOf("Advice only (shadow)")).toBe("10");
-    expect(totalOf("Advice applied (apply)")).toBe("2");
+    expect(totalOf("Shadow")).toBe("10");
+    expect(totalOf("Applied")).toBe("2");
     expect(totalOf("With advice")).toBe("10");
   });
 
-  it("renders nothing when no run was routed", async () => {
+  it("says so inside the same panel when no run was routed", async () => {
     daemon.apiFetch.mockImplementation(
       systemFetch(systemWorld({ routeReport: { ...report, runs: 0, pairs: [] } })),
     );
 
     await renderSystem();
 
-    await screen.findByRole("list", { name: "Subsystems" });
+    await screen.findByRole("heading", { name: "Router" });
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/route/report?days=30"));
+    expect(await screen.findByText("No routed runs in the last 30 days")).toBeDefined();
     expect(screen.queryByText(/Router \(last/)).toBeNull();
   });
 
-  it("an older daemon's 404 shows no panel and no error", async () => {
+  it("an older daemon's 404 keeps the panel with one short line and no alert", async () => {
     daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
 
     await renderSystem();
 
-    await screen.findByRole("list", { name: "Subsystems" });
+    await screen.findByRole("heading", { name: "Router" });
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/route/report?days=30"));
+    expect(await screen.findByText("Router report unavailable")).toBeDefined();
     expect(screen.queryByText(/Router \(last/)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
   });
