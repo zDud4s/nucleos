@@ -474,7 +474,9 @@ the contract, not a snapshot.
 | `accounts/adapters/mod.rs` | Adapter registry; the `fake` adapter is built only for tests and the `testkit` feature. Provider literals live only under `accounts/adapters/`. |
 | `engines/adapters/claude/account.rs` | The Claude account adapter (re-exported as `accounts::adapters::claude`). |
 | `engines/adapters/codex/account.rs` | The Codex account adapter (re-exported as `accounts::adapters::codex`). |
-| `engines/adapters.rs`-tree: `engines/adapters/mod.rs`, `claude/mod.rs`, `codex/mod.rs` | Per-engine adapter homes (spec `2026-11-18-motor-por-contrato-design.md` step 1a): module declarations only. The fleet adapters below sit in this tree but compile in the app crate through `#[path]` in `fleet.rs`. |
+| `engines/adapters/mod.rs` | Per-engine adapter homes (spec `2026-11-18-motor-por-contrato-design.md` step 1a): module declarations only. The fleet adapters below sit in this tree but compile in the app crate through `#[path]` in `fleet.rs`. |
+| `engines/adapters/claude/mod.rs` | The Claude adapter home: module declarations only. |
+| `engines/adapters/codex/mod.rs` | The Codex adapter home: module declarations only. |
 | `accounts/adapters/fake.rs` | A scripted adapter for tests: no real provider, a `FAKE_HOME` locator and canned login lines. |
 | `accounts/pool.rs` | `PoolState`, the daemon's in-memory view of the accounts, their usage and live sessions, plus reservations released on drop. An empty pool makes every pick the default. |
 | `accounts/choose.rs` | `choose_account` and its `Decision`/`Reason`/`Score` vocabulary. A pure function; the skeleton always answers `Default`. |
