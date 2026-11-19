@@ -1641,7 +1641,11 @@ mod tests {
             materialize(&bundle(temp.path(), "1.0"), &checkout, &record, Mode::Apply).unwrap();
         assert_eq!(
             report.written,
-            vec![".claude/skills/plan/SKILL.md".to_string()]
+            // The skill is written once for Claude and once for its Codex mirror.
+            vec![
+                ".agents/skills/plan/SKILL.md".to_string(),
+                ".claude/skills/plan/SKILL.md".to_string()
+            ]
         );
         assert_eq!(report.reserved.len(), 2);
         assert!(!checkout.join(".claude/settings.json").exists());
