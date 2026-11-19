@@ -866,7 +866,9 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
     ("static_fallback"). Otherwise the held COUNT must be under `ceiling` (the caller passes
     dynamic_max_jobs()) and the probe must show room: free RAM, idle cores (skipped when busy_cores is unknown) and, only when that room is
     close to the floors (or from SETTLE_ALWAYS_HELD held jobs on, whatever the room), a settle
-    window since the last admission (see settle_needed)."""
+    window since the last admission (see settle_needed). `adm` also carries `busy_cores`,
+    `held_pred` and `why`: the list of failing conditions ("ram", "idle", "settle", "ceiling",
+    "disk"), all evaluated, empty when admitted, alone or on the static fallback."""
     avail = None
     idle = None
     usable = isinstance(p, dict)
@@ -882,31 +884,89 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
             # Held jobs still compiling have not ramped up: the probe shows their room as idle.
             # Subtract the not-yet-used share of their predicted cores (prediction minus what the
             # machine already shows busy), so idle = logical - max(busy, held prediction).
-            unused = max(0.0, float(held_pred_cores or 0.0) - float(b))
-            idle = float(lg) - float(b) - unused
+            idle = effective_idle(lg, b, float(held_pred_cores or 0.0))
+
+    why: list[str] = []
 
     def adm(rule: str) -> dict:
+        pb = p.get("busy_cores") if isinstance(p, dict) else None
         return {
             "mode": "dynamic", "rule": rule,
             "avail_mb": round(avail) if avail is not None else None,
             "idle_cores": round(idle, 1) if idle is not None else None,
             "held_n": n_held,
+            "busy_cores": pb,
+            "held_pred": round(float(held_pred_cores or 0.0), 1),
+            "why": list(why),
         }
 
     if n_held <= 0:
         return True, adm("alone")
     busy = disk_saturated(disk)
     if busy is not None:
+        why.append("disk")
         return False, {**adm("disk"), "disk_busy_pct": busy}
     if not usable:
         return bool(static_fit), adm("static_fallback")
+    # Evaluate every condition (no early return) so a denial lists all of its reasons.
+    if avail < min_avail_mb(p):
+        why.append("ram")
+    if idle is not None and idle < _env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0):
+        why.append("idle")
+    if ((settle_needed(avail, idle, p) or n_held >= SETTLE_ALWAYS_HELD)
+            and since_admit_s < _env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0)):
+        why.append("settle")
     if n_held >= ceiling:
-        return False, adm("room")
-    ok = (avail >= min_avail_mb(p)
-          and (idle is None or idle >= _env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0))
-          and (not (settle_needed(avail, idle, p) or n_held >= SETTLE_ALWAYS_HELD)
-               or since_admit_s >= _env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0)))
-    return ok, adm("room")
+        why.append("ceiling")
+    return not why, adm("room")
+
+
+def held_pred_cores(held_recs, now: float | None = None) -> float:
+    """Predicted cores of the held multi-weight jobs that have not ramped up yet. Items are rec
+    dicts or (Path, rec) tuples. Each rec with weight > 1 and a numeric `pred_cores` counts
+    FACTOR * pred_cores, fading linearly to 0 over RAMP_S seconds since `admitted_at` (for a
+    tuple without it, the lock file's mtime). Weight-1 jobs count 0. Never raises."""
+    try:
+        factor = _env_pos("NUCLEOS_HEAVY_PRED_CORES_FACTOR", 0.5)
+        ramp = _env_pos("NUCLEOS_HEAVY_RAMP_S", 120.0)
+        t = time.time() if now is None else now
+        total = 0.0
+        for item in held_recs or []:
+            path = None
+            rec = item
+            if isinstance(item, tuple):
+                path, rec = item[0], item[1]
+            if not isinstance(rec, dict):
+                continue
+            try:
+                weight = int(rec.get("weight") or 1)
+            except (TypeError, ValueError):
+                weight = 1
+            pred = rec.get("pred_cores")
+            if weight <= 1 or not _num(pred):
+                continue
+            at = rec.get("admitted_at")
+            if _num(at):
+                age = t - float(at)
+            elif path is not None:
+                try:
+                    age = t - os.stat(path).st_mtime
+                except (OSError, TypeError, ValueError):
+                    age = 0.0
+            else:
+                age = 0.0
+            total += factor * float(pred) * max(0.0, 1.0 - age / ramp)
+        return total
+    except Exception:
+        return 0.0
+
+
+def effective_idle(logical, busy, held_pred) -> float | None:
+    """Idle cores net of the not-yet-used predicted share of held jobs:
+    logical - max(busy, held_pred). None when busy or logical is not numeric. Not clamped."""
+    if not _num(busy) or not _num(logical):
+        return None
+    return float(logical) - max(float(busy), float(held_pred or 0.0))
 
 
 def settle_needed(avail_mb: float, idle_cores: float | None, p: dict | None) -> bool:

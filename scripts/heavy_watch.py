@@ -192,8 +192,8 @@ def dynamic_state(held: list, cap: int | None = None) -> dict | None:
         return None
     avail = float(p["avail_mb"])
     busy, logical = p.get("busy_cores"), p.get("logical")
-    idle = (float(logical) - float(busy)
-            if isinstance(busy, (int, float)) and isinstance(logical, (int, float)) else None)
+    # Same figure the broker decides on: net of the held jobs' not-yet-used predicted cores.
+    idle = hc.effective_idle(logical, busy, hc.held_pred_cores(held))
     try:
         since = time.time() - max(f.stat().st_mtime for f, _ in held)
     except (OSError, ValueError):
