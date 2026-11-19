@@ -226,7 +226,9 @@
 
 /* Tiles inside a panel body (Health): narrower tracks and a tighter tile, same surface. */
 .sy-kpis.sy-kpis-compact {
-  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  grid-template-columns: none;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: var(--space-2);
   margin-bottom: var(--space-3);
 }
@@ -242,18 +244,18 @@
 .sy-kpi dd.sy-stat-warn { color: var(--tone-paused-fg); }
 .sy-kpi dd.sy-stat-danger { color: var(--tone-danger-fg); }
 
-/* Subsystems and Router side by side; each panel keeps its own height (no stretching). */
-.sy-health-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
-  gap: var(--space-4);
+/* Under 40rem the one row of tiles wraps to two. */
+@media (max-width: 40rem) {
+  .sy-kpis.sy-kpis-compact {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  }
 }
 
-@media (max-width: 64rem) {
-  .sy-health-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
+/* A quiet suffix in a panel head (the Router's window). */
+.sy-panel-quiet {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
 }
 
 /* The tip and Details sit in the tile's corner. */
@@ -363,9 +365,13 @@
   min-width: 0;
 }
 
-/* The facts list dissolves into the row's grid; its two cells become columns. */
-.sy-sidecar-facts {
-  display: contents;
+/* The header row: the same grid, quiet uppercase labels once, instead of on every row. */
+.ui-rows-row.sy-sidecar-head {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
 
 .sy-sidecar-state {
@@ -378,6 +384,10 @@
   .ui-rows-row.sy-sidecar-row {
     grid-template-columns: minmax(0, 7rem) 6.5rem minmax(0, 1fr) minmax(0, 1fr);
     row-gap: var(--space-1);
+  }
+
+  .ui-rows-row.sy-sidecar-head {
+    display: none;
   }
 
   .ui-rows-row.sy-sidecar-row > .sy-sidecar-out {
@@ -400,18 +410,11 @@
   color: var(--text);
 }
 
-.sy-sidecar-facts .sy-fact {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  min-width: 0;
+.sy-sidecar-fact {
   white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.sy-sidecar-facts .sy-fact dd {
-  margin: 0;
   font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .sy-sidecar-out {
@@ -872,12 +875,12 @@
 /* -- machine settings ------------------------------------------------------ */
 
 /* The Machine tab in two balanced columns: Brain, the tall panel, on the left; the short ones stacked
-   on the right. Every panel keeps its own height (columns align to the top, nothing is stretched into
-   an empty box). One column under 52rem. */
+   on the right. The columns share one height (grid stretch); the right column's leftover height is
+   shared across its panels, not dumped into one. One column under 52rem. */
 .sy-machine-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
+  align-items: stretch;
   gap: var(--space-4);
 }
 
@@ -899,11 +902,18 @@
 }
 
 .sy-machine-side > .ui-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
   min-width: 0;
 }
 
+.sy-machine-side > .ui-panel > .ui-panel-body {
+  flex: 1 1 auto;
+}
+
 /* The short panels are compact: a tighter heading and body, so a one-row panel such as Engines is
-   not a tall box around a single line. They keep their own height; nothing stretches them. */
+   not a tall box around a single line. Leftover column height is split evenly between them. */
 .sy-machine-side > .ui-panel > .ui-panel-head {
   align-items: center;
   padding: var(--space-2) var(--space-4);

@@ -718,10 +718,13 @@ describe("System - router report", () => {
 
     await renderSystem();
 
-    expect(await screen.findByRole("heading", { name: "Router (last 30 days)" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Router" })).toBeTruthy();
     expect(totalOf("Routed runs")).toBe("12");
     expect(totalOf("Match rate")).toBe("75%");
-    expect(screen.getByText("claude · sonnet · high → claude · haiku · low")).toBeTruthy();
+    expect(screen.getByText("Sonnet · high")).toBeTruthy();
+    expect(screen.getByText("Haiku · low")).toBeTruthy();
+    expect(screen.getByRole("columnheader", { name: "Ran on" })).toBeTruthy();
+    expect(screen.getByRole("columnheader", { name: "Advised" })).toBeTruthy();
   });
 
   it("names the router's modes so they are not mistaken for a run's shadow mode, raw words kept", async () => {
@@ -729,7 +732,7 @@ describe("System - router report", () => {
 
     await renderSystem();
 
-    await screen.findByRole("heading", { name: "Router (last 30 days)" });
+    await screen.findByRole("heading", { name: "Router" });
     expect(totalOf("Shadow")).toBe("10");
     expect(totalOf("Applied")).toBe("2");
     expect(totalOf("With advice")).toBe("10");
@@ -797,17 +800,17 @@ describe("System - sidecar cards", () => {
     const browserCard = rowFor(list, "browser");
     const webCard = rowFor(list, "web");
 
-    // browser: no recorded start, so no "started" fact — but the failure, the
-    // last line and the restart count all show.
-    expect(within(browserCard).queryByText("started")).toBeNull();
+    // The columns are named once, in the header row, not on every row.
+    expect(within(list).getAllByText("Started")).toHaveLength(1);
+    expect(within(list).getAllByText("Restarts")).toHaveLength(1);
+
+    // browser: no recorded start, so an empty cell; the failure, the last line and the restart
+    // count all show.
     expect(browserCard.textContent).toMatch(/exited: exit code: 1/);
     expect(browserCard.textContent).toMatch(/panic: no display/);
-    expect(browserCard.textContent).toMatch(/restarts/i);
     expect(browserCard.textContent).toMatch(/3/);
 
-    // web: a real start time shows as "started" — and with nothing to report,
-    // neither a failure line nor a last-line fact renders at all.
-    expect(within(webCard).getByText("started")).toBeDefined();
+    // web: with nothing to report, no failure line renders at all.
     expect(webCard.textContent).not.toMatch(/exited/);
     expect(within(webCard).queryByRole("alert")).toBeNull();
 

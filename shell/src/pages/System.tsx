@@ -296,11 +296,9 @@ function HealthView({
 }) {
   return (
     <>
-      <div className="sy-health-grid">
-        <HealthReadoutPanel health={health} />
-        <RouterReportPanel />
-      </div>
+      <HealthReadoutPanel health={health} />
       <SidecarCardsPanel sidecars={sidecars} />
+      <RouterReportPanel />
     </>
   );
 }
@@ -371,7 +369,6 @@ function HealthReadoutPanel({
     .sort(bySubsystemHealth);
   const shown = attention.length > 4 ? attention.slice(0, 3) : attention;
   const stats: KpiItem[] = [
-    { label: "Subsystems", value: rows.length },
     { label: "Ok", value: count("ok") },
     { label: "Degraded", value: count("degraded"), tone: count("degraded") > 0 ? "sy-stat-warn" : undefined },
     { label: "Down", value: count("down"), tone: count("down") > 0 ? "sy-stat-danger" : undefined },
@@ -385,7 +382,7 @@ function HealthReadoutPanel({
   return (
     <Panel title="Subsystems" aside={aside}>
       {health.data === undefined && !health.isError && (
-        <Skeleton label="Reading the subsystems" variant="cards" count={5} gridClassName="sy-kpis-skeleton" height="3.75rem" />
+        <Skeleton label="Reading the subsystems" variant="cards" count={4} gridClassName="sy-kpis-skeleton" height="3.75rem" />
       )}
       {health.isError && health.data === undefined && (
         <HealthError error={health.error} />
@@ -467,9 +464,15 @@ function HealthReadoutPanel({
   );
 }
 
-/** One side of a pair as `runner · model · effort`, skipping what is unknown. */
-function pairLabel(runner: string | null, model: string | null, effort: string | null): string {
-  return routeTriple([runner, model, effort]) ?? "unknown";
+/** One side of a pair as `model · effort` (the runner is dropped when `dropRunner`), skipping what is unknown. */
+function pairLabel(
+  runner: string | null,
+  model: string | null,
+  effort: string | null,
+  dropRunner: boolean,
+): string {
+  const label = routeTriple([dropRunner ? null : runner, model, effort]) ?? "unknown";
+  return dropRunner ? label.charAt(0).toUpperCase() + label.slice(1) : label;
 }
 
 /**
@@ -517,34 +520,42 @@ function RouterReportPanel() {
   ];
   return (
     <Panel
-      title={`Router (last ${String(data.days)} days)`}
+      title="Router"
       aside={
-        <Tip
-          name="About the router modes"
-          tip="Shadow: the router advised and the run kept its own choice. Applied: the run launched the advice. Not the Runs page's shadow mode."
-        />
+        <>
+          <span className="sy-panel-quiet">{String(data.days)} days</span>
+          <Tip
+            name="About the router"
+            tip="Shadow: the router advised and the run kept its own choice. Applied: the run launched the advice. Not the Runs page's shadow mode. Each row counts runs that ran on one model while the router advised another, and how many passed."
+          />
+        </>
       }
     >
       <KpiTiles items={totals} />
       {pairs.length > 0 && (
-        <Table caption="Ran → advised">
+        <Table label="Runs by model and advice">
           <thead>
             <tr>
-              <Th>Pair</Th>
+              <Th>Ran on</Th>
+              <Th>Advised</Th>
               <Th num>Runs</Th>
               <Th num>Passed</Th>
               <Th num>Failed</Th>
             </tr>
           </thead>
           <tbody>
-            {pairs.map((pair, index) => (
-              <tr key={index}>
-                <Td>{`${pairLabel(pair.runner, pair.model, pair.effort)} → ${pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort)}`}</Td>
-                <Td num>{pair.runs}</Td>
-                <Td num>{pair.passed}</Td>
-                <Td num>{pair.failed}</Td>
-              </tr>
-            ))}
+            {pairs.map((pair, index) => {
+              const sameRunner = pair.runner === pair.advised_runner;
+              return (
+                <tr key={index}>
+                  <Td>{pairLabel(pair.runner, pair.model, pair.effort, sameRunner)}</Td>
+                  <Td>{pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort, sameRunner)}</Td>
+                  <Td num>{pair.runs}</Td>
+                  <Td num>{pair.passed}</Td>
+                  <Td num>{pair.failed}</Td>
+                </tr>
+              );
+            })}
           </tbody>
         </Table>
       )}
@@ -578,6 +589,14 @@ function SidecarCardsPanel({
       )}
       {sidecars.data !== undefined && sidecars.data.length > 0 && (
         <Rows label="Sidecars">
+          <Row dense className="sy-sidecar-row sy-sidecar-head">
+            <span>Name</span>
+            <span>State</span>
+            <span>Started</span>
+            <span>Restarts</span>
+            <span>Last output</span>
+            <span />
+          </Row>
           {sidecars.data.map((row) => (
             <SidecarCard key={row.name} sidecar={row} />
           ))}
@@ -599,22 +618,10 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
       <span className="sy-sidecar-state">
         <StateBadge domain="sidecar" state={sidecar.state} />
       </span>
-      <dl className="sy-sidecar-facts">
-        <div className="sy-fact">
-          {sidecar.started_at !== null && (
-            <>
-              <dt>started</dt>
-              <dd>
-                <RelativeTime at={sidecar.started_at} />
-              </dd>
-            </>
-          )}
-        </div>
-        <div className="sy-fact">
-          <dt>restarts</dt>
-          <dd>{sidecar.restarts}</dd>
-        </div>
-      </dl>
+      <span className="sy-sidecar-fact">
+        {sidecar.started_at !== null && <RelativeTime at={sidecar.started_at} />}
+      </span>
+      <span className="sy-sidecar-fact">{sidecar.restarts}</span>
       {/* What the sidecar last said, and the failure above it when there is one — each one
           clipped line, the whole text in the tooltip. */}
       <div className={wide ? "sy-sidecar-out sy-sidecar-out-wide" : "sy-sidecar-out"}>
