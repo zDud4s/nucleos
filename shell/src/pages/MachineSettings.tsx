@@ -221,24 +221,31 @@ function SettingPanel({
  * the input is cleared the moment it is accepted, and `present` is the only
  * thing this ever renders about a stored credential.
  */
-export function SecretControl({ secret }: { secret: MachineSecret }) {
+export function SecretControl({ secret, compact = false }: { secret: MachineSecret; compact?: boolean }) {
   const store = useStoreSecret();
   const forget = useForgetSecret();
   const [value, setValue] = useState("");
   // What just happened, said in a live region: an emptied input is not an announcement.
   const [outcome, setOutcome] = useState<"stored" | "forgotten" | null>(null);
 
+  // "unknown" is not the same as "not set", and acting on the two differs: one wants a
+  // credential pasted, the other wants somebody to look at the store.
+  const badge = (
+    <StateBadge
+      domain="credential"
+      state={secret.present === true ? "set" : secret.present === false ? "unset" : "unknown"}
+    />
+  );
+  // Compact (a row inside a card): the key without its area prefix, capitalised, and the badge after the buttons.
+  const bare = secret.key.startsWith(`${secret.area}-`) ? secret.key.slice(secret.area.length + 1) : secret.key;
+  const shownKey = compact ? bare.charAt(0).toUpperCase() + bare.slice(1) : secret.key;
+
   return (
-    <div className="sy-secret">
+    <div className={compact ? "sy-secret sy-secret-compact" : "sy-secret"}>
       <div className="sy-secret-head">
-        <span className="sy-secret-key">{secret.key}</span>
+        <span className="sy-secret-key">{shownKey}</span>
         <Tip tip={secret.what} name={`About ${secret.key}`} persist />
-        {/* "unknown" is not the same as "not set", and acting on the two differs: one wants a
-            credential pasted, the other wants somebody to look at the store. */}
-        <StateBadge
-          domain="credential"
-          state={secret.present === true ? "set" : secret.present === false ? "unset" : "unknown"}
-        />
+        {compact ? null : badge}
       </div>
       <div className="sy-setting-controls">
         <input
@@ -282,6 +289,7 @@ export function SecretControl({ secret }: { secret: MachineSecret }) {
             }}
           />
         )}
+        {compact ? badge : null}
       </div>
       <p className="sy-meta" role="status">
         {outcome === "stored" && "stored"}

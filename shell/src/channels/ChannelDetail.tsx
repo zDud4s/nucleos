@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { createContext, useState, type ReactNode } from "react";
 import { Tip } from "../ui";
 import "./detail.css";
 
@@ -32,6 +32,7 @@ export function ChannelDetail({
   actions?: ReactNode;
   children: ReactNode;
 }) {
+  const [slot, setSlot] = useState<HTMLElement | null>(null);
   return (
     <section className="ui-panel chd">
       <div className="ui-panel-head chd-head">
@@ -41,12 +42,23 @@ export function ChannelDetail({
           {meta === undefined || meta === null ? null : <span className="chd-meta">{meta}</span>}
           {about}
         </div>
-        {actions === undefined || actions === null ? null : <div className="chd-actions">{actions}</div>}
+        <div className="chd-actions">
+          {actions}
+          <span ref={setSlot} className="chd-slot" />
+        </div>
       </div>
-      <div className="ui-panel-body chd-body">{children}</div>
+      <div className="ui-panel-body chd-body">
+        <ActionsSlot.Provider value={slot}>{children}</ActionsSlot.Provider>
+      </div>
     </section>
   );
 }
+
+/**
+ * The header's actions area, for a form drawn in the body that wants its buttons up there
+ * (`SettingsForm` portals into it). `null` outside a `ChannelDetail`, or before the header mounts.
+ */
+export const ActionsSlot = createContext<HTMLElement | null>(null);
 
 /** One stat tile: a small uppercase term over a larger tabular value. */
 export interface ChannelTile {

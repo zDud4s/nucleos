@@ -882,12 +882,12 @@
 /* -- machine settings ------------------------------------------------------ */
 
 /* The Machine tab in two balanced columns: Brain, the tall panel, on the left; the short ones stacked
-   on the right. Panels keep their own height; only the last one on the right absorbs any difference so
-   the two columns end together. One column under 52rem. */
+   on the right. Every panel keeps its own height (columns align to the top, nothing is stretched into
+   an empty box). One column under 52rem. */
 .sy-machine-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: stretch;
+  align-items: start;
   gap: var(--space-4);
 }
 
@@ -912,8 +912,15 @@
   min-width: 0;
 }
 
-.sy-machine-side > .ui-panel:last-child {
-  flex: 1 1 auto;
+/* The short panels are compact: a tighter heading and body, so a one-row panel such as Engines is
+   not a tall box around a single line. They keep their own height; nothing stretches them. */
+.sy-machine-side > .ui-panel > .ui-panel-head {
+  align-items: center;
+  padding: var(--space-2) var(--space-4);
+}
+
+.sy-machine-side > .ui-panel > .ui-panel-body {
+  padding: var(--space-3) var(--space-4);
 }
 
 /* A settings list line: the label (and its tip) on the left, the control flush right at its natural

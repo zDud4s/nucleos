@@ -1,5 +1,5 @@
 import { useState, type ReactElement, type ReactNode } from "react";
-import { ChannelCardBox, ChannelCards } from "../channels/ChannelDetail";
+import { ChannelCardBox } from "../channels/ChannelDetail";
 import { Button, ErrorNote, Field, Select, Switch, Tip, type FieldProps } from "../ui";
 import {
   defaultFor,
@@ -67,6 +67,7 @@ export interface SettingsGroup {
 
 interface CardPlan {
   title: string | undefined;
+  keys: string[];
   nodes: ReactNode[];
   extra: ReactNode;
 }
@@ -75,17 +76,35 @@ function planCards(keys: readonly string[], nodes: Map<string, ReactNode>, group
   if (groups === undefined || groups.length === 0) {
     const split = keys.length > 4 ? Math.ceil(keys.length / 2) : keys.length;
     const halves = split < keys.length ? [keys.slice(0, split), keys.slice(split)] : [keys];
-    return halves.map((half) => ({ title: undefined, nodes: half.map((key) => nodes.get(key)), extra: null }));
+    return halves.map((half) => ({ title: undefined, keys: [...half], nodes: half.map((key) => nodes.get(key)), extra: null }));
   }
   const placed = new Set<string>();
   const plans: CardPlan[] = groups.map((group) => {
     const mine = group.fields.filter((key) => nodes.has(key) && !placed.has(key));
     mine.forEach((key) => placed.add(key));
-    return { title: group.title, nodes: mine.map((key) => nodes.get(key)), extra: group.extra ?? null };
+    return { title: group.title, keys: mine, nodes: mine.map((key) => nodes.get(key)), extra: group.extra ?? null };
   });
   const rest = keys.filter((key) => !placed.has(key));
-  if (rest.length > 0) plans[plans.length - 1].nodes.push(...rest.map((key) => nodes.get(key)));
+  if (rest.length > 0) {
+    plans[plans.length - 1].keys.push(...rest);
+    plans[plans.length - 1].nodes.push(...rest.map((key) => nodes.get(key)));
+  }
   return plans.filter((plan) => plan.nodes.length > 0 || plan.extra !== null);
+}
+
+/**
+ * Splits the cards into two stacks by estimated height, each card going to the shorter stack so far
+ * (ties to the first). Cards keep their own height: nothing stretches to match its neighbour.
+ */
+function balanceColumns(plans: readonly CardPlan[], weigh: (plan: CardPlan) => number): CardPlan[][] {
+  const columns: CardPlan[][] = [[], []];
+  const heights = [0, 0];
+  for (const plan of plans) {
+    const at = heights[1] < heights[0] ? 1 : 0;
+    columns[at].push(plan);
+    heights[at] += weigh(plan);
+  }
+  return columns.filter((column) => column.length > 0);
 }
 
 /** A schema that refers to itself would otherwise draw forever; past this depth a node is a JSON box. */
@@ -249,18 +268,31 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
       if (bare && rows) {
         const byKey = new Map<string, ReactNode>(drawn.map((key, at) => [key, fields[at]]));
         const plans = planCards(drawn, byKey, groups);
+        // One line per scalar, items + 1 per array; a card's title and its `extra` row count as one each.
+        const weigh = (plan: CardPlan): number =>
+          1 +
+          (plan.extra !== null ? 1 : 0) +
+          plan.keys.reduce((sum, key) => {
+            const { node: field } = unwrapNullable(properties[key], root);
+            const held = record[key];
+            return sum + (nodeKind(field) === "array" ? (Array.isArray(held) ? held.length : 0) + 1 : 1);
+          }, 0);
         // The `extra` of a group is drawn even when the schema has no field for it.
         return (
-          <ChannelCards className="set-cards">
-            {plans.map((plan, at) => (
-              <ChannelCardBox key={plan.title ?? at} title={plan.title}>
-                <div className="set-rows">
-                  {plan.nodes}
-                  {plan.extra}
-                </div>
-              </ChannelCardBox>
+          <div className="set-cols">
+            {balanceColumns(plans, weigh).map((column) => (
+              <div key={column[0].title ?? column[0].keys[0]} className="set-col">
+                {column.map((plan, at) => (
+                  <ChannelCardBox key={plan.title ?? at} title={plan.title}>
+                    <div className="set-rows">
+                      {plan.nodes}
+                      {plan.extra}
+                    </div>
+                  </ChannelCardBox>
+                ))}
+              </div>
             ))}
-          </ChannelCards>
+          </div>
         );
       }
       if (bare) {
@@ -304,6 +336,57 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
     case "array": {
       const items = Array.isArray(value) ? (value as unknown[]) : [];
       const itemSchema = inner.items as SchemaNode;
+      if (rows && nodeKind(unwrapNullable(itemSchema, root).node) === "string") {
+        // Compact: small wrapping inputs with an × each, and one Add, in a single row named by the field.
+        const texts = items.map((item) => (typeof item === "string" ? item : ""));
+        const itemFailures = texts.map((_, index) => errors[pointerJoin(path, index)]);
+        return (
+          <div data-field={path} className="set-row set-array">
+            <div className="set-array-head">
+              <span className="set-array-label">{label}</span>
+              {aboutTip(inner.description)}
+              <Button
+                variant="quiet"
+                aria-label={`Add ${label}`}
+                onClick={() => { onChange([...items, defaultFor(itemSchema, root)]); }}
+              >
+                Add
+              </Button>
+            </div>
+            {texts.length > 0 ? (
+              <ul className="set-chips" aria-label={label}>
+                {texts.map((text, index) => (
+                  <li key={index} className="set-chip">
+                    <input
+                      type="text"
+                      className="sy-field-input set-chip-input"
+                      aria-label={`${label} ${index + 1}`}
+                      aria-invalid={itemFailures[index] !== undefined ? true : undefined}
+                      size={Math.max(4, text.length + 1)}
+                      value={text}
+                      onChange={(event) => {
+                        onChange(items.map((old, at) => (at === index ? event.target.value : old)));
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="set-chip-remove"
+                      aria-label={`Remove ${text === "" ? `${label} ${index + 1}` : text}`}
+                      onClick={() => { onChange(items.filter((_, at) => at !== index)); }}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {itemFailures.map((text, index) =>
+              text === undefined ? null : <ErrorNote key={index}>{text}</ErrorNote>,
+            )}
+            {failure}
+          </div>
+        );
+      }
       return group(
         <>
           {items.map((item, index) => (

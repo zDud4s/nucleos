@@ -1906,7 +1906,7 @@ function EmailConfigDetail() {
           title: "Account",
           fields: ["host", "username", "mailbox", "sent_mailbox"],
           // The password is not part of the document: it is one more row of this card.
-          extra: own.map((secret) => <SecretControl key={secret.key} secret={secret} />),
+          extra: own.map((secret) => <SecretControl key={secret.key} secret={secret} compact />),
         },
         {
           title: "Behaviour",

@@ -45,16 +45,68 @@
 .set-row .ui-field .ui-field-helper { grid-column: 3; justify-self: end; }
 .set-row-switch > div { justify-content: space-between; }
 
+/* The cards as two stacks balanced by height: cards keep their own height and share the top edge.
+   One stack under two minimum widths (about 40rem). */
+.set-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+  gap: var(--space-4);
+  align-items: start;
+  min-width: 0;
+}
+.set-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/* A string array: the label with its Add on one line, the items as small wrapping inputs under it. */
+.set-array-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.set-array-label { font-size: var(--text-sm); color: var(--text); }
+.set-array-head > button { margin-left: auto; }
+.set-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.set-chip { display: inline-flex; align-items: center; gap: var(--space-1); min-width: 0; }
+.set-chip-input {
+  box-sizing: content-box;
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-sm);
+}
+.set-chip-remove {
+  padding: 0 var(--space-1);
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-md);
+  line-height: 1;
+  cursor: pointer;
+}
+.set-chip-remove:hover { color: var(--text); }
+.set-chip-remove:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
 /* The e-mail password sits in its card as one more row: the name and state left, the box and buttons right. */
 .set-rows .sy-secret {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   column-gap: var(--space-3);
   margin: 0;
   padding: 0;
   border-top: none;
 }
-.set-rows .sy-secret > .sy-secret-head { grid-column: 1; }
-.set-rows .sy-secret > .sy-setting-controls { grid-column: 2; margin-top: 0; justify-content: flex-end; }
-.set-rows .sy-secret > :not(.sy-secret-head):not(.sy-setting-controls) { grid-column: 1 / -1; }
+.set-rows .sy-secret > .sy-secret-head { grid-column: 1; flex-wrap: nowrap; }
+.set-rows .sy-secret .sy-secret-key { font-family: inherit; overflow-wrap: normal; white-space: nowrap; }
+.set-rows .sy-secret > .sy-setting-controls { grid-column: 2; margin-top: 0; justify-content: flex-end; flex-wrap: nowrap; gap: var(--space-2); }
+.set-rows .sy-secret .sy-secret-input { flex: 1 1 6rem; max-width: 13rem; }.set-rows .sy-secret > :not(.sy-secret-head):not(.sy-setting-controls) { grid-column: 1 / -1; }

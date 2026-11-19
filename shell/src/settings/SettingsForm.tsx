@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useContext, useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { ActionsSlot } from "../channels/ChannelDetail";
 import { DAEMON_NAME } from "../copy";
 import { ApiRefusal } from "../data/client";
 import {
@@ -172,6 +174,11 @@ export function SettingsForm({ scope, name, takesEffect, onDirty, hide, layout =
         hide={hide}
         layout={layout}
         groups={groups}
+        history={
+          <Button variant="ghost" aria-expanded={historyOpen} onClick={() => setHistoryOpen((open) => !open)}>
+            History
+          </Button>
+        }
         saving={write.isPending}
         busy={write.isPending || rollback.isPending || doc.isFetching}
         onEdit={() => setNotice(null)}
@@ -190,11 +197,6 @@ export function SettingsForm({ scope, name, takesEffect, onDirty, hide, layout =
           );
         }}
       />
-      <div className="sy-setting-controls">
-        <Button aria-expanded={historyOpen} onClick={() => setHistoryOpen((open) => !open)}>
-          History
-        </Button>
-      </div>
       {historyOpen && (
         <SettingHistory
           scope={scope}
@@ -226,6 +228,8 @@ interface EditorProps {
   hide?: readonly string[];
   layout: FieldLayout;
   groups?: readonly SettingsGroup[];
+  /** The History toggle, drawn among the form's buttons. */
+  history: ReactNode;
   saving: boolean;
   busy: boolean;
   onEdit: () => void;
@@ -242,6 +246,7 @@ function Editor({
   hide,
   layout,
   groups,
+  history,
   saving,
   busy,
   onEdit,
@@ -307,6 +312,32 @@ function Editor({
     }
   };
 
+  // Inside a `ChannelDetail` the buttons move up to its header; anywhere else they stay under the form.
+  const slot = useContext(ActionsSlot);
+  const controls = (
+    <div className="sy-setting-controls">
+      <Button disabled={!dirty || busy} onClick={save}>
+        {saving ? "Saving…" : "Save"}
+      </Button>
+      {dirty && !saving && (
+        <Button variant="ghost" onClick={revert}>
+          Revert
+        </Button>
+      )}
+      <Button variant="ghost" aria-pressed={mode === "raw"} onClick={toggleMode}>
+        {mode === "raw" ? "Form" : "Raw JSON"}
+      </Button>
+      {history}
+      {dirty && !saving && <span className="sy-meta">unsaved changes</span>}
+      {layout === "rows" && doc.schema.description !== undefined ? (
+        <Tip name="About this document" persist tip={doc.schema.description} />
+      ) : null}
+      <span className="sy-meta" role="status">
+        {noticeWords(notice, phrase)}
+      </span>
+    </div>
+  );
+
   return (
     <div className="flex flex-col gap-3" onKeyDown={onKeyDown}>
       {doc.schema.description !== undefined && layout !== "rows" && <p className="sy-note">{doc.schema.description}</p>}
@@ -353,26 +384,7 @@ function Editor({
         </p>
       )}
 
-      <div className="sy-setting-controls">
-        <Button disabled={!dirty || busy} onClick={save}>
-          {saving ? "Saving…" : "Save"}
-        </Button>
-        {dirty && !saving && (
-          <Button variant="ghost" onClick={revert}>
-            Revert
-          </Button>
-        )}
-        <Button variant="ghost" aria-pressed={mode === "raw"} onClick={toggleMode}>
-          {mode === "raw" ? "Form" : "Raw JSON"}
-        </Button>
-        {dirty && !saving && <span className="sy-meta">unsaved changes</span>}
-        {layout === "rows" && doc.schema.description !== undefined ? (
-          <Tip name="About this document" persist tip={doc.schema.description} />
-        ) : null}
-        <span className="sy-meta" role="status">
-          {noticeWords(notice, phrase)}
-        </span>
-      </div>
+      {slot !== null ? createPortal(controls, slot) : controls}
 
       {failure !== null && !onField && <ErrorNote>{failureWords(failure)}</ErrorNote>}
     </div>
