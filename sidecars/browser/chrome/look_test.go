@@ -91,6 +91,43 @@ func TestALookOfAPageWithNoRefsDrawsNothingAtAll(t *testing.T) {
 	}
 }
 
+// TestALargeViewportIsScaledDownToTheCeiling: a 2560x1440 viewport is captured with a clip scale
+// that brings the longer side to lookMaxSide, and a small one is captured without any clip.
+func TestALargeViewportIsScaledDownToTheCeiling(t *testing.T) {
+	if got := lookScale(640, 480); got != 1 {
+		t.Fatalf("a viewport under the ceiling was scaled: %v", got)
+	}
+	if got := lookScale(2560, 1440); got*2560 > lookMaxSide+0.001 || got >= 1 {
+		t.Fatalf("scale = %v, longer side would be %v", got, got*2560)
+	}
+
+	fake, driver := connected(t)
+	session := opened(t, driver)
+	fake.Handle("Page.getLayoutMetrics", func(cdptest.Call) (any, error) {
+		return map[string]any{"cssVisualViewport": map[string]any{
+			"pageX": 0, "pageY": 0, "clientWidth": 2560, "clientHeight": 1440,
+		}}, nil
+	})
+	fake.Handle("Page.captureScreenshot", func(cdptest.Call) (any, error) {
+		return map[string]any{"data": ""}, nil
+	})
+	if _, err := driver.Look(context.Background(), session.ID); err != nil {
+		t.Fatalf("look: %v", err)
+	}
+	for _, call := range fake.Calls() {
+		if call.Method != "Page.captureScreenshot" {
+			continue
+		}
+		p := string(call.Params)
+		if !strings.Contains(p, `"scale":0.5`) || !strings.Contains(p, `"jpeg"`) ||
+			!strings.Contains(p, `"captureBeyondViewport":false`) {
+			t.Fatalf("capture params = %s, want a 0.5 scale clip, jpeg, viewport only", p)
+		}
+		return
+	}
+	t.Fatal("no capture was made")
+}
+
 // erased says whether the removal script was run against anything.
 func erased(fake *cdptest.Browser) bool {
 	for _, call := range fake.Calls() {
