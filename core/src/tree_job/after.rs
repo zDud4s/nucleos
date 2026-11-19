@@ -8,9 +8,9 @@
 //! starts it. A predecessor that can never satisfy the wait (abandoned, unknown, finished without a
 //! landing) never starts the job and never cascades: the owner is asked once on the waiting root.
 
-use chrono::{SecondsFormat, Utc};
 use axum::Json;
 use axum::http::StatusCode;
+use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
 
 use super::decisions;
@@ -263,8 +263,15 @@ pub(super) async fn at_launch(
 /// Says in the feed that job `id` was stored waiting for `pred_id` (one line per transition).
 pub(super) async fn announce_waiting(state: &AppState, id: &str, pred_id: &str, reason: &str) {
     let line = format!("tree job {id} waits for tree {pred_id}: {reason}");
-    let _ = crate::feed::append(&state.pool, None, "work_tree_waiting_after", &line, None, None)
-        .await;
+    let _ = crate::feed::append(
+        &state.pool,
+        None,
+        "work_tree_waiting_after",
+        &line,
+        None,
+        None,
+    )
+    .await;
 }
 
 /// The `POST /trees` answer of a waiting job, `None` when the job does not wait.
