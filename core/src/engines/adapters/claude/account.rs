@@ -66,7 +66,7 @@ impl ProviderAdapter for ClaudeAdapter {
     /// A usage limit (5-hour/weekly, with its parsed reset) or a 429 (short mark) on the
     /// stream-json result; see [`super::classify_claude_stream`].
     fn classify_failure(&self, stdout: &str, _stderr: &str) -> Option<LimitHit> {
-        super::classify_claude_stream(stdout, chrono::Utc::now())
+        crate::accounts::adapters::classify_claude_stream(stdout, chrono::Utc::now())
     }
 }
 

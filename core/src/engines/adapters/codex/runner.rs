@@ -3,8 +3,18 @@
 //! `usage` here is the session's running total, good for costs and analytics but NOT for context
 //! occupancy; that comes from the rollout file (see `rollout`).
 
-use super::*;
-use std::path::Path;
+use crate::execution::runner::claude::{RunTokenFile, split_daemon_token};
+use crate::execution::runner::request::start_cli;
+use crate::execution::runner::stream::KEPT_ALIVE;
+use crate::execution::runner::*;
+use crate::process_tree::TreeKiller;
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
 
 mod mcp;
 mod rollout;
@@ -520,9 +530,9 @@ impl CommandRunner for CodexCliRunner {
         // Written before anything else is spawned or staged, so a failure to write is the `Err`
         // that means the CLI never ran; the file lives until this function returns, after the CLI
         // has been reaped.
-        let (child_env, daemon_token) = super::claude::split_daemon_token(&request.env);
+        let (child_env, daemon_token) = split_daemon_token(&request.env);
         let token_file = match daemon_token {
-            Some(token) => Some(super::claude::RunTokenFile::write(token)?),
+            Some(token) => Some(RunTokenFile::write(token)?),
             None => None,
         };
         let (mcp_overrides, mcp_env) = match &request.mcp_config {
@@ -612,14 +622,14 @@ impl CommandRunner for CodexCliRunner {
         // The ONLY `?` from here on, for the reason spelled out in `ClaudeCliRunner`: past the spawn
         // a failure becomes a failed `RunOutcome`, because an `Err` claims no work was done.
         // Through the sandbox door, which sets kill-on-drop and the own process group.
-        let crate::sandbox::Contained { killer, child } = super::request::start_cli(cmd, &request)?;
+        let crate::sandbox::Contained { killer, child } = start_cli(cmd, &request)?;
         let mut child = child;
 
         // Declared after the child so it drops FIRST, which is what keeps the pid it names ours —
         // see `TreeKiller`. `codex` supervises its own tools, so terminating just the parent orphans
         // a build still holding locks inside the worktree the run was supposed to release.
         let mut tree_killer: Option<TreeKiller> = killer;
-        let _cli_pid = super::cli_pids::register(&request.env, child.id());
+        let _cli_pid = crate::execution::runner::cli_pids::register(&request.env, child.id());
         // Held by the kernel so a hard-killed daemon takes the CLI's whole tree with it.
         if let Some(pid) = child.id() {
             KEPT_ALIVE.adopt(pid);
@@ -791,10 +801,10 @@ mod tests {
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let launches =
-            super::super::request::launches_with_missing_bin("NUCLEOS_CODEX_BIN", async {
+            crate::execution::runner::request::launches_with_missing_bin("NUCLEOS_CODEX_BIN", async {
                 let outcome = runner
                     .run_prompt(
-                        super::super::request::neutral_request("hello"),
+                        crate::execution::runner::request::neutral_request("hello"),
                         session_tx,
                         transcript,
                     )
@@ -814,9 +824,9 @@ mod tests {
             ),
             ("NUCLEOS_RUN_ID".to_string(), "42".to_string()),
         ];
-        let (child_env, token) = super::super::claude::split_daemon_token(&request_env);
+        let (child_env, token) = crate::execution::runner::claude::split_daemon_token(&request_env);
         assert_eq!(token, Some("7.request-secret"));
-        let file = super::super::claude::RunTokenFile::write(token.unwrap()).unwrap();
+        let file = crate::execution::runner::claude::RunTokenFile::write(token.unwrap()).unwrap();
         let path = file.path.clone();
 
         let mut cmd = Command::new("codex");

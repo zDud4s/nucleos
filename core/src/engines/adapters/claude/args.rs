@@ -1,6 +1,6 @@
 //! The Claude CLI's argument list: built-in tools, subagents, `cli_args` and the denied tools.
 
-use super::*;
+use crate::execution::runner::*;
 
 /// Built-in tool names denied under `ToolPolicy::McpOnly`.
 ///
@@ -320,7 +320,7 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
 /// there is nothing for a prompt injected into a mail body to talk the model into reaching for —
 /// and naming individual tools beside `*` would only add stderr lines about rules that match
 /// nothing on top of a denial that already covers them.
-pub(super) fn denied_tools(policy: &ToolPolicy, asked: &[String]) -> Vec<String> {
+pub(crate) fn denied_tools(policy: &ToolPolicy, asked: &[String]) -> Vec<String> {
     if *policy == ToolPolicy::None {
         return vec!["*".to_string()];
     }

@@ -13,26 +13,24 @@ use crate::process_tree::TreeKiller;
 
 mod agy;
 mod auth_watch;
-mod claude;
-mod claude_args;
+pub(crate) mod claude;
 pub mod cli_pids;
-mod codex;
 mod command;
 #[cfg(any(test, feature = "testkit"))]
 mod fake;
 mod live;
 mod local_triage;
 mod ollama;
-mod request;
-mod stream;
+pub(crate) mod request;
+pub(crate) mod stream;
 mod turns;
 mod wire;
 
 pub use self::agy::{AgyCliRunner, agy_program};
 pub use self::auth_watch::watch_claude_auth;
 pub use self::claude::*;
-pub use self::claude_args::*;
-pub use self::codex::*;
+pub use crate::engines::adapters::claude::args::*;
+pub use crate::engines::adapters::codex::runner::*;
 pub use self::command::*;
 #[cfg(any(test, feature = "testkit"))]
 pub use self::fake::*;

@@ -1,7 +1,7 @@
 //! The provider adapters, and the production registry that finds one by engine.
 
-pub mod claude;
-pub mod codex;
+pub use crate::engines::adapters::claude::account as claude;
+pub use crate::engines::adapters::codex::account as codex;
 #[cfg(any(test, feature = "testkit"))]
 pub mod fake;
 

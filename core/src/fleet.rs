@@ -3,7 +3,11 @@
 //! `<state_dir>/specs/2026-10-20-fleet-arvore-viva-design.md`.
 
 pub mod book;
+// The per-engine fleet adapters live beside their engine; `fleet` compiles in the app crate, so
+// they are included by path rather than through core's `engines::adapters` tree.
+#[path = "engines/adapters/claude/fleet/mod.rs"]
 pub mod claude_code;
+#[path = "engines/adapters/codex/fleet.rs"]
 pub mod codex_cli;
 pub mod daemon_runs;
 pub mod event;

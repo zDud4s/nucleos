@@ -15,6 +15,7 @@ use crate::config::{ModelsConfig, SeatKind};
 use crate::execution::runner::CommandRunner;
 use crate::models::model_catalog::Discovered;
 
+pub mod adapters;
 pub mod agy;
 mod agy_setting;
 // Sibling files of this one (not under `engines/`): the descriptor data and the per-unit config dir.

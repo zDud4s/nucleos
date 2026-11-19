@@ -398,7 +398,7 @@ pub fn compacted_from_line(line: &str, current: bool) -> bool {
 ///
 /// A `Litter` and not a `TreeKiller`: the two are the same primitive with opposite flags, and this
 /// is the one whose promise survives the daemon being killed rather than asked to stop.
-pub(super) static KEPT_ALIVE: std::sync::LazyLock<crate::process_tree::Litter> =
+pub(crate) static KEPT_ALIVE: std::sync::LazyLock<crate::process_tree::Litter> =
     std::sync::LazyLock::new(crate::process_tree::Litter::new);
 
 /// Where a pending tool call opens and closes in the stream: an assistant line's `tool_use` ids
