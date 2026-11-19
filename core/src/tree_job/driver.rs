@@ -215,6 +215,11 @@ async fn advance(state: &AppState, job_id: &str, gate: Option<GateFn>) {
     if let Err(error) = super::pending_start::retry_pending_starts(state, job_id).await {
         tracing::warn!(job = job_id, %error, "tree driver could not retry the pending starts");
     }
+    // A job waiting for another tree to land: released here once it has, asked about once if the
+    // wait can never end. Outside the lock: both routes take it.
+    if let Err(error) = super::after::release(state, job_id).await {
+        tracing::warn!(job = job_id, %error, "tree driver could not release the waiting job");
+    }
     // A root run the disk or git refused at launch: marked on the job, retried here every sweep.
     if let Err(error) = super::root_pending::retry(state, job_id).await {
         tracing::warn!(job = job_id, %error, "tree driver could not retry the root start");
@@ -232,6 +237,10 @@ async fn pass(
         return Ok(());
     };
     if job.state == JOB_TERMINAL_STATE {
+        return Ok(());
+    }
+    // A job waiting for another tree has no root, no branch and nothing to land yet.
+    if super::after::is_waiting(&job) {
         return Ok(());
     }
 

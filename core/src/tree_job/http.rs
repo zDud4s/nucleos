@@ -322,12 +322,17 @@ struct TreeBody {
     land: Option<String>,
     /// The Claude Code session that launched the tree (`work_nodes.launching_session_id` of the root).
     launching_session_id: Option<String>,
+    /// A tree that must land before this one starts (blank counts as absent).
+    after: Option<String>,
 }
 
 /// The values of `land`, the first one being the default (no tree moves master unless asked).
 const LAND_MODES: [&str; 2] = ["hold", "integration"];
 
 fn summary(job: &TreeJob, replayed: bool) -> Value {
+    if let Some(waiting) = crate::tree_job::after::summary(job, replayed) {
+        return waiting;
+    }
     if let Some(reason) = crate::tree_job::root_pending::reason_of(job) {
         return json!({
             "id": job.id,
@@ -409,6 +414,14 @@ async fn post_tree(
     if let Some(job) = store::load(&state.pool, &id).await.map_err(store_refusal)? {
         return Ok(Json(summary(&job, true)));
     }
+    let waiting_reason = crate::tree_job::after::at_launch(
+        &state,
+        &id,
+        body.after.as_deref(),
+        &project_id,
+        &feature_branch,
+    )
+    .await?;
 
     let opened = work_nodes::open(
         &state.pool,
@@ -427,6 +440,12 @@ async fn post_tree(
     let created = now();
     let mut manifest = Manifest::new(&id, &feature_branch, &goal, &project_root, &dirty);
     manifest.extra.insert("landing".to_owned(), json!(land));
+    if let Some((pred_id, reason)) = &waiting_reason {
+        manifest.extra.insert(
+            crate::tree_job::after::MARKER.to_owned(),
+            crate::tree_job::after::mark_value(pred_id, &now(), reason),
+        );
+    }
     let job = TreeJob {
         id: id.clone(),
         root_node_id: opened.id.clone(),
@@ -455,6 +474,11 @@ async fn post_tree(
         .map_err(db_refusal)?;
     // `start` takes the job lock in `open_branch` and `bind_branch`, and the mutex is not reentrant.
     drop(guard);
+    // A job that waits for another tree starts no root: the driver releases it once that tree lands.
+    if let Some((pred_id, reason)) = &waiting_reason {
+        crate::tree_job::after::announce_waiting(&state, &id, pred_id, reason).await;
+        return Ok(Json(summary(&job, false)));
+    }
     // A root that cannot start never fails the request: the job exists and stays open, the answer
     // is `root_pending` with the reason, the feed says why, and the driver retries each sweep.
     if let Err(reason) = crate::tree_job::root_pending::start(&state, &job).await {
@@ -623,6 +647,7 @@ async fn get_tree(
         "goal": job.goal,
         "state": job.state,
         "root_start_failure": crate::tree_job::root_pending::reason_of(&job),
+        "waiting_after": crate::tree_job::after::view(&job),
         "contract": job.contract,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
@@ -720,6 +745,8 @@ async fn post_abandon(
     job.manifest
         .extra
         .insert("finish".to_owned(), finish.clone());
+    // A waiting job that is abandoned is no longer waiting for anything.
+    job.manifest.extra.remove(super::after::MARKER);
     job.manifest.state = JOB_TERMINAL_STATE.to_owned();
     job.state = JOB_TERMINAL_STATE.to_owned();
     job.updated_at = at;
@@ -2386,6 +2413,472 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    // ----- `after`: a tree that waits for another to land -----
+
+    fn after_body(id: &str, pred: &str) -> Value {
+        let mut body = tree_body(id);
+        body["after"] = json!(pred);
+        body
+    }
+
+    fn landed_extra() -> Vec<(&'static str, Value)> {
+        vec![
+            ("landing", json!("integration")),
+            ("land_sha", json!("abc123")),
+        ]
+    }
+
+    /// An open job of `project-0` on `branch`, the predecessor a test waits for.
+    async fn seed_predecessor(pool: &SqlitePool, id: &str, branch: &str) {
+        seed_job(pool, id, "open", vec![], &[]).await;
+        let mut job = loaded(pool, id).await;
+        job.project_id = Some("project-0".to_owned());
+        job.feature_branch = Some(branch.to_owned());
+        // `store::update` writes only state and manifest, so the two columns go in directly.
+        sqlx::query("UPDATE tree_jobs SET project_id = ?, feature_branch = ? WHERE id = ?")
+            .bind(&job.project_id)
+            .bind(&job.feature_branch)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Ends a stored job the way the driver or `abandon` would, with `extra` on its manifest.
+    async fn end_job(pool: &SqlitePool, id: &str, extra: &[(&str, Value)]) {
+        let mut job = loaded(pool, id).await;
+        job.state = "finished".to_owned();
+        job.manifest.state = "finished".to_owned();
+        for (key, value) in extra {
+            job.manifest.extra.insert((*key).to_owned(), value.clone());
+        }
+        store::update(pool, &job).await.unwrap();
+    }
+
+    async fn decisions_on(pool: &SqlitePool, node: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE node_id = ?")
+            .bind(node)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn is_waiting_after(pool: &SqlitePool, id: &str) -> bool {
+        crate::tree_job::after::is_waiting(&loaded(pool, id).await)
+    }
+
+    #[tokio::test]
+    async fn post_tree_with_after_unmet_stores_the_job_and_starts_no_root() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+
+        let response = post(&app, "/trees", after_body(JOB, "pred")).await;
+
+        assert_first_call(&response);
+        assert_eq!(
+            response.1["state"],
+            json!("waiting_after"),
+            "{:?}",
+            response.1
+        );
+        assert_eq!(response.1["after"], json!("pred"));
+        assert!(response.1["reason"].is_string(), "{:?}", response.1);
+        assert_eq!(run_rows(&state.pool).await, 0);
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.state, "open");
+        assert!(
+            job.manifest.branches.is_empty(),
+            "a waiting job holds no branch"
+        );
+        assert!(is_waiting_after(&state.pool, JOB).await);
+        let lines = feed_lines_naming(&state.pool, "waits for tree").await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let (_, shown) = get(&app, &format!("/trees/{JOB}")).await;
+        assert_eq!(shown["waiting_after"]["tree"], json!("pred"), "{shown:?}");
+        assert!(shown["waiting_after"]["since"].is_string(), "{shown:?}");
+        assert!(shown["waiting_after"]["reason"].is_string(), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn post_tree_with_after_already_landed_starts_at_once() {
+        let state = test_state().await;
+        let app = app(&state);
+        let repo = Repo::new();
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        end_job(&state.pool, "pred", &landed_extra()).await;
+        let mut body = repo_tree_body(JOB, &repo);
+        body["after"] = json!("pred");
+
+        let response = post(&app, "/trees", body).await;
+
+        assert_first_call(&response);
+        assert_eq!(response.1["state"], json!("open"), "{:?}", response.1);
+        assert_eq!(run_rows(&state.pool).await, 1);
+        assert!(!is_waiting_after(&state.pool, JOB).await);
+        let (_, shown) = get(&app, &format!("/trees/{JOB}")).await;
+        assert!(shown["waiting_after"].is_null(), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn post_tree_with_a_blank_after_is_a_plain_launch() {
+        let state = test_state().await;
+        let response = post(&app(&state), "/trees", after_body(JOB, "   ")).await;
+
+        assert_first_call(&response);
+        assert_ne!(
+            response.1["state"],
+            json!("waiting_after"),
+            "{:?}",
+            response.1
+        );
+        assert!(!is_waiting_after(&state.pool, JOB).await);
+    }
+
+    #[tokio::test]
+    async fn post_tree_after_unknown_is_404() {
+        let state = test_state().await;
+        let response = post(&app(&state), "/trees", after_body(JOB, "nobody")).await;
+
+        assert_error_naming(&response, StatusCode::NOT_FOUND, "nobody");
+        assert_eq!(job_rows(&state.pool).await, 0);
+        assert_eq!(node_rows(&state.pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn post_tree_after_self_is_400() {
+        let state = test_state().await;
+        let response = post(&app(&state), "/trees", after_body(JOB, JOB)).await;
+
+        assert_error(&response, StatusCode::BAD_REQUEST);
+        assert_eq!(job_rows(&state.pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn post_tree_after_other_project_is_400() {
+        let state = test_state().await;
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        let mut pred = loaded(&state.pool, "pred").await;
+        pred.project_id = Some("project-9".to_owned());
+        store::update(&state.pool, &pred).await.unwrap();
+
+        let response = post(&app(&state), "/trees", after_body(JOB, "pred")).await;
+
+        assert_error_naming(&response, StatusCode::BAD_REQUEST, "project");
+        assert_eq!(job_rows(&state.pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn post_tree_after_a_held_tree_with_work_and_another_feature_branch_is_409() {
+        let state = test_state().await;
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        end_job(&state.pool, "pred", &[("landing", json!("held"))]).await;
+
+        let response = post(&app(&state), "/trees", after_body(JOB, "pred")).await;
+
+        assert_error_naming(&response, StatusCode::CONFLICT, "pred");
+        assert_eq!(job_rows(&state.pool).await, 1);
+        assert_eq!(node_rows(&state.pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn post_tree_after_a_held_tree_on_the_same_feature_branch_is_accepted() {
+        let state = test_state().await;
+        seed_predecessor(&state.pool, "pred", "feat/tree").await;
+        end_job(&state.pool, "pred", &[("landing", json!("held"))]).await;
+
+        let response = post(&app(&state), "/trees", after_body(JOB, "pred")).await;
+
+        assert_first_call(&response);
+        assert_ne!(
+            response.1["state"],
+            json!("waiting_after"),
+            "{:?}",
+            response.1
+        );
+        assert!(!is_waiting_after(&state.pool, JOB).await);
+    }
+
+    #[tokio::test]
+    async fn post_tree_after_an_abandoned_tree_is_409() {
+        let state = test_state().await;
+        seed_predecessor(&state.pool, "pred", "feat/tree").await;
+        end_job(
+            &state.pool,
+            "pred",
+            &[("finish", json!({"status": "abandoned", "reason": "x"}))],
+        )
+        .await;
+
+        let response = post(&app(&state), "/trees", after_body(JOB, "pred")).await;
+
+        assert_error_naming(&response, StatusCode::CONFLICT, "abandoned");
+    }
+
+    #[tokio::test]
+    async fn release_starts_the_root_once_the_predecessor_lands() {
+        let state = test_state().await;
+        let app = app(&state);
+        let repo = Repo::new();
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        let mut body = repo_tree_body(JOB, &repo);
+        body["after"] = json!("pred");
+        assert_first_call(&post(&app, "/trees", body).await);
+
+        // The predecessor is still open: the sweeps start nothing and say nothing.
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+        assert_eq!(run_rows(&state.pool).await, 0);
+        assert!(is_waiting_after(&state.pool, JOB).await);
+        assert!(feed_lines_naming(&state.pool, "released").await.is_empty());
+
+        end_job(&state.pool, "pred", &landed_extra()).await;
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+
+        assert_eq!(run_rows(&state.pool).await, 1);
+        assert!(!is_waiting_after(&state.pool, JOB).await);
+        let job = loaded(&state.pool, JOB).await;
+        assert!(job.manifest.branches.contains_key("root"));
+        let released = feed_lines_naming(&state.pool, "released").await;
+        assert_eq!(released.len(), 1, "one line per transition: {released:?}");
+        let (_, shown) = get(&app, &format!("/trees/{JOB}")).await;
+        assert!(shown["waiting_after"].is_null(), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn the_feature_branch_is_cut_after_the_landing() {
+        let state = test_state().await;
+        let app = app(&state);
+        let repo = Repo::new();
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        let mut body = repo_tree_body(JOB, &repo);
+        body["after"] = json!("pred");
+        assert_first_call(&post(&app, "/trees", body).await);
+        assert!(
+            repo.git(&["branch", "--list", "feat/tree"])
+                .trim()
+                .is_empty(),
+            "the feature branch was cut while the job waits"
+        );
+
+        end_job(&state.pool, "pred", &landed_extra()).await;
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+
+        assert!(
+            repo.git(&["branch", "--list", "feat/tree"])
+                .contains("feat/tree"),
+            "the feature branch was not cut at the release"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_waits_while_the_predecessor_land_is_refused_and_keeps_the_reason() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        assert_first_call(&post(&app, "/trees", after_body(JOB, "pred")).await);
+        let mut pred = loaded(&state.pool, "pred").await;
+        pred.manifest
+            .extra
+            .insert("land_refusal".to_owned(), json!("the gate is red"));
+        store::update(&state.pool, &pred).await.unwrap();
+
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+
+        assert!(is_waiting_after(&state.pool, JOB).await);
+        assert_eq!(run_rows(&state.pool).await, 0);
+        let root = loaded(&state.pool, JOB).await.root_node_id;
+        assert_eq!(decisions_on(&state.pool, &root).await, 0);
+        let (_, shown) = get(&app, &format!("/trees/{JOB}")).await;
+        let reason = shown["waiting_after"]["reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(reason.contains("the gate is red"), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_predecessor_asks_the_owner_once_and_the_job_does_not_start() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        assert_first_call(&post(&app, "/trees", after_body(JOB, "pred")).await);
+        end_job(
+            &state.pool,
+            "pred",
+            &[("finish", json!({"status": "abandoned", "reason": "x"}))],
+        )
+        .await;
+        let root = loaded(&state.pool, JOB).await.root_node_id;
+
+        for _ in 0..3 {
+            crate::tree_job::driver::advance_job(&state, JOB).await;
+        }
+
+        assert_eq!(decisions_on(&state.pool, &root).await, 1);
+        assert_eq!(run_rows(&state.pool).await, 0);
+        assert!(is_waiting_after(&state.pool, JOB).await);
+        assert_eq!(loaded(&state.pool, JOB).await.state, "open");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_predecessor_asks_the_owner_once() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        assert_first_call(&post(&app, "/trees", after_body(JOB, "pred")).await);
+        sqlx::query("DELETE FROM tree_jobs WHERE id = 'pred'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let root = loaded(&state.pool, JOB).await.root_node_id;
+
+        for _ in 0..2 {
+            crate::tree_job::driver::advance_job(&state, JOB).await;
+        }
+
+        assert_eq!(decisions_on(&state.pool, &root).await, 1);
+        assert_eq!(run_rows(&state.pool).await, 0);
+        assert!(is_waiting_after(&state.pool, JOB).await);
+    }
+
+    #[tokio::test]
+    async fn chain_a_b_c_releases_in_order() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "tree-a", "feat/a").await;
+        assert_first_call(&post(&app, "/trees", after_body("tree-b", "tree-a")).await);
+        assert_first_call(&post(&app, "/trees", after_body("tree-c", "tree-b")).await);
+
+        // Nothing has landed: neither waits less.
+        for id in ["tree-b", "tree-c"] {
+            crate::tree_job::driver::advance_job(&state, id).await;
+            assert!(is_waiting_after(&state.pool, id).await, "{id} left early");
+        }
+
+        // A lands: B is released, C still waits for B.
+        end_job(&state.pool, "tree-a", &landed_extra()).await;
+        for id in ["tree-c", "tree-b"] {
+            crate::tree_job::driver::advance_job(&state, id).await;
+        }
+        assert!(!is_waiting_after(&state.pool, "tree-b").await);
+        assert!(is_waiting_after(&state.pool, "tree-c").await);
+
+        // B lands: C is released.
+        end_job(&state.pool, "tree-b", &landed_extra()).await;
+        crate::tree_job::driver::advance_job(&state, "tree-c").await;
+        assert!(!is_waiting_after(&state.pool, "tree-c").await);
+        assert_eq!(feed_lines_naming(&state.pool, "released").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replay_of_a_waiting_job_keeps_the_mark_and_opens_no_second_root() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        let first = post(&app, "/trees", after_body(JOB, "pred")).await;
+        assert_first_call(&first);
+        let nodes = node_rows(&state.pool).await;
+
+        let replay = post(&app, "/trees", after_body(JOB, "pred")).await;
+
+        assert_replayed(&replay);
+        assert_eq!(replay.1["state"], json!("waiting_after"), "{:?}", replay.1);
+        assert_eq!(replay.1["after"], json!("pred"));
+        assert_eq!(node_rows(&state.pool).await, nodes);
+        assert_eq!(run_rows(&state.pool).await, 0);
+        assert_eq!(job_rows(&state.pool).await, 2);
+        assert!(is_waiting_after(&state.pool, JOB).await);
+    }
+
+    #[tokio::test]
+    async fn replay_after_the_predecessor_landed_is_not_409() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        assert_first_call(&post(&app, "/trees", after_body(JOB, "pred")).await);
+        // The predecessor ends held with work on another branch: a fresh launch would be a 409.
+        end_job(&state.pool, "pred", &[("landing", json!("held"))]).await;
+
+        let replay = post(&app, "/trees", after_body(JOB, "pred")).await;
+
+        assert_replayed(&replay);
+    }
+
+    #[tokio::test]
+    async fn abandon_of_a_waiting_job_finishes_it_and_asks_about_its_successor() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "tree-a", "feat/a").await;
+        assert_first_call(&post(&app, "/trees", after_body("tree-b", "tree-a")).await);
+        assert_first_call(&post(&app, "/trees", after_body("tree-c", "tree-b")).await);
+
+        let abandoned = post(
+            &app,
+            "/trees/tree-b/abandon",
+            json!({ "reason": "not needed" }),
+        )
+        .await;
+
+        assert_eq!(abandoned.0, StatusCode::OK, "{:?}", abandoned.1);
+        let b = loaded(&state.pool, "tree-b").await;
+        assert_eq!(b.state, "finished");
+        assert!(!crate::tree_job::after::is_waiting(&b));
+        let c_root = loaded(&state.pool, "tree-c").await.root_node_id;
+        for _ in 0..2 {
+            crate::tree_job::driver::advance_job(&state, "tree-c").await;
+        }
+        assert_eq!(decisions_on(&state.pool, &c_root).await, 1);
+        assert!(is_waiting_after(&state.pool, "tree-c").await);
+        assert_eq!(run_rows(&state.pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_job_is_not_reported_as_stalled() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        assert_first_call(&post(&app, "/trees", after_body(JOB, "pred")).await);
+        let later = chrono::Utc::now() + chrono::Duration::days(2);
+
+        crate::tree_job::stalled::check(&state, JOB, later)
+            .await
+            .unwrap();
+
+        assert!(
+            feed_lines_naming(&state.pool, "has not moved")
+                .await
+                .is_empty(),
+            "a waiting job was reported as stalled"
+        );
+        assert_eq!(
+            decisions_on(&state.pool, &loaded(&state.pool, JOB).await.root_node_id).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mark_survives_a_restart() {
+        let state = test_state().await;
+        seed_predecessor(&state.pool, "pred", "feat/pred").await;
+        assert_first_call(&post(&app(&state), "/trees", after_body(JOB, "pred")).await);
+        let before = loaded(&state.pool, JOB).await.manifest.extra["after"].clone();
+
+        // A restart keeps the database and nothing else: a new router, a new read of the job.
+        let restarted = app(&state);
+        let (_, shown) = get(&restarted, &format!("/trees/{JOB}")).await;
+
+        assert_eq!(shown["waiting_after"]["tree"], json!("pred"), "{shown:?}");
+        assert_eq!(
+            loaded(&state.pool, JOB).await.manifest.extra["after"],
+            before
+        );
+        end_job(&state.pool, "pred", &landed_extra()).await;
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+        assert!(!is_waiting_after(&state.pool, JOB).await);
     }
 
     #[tokio::test]

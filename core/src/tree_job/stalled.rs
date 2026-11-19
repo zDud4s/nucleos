@@ -186,6 +186,7 @@ pub(super) async fn check(
             return Ok(());
         };
         if job.state == JOB_TERMINAL_STATE
+            || super::after::is_waiting(&job)
             || !quiet(&job, now)
             || has_live_run(state, &job).await?
             || has_open_decision(state, &job).await?

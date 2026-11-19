@@ -231,6 +231,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     work_tree_corrupt: { tone: "danger", label: "node tree unreadable" },
     work_tree_root_start_failed: { tone: "danger", label: "node tree root did not start" },
     work_tree_root_started: { tone: "info", label: "node tree root started" },
+    work_tree_waiting_after: { tone: "info", label: "tree waiting" },
+    work_tree_after_released: { tone: "info", label: "tree released" },
     work_tree_relaunch_skipped: { tone: "info", label: "node relaunch skipped" },
     // A branch started as a new orchestrator, or was degraded to a leaf (`tree_job/start_log.rs`): a fact, said once.
     work_tree_descent: { tone: "info", label: "node tree descended" },

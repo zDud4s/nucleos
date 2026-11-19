@@ -729,11 +729,14 @@ impl NucleosTools {
                        project registered with `project_root`. `land` is `integration` (default: \
                        the finished tree lands its work into the project's integration branch) \
                        or `hold` (the work stays on `feature_branch` for the owner to land). \
-                       `contract` and `dirty_owner_files` are optional. Returns {id, \
+                       `contract` and `dirty_owner_files` are optional. `after` is optional: \
+                       the id of a tree that must land before this one starts; until then the \
+                       job waits in state `waiting_after` and no root run opens. Returns {id, \
                        root_node_id, state, replayed} plus `reason` when `state` is \
                        \"root_pending\": the root run did NOT start (the reason says why, e.g. \
                        the disk floor) and the daemon retries it on its own each sweep; \
-                       `tree_status` shows it as `root_start_failure`."
+                       `tree_status` shows it as `root_start_failure`. State \
+                       \"waiting_after\" means the tree named in `after` has not landed yet."
     )]
     pub(super) async fn tree_launch(
         &self,
