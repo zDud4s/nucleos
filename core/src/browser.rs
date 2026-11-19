@@ -2910,7 +2910,7 @@ mod tests {
         runtime
             .embedded
             .register(embedded_key(NO_PROJECT), "http://127.0.0.1:9333");
-        let none = Placement::ephemeral("embedded-none");
+        let none = no_project_placement();
         runtime
             .client
             .embedded_prepare(embedded_key(NO_PROJECT), &none)
