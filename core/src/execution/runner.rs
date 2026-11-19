@@ -29,8 +29,6 @@ mod wire;
 pub use self::agy::{AgyCliRunner, agy_program};
 pub use self::auth_watch::watch_claude_auth;
 pub use self::claude::*;
-pub use crate::engines::adapters::claude::args::*;
-pub use crate::engines::adapters::codex::runner::*;
 pub use self::command::*;
 #[cfg(any(test, feature = "testkit"))]
 pub use self::fake::*;
@@ -41,6 +39,8 @@ pub use self::request::*;
 pub use self::stream::*;
 pub use self::turns::*;
 pub use self::wire::*;
+pub use crate::engines::adapters::claude::args::*;
+pub use crate::engines::adapters::codex::runner::*;
 
 #[cfg(test)]
 mod tests {

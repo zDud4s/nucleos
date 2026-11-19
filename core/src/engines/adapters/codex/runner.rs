@@ -800,8 +800,9 @@ mod tests {
         };
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let launches =
-            crate::execution::runner::request::launches_with_missing_bin("NUCLEOS_CODEX_BIN", async {
+        let launches = crate::execution::runner::request::launches_with_missing_bin(
+            "NUCLEOS_CODEX_BIN",
+            async {
                 let outcome = runner
                     .run_prompt(
                         crate::execution::runner::request::neutral_request("hello"),
@@ -810,7 +811,8 @@ mod tests {
                     )
                     .await;
                 assert!(outcome.is_err(), "the missing binary fails the spawn");
-            });
+            },
+        );
         assert_eq!(launches, 1);
     }
 
