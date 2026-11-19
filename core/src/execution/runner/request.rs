@@ -407,6 +407,15 @@ pub struct RunRequest {
     /// variadic, so a second occurrence REPLACES the first: two flags would be a per-run preference
     /// silently undoing a safety property.
     pub denied_tools: Vec<String>,
+    /// Built-in tool schemas the daemon would like this run's CLI to start without, to save the
+    /// first request's tokens. A HINT, not a permission: unlike `denied_tools` it takes nothing
+    /// from what the run may do, only from what it is shown.
+    ///
+    /// A runner that can drop schemas applies it (Claude folds it into the same
+    /// `--disallowedTools` flag as `denied_tools`). A runner that cannot skips it and records on
+    /// the run that the hint was not applied — it never refuses the run over it, so a hint cannot
+    /// keep an engine from starting. Set by tree leaves only.
+    pub schema_diet: Vec<String>,
     /// What to call this run's session where the CLI shows sessions, or `None` for nameless.
     ///
     /// Cosmetic and nothing else: it reaches the `--resume` picker and the terminal title, and no
@@ -531,6 +540,7 @@ pub(super) fn neutral_request(prompt: &str) -> RunRequest {
         agents: Vec::new(),
         append_system_prompt: None,
         denied_tools: Vec::new(),
+        schema_diet: Vec::new(),
         session_name: None,
         context_window: None,
         messages: None,

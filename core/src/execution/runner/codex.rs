@@ -378,6 +378,19 @@ pub struct CodexCliRunner {
     pub web_search: Option<&'static str>,
 }
 
+/// The line recorded on a run whose `schema_diet` this runner skipped, or `None` when it carried
+/// none. `codex exec` cannot start without a tool's schema, and the hint is only an economy, so the
+/// run goes ahead; what must not happen is the hint vanishing unnoticed.
+fn schema_diet_note(request: &RunRequest) -> Option<String> {
+    if request.schema_diet.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[nucleos] schema_diet not applied by codex exec: {}",
+        request.schema_diet.join(",")
+    ))
+}
+
 impl CodexCliRunner {
     /// Builds the runner used for a chat turn answered by Codex (`Assistants::cli_runner`).
     /// The owner's 2026-09-14 decision pins chat turns read-only; an `McpOnly` turn is pinned
@@ -636,6 +649,16 @@ impl CommandRunner for CodexCliRunner {
 
         let stdout = child.stdout.take().expect("stdout piped above");
         let stderr = child.stderr.take().expect("stderr piped above");
+
+        // A schema diet is a hint this runner cannot apply: say so on the run instead of refusing
+        // it (the way `denied_tools` is) or dropping it without a word.
+        if let Some(note) = schema_diet_note(&request) {
+            tracing::warn!("{note}");
+            if let Ok(mut shared) = transcript.lock() {
+                shared.push_str(&note);
+                shared.push('\n');
+            }
+        }
 
         // Concurrent, because reading only stdout while the child writes stderr deadlocks the moment
         // the OS stderr pipe buffer fills.
@@ -937,6 +960,7 @@ mod tests {
             agents: Vec::new(),
             append_system_prompt: None,
             denied_tools: Vec::new(),
+            schema_diet: Vec::new(),
             session_name: None,
             context_window: None,
             messages: None,
@@ -944,6 +968,33 @@ mod tests {
             allowed_mcp_tools: None,
             background_tasks: false,
         }
+    }
+
+    #[test]
+    fn a_codex_request_with_a_schema_diet_builds_args_and_records_the_skipped_hint() {
+        let mut request = request_with(ToolPolicy::Unrestricted, Vec::new());
+        assert_eq!(schema_diet_note(&request), None);
+        request.schema_diet = vec!["PowerShell".to_string(), "Agent".to_string()];
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert!(
+            !args.iter().any(|a| a.contains("PowerShell")),
+            "the hint is skipped, not passed on: {args:?}"
+        );
+        let note = schema_diet_note(&request).expect("a skipped hint leaves a note");
+        assert!(note.contains("schema_diet not applied"), "{note}");
+        assert!(note.contains("PowerShell,Agent"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_codex_request_with_denied_tools_is_still_refused() {
+        let mut request = request_with(ToolPolicy::Unrestricted, Vec::new());
+        request.denied_tools = vec!["Bash".to_string()];
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
+        let error = CodexCliRunner::for_chat("gpt-5.6-terra".to_string())
+            .run_prompt(request, session_tx, Default::default())
+            .await
+            .expect_err("denied_tools has no counterpart on codex exec");
+        assert!(error.to_string().contains("denied_tools"), "{error}");
     }
 
     #[test]

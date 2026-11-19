@@ -55,13 +55,14 @@ pub(super) const FORMAT_RULES: &str = "A leaf runs only `cargo fmt -p <crate>` a
 /// first request). Its prompt and `wf-leaf` allow only Bash, Read, Edit, Write, Glob, Grep and the
 /// node tools: shell work goes through Bash (`python scripts/heavy.py`), a leaf opens no branch
 /// (no `Agent`), and nobody wakes a headless run (no `ScheduleWakeup`, no `Workflow`).
-const LEAF_DENIED_TOOLS: [&str; 4] = ["PowerShell", "Workflow", "ScheduleWakeup", "Agent"];
+const LEAF_SCHEMA_DIET: [&str; 4] = ["PowerShell", "Workflow", "ScheduleWakeup", "Agent"];
 
-/// What this node's CLI is denied on top of its policy: the leaf list for a leaf, nothing for an
+/// The schema diet of this node's run (`RunRequest::schema_diet`, a hint and not a denial, so an
+/// engine that cannot apply it still starts): the leaf list for a leaf, nothing for an
 /// orchestrator or a root (which dispatch subagents and keep every schema).
-pub(super) fn node_denied_tools(kind: &str) -> Vec<String> {
+pub(super) fn node_schema_diet(kind: &str) -> Vec<String> {
     if kind == crate::work_nodes::KIND_LEAF {
-        LEAF_DENIED_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+        LEAF_SCHEMA_DIET.iter().map(|t| (*t).to_owned()).collect()
     } else {
         Vec::new()
     }
@@ -526,7 +527,7 @@ pub async fn launch_resuming(
                 project_root,
                 tree,
                 session,
-                node_denied_tools(&node_kind),
+                node_schema_diet(&node_kind),
             )
             .await?
         }
@@ -1374,13 +1375,13 @@ mod tests {
     }
 
     #[test]
-    fn a_leaf_is_denied_the_unused_tool_schemas_but_an_orchestrator_is_not() {
-        let leaf = node_denied_tools(crate::work_nodes::KIND_LEAF);
+    fn a_leaf_is_put_on_a_schema_diet_but_an_orchestrator_is_not() {
+        let leaf = node_schema_diet(crate::work_nodes::KIND_LEAF);
         for tool in ["PowerShell", "Workflow", "ScheduleWakeup", "Agent"] {
-            assert!(leaf.iter().any(|t| t == tool), "leaf must deny {tool}");
+            assert!(leaf.iter().any(|t| t == tool), "leaf diet must drop {tool}");
         }
-        assert!(node_denied_tools(crate::work_nodes::KIND_ORCHESTRATOR).is_empty());
-        assert!(node_denied_tools(crate::work_nodes::KIND_ROOT).is_empty());
+        assert!(node_schema_diet(crate::work_nodes::KIND_ORCHESTRATOR).is_empty());
+        assert!(node_schema_diet(crate::work_nodes::KIND_ROOT).is_empty());
     }
 
     #[test]
@@ -1542,6 +1543,20 @@ mod tests {
             assert!(prompt.contains("wait_advice"), "{kind}");
             assert_eq!(prompt.matches(HEADLESS_PREAMBLE).count(), 1, "{kind}");
         }
+    }
+
+    #[test]
+    fn agents_block_quotes_the_real_headless_preamble_opening() {
+        let block = include_str!("../../assets/nucleos-dev/agents-block.md");
+        let opening = HEADLESS_PREAMBLE
+            .split(':')
+            .next()
+            .expect("preamble has an opening");
+        assert!(opening.starts_with("You are a headless node of a tree"));
+        assert!(
+            block.contains(opening),
+            "agents-block.md must quote {opening:?}"
+        );
     }
 
     #[test]
