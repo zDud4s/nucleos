@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use base64::Engine;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
