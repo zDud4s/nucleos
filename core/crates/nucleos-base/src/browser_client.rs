@@ -73,7 +73,7 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// The same placement, carrying the project's allowed loopback origins.
+    /// The same placement, carrying the project's allowed loopback origins (set by the núcleo).
     pub fn with_local_origins(mut self, local_origins: Vec<String>) -> Self {
         self.local_origins = local_origins;
         self
