@@ -9,6 +9,7 @@ use crate::execution::runner::stream::KEPT_ALIVE;
 use crate::execution::runner::*;
 use crate::process_tree::TreeKiller;
 use async_trait::async_trait;
+use base64::Engine as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
