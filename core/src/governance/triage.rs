@@ -28,19 +28,15 @@ pub const BATCH_MAX: usize = 20;
 /// cost-amortisation batch accepts for no improvement in verdict quality (decision #5).
 pub const LOCAL_BATCH_MAX: usize = 5;
 
-/// 8,192 tokens hold the pessimistic five-message prompt with margin. Local inference has no fixed
-/// paid prompt cost to amortise, so reserving a larger context would only hide accidental prompt
-/// growth until Ollama truncates mail that the verdict is supposed to cover.
-pub const LOCAL_NUM_CTX: usize = 8192;
-
 /// What local triage requires from a model, read by `capabilities::missing_capabilities` instead of
-/// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window: local
-/// triage checks nothing else today, and `capabilities`' own guard test
+/// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window, and only
+/// the floor: the shared `local_ctx::local_num_ctx()` is clamped to the probed window at startup.
+/// `capabilities`' own guard test
 /// (`none_of_the_three_roles_requires_more_than_the_window_today`) fails if this ever claims more without
 /// that being a deliberate change.
 pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
     crate::capabilities::Requirement {
-        context_tokens: LOCAL_NUM_CTX,
+        context_tokens: crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
         tools: false,
         vision: false,
         structured_output: false,
@@ -2674,8 +2670,9 @@ mod tests {
         let pessimistic_tokens = build_prompt(&messages).len().div_ceil(3);
 
         assert!(
-            pessimistic_tokens <= LOCAL_NUM_CTX,
-            "worst-case prompt needs {pessimistic_tokens} tokens, local context has {LOCAL_NUM_CTX}"
+            pessimistic_tokens <= crate::models::local_ctx::local_num_ctx(),
+            "worst-case prompt needs {pessimistic_tokens} tokens, local context has {}",
+            crate::models::local_ctx::local_num_ctx()
         );
     }
 

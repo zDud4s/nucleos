@@ -571,6 +571,8 @@ async fn summarise(web: &WebRuntime, title: &str, markdown: &str) -> Result<Stri
         );
     };
 
+    // Cut an over-long page to the shared window, leaving room for instructions, answer and grammar.
+    let markdown = crate::models::local_ctx::fit_text(markdown, 2048);
     let prompt = format!(
         "You are summarising a web page for someone who will NOT read the page itself.\n\n\
          Two rules, and they matter more than completeness:\n\
@@ -613,7 +615,7 @@ async fn summarise(web: &WebRuntime, title: &str, markdown: &str) -> Result<Stri
         &web.ollama_base_url,
         model,
         &prompt,
-        serde_json::json!({"num_ctx": 16384, "temperature": 0}),
+        serde_json::json!({"num_ctx": crate::models::local_ctx::local_num_ctx(), "temperature": 0}),
         Some(format),
         false,
     )
@@ -801,6 +803,74 @@ mod tests {
 
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    /// Runs `summarise` against a fake Ollama and returns the one chat body it posted.
+    async fn summarise_capturing(markdown: &str) -> serde_json::Value {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\"summary\":\"a page\",\"facts\":[]}"
+                        },
+                        "done": true
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut web = WebRuntime::disabled();
+        web.quarantine_model = Some("qwen3.5:4b".to_string());
+        web.ollama_base_url = format!("http://{address}");
+
+        summarise(&web, "Tokio", markdown).await.unwrap();
+
+        seen.lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("summarise posted a chat request")
+    }
+
+    #[tokio::test]
+    async fn quarantine_request_carries_the_shared_num_ctx() {
+        let body = summarise_capturing("a short page").await;
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
+        );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
+    }
+
+    #[tokio::test]
+    async fn quarantine_truncates_a_page_larger_than_the_local_window() {
+        let page = "word ".repeat(100_000);
+        let body = summarise_capturing(&page).await;
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
+        assert!(prompt.contains("[truncated to fit"));
+        assert!(prompt.len() < page.len());
+    }
+
+    #[tokio::test]
+    async fn quarantine_sends_a_small_page_unchanged() {
+        let body = summarise_capturing("a short page").await;
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
+        assert!(prompt.contains("a short page"));
+        assert!(!prompt.contains("[truncated to fit"));
     }
 
     fn raw() -> Decision {

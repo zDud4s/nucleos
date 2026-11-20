@@ -60,22 +60,15 @@ const MIN_CLEANUP_RATIO: f64 = 0.6;
 /// inside the probed context so the chunk plus the prompt plus the answer all fit.
 const CLEANUP_CHUNK_CHARS: usize = 2_000;
 
-/// Context requested for every cleanup call, and proven at startup before cleanup is armed.
-///
-/// Stated EXPLICITLY on each request and never inherited from Ollama's factory default, which is the
-/// single most expensive lesson the local-triage pillar recorded: Ollama truncates an over-long prompt
-/// in silence, the call still succeeds, and the caller cannot tell. Holds a chunk in, an answer of
-/// comparable size out, and the instructions, with margin.
-pub const CLEANUP_NUM_CTX: usize = 4_096;
-
 /// What voice cleanup requires from a model, read by `capabilities::missing_capabilities` instead of
-/// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window: cleanup
-/// checks nothing else today, and `capabilities`' own guard test
+/// a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window, and only
+/// the floor: the shared `local_ctx::local_num_ctx()` is clamped to the probed window at startup.
+/// `capabilities`' own guard test
 /// (`none_of_the_three_roles_requires_more_than_the_window_today`) fails if this ever claims more without
 /// that being a deliberate change.
 pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
     crate::capabilities::Requirement {
-        context_tokens: CLEANUP_NUM_CTX,
+        context_tokens: crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
         tools: false,
         vision: false,
         structured_output: false,
@@ -419,7 +412,7 @@ pub fn build_cleanup_prompt(instructions: &str, transcript: &str) -> String {
 /// But sentence-first is not sentence-only, and that distinction is the whole point of this
 /// function. Greedy decoding -- which §14.2 made mandatory for latency -- routinely returns a wall
 /// of words with no full stop anywhere in it, and a transcript with no terminator is ONE sentence:
-/// every character of a twenty-minute memo, handed whole to a `CLEANUP_NUM_CTX` window. Ollama then
+/// every character of a twenty-minute memo, handed whole to the shared `num_ctx` window. Ollama then
 /// truncates the input, the reply covers only the prefix, and `accept_cleanup`'s shrink guard
 /// rejects the result -- so the ENTIRE memo silently falls back to raw, not just the oversized
 /// piece. The budget is therefore a ceiling, not a preference.
@@ -569,7 +562,7 @@ pub async fn clean_up(voice: &VoiceRuntime, raw: &str) -> Cleaned {
             &voice.ollama_base_url,
             model,
             &build_cleanup_prompt(&voice.cleanup_prompt, &chunk),
-            serde_json::json!({"num_ctx": CLEANUP_NUM_CTX, "temperature": 0}),
+            serde_json::json!({"num_ctx": crate::models::local_ctx::local_num_ctx(), "temperature": 0}),
             // No grammar: cleanup is plain text in, plain text out. A sampling grammar here would
             // constrain prose to a shape it has no reason to take.
             None,
@@ -1601,6 +1594,50 @@ mod tests {
 
         assert_eq!(cleaned.state, CleanupState::Raw);
         assert_eq!(cleaned.text, "the nucleo owns the db");
+    }
+
+    /// Cleanup sends the one shared `num_ctx`, so Ollama does not reload the model when a memo is
+    /// cleaned between two other local calls.
+    #[tokio::test]
+    async fn cleanup_request_carries_the_shared_num_ctx() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": "the nucleo owns the db"},
+                        "done": true
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let voice = VoiceRuntime {
+            cleanup_model: Some("qwen3.5:4b".to_string()),
+            ollama_base_url: format!("http://{address}"),
+            ..VoiceRuntime::default()
+        };
+
+        clean_up(&voice, "the nucleo owns the db").await;
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("cleanup posted a chat request");
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
+        );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
     }
 
     /// With no model configured, cleanup is skipped rather than attempted — and still says `Raw`.

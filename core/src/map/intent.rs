@@ -320,7 +320,7 @@ const MAX_ANSWER_TURNS: i64 = 4;
 /// and `ClaudeCliRunner` implement [`crate::execution::runner::CommandRunner`], so a single call through the
 /// trait looks like it would serve both — and it does not. `OllamaRunner` is the TRIAGE runner
 /// wearing the trait: it imposes a `{id, class, summary}` grammar on every prompt it is given,
-/// validates the answer as a triage verdict, and pins the context to `triage::LOCAL_NUM_CTX`. An
+/// validates the answer as a triage verdict, and pins the context to the shared `local_ctx::local_num_ctx()`. An
 /// extraction sent through it comes back a triage array, is judged unusable, and parses to nothing.
 ///
 /// So the local brain is asked at the loopback endpoint directly, which is what
@@ -379,23 +379,17 @@ pub async fn extract(
             // Straight to the same parse the other arm ends at, with no `extract_reply` on the way:
             // there is no stream to unwrap here, because `ollama_chat` returns `message.content`,
             // which is the model's words and nothing else.
+            // [`MAX_SPEC_BYTES`] lets a document reach 60 000 bytes, more than the shared window
+            // holds, so the source is cut to fit (with a visible marker) instead of exceeding it.
+            // `map_decisions` records WHICH brain answered every row, so a list drawn from a cut
+            // document stays attributable.
+            let source = crate::models::local_ctx::fit_text(source, 2048);
             crate::execution::runner::ollama_chat(
                 client,
                 base_url,
                 model,
-                &extraction_prompt(spec_slug, source),
-                // **A window this machine has not proved it has, and that is a known limit rather
-                // than an oversight.** The startup probe only ever established that the configured
-                // model holds `triage::LOCAL_NUM_CTX` — 8192 — while [`MAX_SPEC_BYTES`] lets a
-                // document reach 60 000. A local model whose real window is smaller will answer
-                // about less of the document than it was handed, and will say nothing about having
-                // done so.
-                //
-                // What keeps that from being a silently wrong answer is the column: `map_decisions`
-                // records WHICH brain answered every row, so a thin local list is attributable
-                // rather than mysterious, and the owner reads the two lists beside each other.
-                // Visibly approximate is the bargain this slice makes; silently wrong is not.
-                serde_json::json!({"num_ctx": 32_768, "temperature": 0}),
+                &extraction_prompt(spec_slug, &source),
+                serde_json::json!({"num_ctx": crate::models::local_ctx::local_num_ctx(), "temperature": 0}),
                 Some(extraction_format()),
                 false,
             )
@@ -1130,5 +1124,58 @@ mod tests {
                 .is_some_and(|kinds| kinds.iter().any(|kind| kind == "a")),
             "type A is offered so the model has somewhere to put one, and dropped at the parse"
         );
+    }
+
+    /// Posts `source` through the Loopback arm and returns the one body the fake Ollama saw.
+    async fn extraction_body_for(source: &str) -> serde_json::Value {
+        let (base_url, seen) = loopback_answering(r#"{"decisions":[]}"#).await;
+        let client = reqwest::Client::new();
+        extract(
+            Extractor::Loopback {
+                client: &client,
+                base_url: &base_url,
+                model: "qwen2",
+            },
+            "slug",
+            source,
+        )
+        .await
+        .expect("extract");
+        seen.lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a chat request was posted")
+    }
+
+    #[tokio::test]
+    async fn the_loopback_extraction_carries_the_shared_num_ctx() {
+        let body = extraction_body_for("## §1\nbody").await;
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
+        );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
+    }
+
+    #[tokio::test]
+    async fn the_loopback_extraction_truncates_a_source_larger_than_the_local_window() {
+        let source = format!("## §1\n{}", "word ".repeat(12_000));
+        let body = extraction_body_for(&source).await;
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
+        assert!(prompt.contains("[truncated to fit"));
+        assert!(prompt.len() < source.len());
+    }
+
+    #[tokio::test]
+    async fn the_loopback_extraction_sends_a_small_source_unchanged() {
+        let body = extraction_body_for("## §1\nbody").await;
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
+        assert!(prompt.contains("## §1\nbody"));
+        assert!(!prompt.contains("[truncated to fit"));
     }
 }

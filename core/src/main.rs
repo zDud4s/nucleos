@@ -352,6 +352,10 @@ async fn daemon_main() -> std::process::ExitCode {
 
     let machine_config: config::MachineConfig = machine_doc();
     let models_config: config::ModelsConfig = machine_doc();
+    models::local_ctx::init_local_num_ctx(models_config.ollama_num_ctx_declaration());
+    // Every distinct local Ollama model is probed here, once, so the shared value is final before
+    // any feature reads it; the per-feature probes below only decide their own posture.
+    capabilities::probe_shared_num_ctx(&models_config).await;
     // The owner's saved choice (Settings) wins over the file, which is the default of an untouched
     // install; `embed::install` is called again by the settings door when the choice changes.
     embed::install(Arc::new(embed::OllamaEmbedder::new(
@@ -366,18 +370,17 @@ async fn daemon_main() -> std::process::ExitCode {
             execution::runner::OLLAMA_BASE_URL.to_string(),
             model.clone(),
         );
-        // The requirement's own field, not `governance::triage::LOCAL_NUM_CTX` directly: this is the number
-        // that gets enforced, and it must come FROM the declaration the role states below, not
-        // sit beside it as a second copy that could drift out of step. `CAPABILITY_REQUIREMENT`
-        // is itself defined from `LOCAL_NUM_CTX`, which is the link that keeps them together.
-        let declared = capabilities::discover_ollama_as(
+        // Probed against the shared value; a window between the floor and it clamps the value
+        // instead of refusing the model.
+        let mut declared = capabilities::discover_ollama_as(
             &reqwest::Client::new(),
             execution::runner::OLLAMA_BASE_URL,
             &model,
-            governance::triage::CAPABILITY_REQUIREMENT.context_tokens,
+            models::local_ctx::local_num_ctx(),
             "local model",
         )
         .await;
+        models::local_ctx::clamp_local_num_ctx_to_probe(&mut declared.context);
         let missing = capabilities::missing_capabilities(
             &governance::triage::CAPABILITY_REQUIREMENT,
             &declared,
@@ -513,17 +516,16 @@ async fn daemon_main() -> std::process::ExitCode {
     // exactly what `integrations::voice::clean_up` does at runtime, decided once here at startup.
     let voice_cleanup_model = match models_config.voice_cleanup_model.clone() {
         Some(model) if voice_config.armed() => {
-            // The requirement's own field, not `integrations::voice::CLEANUP_NUM_CTX` directly — see the same
-            // note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined from
-            // `CLEANUP_NUM_CTX`, so the two stay linked without a second number to keep in step.
-            let declared = capabilities::discover_ollama_as(
+            // Probed against the shared value; a window between the floor and it clamps the value.
+            let mut declared = capabilities::discover_ollama_as(
                 &reqwest::Client::new(),
                 execution::runner::OLLAMA_BASE_URL,
                 &model,
-                integrations::voice::CAPABILITY_REQUIREMENT.context_tokens,
+                models::local_ctx::local_num_ctx(),
                 "voice cleanup",
             )
             .await;
+            models::local_ctx::clamp_local_num_ctx_to_probe(&mut declared.context);
             let missing = capabilities::missing_capabilities(
                 &integrations::voice::CAPABILITY_REQUIREMENT,
                 &declared,
@@ -651,20 +653,21 @@ async fn daemon_main() -> std::process::ExitCode {
         resolved_local_engine.as_ref(),
     ) {
         (Some(model), Some(resolved)) => {
-            // The requirement's own field, not `models::local_agent::TURN_NUM_CTX` directly — see the
-            // same note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined
-            // from `TURN_NUM_CTX`, so the two stay linked without a second number to keep in
-            // step.
-            let declared = capabilities::discover_local_as(
+            // Probed against the shared value; only Ollama receives `num_ctx`, so only its window
+            // may lower it (an OpenAI-compatible server's window must not).
+            let mut declared = capabilities::discover_local_as(
                 &reqwest::Client::new(),
                 resolved.engine,
                 &resolved.base_url,
                 &model,
-                models::local_agent::CAPABILITY_REQUIREMENT.context_tokens,
+                models::local_ctx::local_num_ctx(),
                 resolved.declared_context_tokens,
                 "local assistant",
             )
             .await;
+            if resolved.engine == config::LocalEngine::Ollama {
+                models::local_ctx::clamp_local_num_ctx_to_probe(&mut declared.context);
+            }
             let missing = capabilities::missing_capabilities(
                 &models::local_agent::CAPABILITY_REQUIREMENT,
                 &declared,

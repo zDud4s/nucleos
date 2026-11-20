@@ -1259,7 +1259,7 @@ impl Drop for UnclaimedMcpConfig {
 ///
 /// Small, and bounded again by characters below, because every one of these is re-sent on every
 /// round of the tool loop — so a generous history is multiplied by `MAX_TOOL_ROUNDS` before it
-/// reaches `TURN_NUM_CTX`. Six is enough for "and the second one?" and for the follow-up after that.
+/// reaches the shared `local_num_ctx()` window. Six is enough for "and the second one?" and for the follow-up after that.
 pub(super) const HISTORY_TURNS: i64 = 6;
 
 /// The character budget for replayed history, counted newest-first.

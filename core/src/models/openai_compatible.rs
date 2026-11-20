@@ -679,7 +679,7 @@ mod tests {
             &catalogue,
             "qwen/qwen3-8b",
             Some(8192),
-            crate::models::local_agent::TURN_NUM_CTX,
+            crate::models::local_ctx::local_num_ctx(),
         );
 
         assert_eq!(
@@ -711,7 +711,7 @@ mod tests {
             &catalogue,
             "qwen/qwen3-8b",
             Some(65536),
-            crate::models::local_agent::TURN_NUM_CTX,
+            crate::models::local_ctx::local_num_ctx(),
         );
 
         assert_eq!(
@@ -723,7 +723,7 @@ mod tests {
 
     /// Neither probed nor declared is refused, never guessed.
     ///
-    /// This is `local_agent::TURN_NUM_CTX`'s guard re-expressed on a wire that has no `num_ctx`
+    /// This is `local_ctx::local_num_ctx`'s guard re-expressed on a wire that has no `num_ctx`
     /// field to state it on. A turn ACCUMULATES — system message, question, then every tool schema
     /// and every tool result again on each round — so a window assumed from a vendor default is how
     /// a long conversation becomes a short one nobody was told about. Defaulting to any number here
@@ -743,7 +743,7 @@ mod tests {
             &catalogue,
             "qwen/qwen3-8b",
             None,
-            crate::models::local_agent::TURN_NUM_CTX,
+            crate::models::local_ctx::local_num_ctx(),
         );
 
         assert_eq!(

@@ -157,7 +157,7 @@
     },
     "local_context_tokens": {
       "default": null,
-      "description": "The context window this local server serves, DECLARED here because for one of the two\nengines nothing can discover it: Ollama answers `/api/show`, and an OpenAI-compatible\n`/v1/models` states no window at all.\n\nAbsent stays `None` and nothing invents a number. A guessed window is not a harmless default\n— it is a figure the daemon would then act on when deciding what fits in a turn — which is\nthe argument `AssistantChoice::tools` makes for never marking `Some(false)` on a guess,\narriving here as a count instead of a flag.",
+      "description": "The context window this local server serves, DECLARED here because for one of the two\nengines nothing can discover it: Ollama answers `/api/show`, and an OpenAI-compatible\n`/v1/models` states no window at all.\n\nWith the Ollama engine (`local_engine` absent or `ollama`) it ALSO sets the one `num_ctx`\nevery local Ollama call sends (default 8192, clamped to the smallest probed model window);\nread once at startup. With `openai_compatible` it keeps only the meaning above: that\nserver's window, and the Ollama `num_ctx` stays at its default.\n\nAbsent stays `None` and nothing invents a number. A guessed window is not a harmless default\n— it is a figure the daemon would then act on when deciding what fits in a turn — which is\nthe argument `AssistantChoice::tools` makes for never marking `Some(false)` on a guess,\narriving here as a count instead of a flag.",
       "format": "uint",
       "minimum": 0,
       "type": [

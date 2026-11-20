@@ -463,7 +463,7 @@ fn triage_format() -> serde_json::Value {
 /// grammar on every prompt it is handed, so a judgement sent through it comes back as a triage
 /// array and parses to nothing.
 ///
-/// The local window is `triage::LOCAL_NUM_CTX`, and unlike the extraction next door that is not a
+/// The local window is `local_ctx::local_num_ctx()`, and unlike the extraction next door that is not a
 /// window this machine has failed to prove: the startup probe establishes exactly this size, and a
 /// triage prompt is one decision plus at most [`MAX_LISTED_PATHS`] paths twice over. The extraction
 /// asks for four times it because a spec runs to 60 000 bytes; this does not, so it does not.
@@ -489,7 +489,7 @@ pub async fn ask(
                 model,
                 &prompt,
                 serde_json::json!({
-                    "num_ctx": crate::governance::triage::LOCAL_NUM_CTX,
+                    "num_ctx": crate::models::local_ctx::local_num_ctx(),
                     // Zero, because the question has one right answer about one decision and a
                     // sampled one would make a re-run disagree with itself over evidence that had
                     // not moved — and `inputs_digest` is built on the premise that unchanged inputs
@@ -1165,6 +1165,58 @@ mod tests {
     /// The digest of one decision read against one state of the anchors.
     fn digest_of(decision: &Anchored, anchors: &Anchors) -> String {
         inputs_digest(Evidence { decision, anchors })
+    }
+
+    #[tokio::test]
+    async fn the_loopback_triage_question_carries_the_shared_num_ctx() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let recorder = std::sync::Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": "{}"},
+                        "done": true
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+        let decision = decision(Anchor::Ambiguous, &["core/src/map/triage.rs"], &[]);
+
+        ask(
+            crate::map::intent::Extractor::Loopback {
+                client: &client,
+                base_url: &base_url,
+                model: "qwen2",
+            },
+            Evidence {
+                decision: &decision,
+                anchors: &Anchors::Computed("aaa core/src/map/triage.rs".to_owned()),
+            },
+        )
+        .await
+        .expect("the fake answered");
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a chat request was posted");
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
+        );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
     }
 
     #[test]
