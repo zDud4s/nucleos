@@ -44,7 +44,7 @@ while not ((d / f"{tag}.stop").exists() or (d / "all.stop").exists()):
     time.sleep(0.05)
 '''
 
-ADM_KEYS = {"mode", "rule", "avail_mb", "idle_cores", "held_n"}
+ADM_KEYS = {"mode", "rule", "avail_mb", "idle_cores", "held_n", "busy_cores", "held_pred", "why"}
 
 
 def wait_for(pred, timeout: float = 30.0, step: float = 0.1) -> bool:
@@ -346,6 +346,142 @@ class Pure(unittest.TestCase):
         ok, adm = c.dynamic_fit(1, self.probe(2), 100.0, 8, True, held_pred_cores=5.0)
         self.assertTrue(ok)
         self.assertEqual(adm["idle_cores"], 7.0)
+
+    def test_held_pred_decays_with_age(self) -> None:
+        c = self.load()
+        now = 1_000_000.0
+        self.assertEqual(c.held_pred_cores([{"weight": 2, "pred_cores": 10, "admitted_at": now}],
+                                           now=now), 5.0)
+        self.assertEqual(c.held_pred_cores([{"weight": 2, "pred_cores": 10,
+                                             "admitted_at": now - 60}], now=now), 2.5)
+        for age in (120, 500):
+            self.assertEqual(c.held_pred_cores([{"weight": 2, "pred_cores": 10,
+                                                 "admitted_at": now - age}], now=now), 0)
+        # No admitted_at: the lock file's mtime stands in for the admission time.
+        tmp = Path(tempfile.mkdtemp(prefix="heavy-pred-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        f = tmp / "slot.lock"
+        f.write_text("x")
+        os.utime(f, (now - 60, now - 60))
+        rec = {"weight": 2, "pred_cores": 10}
+        self.assertEqual(c.held_pred_cores([(f, rec)], now=now), 2.5)
+
+    def test_held_pred_future_admitted_at_is_clamped(self) -> None:
+        c = self.load()
+        now = 1_000_000.0
+        # A clock stepped back: admitted_at in the future never reserves more than FACTOR*pred.
+        self.assertEqual(c.held_pred_cores([{"weight": 2, "pred_cores": 10,
+                                             "admitted_at": now + 60}], now=now), 5.0)
+
+    def test_held_pred_ignores_weight_one(self) -> None:
+        c = self.load()
+        now = 1_000_000.0
+        w1 = {"weight": 1, "pred_cores": 10, "admitted_at": now}
+        w2 = {"weight": 2, "pred_cores": 10, "admitted_at": now}
+        self.assertEqual(c.held_pred_cores([w1], now=now), 0)
+        self.assertEqual(c.held_pred_cores([w1, w2, w2], now=now), 10.0)
+
+    def test_effective_idle_matches_watch_view(self) -> None:
+        c = self.load()
+        self.assertEqual(c.effective_idle(12, 2, 5.0), 7.0)
+        self.assertEqual(c.effective_idle(12, 8, 5.0), 4.0)
+        self.assertEqual(c.effective_idle(12, 2, 52.5), -40.5)
+        self.assertIsNone(c.effective_idle(12, None, 5.0))
+        # The watch must show the same idle the broker decides on.
+        sys.path.insert(0, str(ROOT / "scripts"))
+        self.addCleanup(sys.path.remove, str(ROOT / "scripts"))
+        spec = importlib.util.spec_from_file_location("heavy_watch_dyn_under_test",
+                                                      ROOT / "scripts" / "heavy_watch.py")
+        watch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watch)
+        tmp = Path(tempfile.mkdtemp(prefix="heavy-watch-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        f = tmp / "slot.lock"
+        f.write_text("x")
+        rec = {"weight": 2, "pred_cores": 10, "admitted_at": time.time()}
+        held = [(f, rec)]
+        with mock.patch.object(watch.heavy, "_cost_mod", return_value=c), \
+                mock.patch.object(c, "admission_mode", return_value="dynamic"), \
+                mock.patch.object(c, "dynamic_probe", return_value=self.probe(2)):
+            st = watch.dynamic_state(held)
+        # The reserve decays with wall-clock time between the two reads, so allow drift.
+        self.assertAlmostEqual(st["idle"], c.effective_idle(12, 2, c.held_pred_cores(held)),
+                               delta=0.05)
+
+    def test_dynamic_fit_adm_reports_why(self) -> None:
+        c = self.load()
+        os.environ["NUCLEOS_HEAVY_MIN_AVAIL_MB"] = "1536"
+        # Admitted: empty why, new keys present.
+        ok, adm = c.dynamic_fit(1, self.probe(2), 100.0, 4, True)
+        self.assertTrue(ok)
+        self.assertEqual(adm["why"], [])
+        self.assertEqual(adm["busy_cores"], 2)
+        self.assertEqual(adm["held_pred"], 0.0)
+        # Each failing condition alone.
+        ok, adm = c.dynamic_fit(1, self.probe(2, avail=500), 100.0, 4, True)
+        self.assertEqual(adm["why"], ["ram"])
+        ok, adm = c.dynamic_fit(1, self.probe(11.5), 100.0, 4, True)
+        self.assertEqual(adm["why"], ["idle"])
+        ok, adm = c.dynamic_fit(1, self.probe(2, avail=6000), 0.0, 4, True)
+        self.assertEqual(adm["why"], ["settle"])
+        ok, adm = c.dynamic_fit(4, self.probe(0), 100.0, 4, True)
+        self.assertEqual(adm["why"], ["ceiling"])
+        # held_pred reported rounded.
+        ok, adm = c.dynamic_fit(1, self.probe(2), 100.0, 4, True, held_pred_cores=5.04)
+        self.assertEqual(adm["held_pred"], 5.0)
+        # Combinations list every failing condition.
+        ok, adm = c.dynamic_fit(1, self.probe(11.5, avail=500), 100.0, 4, True)
+        self.assertEqual(sorted(adm["why"]), ["idle", "ram"])
+        ok, adm = c.dynamic_fit(4, self.probe(11.5, avail=500), 0.0, 4, True)
+        self.assertEqual(sorted(adm["why"]), ["ceiling", "idle", "ram", "settle"])
+        # Alone and static fallback never carry a reason.
+        _, adm = c.dynamic_fit(0, self.probe(2), 0.0, 4, False)
+        self.assertEqual(adm["why"], [])
+        _, adm = c.dynamic_fit(1, None, 100.0, 4, False)
+        self.assertEqual(adm["why"], [])
+        # Disk rule.
+        ok, adm = c.dynamic_fit(1, self.probe(2), 100.0, 4, True, disk={"busy_pct": 97})
+        self.assertFalse(ok)
+        self.assertEqual(adm["why"], ["disk"])
+
+    def test_denial_is_logged_and_rate_limited(self) -> None:
+        spec = importlib.util.spec_from_file_location("heavy_denial_under_test", HEAVY)
+        heavy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heavy)
+        tmp = Path(tempfile.mkdtemp(prefix="heavy-denial-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = heavy.DenialLog(tmp, every_s=30.0)
+        t0 = 1_000_000.0
+        adm = {"mode": "dynamic", "rule": "room", "why": ["idle"]}
+        path = tmp / "denials.jsonl"
+        self.assertTrue(log.note("test", adm, now=t0))
+        rows = read_jsonl(path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["cls"], "test")
+        self.assertEqual(rows[0]["adm"], adm)
+        self.assertIn("held_n", rows[0])
+        self.assertIn("ts", rows[0])
+        # Same reason within the interval: rate-limited.
+        self.assertFalse(log.note("test", adm, now=t0 + 5))
+        self.assertEqual(len(read_jsonl(path)), 1)
+        # A changed reason is written at once.
+        adm2 = {**adm, "why": ["idle", "settle"]}
+        self.assertTrue(log.note("test", adm2, now=t0 + 6))
+        self.assertEqual(len(read_jsonl(path)), 2)
+        # Same reason again after the interval.
+        self.assertTrue(log.note("test", adm2, now=t0 + 6 + 31))
+        self.assertEqual(len(read_jsonl(path)), 3)
+
+    def test_denial_log_fails_open(self) -> None:
+        spec = importlib.util.spec_from_file_location("heavy_denial_open_under_test", HEAVY)
+        heavy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heavy)
+        tmp = Path(tempfile.mkdtemp(prefix="heavy-denial-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        blocker = tmp / "file"
+        blocker.write_text("x")
+        log = heavy.DenialLog(blocker / "sub")  # parent is a regular file: the write raises
+        log.note("test", {"mode": "dynamic", "rule": "room", "why": ["idle"]}, now=1_000_000.0)
 
     # 9
     def test_dynamic_fit_idle_cores_and_none_busy(self) -> None:

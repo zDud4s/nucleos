@@ -42,7 +42,7 @@ while not ((d / f"{tag}.stop").exists() or (d / "all.stop").exists()):
     time.sleep(0.05)
 '''
 
-ADM_KEYS = {"mode", "rule", "avail_mb", "idle_cores", "held_n"}
+ADM_KEYS = {"mode", "rule", "avail_mb", "idle_cores", "held_n", "busy_cores", "held_pred", "why"}
 
 # Every env var that changes what the code under test decides.
 CLEARED = (

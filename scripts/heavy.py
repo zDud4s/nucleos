@@ -922,7 +922,7 @@ BATCH_MAX = 8
 
 
 def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int, dyn: bool,
-                     pr: dict | None, dk: dict | None) -> int:
+                     pr: dict | None, dk: dict | None, held_ents: list | None = None) -> int:
     """Called by the Mutex holder right after it admitted the head: admit the entries behind it,
     in queue order, for as long as they fit (static capacity, then dynamic_fit with the held
     count and probe updated for each grant, which also applies the disk rule). The first that does
@@ -935,6 +935,7 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
     limit = int(_env_float("NUCLEOS_HEAVY_BATCH_MAX", float(BATCH_MAX)))
     p = dict(pr) if isinstance(pr, dict) else pr
     n, w, granted = held_n, held_w, 0
+    reserve = list(held_ents or [])  # (Path, rec) of what is held, grown with each grant
     me = os.getpid()
     sample_ts = None
     if isinstance(p, dict) and not os.environ.get("NUCLEOS_HEAVY_FAKE_PROBE"):
@@ -957,7 +958,8 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
         adm = None
         if dyn:
             try:
-                ok, adm = hc.dynamic_fit(n, p, 0.0, hc.dynamic_max_jobs(p), True, disk=dk)
+                ok, adm = hc.dynamic_fit(n, p, 0.0, hc.dynamic_max_jobs(p), True, disk=dk,
+                                         held_pred_cores=hc.held_pred_cores(reserve))
             except Exception:
                 break
             if not ok:
@@ -967,6 +969,7 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
         frec["grant"] = f.name  # the entry it replaces: the waiter recognises its own grant
         if adm:
             frec["adm"] = adm
+        frec["admitted_at"] = time.time()
         try:
             if hw is not None:
                 hw.retry_io(lambda: hpath.write_text(json.dumps(frec), encoding="utf-8"))
@@ -995,6 +998,7 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
             break
         granted += 1
         n += 1
+        reserve.append((hpath, frec))
         w += wt
         if isinstance(p, dict):
             # The probe predates this grant: charge one job budget so a batch cannot admit
@@ -1029,6 +1033,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     qfile = queue_dir / f"{rec['prio']}-{arrival_ns or time.time_ns()}-{me}"
     queued = False
     last_report = t0
+    denials = DenialLog(directory)
     shadow = None
     dyn = False
     hc = None
@@ -1162,10 +1167,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                             # empties a 32-thread machine with two jobs. Measured 2026-11-15
                             # (log.jsonl): nextest runs ~20% slower with 4 held than alone, so
                             # NUCLEOS_HEAVY_PRED_CORES_FACTOR (default 0.5) discounts it.
-                            held_pred = hc._env_pos("NUCLEOS_HEAVY_PRED_CORES_FACTOR", 0.5) * sum(
-                                float(r["pred_cores"]) for r in held_recs
-                                if hc._num(r.get("pred_cores"))
-                                and int(r.get("weight") or 1) > 1)
+                            held_pred = hc.held_pred_cores(held_ents)
                             fit, adm = hc.dynamic_fit(len(held_recs), pr, since,
                                                       hc.dynamic_max_jobs(pr), static_fit,
                                                       disk=dk, held_pred_cores=held_pred)
@@ -1176,8 +1178,14 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                                 if (not fit and adm and adm.get("rule") == "disk") else None)
                         if fit and adm:
                             rec["adm"] = adm
+                        if not fit and adm:
+                            try:
+                                denials.note(rec.get("cls"), adm)
+                            except Exception:
+                                pass
                     mx.mark("decision")
                     if fit:
+                        rec["admitted_at"] = time.time()
                         (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
                         try:
                             _unlink(qfile)
@@ -1199,7 +1207,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                             try:
                                 _grant_followers(
                                     hc, directory, order, len(held_recs) + 1,
-                                    held + int(rec["weight"]), dyn and probed, pr, dk)
+                                    held + int(rec["weight"]), dyn and probed, pr, dk,
+                                    list(held_ents) + [(held_dir / str(me), rec)])
                             except Exception:
                                 pass  # the head is admitted either way
                             mx.mark("batch")
@@ -3110,6 +3119,41 @@ def append_log(row: dict, directory: Path) -> None:
             os.close(fd)
     except Exception as exc:
         sys.stderr.write(f"heavy: could not write the log: {exc}\n")
+
+
+class DenialLog:
+    """Rate-limited record of dynamic-admission denials in `denials.jsonl`: one row when the
+    set of reasons (`adm["why"]`) changes, otherwise at most one every `every_s` seconds."""
+
+    def __init__(self, directory: Path, every_s: float = 30.0) -> None:
+        self.directory = Path(directory)
+        self.every_s = every_s
+        self._last_why = None
+        self._last_ts = None
+
+    def note(self, cls, adm: dict, now: float | None = None) -> bool:
+        try:
+            now = time.time() if now is None else now
+            why = tuple(sorted(adm.get("why") or []))
+            if (why == self._last_why and self._last_ts is not None
+                    and now - self._last_ts < self.every_s):
+                return False
+            row = {"ts": now, "cls": cls, "held_n": adm.get("held_n"), "adm": adm}
+            self.directory.mkdir(parents=True, exist_ok=True)
+            path = self.directory / "denials.jsonl"
+            data = (json.dumps(row) + "\n").encode("utf-8")
+            if not (os.name == "nt" and _append_whole_nt(path, data)):
+                fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                             | getattr(os, "O_BINARY", 0), 0o666)
+                try:
+                    os.write(fd, data)
+                finally:
+                    os.close(fd)
+            self._last_why = why
+            self._last_ts = now
+            return True
+        except Exception:
+            return False
 
 
 def _append_whole_nt(path: Path, data: bytes) -> bool:
