@@ -127,24 +127,16 @@ pub fn classify_codex_text(stdout: &str, stderr: &str, now: DateTime<Utc>) -> Op
     })
 }
 
-static CLAUDE: claude::ClaudeAdapter = claude::ClaudeAdapter;
-static CODEX: codex::CodexAdapter = codex::CodexAdapter;
-
-/// The one table both `adapter_for` and `pooled_engines` read, so the two cannot drift.
-static REGISTRY: &[(&str, &dyn ProviderAdapter)] =
-    &[(claude::ENGINE, &CLAUDE), (codex::ENGINE, &CODEX)];
-
-/// The production registry. None for engines outside the pool (local, agy, gemini-api).
+/// The account adapter of an engine, read from the engine registry
+/// (`engines::adapters::REGISTRY`) that `pooled_engines` reads too, so the two cannot drift. None
+/// for engines outside the pool (local, agy, gemini-api).
 pub fn adapter_for(engine: &str) -> Option<&'static dyn ProviderAdapter> {
-    REGISTRY
-        .iter()
-        .find(|(name, _)| *name == engine)
-        .map(|(_, adapter)| *adapter)
+    crate::engines::adapters::entry_of(engine).map(|entry| entry.accounts)
 }
 
 /// The engines the pool can hold an account for, in registry order.
 pub fn pooled_engines() -> Vec<&'static str> {
-    REGISTRY.iter().map(|(name, _)| *name).collect()
+    crate::engines::adapters::registered_ids()
 }
 
 #[cfg(test)]

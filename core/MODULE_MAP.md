@@ -471,12 +471,15 @@ the contract, not a snapshot.
 | `accounts/settings.rs` | `AccountPoolDoc`, the machine settings document `account_pool.yaml` for the pool's knobs. |
 | `accounts/store.rs` | The `accounts` table (migration 0274): list, insert, rename, state changes. |
 | `accounts/provider.rs` | The `ProviderAdapter` trait (C4): how one provider is logged into, launched with an account's credentials and how its failures are classified. |
-| `accounts/adapters/mod.rs` | Adapter registry; the `fake` adapter is built only for tests and the `testkit` feature. Provider literals live only under `accounts/adapters/`. |
+| `accounts/adapters/mod.rs` | Account adapter lookups (`adapter_for`, `pooled_engines`) read from `engines/adapters` `REGISTRY`; the `fake` adapter is built only for tests and the `testkit` feature. Provider literals live only under `accounts/adapters/`. |
 | `engines/adapters/claude/account.rs` | The Claude account adapter (re-exported as `accounts::adapters::claude`). |
 | `engines/adapters/codex/account.rs` | The Codex account adapter (re-exported as `accounts::adapters::codex`). |
-| `engines/adapters/mod.rs` | Per-engine adapter homes (spec `2026-11-18-motor-por-contrato-design.md` step 1a): module declarations only. The fleet adapters below sit in this tree but compile in the app crate through `#[path]` in `fleet.rs`. |
+| `engines/adapters/mod.rs` | Per-engine adapter homes (spec `2026-11-18-motor-por-contrato-design.md` step 1a): the capabilities and the open registry (`RegistryEntry`: id, descriptor, `ExecutionAdapter`, account adapter, fleet source name; `entry_of`, `capabilities_of`, `execution_of`, `registered_ids`). The fleet adapters below sit in this tree but compile in the app crate through `#[path]` in `fleet.rs`. |
 | `engines/adapters/claude/mod.rs` | The Claude adapter home: module declarations only. |
+| `engines/adapters/claude/engine.rs` | The Claude execution adapter: every capability on, hook wiring as settings entries, config dir `.claude`. |
 | `engines/adapters/codex/mod.rs` | The Codex adapter home: module declarations only. |
+| `engines/adapters/codex/engine.rs` | The Codex execution adapter: its narrower capabilities, pretool hook from 0.166.0, wiring refusals, config dir `.codex`. |
+| `engines/adapters/capabilities.rs` | `EngineCapabilities` (spec 2026-11-18 §6.2), `Support`, `HookWiring` and `WireRefusal`. |
 | `accounts/adapters/fake.rs` | A scripted adapter for tests: no real provider, a `FAKE_HOME` locator and canned login lines. |
 | `accounts/pool.rs` | `PoolState`, the daemon's in-memory view of the accounts, their usage and live sessions, plus reservations released on drop. An empty pool makes every pick the default. |
 | `accounts/choose.rs` | `choose_account` and its `Decision`/`Reason`/`Score` vocabulary. A pure function; the skeleton always answers `Default`. |
@@ -785,7 +788,7 @@ the contract, not a snapshot.
 | `embed.rs` | Local (Ollama) embeddings of knowledge rows: the client behind a trait, f32 blobs and cosine, the backfill and the nearest-row query. Never logs a text or a vector. |
 | `engines.rs` | The engine description table: one row per engine (`claude`, `codex`, `local`) with id, display name, seat kind, transport (CLI process or HTTP), installed probe, utility default and runner constructor. Plain data plus lookups, each taking the table as an argument so a test can add a fourth row without a production registration path. `capabilities::Engine`, `RunnerKind`, `ChatEngine`, `ENGINE_SEAT_KINDS`, `translatable_runners` and `installed_engines` derive from or iterate it; an unknown runner string still collapses to `claude`. |
 | `engines_descriptor.rs` | The engine descriptor as data (`EngineDescriptor`: binary, config var, settings flag, domains) in the `engine_descriptors` machine settings document, stored in nucleos.db and never under `.ai/`; `refuse_under_grants` refuses one that sits under a sandbox grant; `builtin()` holds claude and codex. |
-| `engines_unit_config.rs` | The config dir of one unit (run or chat) outside the working tree, named `.claude`: paths of the settings file, hook script and MCP config, and `write_in`/`write_mcp`, which write through the sandbox crossing with the config dir as the only grant. |
+| `engines_unit_config.rs` | The config dir of one unit (run or chat) outside the working tree, named by the engine's adapter (`.claude` for Claude; `unit_config_dir_for` asks any engine): paths of the settings file, hook script and MCP config, and `write_in`/`write_mcp`, which write through the sandbox crossing with the config dir as the only grant. |
 | `engines/agy_setting.rs` | The `agy` settings document, `AgyDoc { enabled, acknowledged_warning_version }`; `finish` refuses `enabled` without the current warning version, so no door stores an unacknowledged opt-in. |
 | `engines/agy.rs` | The agy (Antigravity CLI) engine: the unsupported-use `WARNING` and its `WARNING_VERSION`, `enabled()` (the one reader of the opt-in document, false on any read error), `installed()` and `runner()`. |
 | `embed/cluster.rs` | **Pure.** The one deterministic vector grouping (seed-anchored, inclusive cosine threshold, no chaining) shared by the generalisation pass and the themes. |
