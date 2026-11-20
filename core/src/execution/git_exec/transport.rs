@@ -384,7 +384,9 @@ pub async fn run_git(
     match tokio::time::timeout(DRAIN_GRACE, drained).await {
         Ok(Ok(())) => {
             if let Some(killer) = killer.as_mut() {
-                killer.disarm();
+                // Both pipes are drained, so nothing in flight is lost: take down anything git left
+                // in the tree (a background helper) instead of letting it outlive the command.
+                killer.reap();
             }
         }
         Ok(Err(reason)) => return Err(reason),

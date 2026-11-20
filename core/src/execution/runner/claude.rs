@@ -665,9 +665,11 @@ impl CommandRunner for ClaudeCliRunner {
                 None
             }
         };
-        // Reaped, so the process is gone and there is nothing left to kill.
+        // The CLI is reaped and stdout has ended, so terminate whatever it left running (a tool's
+        // background process) rather than letting it outlive the run. Bytes the CLI already wrote
+        // to stderr stay readable in the pipe after its writers die, so the drain below loses none.
         if let Some(killer) = tree_killer.as_mut() {
-            killer.disarm();
+            killer.reap();
         }
 
         // The CLI has been reaped, so whatever still holds stderr open is a descendant of it; give the

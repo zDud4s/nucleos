@@ -235,7 +235,9 @@ pub(super) async fn spawn_gh_argv(
     };
     if tokio::time::timeout(DRAIN_GRACE, drained).await.is_ok() {
         if let Some(killer) = killer.as_mut() {
-            killer.disarm();
+            // Both pipes are drained, so nothing in flight is lost: take down anything `gh` left in
+            // the tree instead of letting it outlive the command.
+            killer.reap();
         }
     } else {
         // The exit code survives a stuck drain: `gh` ran and said how it ended, and only the tail is
