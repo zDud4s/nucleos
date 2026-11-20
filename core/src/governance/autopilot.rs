@@ -535,7 +535,8 @@ fn hook_entry() -> serde_json::Value {
 /// refusal (Codex before 0.166.0) or a CLI-args wiring, neither of which is a settings entry.
 fn hook_entry_for(engine: &str) -> Option<serde_json::Value> {
     use crate::engines::adapters::{HookWiring, execution_of};
-    let command = format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"");
+    let command =
+        format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"");
     let HookWiring::SettingsEntry(mut entry) = execution_of(engine)?.wire_pretool(&command).ok()?
     else {
         return None;

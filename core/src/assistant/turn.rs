@@ -1007,8 +1007,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         }
         // Skipped for the kept process alone: if that process is gone when the turn reaches it, the
         // turn spawns one, and the spawn reads the briefing the turn did not.
-        let late_briefing: Option<LateBriefing> = (takes_system_prompt(cli) && kept && !warmed_unbriefed)
-            .then(|| {
+        let late_briefing: Option<LateBriefing> =
+            (takes_system_prompt(cli) && kept && !warmed_unbriefed).then(|| {
                 let pool = pool.clone();
                 let text = text.clone();
                 Box::pin(async move {
@@ -1530,9 +1530,15 @@ mod tests {
             system_prompt_with_knowledge("claude", Some("x".into()), Some("block"))
                 .is_some_and(|text| text.contains("block"))
         );
-        assert!(crate::assistant::turn::prewarm::briefing_wanted("claude", false));
-        assert!(!crate::assistant::turn::prewarm::briefing_wanted("claude", true));
-        assert!(!crate::assistant::turn::prewarm::briefing_wanted("codex", false));
+        assert!(crate::assistant::turn::prewarm::briefing_wanted(
+            "claude", false
+        ));
+        assert!(!crate::assistant::turn::prewarm::briefing_wanted(
+            "claude", true
+        ));
+        assert!(!crate::assistant::turn::prewarm::briefing_wanted(
+            "codex", false
+        ));
     }
 
     /// A Codex stream whose `turn.completed` reports the SESSION's running total (130k) while the
