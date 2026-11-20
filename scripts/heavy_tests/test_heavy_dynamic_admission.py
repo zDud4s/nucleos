@@ -483,6 +483,44 @@ class Pure(unittest.TestCase):
         log = heavy.DenialLog(blocker / "sub")  # parent is a regular file: the write raises
         log.note("test", {"mode": "dynamic", "rule": "room", "why": ["idle"]}, now=1_000_000.0)
 
+    def _denial_log(self):
+        spec = importlib.util.spec_from_file_location("heavy_denial_cap_under_test", HEAVY)
+        heavy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heavy)
+        tmp = Path(tempfile.mkdtemp(prefix="heavy-denial-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return tmp, heavy.DenialLog(tmp, every_s=30.0)
+
+    def test_denial_log_rotates_at_the_cap(self) -> None:
+        tmp, log = self._denial_log()
+        path = tmp / "denials.jsonl"
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_DENIALS_MAX_BYTES": "200"}):
+            for i in range(6):  # a different reason set each time bypasses the rate limit
+                self.assertTrue(log.note("test", {"why": [f"r{i}"]}, now=1_000_000.0 + i))
+        old = tmp / "denials.jsonl.1"
+        self.assertTrue(old.exists())
+        # The size is checked before the append, so the cap overshoots by at most one row.
+        self.assertLess(path.stat().st_size, 200 + 100)
+        kept = read_jsonl(old) + read_jsonl(path)
+        self.assertEqual(kept[-1]["adm"]["why"], ["r5"])
+        self.assertGreaterEqual(len(kept), 2)
+
+    def test_denial_log_garbage_cap_uses_default(self) -> None:
+        tmp, log = self._denial_log()
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_DENIALS_MAX_BYTES": "banana"}):
+            for i in range(6):
+                log.note("test", {"why": [f"r{i}"]}, now=1_000_000.0 + i)
+        self.assertFalse((tmp / "denials.jsonl.1").exists())
+        self.assertEqual(len(read_jsonl(tmp / "denials.jsonl")), 6)
+
+    def test_denial_log_rotation_failure_still_appends(self) -> None:
+        tmp, log = self._denial_log()
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_DENIALS_MAX_BYTES": "50"}):
+            self.assertTrue(log.note("test", {"why": ["a"]}, now=1_000_000.0))
+            with mock.patch("os.replace", side_effect=OSError("busy")):
+                self.assertTrue(log.note("test", {"why": ["b"]}, now=1_000_001.0))
+        self.assertEqual(len(read_jsonl(tmp / "denials.jsonl")), 2)
+
     # 9
     def test_dynamic_fit_idle_cores_and_none_busy(self) -> None:
         c = self.load()

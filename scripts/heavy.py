@@ -3131,6 +3131,18 @@ class DenialLog:
         self._last_why = None
         self._last_ts = None
 
+    @staticmethod
+    def _rotate(path: Path) -> None:
+        """Keep one generation: at or over the cap (`NUCLEOS_HEAVY_DENIALS_MAX_BYTES`, default
+        1 MiB), `denials.jsonl` replaces `denials.jsonl.1`. Fails open: another broker may have
+        rotated first or hold the file open, and the append goes ahead either way."""
+        try:
+            cap = _env_float("NUCLEOS_HEAVY_DENIALS_MAX_BYTES", 1048576.0)
+            if path.stat().st_size >= cap:
+                os.replace(str(path), str(path) + ".1")
+        except OSError:
+            pass
+
     def note(self, cls, adm: dict, now: float | None = None) -> bool:
         try:
             now = time.time() if now is None else now
@@ -3142,6 +3154,7 @@ class DenialLog:
             self.directory.mkdir(parents=True, exist_ok=True)
             path = self.directory / "denials.jsonl"
             data = (json.dumps(row) + "\n").encode("utf-8")
+            self._rotate(path)
             if not (os.name == "nt" and _append_whole_nt(path, data)):
                 fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT
                              | getattr(os, "O_BINARY", 0), 0o666)
