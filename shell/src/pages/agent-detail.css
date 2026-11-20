@@ -1,0 +1,45 @@
+/**
+ * `/agents/$agentId`, `agent-detail-` throughout.
+ *
+ * Two columns that end at the same height: the grid stretches both, the left
+ * Definition panel fills its column, and the right panels share what is left of
+ * theirs with flex rather than one of them stretching into an empty box.
+ */
+
+.agent-detail-back {
+  align-self: flex-start;
+  font-size: var(--text-sm);
+}
+
+.agent-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: var(--space-3);
+}
+
+.agent-detail-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.agent-detail-col > .ui-panel {
+  flex: 1 1 auto;
+  margin: 0;
+}
+
+/* Save, Revert and the status, on the form's last row. */
+.agent-detail-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+@media (max-width: 64rem) {
+  .agent-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -16,6 +16,7 @@ import { RouteError } from "./app/RouteError";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { validateAnalyticsSearch } from "./data/analytics";
 import { QuickCapture } from "./quick-capture/QuickCapture";
+import { AgentDetail } from "./pages/AgentDetail";
 import { Agents } from "./pages/Agents";
 import { Analytics } from "./pages/Analytics";
 import { Calendar, validateCalendarSearch } from "./pages/Calendar";
@@ -204,6 +205,7 @@ const DETAIL_ROUTES: {
   validateSearch?: (search: Record<string, unknown>) => unknown;
 }[] = [
   { path: "/runs/$runId", component: RunDetail },
+  { path: "/agents/$agentId", component: AgentDetail },
   /*
     Adding a project has a route but draws a dialog: the roster, with the wizard on the shared
     `Modal` over it (owner's call 2026-10-09, overriding the earlier page-not-dialog reading of
