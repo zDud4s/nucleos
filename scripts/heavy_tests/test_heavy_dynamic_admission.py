@@ -404,7 +404,9 @@ class Pure(unittest.TestCase):
                 mock.patch.object(c, "admission_mode", return_value="dynamic"), \
                 mock.patch.object(c, "dynamic_probe", return_value=self.probe(2)):
             st = watch.dynamic_state(held)
-        self.assertEqual(st["idle"], c.effective_idle(12, 2, c.held_pred_cores(held)))
+        # The reserve decays with wall-clock time between the two reads, so allow drift.
+        self.assertAlmostEqual(st["idle"], c.effective_idle(12, 2, c.held_pred_cores(held)),
+                               delta=0.05)
 
     def test_dynamic_fit_adm_reports_why(self) -> None:
         c = self.load()
