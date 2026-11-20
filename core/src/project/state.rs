@@ -47,6 +47,11 @@ pub const PINS_FILE: &str = "workflows.yaml";
 /// state directory, which is why it is in [`ALL_FILES`] and not in [`FILES`].
 pub const AUTOMATIONS_FILE: &str = "automations.yaml";
 
+/// The loopback origins the project's agent browsers may open ([`crate::browser::local_origins`]). Read
+/// from the settings store only; it is in [`ALL_FILES`] so an agent cannot authorize itself by writing a
+/// copy.
+pub const BROWSER_PROJECT_FILE: &str = "browser_project.yaml";
+
 /// That a person onboarded this project to NucleOS, when, and what they confirmed. Written only by
 /// [`crate::onboarding`] — the onboarding route and its one-time migration — and never copied from
 /// anywhere: it has no older home, because it records a decision this app did not ask for before.
@@ -76,6 +81,7 @@ pub const ALL_FILES: &[&str] = &[
     AUTOPILOT_FILE,
     PINS_FILE,
     AUTOMATIONS_FILE,
+    BROWSER_PROJECT_FILE,
     ONBOARDED_FILE,
     MATERIALIZED_FILE,
 ];

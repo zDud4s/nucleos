@@ -97,6 +97,10 @@ type Policy struct {
 	// It also accepts http://, which Origins never does: a local dev server on plain http is the
 	// ordinary case here, and there is no session on it to lose.
 	Loopback []string
+	// ForbiddenPorts are loopback ports that no Loopback entry can open: the daemon's HTTP port,
+	// every sidecar's port, the shell's CDP ports. They are checked BEFORE Loopback, so a listed
+	// origin on one of them is still refused. Empty is today's behaviour.
+	ForbiddenPorts []int
 	// Writable are the origins this profile may submit a form to.
 	//
 	// A subset of Origins in practice and NOT by construction: reading a site and acting as the
@@ -142,6 +146,11 @@ func (p Policy) validate(emptyProject bool) error {
 			return fmt.Errorf("fence: %q is not a loopback origin", entry)
 		}
 	}
+	for _, port := range p.ForbiddenPorts {
+		if port <= 0 || port > 65535 {
+			return fmt.Errorf("fence: %d is not a port", port)
+		}
+	}
 	for _, entry := range p.Writable {
 		if normaliseWritable(entry) == "" {
 			return fmt.Errorf("fence: %q is not an origin a form could be submitted to", entry)
@@ -183,6 +192,9 @@ type Verdict struct {
 	Allow       bool
 	Consequence browser.Consequence
 	Detail      string
+	// Origin is the loopback origin a ConsequenceLoopback refusal stopped, so the núcleo can open a
+	// decision for it without parsing Detail. "" for every other refusal.
+	Origin string
 }
 
 func allow() Verdict { return Verdict{Allow: true} }
@@ -285,8 +297,8 @@ func Decide(policy Policy, request Request) Verdict {
 	// allowlist entry is the only way in, so a profile that has business with a local service says so
 	// in configuration rather than by a page guessing a port.
 	if isLoopbackURL(request.URL) {
-		if !listedLoopback(loopbackOriginOf(request.URL), policy.Loopback) {
-			return refuse(browser.ConsequenceLoopback, "this machine's own services are not addressable from a page")
+		if verdict := decideLoopback(policy, loopbackOriginOf(request.URL)); !verdict.Allow {
+			return verdict
 		}
 		// Admitted by name, so the site allowlist below does not also have to cover it — and could
 		// not, being https-only by design. This is what makes a local dev server on plain http
@@ -465,10 +477,46 @@ func DecideTunnel(policy Policy, hostPort string) Verdict {
 		return refuse(browser.ConsequenceChannel, "unreadable CONNECT target")
 	}
 	// CONNECT means TLS, so the origin behind it is an https one whatever the port.
-	if isLoopbackHost(host) && !listedLoopback(normaliseLoopback("https://"+hostPort), policy.Loopback) {
-		return refuse(browser.ConsequenceLoopback, "this machine's own services are not addressable from a page")
+	if isLoopbackHost(host) {
+		return decideLoopback(policy, normaliseLoopback("https://"+hostPort))
 	}
 	return allow()
+}
+
+// decideLoopback judges one loopback origin ("scheme://host:port", already normalised, or "" when it
+// could not be). A forbidden port is refused FIRST, so a listed origin on the daemon's or a
+// sidecar's port is still refused; then the Loopback list decides. Every refusal carries the origin.
+func decideLoopback(policy Policy, origin string) Verdict {
+	if port := originPort(origin); port != 0 {
+		for _, forbidden := range policy.ForbiddenPorts {
+			if forbidden == port {
+				return refuseLoopback(origin, "port %d belongs to NucleOS itself and cannot be opened", port)
+			}
+		}
+	}
+	if !listedLoopback(origin, policy.Loopback) {
+		return refuseLoopback(origin, "this machine's own services are not addressable from a page")
+	}
+	return allow()
+}
+
+func refuseLoopback(origin, format string, args ...any) Verdict {
+	verdict := refuse(browser.ConsequenceLoopback, format, args...)
+	verdict.Origin = origin
+	return verdict
+}
+
+// originPort is the port of a normalised "scheme://host:port", or 0.
+func originPort(origin string) int {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		return 0
+	}
+	return port
 }
 
 // loopbackOriginOf reduces a url to "scheme://host:port", keeping the scheme — unlike [OriginOf],

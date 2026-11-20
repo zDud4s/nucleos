@@ -187,6 +187,7 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	result := browser.Done()
 	if refused != nil {
 		result = browser.Refused(refused.Consequence, refused.Detail)
+		result.Refusal.Origin = refused.Origin
 	}
 	// Both, and in this order: an act can be refused AND move the page. A click that navigates and
 	// also fires a blocked beacon is one act with two things worth saying about it, and reporting

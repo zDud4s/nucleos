@@ -338,6 +338,25 @@ pub async fn post_act(
                         .unwrap_or_default(),
                     "the fence refused an action"
                 );
+                // A loopback refusal for an origin the project has not allowed is the owner's call.
+                // The act carries the target in `url` (when the page moved) or `text` (a navigate).
+                let loopback = result
+                    .refusal
+                    .as_ref()
+                    .is_some_and(|refusal| refusal.consequence == super::local_origins::LOOPBACK);
+                if loopback {
+                    let target = [result.url.as_str(), body.text.as_str()]
+                        .into_iter()
+                        .find(|candidate| super::local_origins::origin_of_url(candidate).is_some());
+                    if let Some(target) = target {
+                        super::local_origins::ask_for_origin(
+                            &state.pool,
+                            row.project_id.as_deref(),
+                            target,
+                        )
+                        .await;
+                    }
+                }
             }
             // Before the answer goes back, and that ordering is the point. What the sidecar reports
             // here is what LEFT the machine as the person, so the record of it must not depend on
