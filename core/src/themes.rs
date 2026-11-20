@@ -1658,7 +1658,7 @@ mod shared_num_ctx_tests {
         let base_url = format!("http://{address}");
         let client = reqwest::Client::new();
 
-        ask_plain(\&crate::map::intent::Extractor::Loopback { client: \&client, base_url: \&base_url, model: "qwen2" }, "prompt".to_string())
+        ask_plain(&crate::map::intent::Extractor::Loopback { client: &client, base_url: &base_url, model: "qwen2" }, "prompt".to_string())
         .await
         .expect("the fake answered");
 
