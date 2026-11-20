@@ -30,6 +30,11 @@ mod no_legacy_telegram;
 #[path = "../tests/routes_still_used.rs"]
 mod routes_still_used;
 
+// No engine named outside engines/adapters/ except a list that only shrinks (motor por contrato §6.9).
+#[cfg(test)]
+#[path = "../tests/engine_names.rs"]
+mod engine_names;
+
 // No two migrations share a number (a silent merge of two branches breaks every DB test).
 #[cfg(test)]
 #[path = "../tests/migration_numbers.rs"]

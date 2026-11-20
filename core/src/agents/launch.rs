@@ -199,9 +199,13 @@ fn plan_launch(
 /// The runners a pin on `engine` may use. An engine with no arm is refused by name, never run
 /// as Claude.
 fn runners_for_pin(engine: Engine, label: &str) -> Result<Vec<RunnerKind>, LaunchError> {
+    // A registered engine is its own runner.
+    if let Some(kind) =
+        RunnerKind::parse(engine.as_str()).filter(|&kind| capabilities::is_registered(kind))
+    {
+        return Ok(vec![kind]);
+    }
     Ok(match engine {
-        Engine::Claude => vec![RunnerKind::Claude],
-        Engine::Codex => vec![RunnerKind::Codex],
         Engine::Local => Vec::new(),
         // Refused by the caller; no runner is ever listed for agy.
         Engine::Agy => Vec::new(),
@@ -217,7 +221,7 @@ fn runners_for_pin(engine: Engine, label: &str) -> Result<Vec<RunnerKind>, Launc
 /// The Claude built-ins `caps` grant that a loadout can list, or none when `pin` names another
 /// engine.
 fn claude_builtins(caps: &[Capability], pin: Option<&(Engine, String)>) -> Vec<String> {
-    if pin.is_some_and(|(engine, _)| *engine != Engine::Claude) {
+    if pin.is_some_and(|(engine, _)| !capabilities::enforces_denied_tools(*engine)) {
         return Vec::new();
     }
     capabilities::translate(Engine::Claude, caps)
@@ -378,6 +382,17 @@ mod tests {
                 .contains("the zed engine is not available for agents, teams or council"),
             "{error}"
         );
+    }
+
+    /// The registry read answers as the name arms did: a registered engine is its own runner, the
+    /// local model and agy list none.
+    #[test]
+    fn runners_for_pin_reads_the_registry() {
+        let runners = |engine| runners_for_pin(engine, "r@1.0.0").unwrap();
+        assert_eq!(runners(Engine::Claude), vec![Claude]);
+        assert_eq!(runners(Engine::Codex), vec![Codex]);
+        assert!(runners(Engine::Local).is_empty());
+        assert!(runners(Engine::Agy).is_empty());
     }
 
     #[test]

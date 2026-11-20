@@ -66,7 +66,7 @@ impl ProviderAdapter for CodexAdapter {
     /// A usage limit (reset read from "try again in ...") or a 429; see
     /// [`super::classify_codex_text`].
     fn classify_failure(&self, stdout: &str, stderr: &str) -> Option<LimitHit> {
-        super::classify_codex_text(stdout, stderr, chrono::Utc::now())
+        crate::accounts::adapters::classify_codex_text(stdout, stderr, chrono::Utc::now())
     }
 }
 

@@ -213,7 +213,8 @@ pub(super) async fn mark_account_limited(
     crate::accounts::launch_chat::mark_hit_and_announce(
         pool,
         None,
-        "claude",
+        // The watch weighs the Claude CLI's own signals (phase 2 makes the event engine-neutral).
+        crate::engines::CLAUDE,
         &crate::accounts::AccountId(account.to_owned()),
         &hit,
         now,

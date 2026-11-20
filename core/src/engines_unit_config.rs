@@ -66,9 +66,22 @@ fn key(unit_dir: &Path) -> String {
 ///
 /// Named `.claude` on purpose: it is the unit's `CLAUDE_CONFIG_DIR`, and the hook scripts inside it
 /// keep the `.claude/hooks/...` tail every detector (`HOOK_SCRIPT`, the stop timer, the timeout
-/// raiser) already matches on, so none of them needs to learn a second layout.
+/// raiser) already matches on, so none of them needs to learn a second layout. The name is the
+/// Claude adapter's own (`unit_config_dir_name`); [`unit_config_dir_for`] asks any other engine's.
 pub fn unit_config_dir(unit_dir: &Path) -> PathBuf {
-    base().join(key(unit_dir)).join(".claude")
+    base().join(key(unit_dir)).join(claude_dir_name())
+}
+
+/// The config dir of the unit working in `unit_dir`, for `engine`: the directory name is what that
+/// engine's adapter declares. `None` for an engine outside the registry.
+pub fn unit_config_dir_for(engine: &str, unit_dir: &Path) -> Option<PathBuf> {
+    let name = crate::engines::adapters::execution_of(engine)?.unit_config_dir_name();
+    Some(base().join(key(unit_dir)).join(name))
+}
+
+fn claude_dir_name() -> &'static str {
+    use crate::engines::adapters::ExecutionAdapter;
+    crate::engines::adapters::claude::engine::ClaudeEngine.unit_config_dir_name()
 }
 
 /// `path` as the forward-slash text a hook command carries, which `python` reads on every platform
@@ -97,7 +110,7 @@ pub fn mcp_file(config_dir: &Path, name: &str) -> PathBuf {
 pub fn chat_config_dir(id: &str) -> PathBuf {
     base()
         .join(format!("chat-{}", key(Path::new(id))))
-        .join(".claude")
+        .join(claude_dir_name())
 }
 
 /// Writes an MCP config at `path` (made by [`mcp_file`]): the config dir is the grandparent, and

@@ -443,7 +443,17 @@ pub fn runner_for_turn(
 
 /// Whether this turn may retain a live CLI process for a later turn.
 pub fn may_keep_process(policy: crate::execution::runner::ToolPolicy, cli: &str) -> bool {
-    matches!(policy, crate::execution::runner::ToolPolicy::Unrestricted) && cli == "claude"
+    matches!(policy, crate::execution::runner::ToolPolicy::Unrestricted) && can_steer(cli)
+}
+
+/// Whether the engine's CLI takes input on a live process (`steer`), so a process can be kept.
+pub(super) fn can_steer(cli: &str) -> bool {
+    crate::engines::adapters::capabilities_of(cli).is_some_and(|declared| declared.steer)
+}
+
+/// Whether the engine's CLI takes a per-spawn system prompt, which is where the briefing travels.
+pub(super) fn takes_system_prompt(cli: &str) -> bool {
+    crate::engines::adapters::capabilities_of(cli).is_some_and(|declared| declared.system_prompt)
 }
 
 /// How long a chat turn may run: `silence` is how long without a new stream event, `ceiling` the
@@ -477,7 +487,7 @@ pub(super) fn system_prompt_with_knowledge(
     instructions: Option<String>,
     block: Option<&str>,
 ) -> Option<String> {
-    if cli != "claude" {
+    if !takes_system_prompt(cli) {
         return instructions;
     }
     let Some(block) = block else {
@@ -998,8 +1008,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         }
         // Skipped for the kept process alone: if that process is gone when the turn reaches it, the
         // turn spawns one, and the spawn reads the briefing the turn did not.
-        let late_briefing: Option<LateBriefing> = (cli == "claude" && kept && !warmed_unbriefed)
-            .then(|| {
+        let late_briefing: Option<LateBriefing> =
+            (takes_system_prompt(cli) && kept && !warmed_unbriefed).then(|| {
                 let pool = pool.clone();
                 let text = text.clone();
                 Box::pin(async move {
@@ -1502,6 +1512,35 @@ mod tests {
     use crate::state::AppState;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn steer_and_system_prompt_probes_hold_for_claude_alone() {
+        use crate::execution::runner::ToolPolicy;
+        // Claude keeps a process and takes the briefing as a system prompt; Codex does neither.
+        assert!(can_steer("claude") && takes_system_prompt("claude"));
+        assert!(!can_steer("codex") && !takes_system_prompt("codex"));
+        assert!(!can_steer("agy") && !takes_system_prompt("agy"));
+        assert!(may_keep_process(ToolPolicy::Unrestricted, "claude"));
+        assert!(!may_keep_process(ToolPolicy::McpOnly, "claude"));
+        assert!(!may_keep_process(ToolPolicy::Unrestricted, "codex"));
+        assert_eq!(
+            system_prompt_with_knowledge("codex", Some("x".into()), Some("block")),
+            Some("x".to_owned())
+        );
+        assert!(
+            system_prompt_with_knowledge("claude", Some("x".into()), Some("block"))
+                .is_some_and(|text| text.contains("block"))
+        );
+        assert!(crate::assistant::turn::prewarm::briefing_wanted(
+            "claude", false
+        ));
+        assert!(!crate::assistant::turn::prewarm::briefing_wanted(
+            "claude", true
+        ));
+        assert!(!crate::assistant::turn::prewarm::briefing_wanted(
+            "codex", false
+        ));
+    }
 
     /// A Codex stream whose `turn.completed` reports the SESSION's running total (130k) while the
     /// window actually holds far less. The thread id is the one `thread.started` announces.

@@ -36,10 +36,16 @@ impl ChatEngine {
     /// compaction and rotation act on that reading, and agy's output carries none. An allow-list: a
     /// row nobody classified fails closed.
     pub fn measures_fill(self) -> bool {
-        matches!(
-            self,
-            Self::Claude | Self::Codex | Self::Local | Self::OpenRouter | Self::GeminiApi
-        )
+        match self.declared() {
+            Some(declared) => declared.context_fill,
+            None => matches!(self, Self::Local | Self::OpenRouter | Self::GeminiApi),
+        }
+    }
+
+    /// What the engine's adapter declares, for an engine in the registry; `None` for the hosted and
+    /// local brains and for agy, which have no adapter.
+    fn declared(self) -> Option<crate::engines::adapters::EngineCapabilities> {
+        crate::engines::adapters::capabilities_of(self.as_str())
     }
 
     /// The chat engine of a CLI runner string; unknown strings collapse to claude.
@@ -122,10 +128,20 @@ pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> Ch
 pub fn support(engine: ChatEngine, capability: Capability) -> Support {
     use Capability::*;
     use Support::{No, Warn, Yes};
+    // An engine with an adapter answers from what the adapter declares (spec 2026-11-18 §6.2);
+    // `--add-dir` and the registry's MCP servers have no capability of their own yet, so a
+    // registered engine takes them.
+    if let Some(declared) = engine.declared() {
+        let has = |present: bool| if present { Yes } else { No };
+        return match capability {
+            Effort => has(!declared.efforts.is_empty()),
+            ExtraDirs | RegistryMcp => Yes,
+            DeniedTools => has(declared.denied_tools),
+            TurnBudget => has(declared.budget_cap),
+            Agents => has(declared.subagents),
+        };
+    }
     match (capability, engine) {
-        (Effort | ExtraDirs | RegistryMcp, ChatEngine::Claude | ChatEngine::Codex) => Yes,
-        (DeniedTools | Agents, ChatEngine::Claude) => Yes,
-        (TurnBudget, ChatEngine::Claude) => Yes,
         (TurnBudget, ChatEngine::Local | ChatEngine::OpenRouter) => Warn,
         // Agy takes `--effort` and `--add-dir` and refuses every other control.
         (Effort | ExtraDirs, ChatEngine::Agy) => Yes,
@@ -203,6 +219,16 @@ mod tests {
         );
         assert!(require(ChatEngine::Codex, TurnBudget, "set a budget").is_err());
         assert!(require(ChatEngine::Codex, DeniedTools, "deny a tool").is_err());
+    }
+
+    #[test]
+    fn measures_fill_reads_the_adapter_and_keeps_the_unregistered_allow_list() {
+        assert!(ChatEngine::Claude.measures_fill());
+        assert!(ChatEngine::Codex.measures_fill());
+        assert!(ChatEngine::Local.measures_fill());
+        assert!(ChatEngine::OpenRouter.measures_fill());
+        assert!(ChatEngine::GeminiApi.measures_fill());
+        assert!(!ChatEngine::Agy.measures_fill());
     }
 
     #[test]

@@ -500,7 +500,7 @@ pub(super) fn cli_launches_on_this_thread() -> usize {
 
 /// Starts a CLI runner's configured command through the sandbox door and returns the child and the
 /// killer of its tree. The one launch of `claude`, `codex` and `agy`.
-pub(super) fn start_cli(
+pub(crate) fn start_cli(
     command: Command,
     request: &RunRequest,
 ) -> std::io::Result<crate::sandbox::Contained> {
@@ -512,7 +512,7 @@ pub(super) fn start_cli(
 
 /// A request with every control at its neutral value, for the runners' launch tests.
 #[cfg(test)]
-pub(super) fn neutral_request(prompt: &str) -> RunRequest {
+pub(crate) fn neutral_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.to_string(),
         env: Vec::new(),
@@ -568,7 +568,7 @@ pub(super) fn launches_during<F: std::future::Future>(run: F) -> usize {
 /// not exist: the launch is attempted (and counted) and fails, so no real CLI ever starts. Holds
 /// the process-wide environment lock for the duration.
 #[cfg(test)]
-pub(super) fn launches_with_missing_bin<F: std::future::Future>(bin_var: &str, run: F) -> usize {
+pub(crate) fn launches_with_missing_bin<F: std::future::Future>(bin_var: &str, run: F) -> usize {
     let _lock = crate::execution::worktree::test_env_lock();
     let previous = std::env::var_os(bin_var);
     let missing = std::env::temp_dir().join("nucleos-no-such-cli-binary");

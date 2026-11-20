@@ -11,7 +11,7 @@
 //! A node WITHOUT `agent:` goes to [`ProtocolAndBody`], untouched.
 use std::sync::Arc;
 
-use crate::agents::capabilities::{CodexSandbox, Engine};
+use crate::agents::capabilities::{CodexSandbox, Engine, is_registered, pins_sandbox};
 use crate::agents::launch::{self, AgentLaunch, LaunchError, Pins};
 use crate::agents::output::{self, OutputShape};
 use crate::models::route_advice::{CodexProfile, RunnerKind};
@@ -51,15 +51,9 @@ fn pins_of(node: &crate::workflows::graph::Node) -> Pins {
 }
 
 fn runner_of(engine: Engine) -> Option<RunnerKind> {
-    match engine {
-        Engine::Claude => Some(RunnerKind::Claude),
-        Engine::Codex => Some(RunnerKind::Codex),
-        Engine::Local => None,
-        // Never launches: `pin_of` refuses agy by name before this is asked.
-        Engine::Agy => None,
-        // An engine with no arm has no runner; `pin_of` then refuses it by name.
-        _ => None,
-    }
+    // A registered engine is a runner; the local model, agy (refused by name in `pin_of` before this
+    // is asked) and any engine outside the registry have none, and `pin_of` refuses them by name.
+    RunnerKind::parse(engine.as_str()).filter(|&kind| is_registered(kind))
 }
 
 /// The dispatcher's pin for the launch's `(engine, model)`. The local engine is not a runner a
@@ -94,16 +88,17 @@ fn pin_of(
         )));
     };
     let profile = codex_profile(sandbox, web_search);
+    let pins = pins_sandbox(engine);
     Ok(Some(EnginePin {
         runner,
         model: Some(model).filter(|model| !model.is_empty()),
         effort: effort
             .filter(|effort| !effort.is_empty())
             .map(str::to_owned),
-        // Only Codex has a sandbox to pin.
-        sandbox: (runner == RunnerKind::Codex).then_some(profile.sandbox),
+        // Only an engine with a coarse sandbox has one to pin.
+        sandbox: pins.then_some(profile.sandbox),
         // Claude has no such switch: its web tools are granted through the loadout.
-        web_search: profile.web_search.filter(|_| runner == RunnerKind::Codex),
+        web_search: profile.web_search.filter(|_| pins),
     }))
 }
 

@@ -298,6 +298,24 @@ fn the_retry_is_pinned_to_the_refused_runs_engine_and_model_with_the_report_appe
         "{}",
         retry.prompt
     );
+    // A Codex retry keeps the sandbox (read-only when none was recorded) and nothing else changes.
+    let codex = engine::retried_launch(
+        NodeLaunch::plain("P".into()),
+        Some("codex"),
+        None,
+        None,
+        "r",
+    );
+    assert_eq!(
+        codex.pin,
+        Some(EnginePin {
+            runner: RunnerKind::Codex,
+            model: None,
+            effort: None,
+            sandbox: Some("read-only"),
+            web_search: None,
+        })
+    );
     // A run with no recorded engine leaves the launcher's own pin alone.
     let unpinned = engine::retried_launch(NodeLaunch::plain("P".into()), None, None, None, "r");
     assert_eq!(unpinned.pin, None);
