@@ -171,6 +171,14 @@ interface ConfirmButtonBase {
    * at. Passed straight through as `aria-describedby`.
    */
   describedBy?: string;
+  /**
+   * The accessible name while engaged, for a drawn `confirmLabel` that is shorter than the name
+   * (a compact "Confirm" that must still be announced as "Delete <name>"). At rest the name is
+   * the label, as ever.
+   */
+  armedName?: string;
+  /** The accessible name at rest, for a label that is only a glyph. */
+  restName?: string;
 }
 
 /**
@@ -256,6 +264,8 @@ export function ConfirmButton({
   unavailable,
   title,
   describedBy,
+  armedName,
+  restName,
 }: ConfirmButtonProps) {
   // The two-step state below belongs to the screen-reader fallback ONLY.
   const [armed, setArmed] = useState(false);
@@ -675,8 +685,9 @@ export function ConfirmButton({
         intent={intent}
         disabled={disabled}
         aria-disabled={unavailable === true ? "true" : undefined}
-        title={title}
         aria-describedby={describedBy}
+        aria-label={engaged ? armedName : restName}
+        title={title ?? (engaged ? armedName : restName)}
         aria-roledescription="hold button"
         onClick={handleClick}
         onKeyDown={handleKeyDown}

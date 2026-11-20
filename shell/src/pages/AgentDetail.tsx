@@ -118,7 +118,9 @@ function AgentPage({ agent }: { agent: Agent }) {
           <span className="agent-detail-delete">
             <ConfirmButton
               label="Delete"
-              confirmLabel={`Delete ${agent.name}`}
+              confirmLabel="Confirm"
+              armedName={`Delete ${agent.name}`}
+              sayAs={`Delete ${agent.name}`}
               variant="danger"
               disabled={del.isPending}
               onConfirm={() => del.mutate(agent.id, { onSuccess: () => void navigate({ to: "/agents" }) })}

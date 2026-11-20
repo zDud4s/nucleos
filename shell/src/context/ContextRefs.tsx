@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { Pencil, X } from "lucide-react";
 import {
   useAddContextRef,
   useContextRefs,
@@ -19,6 +20,7 @@ import {
   ConfirmButton,
   ErrorNote,
   Field,
+  IconButton,
   Quiet,
   RefusalNote,
   Row,
@@ -257,12 +259,17 @@ function RefRow({
             )}
             {row.note !== null && <span className="context-note-inline">{row.note}</span>}
             <span className="context-line-actions">
-              <Button variant="quiet" onClick={() => setDraft(row.note ?? "")}>
-                {row.note === null ? "Add note" : "Edit note"}
-              </Button>
+              <IconButton
+                icon={Pencil}
+                label={`${row.note === null ? "Add" : "Edit"} note for ${basename(row.path)}`}
+                onClick={() => setDraft(row.note ?? "")}
+              />
               <ConfirmButton
-                label="Remove"
-                confirmLabel={`Remove ${row.path}`}
+                label={<X className="context-icon" size={14} strokeWidth={1.5} aria-hidden="true" />}
+                confirmLabel={<X className="context-icon" size={14} strokeWidth={1.5} aria-hidden="true" />}
+                sayAs={`Remove ${row.path}`}
+                restName={`Remove ${basename(row.path)}`}
+                armedName={`Remove ${row.path}`}
                 variant="quiet"
                 disabled={remove.isPending}
                 onConfirm={() => remove.mutate(row.id)}

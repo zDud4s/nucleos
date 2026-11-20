@@ -99,3 +99,21 @@
   margin-left: auto;
   flex: none;
 }
+
+/* The icon-only row actions: no wrap, and the remove glyph sits at the weight of its neighbour. */
+.context-line {
+  flex-wrap: nowrap;
+}
+
+.context-line .context-line-actions {
+  gap: var(--space-1);
+}
+
+.context-icon {
+  display: block;
+}
+
+/* An icon-only remove has no room for the reduced-motion "Keep holdingâ€¦" text. */
+.context-line .ui-confirm-keep {
+  display: none;
+}

@@ -113,7 +113,7 @@ describe("AgentDetail - the definition", () => {
 
     expect(await screen.findByLabelText("Model")).toBeDefined();
     fireEvent.click(screen.getByRole("button", { name: "About model" }));
-    expect(screen.getByText(/engine's default/)).toBeDefined();
+    expect(screen.getByText(/lets the engine choose/)).toBeDefined();
   });
 
   it("shows the save status only when there is one", async () => {
@@ -139,13 +139,49 @@ describe("AgentDetail - what hangs off the agent", () => {
     expect(await within(memory).findByText("Copy is short")).toBeDefined();
     expect(within(memory).queryByText("Someone else's habit")).toBeNull();
     expect(await screen.findByRole("region", { name: "Tools" })).toBeDefined();
-    expect(await screen.findByRole("region", { name: "Loadout preview" })).toBeDefined();
+    expect(await screen.findByRole("region", { name: "Briefing preview" })).toBeDefined();
     expect(screen.queryByRole("heading", { level: 2, name: "Definition" })).toBeNull();
     expect(screen.queryByRole("tab")).toBeNull();
   });
 });
 
+describe("AgentDetail - the model", () => {
+  it("keeps a model the catalogue lacks as an extra option", async () => {
+    await openAgent([agent({ model: "claude-legacy-3" })], "/agents/copywriter");
+
+    const select = (await screen.findByLabelText("Model")) as HTMLSelectElement;
+    expect(select.value).toBe("claude-legacy-3");
+    expect(within(select).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "Default",
+      "opus",
+      "sonnet",
+      "haiku",
+      "claude-legacy-3",
+    ]);
+  });
+
+  it("reads a null model as Default", async () => {
+    await openAgent([agent({ model: null })], "/agents/copywriter");
+
+    expect(((await screen.findByLabelText("Model")) as HTMLSelectElement).value).toBe("");
+  });
+});
+
 describe("AgentDetail - delete", () => {
+  it("arms into a short Confirm and keeps the agent's name in the accessible name", async () => {
+    await openAgent([agent()], "/agents/copywriter");
+
+    const button = await screen.findByRole("button", { name: "Delete" });
+    expect(button.textContent).toContain("Delete");
+    fireEvent.click(button);
+    await afterDwell();
+
+    const armed = screen.getByRole("button", { name: "Delete copywriter" });
+    expect(armed.getAttribute("aria-label")).toBe("Delete copywriter");
+    expect(armed.textContent).toContain("Confirm");
+    expect(armed.textContent).not.toContain("copywriter");
+  });
+
   it("names what stands on the agent behind a tip", async () => {
     await openAgent([agent({ id: "controller", name: "controller" })], "/agents/controller", {
       teams: [team({ name: "Finanças", director_agent_id: "controller" })],

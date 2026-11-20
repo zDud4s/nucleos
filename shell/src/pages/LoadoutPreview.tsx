@@ -1,7 +1,7 @@
 import { useId, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { apiFetch } from "../data/client";
-import { Button, ErrorNote, Field, Quiet, Radio, SectionHead, Segmented } from "../ui";
+import { Button, ErrorNote, Field, Quiet, Radio, SectionHead, Segmented, Tip } from "../ui";
 import "./loadout-preview.css";
 import { DAEMON_NAME } from "../copy";
 
@@ -56,8 +56,21 @@ export function LoadoutPreview({ agentId, variant }: { agentId: string; variant?
 
   if (compact) {
     return (
-      <section className="learned-group loadout-preview loadout-preview-section" aria-label="Loadout preview">
-        <SectionHead title="Loadout" />
+      <section className="learned-group loadout-preview loadout-preview-section" aria-label="Briefing preview">
+        <SectionHead
+          title="Briefing"
+          aside={
+            <Tip
+              name="About the briefing preview"
+              tip={
+                <span>
+                  Type a task to see the memory, tools and context this agent would receive for it. Runs in picks
+                  whether the preview is for a team run or a job node.
+                </span>
+              }
+            />
+          }
+        />
         <form
           className="loadout-preview-line"
           onSubmit={(event) => {
@@ -73,7 +86,10 @@ export function LoadoutPreview({ agentId, variant }: { agentId: string; variant?
               onChange={(event) => setTask(event.target.value)}
             />
           </Field>
-          <Segmented label="Runs in" value={box} options={BOXES} onChange={setBox} />
+          <span className="loadout-preview-as">
+            <span className="loadout-preview-as-label">Runs in</span>
+            <Segmented label="Runs in" value={box} options={BOXES} onChange={setBox} />
+          </span>
           <Button type="submit" disabled={preview.isPending}>
             Preview
           </Button>
@@ -85,8 +101,8 @@ export function LoadoutPreview({ agentId, variant }: { agentId: string; variant?
   }
 
   return (
-    <section className="learned-group loadout-preview" aria-label="Loadout preview">
-      <h3>Loadout preview</h3>
+    <section className="learned-group loadout-preview" aria-label="Briefing preview">
+      <h3>Briefing preview</h3>
       <form
         className="loadout-preview-form"
         onSubmit={(event) => {
@@ -135,7 +151,9 @@ function PreviewResult({ answer, compact = false }: { answer: LoadoutPreviewAnsw
         )}
       </section>
       <section aria-label="Tools it would hold">
-        <h4>Tools</h4>
+        <h4>
+          Tools <span className="loadout-preview-count">{tools.length}</span>
+        </h4>
         {tools.length === 0 ? (
           <Quiet compact={compact} says={compact ? "None" : "No tools: this agent would run without any."} />
         ) : (
@@ -150,7 +168,9 @@ function PreviewResult({ answer, compact = false }: { answer: LoadoutPreviewAnsw
         )}
       </section>
       <section aria-label="Context it would be offered">
-        <h4>Context</h4>
+        <h4>
+          Context <span className="loadout-preview-count">{refs.length}</span>
+        </h4>
         {refs.length === 0 ? (
           <Quiet compact={compact} says={compact ? "None" : "No context files would be offered."} />
         ) : (

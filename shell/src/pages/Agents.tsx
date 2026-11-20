@@ -15,6 +15,7 @@ import {
   type Employer,
   type Employment,
 } from "../data/agents";
+import { modelOptions, useLocalModels } from "../data/agent-models";
 import { useTeams } from "../data/teams";
 import {
   Button,
@@ -618,6 +619,45 @@ export function requestFromDraft(draft: AgentDraft): AgentRequest {
 }
 
 /**
+ * The model of a draft, chosen from what its engine offers. "Default" is blank, as before; a model
+ * the agent already names stays listed even when the catalogue lacks it.
+ */
+function ModelSelect({
+  id,
+  draft,
+  onChange,
+  required,
+  describedBy,
+}: {
+  id: string;
+  draft: AgentDraft;
+  onChange: (next: Partial<AgentDraft>) => void;
+  required: boolean;
+  describedBy?: string;
+}) {
+  const local = useLocalModels(draft.engine === "local");
+  const options = modelOptions(draft.engine, draft.model, local);
+  return (
+    <Select
+      block
+      mono
+      id={id}
+      aria-required={required}
+      aria-describedby={describedBy}
+      value={draft.model}
+      onChange={(event) => onChange({ model: event.target.value })}
+    >
+      <option value="">Default</option>
+      {options.map((model) => (
+        <option key={model} value={model}>
+          {model}
+        </option>
+      ))}
+    </Select>
+  );
+}
+
+/**
  * The fields `NewAgentForm` and the editor share.
  *
  * One field set for both, so the two cannot answer "what does an `AgentRequest`
@@ -678,7 +718,7 @@ export function AgentFields({
             <Select
               block
               value={draft.engine}
-              onChange={(event) => onChange({ engine: event.target.value as AgentEngine })}
+              onChange={(event) => onChange({ engine: event.target.value as AgentEngine, model: "" })}
             >
               <option value="claude">claude</option>
               <option value="codex">codex</option>
@@ -690,15 +730,10 @@ export function AgentFields({
               <label htmlFor={`${fieldId}-model`}>Model</label>
               <Tip
                 name="About model"
-                tip={<span>{modelRequired ? "Required for a local engine." : "Blank uses the engine's default."}</span>}
+                tip={<span>{modelRequired ? "Required for a local engine." : "Default lets the engine choose."}</span>}
               />
             </span>
-            <input
-              id={`${fieldId}-model`}
-              aria-required={modelRequired}
-              value={draft.model}
-              onChange={(event) => onChange({ model: event.target.value })}
-            />
+            <ModelSelect id={`${fieldId}-model`} draft={draft} onChange={onChange} required={modelRequired} />
           </div>
         </div>
         {capabilities}
@@ -743,7 +778,7 @@ export function AgentFields({
         <Select
           block
           value={draft.engine}
-          onChange={(event) => onChange({ engine: event.target.value as AgentEngine })}
+          onChange={(event) => onChange({ engine: event.target.value as AgentEngine, model: "" })}
         >
           <option value="claude">claude</option>
           <option value="codex">codex</option>
@@ -755,15 +790,15 @@ export function AgentFields({
         <label htmlFor={`${fieldId}-model`}>
           <span>Model</span>
         </label>
-        <input
+        <ModelSelect
           id={`${fieldId}-model`}
-          aria-required={modelRequired}
-          aria-describedby={`${fieldId}-model-hint`}
-          value={draft.model}
-          onChange={(event) => onChange({ model: event.target.value })}
+          describedBy={`${fieldId}-model-hint`}
+          draft={draft}
+          onChange={onChange}
+          required={modelRequired}
         />
         <small className="agents-hint" id={`${fieldId}-model-hint`}>
-          {modelRequired ? "Required for a local engine." : "Blank uses the engine's default."}
+          {modelRequired ? "Required for a local engine." : "Default lets the engine choose."}
         </small>
       </div>
 
