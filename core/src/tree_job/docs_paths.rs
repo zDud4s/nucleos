@@ -26,7 +26,7 @@ pub fn owned_glob_matches(glob: &str, path: &str) -> bool {
 
 /// True when `file` is inside what a declared path owns: a glob match, or, for a bare directory
 /// (`shell`, `shell/`, no `*`), anything below it. Traversal is never owned.
-pub(crate) fn owns(glob: &str, file: &str) -> bool {
+pub fn owns(glob: &str, file: &str) -> bool {
     let glob = glob.replace('\\', "/");
     let file = file.replace('\\', "/");
     let dir = glob.trim_end_matches('/');
