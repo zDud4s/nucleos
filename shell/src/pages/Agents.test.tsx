@@ -11,10 +11,13 @@ vi.mock("../data/client", async (original) => ({
 
 import { Agents } from "./Agents";
 import { ApiRefusal } from "../data/client";
-import type { Agent, Employer } from "../data/agents";
-import { daemonFetch, daemonState, renderApp, renderWithQuery } from "../test/harness";
-import { known, knowledgeAnswer } from "../brain/knowledge/test-helpers";
-import type { Known } from "../data/knowledge";
+import { agent, agentsFetch, team } from "./agentsTestHelpers";
+import { daemonFetch, daemonState, renderApp, renderWithRouter } from "../test/harness";
+
+/** The page needs a router around it: every name is a link. */
+async function renderAgents() {
+  return renderWithRouter(<Agents />, { initialPath: "/agents" });
+}
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -27,131 +30,10 @@ beforeEach(() => {
 
 /* ------------------------------------------------------------ fixtures -- */
 
-function agent(overrides: Partial<Agent> = {}): Agent {
-  return {
-    id: "copywriter",
-    name: "copywriter",
-    speciality: "writes short copy",
-    prompt: "You write short, punchy copy.",
-    engine: "claude",
-    model: null,
-    capabilities: ["mcp.nucleos"],
-    tool_policy: "mcp_only",
-    created_at: "2026-08-01T09:00:00Z",
-    updated_at: "2026-08-01T09:00:00Z",
-    ...overrides,
-  };
-}
-
-function team(overrides: Partial<Employer> = {}): Employer {
-  return { id: "financas", name: "Finanças", director_agent_id: "", members: [], ...overrides };
-}
-
-/**
- * The agent routes, over mutable state — the same shape `councilFetch` in
- * `Council.test.tsx` uses: a page that
- * refetches after a mutation needs the next `GET` to answer with the changed
- * row, not with whatever a one-shot mock happened to return first.
- *
- * `/teams` is answered here too, because the page reads it for one derived
- * number per row. An unanswered query would leave `data` undefined, which the
- * page draws as "not known" — a state worth testing on purpose and never worth
- * falling into by accident.
- */
-function agentsFetch(
-  rows: Agent[],
-  opts: {
-    teams?: Employer[];
-    knowledge?: Known[];
-    onCreate?: (body: Record<string, unknown>) => unknown;
-    onUpdate?: (id: string, body: Record<string, unknown>) => unknown;
-    onDelete?: (id: string) => unknown;
-  } = {},
-): (path: string, init?: RequestInit) => Promise<unknown> {
-  /*
-    Every read answers with FRESH objects, copied off the state this closure
-    holds. Returning the array itself is what a hand-written fake reaches for
-    first and it is quietly wrong: react-query keeps the previously stored value
-    when the next one is reference-equal to it, so a fake that mutates a row in
-    place and hands the same array back reports no change at all, and the page
-    under test renders stale text that the store already disagrees with. A real
-    daemon parses new objects out of JSON every time; so does this.
-  */
-  return async (path, init) => {
-    if (path === "/teams") return (opts.teams ?? []).map((row) => ({ ...row }));
-    const listed = knowledgeAnswer(path, opts.knowledge ?? []);
-    if (listed !== undefined) return listed.map((row) => ({ ...row }));
-
-    if (path === "/agents" && init?.method === "POST") {
-      const body = JSON.parse(init.body as string) as Record<string, unknown>;
-      if (opts.onCreate !== undefined) return opts.onCreate(body);
-      const created: Agent = {
-        id: String(body.name),
-        name: String(body.name),
-        speciality: String(body.speciality),
-        prompt: String(body.prompt),
-        engine: String(body.engine),
-        model: (body.model as string | null) ?? null,
-        capabilities: body.capabilities as string[],
-        tool_policy: "none",
-        created_at: "2026-08-18T09:00:00Z",
-        updated_at: "2026-08-18T09:00:00Z",
-      };
-      rows.push(created);
-      return created;
-    }
-    if (path === "/agents") return rows.map((row) => ({ ...row }));
-
-    const idMatch = /^\/agents\/([^/]+)$/.exec(path);
-    if (idMatch !== null && init?.method === "PUT") {
-      const id = decodeURIComponent(idMatch[1]);
-      const body = JSON.parse(init.body as string) as Record<string, unknown>;
-      if (opts.onUpdate !== undefined) return opts.onUpdate(id, body);
-      const row = rows.find((candidate) => candidate.id === id);
-      if (row === undefined) throw new ApiRefusal(404, "not_found", "");
-      row.name = String(body.name);
-      row.speciality = String(body.speciality);
-      row.prompt = String(body.prompt);
-      row.engine = String(body.engine);
-      row.model = (body.model as string | null) ?? null;
-      row.capabilities = body.capabilities as string[];
-      return row;
-    }
-    if (idMatch !== null && init?.method === "DELETE") {
-      const id = decodeURIComponent(idMatch[1]);
-      if (opts.onDelete !== undefined) return opts.onDelete(id);
-      const index = rows.findIndex((candidate) => candidate.id === id);
-      if (index === -1) throw new ApiRefusal(404, "not_found", "");
-      rows.splice(index, 1);
-      return undefined;
-    }
-    return undefined;
-  };
-}
-
-/** The dwell `ConfirmButton` needs between arming and confirming — see `KillSwitchControl.test.tsx`. */
-async function afterDwell(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 350));
-}
-
 /** Open the create dialog, which is closed until somebody asks for it. */
 async function openCreate(): Promise<HTMLElement> {
   fireEvent.click(await screen.findByRole("button", { name: "New agent" }));
   return screen.findByRole("dialog", { name: "New agent" });
-}
-
-/** Select a row, which is what opens the one editor dialog on the page. */
-async function openEditor(name: string): Promise<HTMLElement> {
-  fireEvent.click(await screen.findByRole("button", { name }));
-  return screen.findByRole("dialog", { name: `Editing ${name}` });
-}
-
-/**
- * The editor holds one section at a time; the Remove, Memory and Tools ones sit behind a tab.
- * Tabs are Radix, so they are selected by `mouseDown` and not by `click`.
- */
-function openTab(editor: HTMLElement, name: string) {
-  fireEvent.mouseDown(within(editor).getByRole("tab", { name }));
 }
 
 /* ------------------------------------------------------------ the shape -- */
@@ -159,9 +41,9 @@ function openTab(editor: HTMLElement, name: string) {
 describe("Agents - the shape of the page", () => {
   it("does not open a form over a catalogue nobody has read yet", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    await screen.findByRole("button", { name: "copywriter" });
+    await screen.findByRole("link", { name: "copywriter" });
     expect(screen.queryByLabelText("Name")).toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
 
@@ -173,7 +55,7 @@ describe("Agents - the shape of the page", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "one", name: "one" }), agent({ id: "two", name: "two" })]),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     const table = await screen.findByRole("table");
     // Header row plus one per agent, and no second table pretending to be one.
@@ -183,7 +65,7 @@ describe("Agents - the shape of the page", () => {
 
   it("the catalogue says what its marks mean", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     const key = await screen.findByText(/directs a team/);
     expect(key.textContent).toContain("on a team’s roster");
@@ -193,7 +75,7 @@ describe("Agents - the shape of the page", () => {
 
   it("the key spends one glyph per meaning", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     const key = await screen.findByText(/directs a team/);
     expect(key.textContent).toContain("■ has tools");
@@ -201,24 +83,17 @@ describe("Agents - the shape of the page", () => {
     expect(key.textContent).not.toContain("● has tools");
   });
 
-  it("keeps one editor dialog, and swaps it rather than stacking a second", async () => {
+  it("links each name to the agent's own page", async () => {
     daemon.apiFetch.mockImplementation(
-      agentsFetch([agent({ id: "one", name: "one" }), agent({ id: "two", name: "two", speciality: "second" })]),
+      agentsFetch([agent({ id: "one", name: "one" }), agent({ id: "two", name: "two" })]),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    await openEditor("one");
-    expect(screen.getAllByLabelText("Prompt")).toHaveLength(1);
-
-    // The modal holds the page inert, so the way to another agent is through Close.
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    const link = await screen.findByRole("link", { name: "two" });
+    expect(link.getAttribute("href")).toBe("/agents/two");
+    expect(link.getAttribute("aria-haspopup")).toBeNull();
+    fireEvent.click(link);
     expect(screen.queryByRole("dialog")).toBeNull();
-
-    await openEditor("two");
-    expect(screen.getAllByLabelText("Prompt")).toHaveLength(1);
-    expect(screen.queryByRole("dialog", { name: "Editing one" })).toBeNull();
-    // The draft reseeded from the newly chosen agent rather than carrying over.
-    expect((screen.getByLabelText("Speciality") as HTMLInputElement).value).toBe("second");
   });
 });
 
@@ -229,16 +104,16 @@ describe("Agents - the name and the id", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "head-of-content", name: "head of content" })]),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText("head-of-content")).toBeDefined();
   });
 
   it("says what the id IS, rather than leaving the same word twice with no reason", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent({ id: "tradutor", name: "tradutor" })]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    const cell = (await screen.findByRole("button", { name: "tradutor" })).closest("th") as HTMLElement;
+    const cell = (await screen.findByRole("link", { name: "tradutor" })).closest("th") as HTMLElement;
     // Everything separating the name from the id on screen is spatial, and none
     // of it is read out. Without this the row is the same word, twice.
     expect(cell.textContent).toContain("known to the background service as tradutor");
@@ -246,7 +121,7 @@ describe("Agents - the name and the id", () => {
 
   it("marks the id once a rename has left it behind, and says what still points at it", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent({ id: "auditor", name: "Auditor Sénior" })]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     const id = await screen.findByText(/auditor/, { selector: ".agents-id-diverged" });
     expect(id.textContent).toContain("auditor");
@@ -257,7 +132,7 @@ describe("Agents - the name and the id", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "head-of-content", name: "Head of Content" })]),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     await screen.findByText("head-of-content");
     expect(document.querySelector(".agents-id-diverged")).toBeNull();
@@ -270,7 +145,7 @@ describe("Agents - the name and the id", () => {
 describe("Agents - what an agent can do", () => {
   it("reads a null model as the engine's default and says what naming none costs", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent({ model: null })]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText("the engine’s default")).toBeDefined();
     expect(screen.getByText(/can never take a council seat/i)).toBeDefined();
@@ -278,7 +153,7 @@ describe("Agents - what an agent can do", () => {
 
   it("says nothing about council seats for an agent that names a model", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent({ model: "gpt-5-codex", engine: "codex" })]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText("gpt-5-codex")).toBeDefined();
     expect(screen.queryByText(/council seat/i)).toBeNull();
@@ -291,9 +166,9 @@ describe("Agents - what an agent can do", () => {
         agent({ id: "bare", name: "bare", capabilities: [], tool_policy: "none" }),
       ]),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    await screen.findByRole("button", { name: "armed" });
+    await screen.findByRole("link", { name: "armed" });
     expect(screen.getByText(/mcp_only: has tools/)).toBeDefined();
     expect(screen.getByText(/none: no tools at all/)).toBeDefined();
     // The seven tones are the núcleo's state vocabulary; nothing here is a state.
@@ -302,16 +177,16 @@ describe("Agents - what an agent can do", () => {
 
   it("says so rather than guessing when the policy is one this shell has never heard of", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent({ tool_policy: "read_only" })]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText(/read_only: this shell has no reading for that policy/)).toBeDefined();
   });
 
   it("renders no provenance, because nothing in the núcleo stores it", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    await screen.findByRole("button", { name: "copywriter" });
+    await screen.findByRole("link", { name: "copywriter" });
     expect(screen.queryByText(/provenance/i)).toBeNull();
     expect(screen.queryByText(/recruit/i)).toBeNull();
   });
@@ -329,7 +204,7 @@ describe("Agents - how much of an agent is spoken for", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "auditor", name: "auditor" })], { teams: departments }),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText(/on the roster of Finanças, Marketing/)).toBeDefined();
     // The matrix answers "where" and is not redrawn here.
@@ -340,7 +215,7 @@ describe("Agents - how much of an agent is spoken for", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "controller", name: "controller" })], { teams: departments }),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText(/directs Finanças/)).toBeDefined();
   });
@@ -353,9 +228,9 @@ describe("Agents - how much of an agent is spoken for", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "sysadmin", name: "sysadmin" })], { teams: own }),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    const cell = (await screen.findByRole("button", { name: "sysadmin" }))
+    const cell = (await screen.findByRole("link", { name: "sysadmin" }))
       .closest("tr")
       ?.querySelector(".agents-figure") as HTMLElement;
     expect(cell.textContent).toContain("directs Segurança");
@@ -370,7 +245,7 @@ describe("Agents - how much of an agent is spoken for", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "sysadmin", name: "sysadmin" })], { teams: two }),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText(/directs Segurança/)).toBeDefined();
     expect(screen.getByText(/on the roster of Informática/)).toBeDefined();
@@ -380,7 +255,7 @@ describe("Agents - how much of an agent is spoken for", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "spare", name: "spare", model: "sonnet" })], { teams: departments }),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText("no team names this one")).toBeDefined();
     expect(screen.getByText(/1 nobody uses/)).toBeDefined();
@@ -392,7 +267,7 @@ describe("Agents - how much of an agent is spoken for", () => {
       if (path === "/agents") return [agent({ id: "spare", name: "spare", model: "sonnet" })];
       return undefined;
     });
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText(/the team list has not answered/)).toBeDefined();
     expect(screen.queryByText("no team names this one")).toBeNull();
@@ -405,7 +280,7 @@ describe("Agents - how much of an agent is spoken for", () => {
 describe("Agents - the policy control and the local-engine model requirement", () => {
   it("offers every known capability as a checkbox and sends the ticked ones", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     const panel = await openCreate();
     const group = within(panel).getByRole("group", { name: "Capabilities" });
@@ -418,7 +293,7 @@ describe("Agents - the policy control and the local-engine model requirement", (
 
   it("refuses submit when engine is local and no model is named", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     const panel = await openCreate();
     fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "analyst" } });
@@ -439,136 +314,12 @@ describe("Agents - the policy control and the local-engine model requirement", (
 /* --------------------------------------------------------------- editor -- */
 
 describe("Agents - the dialogs close", () => {
-  it("closes the editor on Close, Cancel and Escape, and clears the selection", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
-
-    for (const close of [
-      (dialog: HTMLElement) => fireEvent.click(within(dialog).getByRole("button", { name: "Close" })),
-      (dialog: HTMLElement) => fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" })),
-      (dialog: HTMLElement) => fireEvent.keyDown(dialog, { key: "Escape" }),
-    ]) {
-      close(await openEditor("copywriter"));
-      expect(screen.queryByRole("dialog")).toBeNull();
-    }
-  });
-
   it("closes the create dialog on Escape", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     fireEvent.keyDown(await openCreate(), { key: "Escape" });
     expect(screen.queryByRole("dialog")).toBeNull();
-  });
-});
-
-describe("Agents - editing a row", () => {
-  it("sends a PUT carrying every field including the unchanged ones, and the table shows the returned agent", async () => {
-    const rows = [agent({ id: "copywriter", name: "copywriter", speciality: "writes short copy" })];
-    daemon.apiFetch.mockImplementation(agentsFetch(rows));
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("copywriter");
-    fireEvent.change(within(editor).getByLabelText("Speciality"), {
-      target: { value: "writes long-form copy" },
-    });
-    fireEvent.click(within(editor).getByRole("button", { name: "Save changes" }));
-
-    await screen.findByText("writes long-form copy");
-
-    expect(daemon.apiFetch).toHaveBeenCalledWith(
-      "/agents/copywriter",
-      expect.objectContaining({
-        method: "PUT",
-        body: JSON.stringify({
-          name: "copywriter",
-          speciality: "writes long-form copy",
-          prompt: "You write short, punchy copy.",
-          engine: "claude",
-          model: null,
-          capabilities: ["mcp.nucleos"],
-        }),
-      }),
-    );
-  });
-
-  it("says that saving reaches work already queued, because a prompt is read at dispatch", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("copywriter");
-    fireEvent.click(within(editor).getByRole("button", { name: "About saving" }));
-    expect(within(editor).getByText(/reaches work that is already queued/i)).toBeDefined();
-  });
-
-  it("shows the prompt in the editor rather than behind a per-row disclosure", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
-
-    await screen.findByRole("button", { name: "copywriter" });
-    expect(document.querySelector("details")).toBeNull();
-
-    const editor = await openEditor("copywriter");
-    expect((within(editor).getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe(
-      "You write short, punchy copy.",
-    );
-  });
-});
-
-/* ------------------------------------------------------------- refusals -- */
-
-describe("Agents - what stands on an agent", () => {
-  it("names what it can see before the delete is armed, and admits what it cannot", async () => {
-    const departments = [team({ name: "Finanças", director_agent_id: "controller" })];
-    daemon.apiFetch.mockImplementation(
-      agentsFetch([agent({ id: "controller", name: "controller" })], { teams: departments }),
-    );
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("controller");
-    openTab(editor, "Remove");
-    expect(within(editor).getByText(/directs Finanças/)).toBeDefined();
-    expect(within(editor).getByText(/an item of a team run, or of a job/)).toBeDefined();
-  });
-
-  it("does not let an empty roster read as a clean delete", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([agent()], { teams: [] }));
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("copywriter");
-    openTab(editor, "Remove");
-    expect(within(editor).getByText(/No team names copywriter/)).toBeDefined();
-    expect(within(editor).getByText(/is not something this page can see/)).toBeDefined();
-  });
-});
-
-describe("Agents - a delete answering 409", () => {
-  it("names all four grounds the núcleo refuses on, not only the two about teams", async () => {
-    const rows = [agent({ id: "director", name: "director" })];
-    daemon.apiFetch.mockImplementation(
-      agentsFetch(rows, {
-        onDelete: () => {
-          throw new ApiRefusal(409, "conflict", "");
-        },
-      }),
-    );
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("director");
-    openTab(editor, "Remove");
-    fireEvent.click(within(editor).getByRole("button", { name: "Delete" }));
-    await afterDwell();
-    fireEvent.click(within(editor).getByRole("button", { name: /Delete director/ }));
-
-    expect(
-      await screen.findByText(
-        "this agent directs or belongs to a team, or is holding an item of a team run or of a job",
-      ),
-    ).toBeDefined();
-    // The old sentence sent anybody who had already emptied every roster
-    // looking for a team that does not exist.
-    expect(screen.queryByText("a team is standing on this agent")).toBeNull();
-    expect(screen.queryByText(/something about this has already changed/i)).toBeNull();
   });
 });
 
@@ -581,7 +332,7 @@ describe("Agents - a create answering 409", () => {
         },
       }),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     const panel = await openCreate();
     fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "copywriter" } });
@@ -600,7 +351,7 @@ describe("Agents - a create answering 409", () => {
 describe("Agents - an empty catalogue", () => {
   it("teaches what an agent is for", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
     expect(await screen.findByText("No agent has been hired yet")).toBeDefined();
     fireEvent.click(screen.getByRole("button", { name: "Why?" }));
@@ -611,73 +362,9 @@ describe("Agents - an empty catalogue", () => {
   });
 });
 
-/* ------------------------------------------------------- the own memory -- */
-
-describe("Agents - the agent's own memory", () => {
-  it("the agent editor shows the agent's own memory", async () => {
-    daemon.apiFetch.mockImplementation(
-      agentsFetch([agent()], {
-        knowledge: [
-          known({ id: 1, scope_kind: "agent", scope_id: "copywriter", title: "Copy is short" }),
-          known({ id: 2, scope_kind: "agent", scope_id: "other", title: "Someone else's habit" }),
-          known({ id: 3, scope_kind: "project", scope_id: "nucleos", title: "A project fact" }),
-        ],
-      }),
-    );
-    renderWithQuery(<Agents />);
-
-    const dialog = await openEditor("copywriter");
-    openTab(dialog, "Memory and context");
-    const memory = await within(dialog).findByRole("region", { name: "Memory" });
-
-    expect(await within(memory).findByText("Copy is short")).toBeDefined();
-    expect(within(memory).queryByText("Someone else's habit")).toBeNull();
-    expect(within(memory).queryByText("A project fact")).toBeNull();
-  });
-});
-
 /* ------------------------------------------------------------- the route -- */
 
 describe("Agents - the route", () => {
-  it("splits the editor into sections and keeps Save on the definition only", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("copywriter");
-    expect(within(editor).getByRole("button", { name: "Save changes" })).toBeDefined();
-    expect(within(editor).queryByRole("region", { name: "Memory" })).toBeNull();
-
-    openTab(editor, "Tools and loadout");
-    expect(within(editor).queryByRole("button", { name: "Save changes" })).toBeNull();
-    expect(within(editor).queryByLabelText("Name")).toBeNull();
-    expect(within(editor).getAllByRole("button", { name: "Close" }).length).toBeGreaterThan(0);
-  });
-
-  it("says why Save is off, and toasts Agent saved once the daemon answered", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("copywriter");
-    fireEvent.change(within(editor).getByLabelText("Name"), { target: { value: "  " } });
-    expect(within(editor).getByText("Needs a name")).toBeDefined();
-    expect((within(editor).getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
-
-    fireEvent.change(within(editor).getByLabelText("Name"), { target: { value: "copywriter two" } });
-    fireEvent.click(within(editor).getByRole("button", { name: "Save changes" }));
-    expect(await screen.findByText("Agent saved")).toBeDefined();
-    expect(within(editor).queryByText("Saved")).toBeNull();
-  });
-
-  it("keeps the Model hint attached to the field instead of replacing its name", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
-
-    const editor = await openEditor("copywriter");
-    const model = within(editor).getByLabelText("Model");
-    const hint = document.getElementById(model.getAttribute("aria-describedby") ?? "");
-    expect(hint?.textContent).toMatch(/engine's default/);
-  });
-
   it("is registered in the real tree and is no longer the placeholder", async () => {
     const rows = [agent()];
     const shared = daemonFetch(daemonState());
@@ -703,24 +390,24 @@ describe("Agents - filtering the catalogue", () => {
         agent({ id: "auditor", name: "auditor", speciality: "checks the books", model: null }),
       ]),
     );
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    await screen.findByRole("button", { name: "copywriter" });
+    await screen.findByRole("link", { name: "copywriter" });
     fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "books" } });
-    expect(screen.queryByRole("button", { name: "copywriter" })).toBeNull();
-    expect(screen.getByRole("button", { name: "auditor" })).toBeDefined();
+    expect(screen.queryByRole("link", { name: "copywriter" })).toBeNull();
+    expect(screen.getByRole("link", { name: "auditor" })).toBeDefined();
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: /Without a model/ }));
-    expect(screen.queryByRole("button", { name: "copywriter" })).toBeNull();
-    expect(screen.getByRole("button", { name: "auditor" })).toBeDefined();
+    expect(screen.queryByRole("link", { name: "copywriter" })).toBeNull();
+    expect(screen.getByRole("link", { name: "auditor" })).toBeDefined();
   });
 
   it("says so when nothing matches", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
-    renderWithQuery(<Agents />);
+    await renderAgents();
 
-    await screen.findByRole("button", { name: "copywriter" });
+    await screen.findByRole("link", { name: "copywriter" });
     fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "zzz" } });
     expect(screen.getByText("No agent matches that filter.")).toBeDefined();
   });

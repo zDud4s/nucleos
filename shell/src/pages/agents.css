@@ -121,30 +121,6 @@
   background: var(--surface-raised);
 }
 
-/*
-  The open row is marked by `.ui-current` — a 2px inset rule on the leading
-  edge, in `--text` — and by nothing else. It was `background:
-  var(--surface-sunken)`, argued for here on the grounds that sunken recedes
-  below the panel in dark and in light alike; that argument was sound and is no
-  longer the point. The app says "this one" one way everywhere now (the This-One
-  Rule, decided by the owner on 2026-09-06), and a page keeping its own good
-  answer is exactly how six pages each arrived at a different one.
-
-  **The class goes on the leading cell, not on the `tr`.** In a
-  `border-collapse: collapse` table a row is not a box that paints a shadow of
-  its own, so an inset rule asked for on the `tr` is a mark nobody sees. The row
-  header IS the row's leading edge and is a box, so the geometry the rule asks
-  for lands there unchanged. `agents-row-open` stays on the `tr` because the
-  weight below is a fact about the whole row rather than about one cell.
-
-  The weight is emphasis and not a second mark: `.ui-current` says which row,
-  and the semibold name says which agent the editor below is holding. What the
-  rule forbids is restating the choice as a fill, and this is not one.
-*/
-.agents-row-open .agents-name {
-  font-weight: var(--weight-semibold);
-}
-
 /* ------------------------------------------------------------ row header -- */
 
 /*
@@ -179,14 +155,10 @@
   see the field rule below, which is one of them.
 */
 .agents-name {
-  padding: 0;
-  border: none;
-  background: none;
+  text-decoration: none;
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   color: var(--text);
-  text-align: left;
-  cursor: pointer;
 }
 
 .agents-name:hover {
@@ -387,28 +359,11 @@
   color: var(--text-faint);
 }
 
-/* ================================================================ remove == */
-
-/*
-  The delete, under a rule of its own, with what this page can see standing on
-  the agent beside it rather than after the refusal.
-*/
-.agents-remove {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-3);
-  margin-top: var(--space-4);
-  padding-top: var(--space-4);
-  border-top: 1px solid var(--border);
-}
-
-.agents-holds {
-  flex: 1 1 22rem;
-  margin: 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
+/* One capability checkbox and its name, side by side. */
+.agents-capability {
+  display: inline-flex;
+  gap: var(--space-1);
+  margin-right: var(--space-3);
 }
 
 /* Why Save is off, or that it worked: pushed to the footer's left edge, beside the buttons. */

@@ -1,4 +1,5 @@
 import { useId, useState } from "react";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
   canTakeASeat,
@@ -7,8 +8,6 @@ import {
   unemployed,
   useAgents,
   useCreateAgent,
-  useDeleteAgent,
-  useUpdateAgent,
   type Agent,
   type AgentEngine,
   type AgentRequest,
@@ -17,12 +16,8 @@ import {
   type Employment,
 } from "../data/agents";
 import { useTeams } from "../data/teams";
-import { ContextRefs } from "../context/ContextRefs";
-import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
-import { ScopedTools } from "../brain/knowledge/ScopedTools";
 import {
   Button,
-  ConfirmButton,
   ErrorNote,
   ListFilter,
   PageHeader,
@@ -35,14 +30,9 @@ import {
   Skeleton,
   StaleNote,
   Table,
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
   Td,
   Th,
   Tip,
-  toastManager,
   usePaletteGroup,
   Checkbox,
 } from "../ui";
@@ -50,7 +40,6 @@ import { usePageKeys } from "../project/pageKeys";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 import "./agents.css";
-import { LoadoutPreview } from "./LoadoutPreview";
 
 // Ids of the two filter chips: the headline's own counts, made clickable.
 const NO_MODEL = "no-model";
@@ -103,7 +92,7 @@ export function Agents() {
   const agents = useAgents();
   const teams = useTeams();
   const [creating, setCreating] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
+  const navigate = useNavigate();
   const [query, setQuery] = useState("");
   const [chipsOn, setChipsOn] = useState<readonly string[]>([]);
 
@@ -119,13 +108,6 @@ export function Agents() {
   */
   const departments: Employer[] = teams.data ?? [];
   const employmentKnown = teams.data !== undefined;
-
-  /*
-    Derived from the list rather than held as a second copy: deleting the
-    selected agent, or losing it to an edit elsewhere, closes the editor by
-    itself instead of leaving a panel open over a row that is gone.
-  */
-  const chosen = rows.find((row) => row.id === selected) ?? null;
 
   // The two counts the headline already states, made into filters. A chip that would match
   // nothing still shows its zero; "nobody uses" exists only once the departments have answered.
@@ -205,7 +187,7 @@ export function Agents() {
               setChipsOn((on) => (on.includes(id) ? on.filter((chip) => chip !== id) : [...on, id]))
             }
             resultCount={shown.length}
-            onOpenOnly={() => setSelected(shown[0].id)}
+            onOpenOnly={() => void navigate({ to: "/agents/$agentId", params: { agentId: shown[0].id } })}
             onClear={() => {
               setQuery("");
               setChipsOn([]);
@@ -216,26 +198,8 @@ export function Agents() {
             rows={shown}
             departments={departments}
             employmentKnown={employmentKnown}
-            selected={chosen?.id ?? null}
-            onSelect={(id) => setSelected((current) => (current === id ? null : id))}
           />
         </Panel>
-      )}
-
-      {/*
-        One editor at a time, in a modal opened by selecting a row. `key`
-        remounts it on a change of selection, which is what reseeds the draft;
-        without it a half-typed edit would survive onto a different agent.
-        Closing the modal clears the selection.
-      */}
-      {chosen !== null && (
-        <AgentEditor
-          key={chosen.id}
-          agent={chosen}
-          employment={employmentOf(chosen.id, departments)}
-          employmentKnown={employmentKnown}
-          onClose={() => setSelected(null)}
-        />
       )}
     </>
   );
@@ -285,7 +249,7 @@ function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
  * the four-word floor, so this page supplies the sentence for all three codes
  * rather than showing the daemon's silence back.
  */
-function SaveRefusal({ error }: { error: unknown }) {
+export function SaveRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding: this agent was not saved</ErrorNote>;
   return (
     <RefusalNote
@@ -317,7 +281,7 @@ function SaveRefusal({ error }: { error: unknown }) {
  * A council roster still does not hold an agent back, and this must not claim
  * that it does.
  */
-function DeleteRefusal({ error }: { error: unknown }) {
+export function DeleteRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding: this agent was not deleted</ErrorNote>;
   return (
     <RefusalNote
@@ -347,14 +311,10 @@ function Catalogue({
   rows,
   departments,
   employmentKnown,
-  selected,
-  onSelect,
 }: {
   rows: Agent[];
   departments: Employer[];
   employmentKnown: boolean;
-  selected: string | null;
-  onSelect: (id: string) => void;
 }) {
   return (
     <div className="agents-scroller">
@@ -376,8 +336,6 @@ function Catalogue({
               agent={agent}
               employment={employmentOf(agent.id, departments)}
               employmentKnown={employmentKnown}
-              open={selected === agent.id}
-              onSelect={() => onSelect(agent.id)}
             />
           ))}
         </tbody>
@@ -394,33 +352,18 @@ function CatalogueRow({
   agent,
   employment,
   employmentKnown,
-  open,
-  onSelect,
 }: {
   agent: Agent;
   employment: Employment;
   employmentKnown: boolean;
-  open: boolean;
-  onSelect: () => void;
 }) {
   return (
-    <tr className={open ? "agents-row agents-row-open" : "agents-row"}>
-      {/*
-        The open row is marked by `.ui-current` — a 2px inset rule on the leading
-        edge, in `--text` — and by nothing else. It goes on the row header rather
-        than on the `tr` because in a `border-collapse: collapse` table a row is
-        not a box that paints a shadow of its own, while the header cell is, and
-        the header cell IS the row's leading edge. See the comment beside
-        `.agents-row-open` for the fill this replaced and why it went.
-      */}
-      <th scope="row" className={open ? "agents-who ui-current" : "agents-who"}>
-        {/*
-          The name is the control. There is no separate Edit button per row: the
-          row IS the way in, and the editor it opens is the only one on the page.
-        */}
-        <button type="button" className="agents-name" onClick={onSelect} aria-haspopup="dialog">
+    <tr className="agents-row">
+      <th scope="row" className="agents-who">
+        {/* The name is the way in: it opens the agent's own page. */}
+        <Link to="/agents/$agentId" params={{ agentId: agent.id }} className="agents-name">
           {agent.name}
-        </button>
+        </Link>
         <Called agent={agent} />
         {/* Prose, so it goes under the name rather than into a column of its
             own — the treatment a department's remit gets on the console. */}
@@ -620,7 +563,7 @@ function Employed({ employment, known }: { employment: Employment; known: boolea
 /* -------------------------------------------------------------- field set -- */
 
 /** The draft a form edits — `AgentRequest` with `model` as a plain string so a blank input is possible. */
-interface AgentDraft {
+export interface AgentDraft {
   name: string;
   speciality: string;
   prompt: string;
@@ -638,7 +581,7 @@ const EMPTY_DRAFT: AgentDraft = {
   capabilities: ["mcp.nucleos"],
 };
 
-function draftFromAgent(agent: Agent): AgentDraft {
+export function draftFromAgent(agent: Agent): AgentDraft {
   return {
     name: agent.name,
     speciality: agent.speciality,
@@ -654,7 +597,7 @@ function isAgentEngine(value: string): value is AgentEngine {
 }
 
 /** A `local` engine must name a model — refused client-side before the round trip, per `agent::validate`. */
-function draftIsValid(draft: AgentDraft): boolean {
+export function draftIsValid(draft: AgentDraft): boolean {
   return (
     draft.name.trim() !== "" &&
     draft.speciality.trim() !== "" &&
@@ -663,7 +606,7 @@ function draftIsValid(draft: AgentDraft): boolean {
 }
 
 /** Every field, always — the route replaces the whole row, so an edit sends the unchanged ones too. */
-function requestFromDraft(draft: AgentDraft): AgentRequest {
+export function requestFromDraft(draft: AgentDraft): AgentRequest {
   return {
     name: draft.name.trim(),
     speciality: draft.speciality.trim(),
@@ -683,7 +626,7 @@ function requestFromDraft(draft: AgentDraft): AgentRequest {
  * time, and a caller that needs to tell two apart scopes the query with
  * `within(...)`.
  */
-function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: Partial<AgentDraft>) => void }) {
+export function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: Partial<AgentDraft>) => void }) {
   const modelRequired = draft.engine === "local";
   const fieldId = useId();
 
@@ -743,7 +686,7 @@ function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: 
       <fieldset className="agents-field agents-field-wide">
         <legend>Capabilities</legend>
         {AGENT_CAPABILITIES.map((capability) => (
-          <label key={capability} style={{ display: "inline-flex", gap: 4, marginRight: 12 }}>
+          <label key={capability} className="agents-capability">
             <Checkbox
               checked={draft.capabilities.includes(capability)}
               onChange={(event) =>
@@ -821,171 +764,10 @@ function NewAgentForm({ onDone }: { onDone: () => void }) {
   );
 }
 
-/* ------------------------------------------------------------------ editor -- */
-
-/**
- * The one editor on the page, in a modal opened by selecting a row.
- *
- * Not inside the row and not below the table, so opening it never changes the
- * height of the catalogue — the same move the console made when it lifted live
- * work out of the cards. "One editor at a time" was already this page's stated
- * invariant; a modal makes it structural rather than a promise.
- *
- * The prompt is read here too. It used to sit behind a per-row `<details>`,
- * which was a second shape for a thing this panel already shows — and the
- * textarea is a draft, not a write: nothing leaves until Save.
- */
-function AgentEditor({
-  agent,
-  employment,
-  employmentKnown,
-  onClose,
-}: {
-  agent: Agent;
-  employment: Employment;
-  employmentKnown: boolean;
-  onClose: () => void;
-}) {
-  const [draft, setDraft] = useState<AgentDraft>(() => draftFromAgent(agent));
-  const [tab, setTab] = useState<EditorTab>("definition");
-  const update = useUpdateAgent();
-  const del = useDeleteAgent();
-  const valid = draftIsValid(draft);
-  const formId = useId();
-  const dirty = JSON.stringify(draft) !== JSON.stringify(draftFromAgent(agent));
-
-  function patch(next: Partial<AgentDraft>) {
-    setDraft((current) => ({ ...current, ...next }));
-  }
-
-  return (
-    <Modal
-      open
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
-      title={`Editing ${agent.name}`}
-      size="md"
-      footer={
-        tab === "definition" ? (
-          <>
-            <span className="agents-save-status" role="status">
-              {update.isPending
-                ? "Saving…"
-                : !valid
-                  ? invalidReason(draft)
-                  : dirty
-                    ? "Unsaved changes"
-                    : ""}
-            </span>
-            <Button variant="ghost" onClick={onClose}>
-              Cancel
-            </Button>
-            {/* The one consequence of this form that is not obvious: `job::persona_for` reads an
-                agent's prompt when an item is DISPATCHED, so saving reaches work planned before. */}
-            <Button type="submit" form={formId} intent="go" disabled={!valid || update.isPending}>
-              {update.isPending ? "Saving…" : "Save changes"}
-            </Button>
-            <Tip
-              name="About saving"
-              tip="Saving reaches work that is already queued: an item reads its agent's prompt when it is dispatched, not when it was planned."
-            />
-          </>
-        ) : (
-          <Button variant="ghost" onClick={onClose}>
-            Close
-          </Button>
-        )
-      }
-    >
-      <Tabs value={tab} onValueChange={(next) => setTab(next as EditorTab)}>
-        <TabsList aria-label="Agent sections">
-          {EDITOR_TABS.map(([key, text]) => (
-            <TabsTrigger key={key} value={key}>
-              {text}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-        <TabsContent value="definition">
-          <form
-            id={formId}
-            className="agents-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (!valid || update.isPending) return;
-              /*
-                Stays open and reseeds from the daemon's answer, the way the charter
-                editor does. Two things come of it: what you see next is what the
-                {DAEMON_NAME} stored rather than what you typed — trimmed, and a blank model
-                turned back into the engine's default — and the row above changes
-                under you, which is the acknowledgement that a form closing itself
-                used to be standing in for. A "saved" toast says so as well, because
-                that row sits behind the overlay.
-              */
-              update.mutate(
-                { id: agent.id, request: requestFromDraft(draft) },
-                {
-                  onSuccess: (savedAgent) => {
-                    setDraft(draftFromAgent(savedAgent));
-                    toastManager.add({ type: "success", title: "Agent saved", description: savedAgent.name });
-                  },
-                },
-              );
-            }}
-          >
-            <AgentFields draft={draft} onChange={patch} />
-          </form>
-          {update.isError && <SaveRefusal error={update.error} />}
-        </TabsContent>
-
-        <TabsContent value="memory">
-          <ContextRefs ownerKind="agent" ownerId={agent.id} />
-          <ScopedMemory scopeKind="agent" scopeId={agent.id} />
-        </TabsContent>
-
-        <TabsContent value="tools">
-          <ScopedTools ownerKind="agent" ownerId={agent.id} />
-          <LoadoutPreview agentId={agent.id} />
-        </TabsContent>
-
-        {/*
-          The delete, and what this page can see standing on it — before the
-          confirmation rather than after the refusal. Never disabled from that
-          reading: the daemon is the authority, rosters move underneath, and a
-          button greyed out by a stale reading is worse than a refusal that tells
-          the truth.
-        */}
-        <TabsContent value="remove">
-          <div className="agents-remove">
-            <p className="agents-holds">{holdSentence(agent, employment, employmentKnown)}</p>
-            <ConfirmButton
-              label="Delete"
-              confirmLabel={`Delete ${agent.name}`}
-              variant="danger"
-              intent="stop"
-              disabled={del.isPending}
-              onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}
-            />
-          </div>
-          {del.isError && <DeleteRefusal error={del.error} />}
-        </TabsContent>
-      </Tabs>
-    </Modal>
-  );
-}
-
-type EditorTab = "definition" | "memory" | "tools" | "remove";
-
-/** The editor's sections: only the first is "editing the agent"; the rest are what hangs off it. */
-const EDITOR_TABS: readonly (readonly [EditorTab, string])[] = [
-  ["definition", "Definition"],
-  ["memory", "Memory and context"],
-  ["tools", "Tools and loadout"],
-  ["remove", "Remove"],
-];
+/* ------------------------------------------------------------ shared -- */
 
 /** Why Save is not available, in the footer beside it rather than only as a greyed button. */
-function invalidReason(draft: AgentDraft): string {
+export function invalidReason(draft: AgentDraft): string {
   if (draft.name.trim() === "") return "Needs a name";
   if (draft.speciality.trim() === "") return "Needs a speciality";
   return "A local engine needs a model";
@@ -999,7 +781,7 @@ function invalidReason(draft: AgentDraft): string {
  * cannot see either work table. So "nobody names this one" is never allowed to
  * read as "this will delete cleanly".
  */
-function holdSentence(agent: Agent, employment: Employment, known: boolean): string {
+export function holdSentence(agent: Agent, employment: Employment, known: boolean): string {
   const work =
     `an item of a team run, or of a job, is not something this page can see, and it is the other half of what the ${DAEMON_NAME} checks`;
 
