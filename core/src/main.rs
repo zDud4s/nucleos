@@ -352,7 +352,10 @@ async fn daemon_main() -> std::process::ExitCode {
 
     let machine_config: config::MachineConfig = machine_doc();
     let models_config: config::ModelsConfig = machine_doc();
-    models::local_ctx::init_local_num_ctx(models_config.local_context_tokens);
+    models::local_ctx::init_local_num_ctx(models_config.ollama_num_ctx_declaration());
+    // Every distinct local Ollama model is probed here, once, so the shared value is final before
+    // any feature reads it; the per-feature probes below only decide their own posture.
+    capabilities::probe_shared_num_ctx(&models_config).await;
     // The owner's saved choice (Settings) wins over the file, which is the default of an untouched
     // install; `embed::install` is called again by the settings door when the choice changes.
     embed::install(Arc::new(embed::OllamaEmbedder::new(
@@ -665,10 +668,6 @@ async fn daemon_main() -> std::process::ExitCode {
             if resolved.engine == config::LocalEngine::Ollama {
                 models::local_ctx::clamp_local_num_ctx_to_probe(&mut declared.context);
             }
-            tracing::info!(
-                num_ctx = models::local_ctx::local_num_ctx(),
-                "effective Ollama num_ctx for every local model call"
-            );
             let missing = capabilities::missing_capabilities(
                 &models::local_agent::CAPABILITY_REQUIREMENT,
                 &declared,

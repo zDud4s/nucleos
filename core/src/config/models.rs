@@ -102,8 +102,10 @@ pub struct ModelsConfig {
     /// engines nothing can discover it: Ollama answers `/api/show`, and an OpenAI-compatible
     /// `/v1/models` states no window at all.
     ///
-    /// It ALSO sets the one `num_ctx` every local Ollama call sends (default 8192, clamped to the
-    /// probed model window); read once at startup.
+    /// With the Ollama engine (`local_engine` absent or `ollama`) it ALSO sets the one `num_ctx`
+    /// every local Ollama call sends (default 8192, clamped to the smallest probed model window);
+    /// read once at startup. With `openai_compatible` it keeps only the meaning above: that
+    /// server's window, and the Ollama `num_ctx` stays at its default.
     ///
     /// Absent stays `None` and nothing invents a number. A guessed window is not a harmless default
     /// — it is a figure the daemon would then act on when deciding what fits in a turn — which is
@@ -777,6 +779,14 @@ impl ModelsConfig {
                 .collect();
         }
         levels
+    }
+
+    /// The `local_context_tokens` that sets the shared Ollama `num_ctx`: only on the Ollama engine.
+    pub fn ollama_num_ctx_declaration(&self) -> Option<usize> {
+        crate::models::local_ctx::declared_ollama_num_ctx(
+            self.local_engine.as_deref(),
+            self.local_context_tokens,
+        )
     }
 
     /// PURE: which local server a local turn is sent to, or why the route may not run at all.
@@ -1625,5 +1635,23 @@ mod agy_catalogue_tests {
         let chat = ModelsConfig::default().catalogue_for_chat(&[]);
         assert!(agy_ids(&chat).is_empty(), "{chat:?}");
         assert!(chat.iter().all(|c| !c.id.starts_with("agy/")), "{chat:?}");
+    }
+}
+
+#[cfg(test)]
+mod ollama_num_ctx_declaration_tests {
+    use super::*;
+
+    #[test]
+    fn the_key_sets_the_shared_num_ctx_only_on_the_ollama_engine() {
+        let mut config = ModelsConfig {
+            local_context_tokens: Some(32768),
+            ..ModelsConfig::default()
+        };
+        assert_eq!(config.ollama_num_ctx_declaration(), Some(32768));
+        config.local_engine = Some("ollama".to_string());
+        assert_eq!(config.ollama_num_ctx_declaration(), Some(32768));
+        config.local_engine = Some("openai_compatible".to_string());
+        assert_eq!(config.ollama_num_ctx_declaration(), None);
     }
 }

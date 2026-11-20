@@ -315,6 +315,54 @@ pub async fn discover_ollama_as(
     }
 }
 
+/// PURE: every `(model, base_url)` a local Ollama call may name, each once: triage (which map,
+/// distill, themes and the PII sweep reuse), voice cleanup (also the web quarantine model, armed or
+/// not) and, only when the local engine is Ollama, the local assistant.
+pub fn local_ollama_models(config: &crate::config::ModelsConfig) -> Vec<(String, String)> {
+    let default_url = crate::execution::runner::OLLAMA_BASE_URL;
+    let mut out: Vec<(String, String)> = crate::models::local_ctx::distinct_models(&[
+        config.local_triage_model.as_deref(),
+        config.voice_cleanup_model.as_deref(),
+    ])
+    .into_iter()
+    .map(|model| (model.to_owned(), default_url.to_owned()))
+    .collect();
+    if let (Some(model), Ok(resolved)) = (&config.local_assistant_model, config.local_engine()) {
+        if resolved.engine == crate::config::LocalEngine::Ollama {
+            let pair = (model.clone(), resolved.base_url);
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
+}
+
+/// Startup: probes every distinct local Ollama model once and clamps the shared `num_ctx` to the
+/// smallest window found at or above the floor. A model below the floor does not move the value;
+/// the feature that uses it is disabled by its own probe. Runs before any feature calls
+/// `local_num_ctx()`, then logs the effective value once.
+pub async fn probe_shared_num_ctx(config: &crate::config::ModelsConfig) -> usize {
+    let client = reqwest::Client::new();
+    for (model, base_url) in local_ollama_models(config) {
+        let mut declared = discover_ollama_as(
+            &client,
+            &base_url,
+            &model,
+            crate::models::local_ctx::local_num_ctx(),
+            "local model",
+        )
+        .await;
+        crate::models::local_ctx::clamp_local_num_ctx_to_probe(&mut declared.context);
+    }
+    let effective = crate::models::local_ctx::local_num_ctx();
+    tracing::info!(
+        num_ctx = effective,
+        "effective Ollama num_ctx for every local model call"
+    );
+    effective
+}
+
 /// One probe for BOTH local dialects, chosen by the engine the operator actually configured.
 ///
 /// `main.rs`'s local-assistant startup called `discover_ollama_as` against
@@ -2720,6 +2768,55 @@ mod tests {
             "an `openai_compatible` engine must never post Ollama's `/api/show`: that request is the \
              hardcoded dialect this test exists to remove, and on a machine without Ollama it is \
              the request that disables the local assistant"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_ollama_models_tests {
+    use super::*;
+
+    fn config() -> crate::config::ModelsConfig {
+        crate::config::ModelsConfig::default()
+    }
+
+    #[test]
+    fn each_distinct_model_is_listed_once() {
+        let mut c = config();
+        c.local_triage_model = Some("a".into());
+        c.voice_cleanup_model = Some("a".into());
+        c.local_assistant_model = Some("a".into());
+        assert_eq!(local_ollama_models(&c).len(), 1);
+        c.voice_cleanup_model = Some("b".into());
+        let names: Vec<String> = local_ollama_models(&c).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_quarantine_model_is_listed_without_a_triage_model() {
+        let mut c = config();
+        c.voice_cleanup_model = Some("v".into());
+        let names: Vec<String> = local_ollama_models(&c).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(names, vec!["v"]);
+    }
+
+    #[test]
+    fn an_openai_compatible_assistant_is_never_probed_as_ollama() {
+        let mut c = config();
+        c.local_engine = Some("openai_compatible".into());
+        c.local_base_url = Some("http://127.0.0.1:8080".into());
+        c.local_assistant_model = Some("llama".into());
+        assert!(local_ollama_models(&c).is_empty());
+    }
+
+    #[test]
+    fn an_ollama_assistant_on_its_own_address_is_listed_too() {
+        let mut c = config();
+        c.local_assistant_model = Some("m".into());
+        c.local_base_url = Some("http://127.0.0.1:9999".into());
+        assert_eq!(
+            local_ollama_models(&c),
+            vec![("m".to_string(), "http://127.0.0.1:9999".to_string())]
         );
     }
 }

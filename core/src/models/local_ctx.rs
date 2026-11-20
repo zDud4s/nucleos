@@ -11,6 +11,27 @@ pub const DEFAULT_LOCAL_NUM_CTX: usize = 8192;
 /// The smallest window a local model must offer; below it the model is refused.
 pub const MIN_LOCAL_NUM_CTX: usize = 4096;
 
+/// PURE: the value of `local_context_tokens` that sets the shared Ollama `num_ctx`: only when the
+/// local engine is Ollama (key absent or `ollama`). With any other engine the key keeps its old
+/// meaning, that server's window, and the shared value stays at its default.
+pub fn declared_ollama_num_ctx(local_engine: Option<&str>, tokens: Option<usize>) -> Option<usize> {
+    match local_engine {
+        None | Some("ollama") => tokens,
+        Some(_) => None,
+    }
+}
+
+/// PURE: the distinct model names of `named`, absent ones dropped, first-seen order kept.
+pub fn distinct_models<'a>(named: &[Option<&'a str>]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for model in named.iter().flatten() {
+        if !out.contains(model) {
+            out.push(model);
+        }
+    }
+    out
+}
+
 /// Marker appended when a text is cut to fit the window.
 const TRUNCATION_MARKER: &str = "\n[truncated to fit the local model's context]";
 
@@ -227,5 +248,25 @@ small data";
 [truncated to fit the local model's context]";
         let kept = fitted.strip_suffix(marker).expect("marker appended");
         assert_eq!(kept.len(), (8192 - 1024 - 1001) * 3);
+    }
+
+    #[test]
+    fn the_declared_window_sets_the_shared_value_only_for_the_ollama_engine() {
+        assert_eq!(declared_ollama_num_ctx(None, Some(16384)), Some(16384));
+        assert_eq!(declared_ollama_num_ctx(Some("ollama"), Some(16384)), Some(16384));
+        assert_eq!(declared_ollama_num_ctx(Some("openai_compatible"), Some(16384)), None);
+        assert_eq!(declared_ollama_num_ctx(Some("typo"), Some(16384)), None);
+        assert_eq!(declared_ollama_num_ctx(None, None), None);
+        assert_eq!(
+            resolve_local_num_ctx(declared_ollama_num_ctx(Some("openai_compatible"), Some(65536)), None),
+            8192
+        );
+    }
+
+    #[test]
+    fn distinct_models_drops_absent_and_repeated_names() {
+        let named = [Some("a"), None, Some("b"), Some("a"), Some("b"), Some("c")];
+        assert_eq!(distinct_models(&named), vec!["a", "b", "c"]);
+        assert!(distinct_models(&[None, None]).is_empty());
     }
 }
