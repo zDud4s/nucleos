@@ -20,14 +20,14 @@
 //!
 //! # Tools
 //!
-//! The `tools` line comes from [`translate`] for [`Engine::Claude`]. A package whose translation is
+//! The `tools` line comes from [`translate`] for the engine that runs subagents ([`subagent_engine`]). A package whose translation is
 //! empty is not generated (`NoTools`): an omitted `tools` line means "inherit everything" in Claude
 //! Code, which would silently widen the agent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::capabilities::{Engine, translate};
+use super::capabilities::{subagent_engine, translate};
 use super::package::{ContextSource, Package, PackageRef, highest_version, load_installed};
 use super::prompt::{ContextRefs, ContextRender, build_prefix};
 use nucleos_base::agent::Capability;
@@ -90,7 +90,7 @@ fn context_refs(pkg: &Package) -> ContextRefs {
 
 /// The full text of `<name>.md` for Claude Code. Pure given the installed package files.
 pub fn render_claude_agent(pkg: &Package) -> Result<String, super::capabilities::Unsupported> {
-    let tools = translate(Engine::Claude, &pkg.capabilities)?;
+    let tools = translate(subagent_engine(), &pkg.capabilities)?;
     // Verified in a real session on 2026-10-21 (plan C1, open question Q3): a subagent defined
     // with `tools: Read, mcp__nucleos__*` received `mcp__nucleos__record`, `verify` and
     // `verify_status`, so the wildcard is accepted in a subagent's `tools` line.
@@ -274,7 +274,7 @@ fn sync_claude_agents_keeping(
             push(Outcome::Reserved);
             continue;
         }
-        let tools = translate(Engine::Claude, &pkg.capabilities).map_err(|e| e.to_string())?;
+        let tools = translate(subagent_engine(), &pkg.capabilities).map_err(|e| e.to_string())?;
         if tools.claude_allowed_tools.is_empty() {
             push(Outcome::NoTools);
             continue;
