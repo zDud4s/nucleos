@@ -79,6 +79,32 @@ pub fn fit_text(text: &str, reserve_tokens: usize) -> Cow<'_, str> {
     fit_text_to(text, local_num_ctx(), reserve_tokens)
 }
 
+/// Tokens kept free for the model's answer when a prompt is fitted.
+const ANSWER_RESERVE_TOKENS: usize = 1024;
+
+/// PURE: `prompt` with only its variable data cut to fit `num_ctx`. `instructions` is the standing
+/// text: when the prompt carries it, everything up to its end is kept verbatim and only what follows is
+/// cut; when the prompt is data alone, the instructions (sent beside it) are reserved for. A prompt that
+/// already fits comes back byte-identical.
+pub fn fit_prompt_data<'a>(prompt: &'a str, instructions: &str, num_ctx: usize) -> Cow<'a, str> {
+    let reserve = ANSWER_RESERVE_TOKENS + instructions.len() / 3 + 1;
+    let split = if instructions.is_empty() {
+        None
+    } else {
+        prompt.find(instructions).map(|at| at + instructions.len())
+    };
+    match split {
+        Some(end) => {
+            let (head, data) = prompt.split_at(end);
+            match fit_text_to(data, num_ctx, reserve) {
+                Cow::Borrowed(_) => Cow::Borrowed(prompt),
+                Cow::Owned(cut) => Cow::Owned(format!("{head}{cut}")),
+            }
+        }
+        None => fit_text_to(prompt, num_ctx, reserve),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +191,41 @@ mod tests {
         assert!(kept.len() <= 18_432);
         assert!(text.starts_with(kept));
         assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn fit_prompt_data_keeps_the_instructions_and_cuts_only_the_data() {
+        let instructions = "INSTRUCTIONS: answer in JSON.";
+        let prompt = format!("{instructions}
+
+--- DATA ---
+{}", "x".repeat(100_000));
+        let fitted = fit_prompt_data(&prompt, instructions, 8192);
+        assert!(fitted.starts_with(&format!("{instructions}
+
+--- DATA ---
+")));
+        assert!(fitted.ends_with("[truncated to fit the local model's context]"));
+        assert!(fitted.len() < 8192 * 3);
+    }
+
+    #[test]
+    fn fit_prompt_data_leaves_a_small_prompt_byte_identical() {
+        let prompt = "INSTRUCTIONS
+
+small data";
+        let fitted = fit_prompt_data(prompt, "INSTRUCTIONS", 8192);
+        assert!(matches!(fitted, std::borrow::Cow::Borrowed(p) if p == prompt));
+    }
+
+    #[test]
+    fn fit_prompt_data_reserves_room_for_instructions_sent_beside_a_data_only_prompt() {
+        let instructions = "i".repeat(3000);
+        let data = "d".repeat(100_000);
+        let fitted = fit_prompt_data(&data, &instructions, 8192);
+        let marker = "
+[truncated to fit the local model's context]";
+        let kept = fitted.strip_suffix(marker).expect("marker appended");
+        assert_eq!(kept.len(), (8192 - 1024 - 1001) * 3);
     }
 }

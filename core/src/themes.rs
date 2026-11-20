@@ -536,11 +536,17 @@ async fn ask_plain(
             base_url,
             model,
         } => {
+            // The knowledge and notes are the variable part: cut them, never the standing text.
+            let data = crate::models::local_ctx::fit_prompt_data(
+                &prompt,
+                SYNTHESIS_STANDING,
+                crate::models::local_ctx::local_num_ctx(),
+            );
             crate::execution::runner::ollama_chat(
                 client,
                 base_url,
                 model,
-                &format!("{SYNTHESIS_STANDING}\n\n{prompt}"),
+                &format!("{SYNTHESIS_STANDING}\n\n{data}"),
                 serde_json::json!({"num_ctx": crate::models::local_ctx::local_num_ctx(), "temperature": 0}),
                 None,
                 false,
@@ -1673,5 +1679,46 @@ mod shared_num_ctx_tests {
             Some(crate::models::local_ctx::local_num_ctx() as u64)
         );
         assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
+    }
+
+    /// A huge data part is cut to the window; the standing instruction is sent intact.
+    #[tokio::test]
+    async fn a_huge_synthesis_input_is_cut_to_the_window_and_the_standing_text_survives() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let recorder = std::sync::Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": "{}"},
+                        "done": true
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+        let standing: &str = SYNTHESIS_STANDING;
+        let huge = format!("{standing}
+
+--- DATA ---
+{}", "x".repeat(200_000));
+
+        ask_plain(&crate::map::intent::Extractor::Loopback { client: &client, base_url: &base_url, model: "qwen2" }, huge)
+        .await
+        .expect("the fake answered");
+
+        let body = seen.lock().unwrap().first().cloned().expect("a chat request was posted");
+        let sent = body["messages"].to_string();
+        assert!(sent.len() < 8192 * 3 + 2048, "the data part was cut to the window");
+        assert!(sent.contains("[truncated to fit the local model's context]"));
+        assert!(sent.contains(&standing[..40]), "the standing text is intact");
     }
 }
