@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -292,7 +292,12 @@ describe("Agents - the policy control and the local-engine model requirement", (
   });
 
   it("refuses submit when engine is local and no model is named", async () => {
-    daemon.apiFetch.mockImplementation(agentsFetch([]));
+    const rows = agentsFetch([]);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === "/assistant/models"
+        ? { choices: [{ id: "llama-local", label: "Llama", brain: "local", efforts: [] }], configured: "sonnet", efforts: [] }
+        : rows(path, init),
+    );
     await renderAgents();
 
     const panel = await openCreate();
@@ -306,8 +311,42 @@ describe("Agents - the policy control and the local-engine model requirement", (
     fireEvent.change(within(panel).getByLabelText("Engine"), { target: { value: "local" } });
     expect(submit.disabled).toBe(true);
 
+    await within(panel).findByRole("option", { name: "llama-local" });
     fireEvent.change(within(panel).getByLabelText("Model"), { target: { value: "llama-local" } });
     expect(submit.disabled).toBe(false);
+  });
+});
+
+describe("Agents - the model is chosen, not typed", () => {
+  const optionsOf = (panel: HTMLElement) =>
+    within(within(panel).getByLabelText("Model")).getAllByRole("option").map((option) => option.textContent);
+
+  it("offers Default and the engine's models, and changes them with the engine", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([]));
+    await renderAgents();
+
+    const panel = await openCreate();
+    expect(within(panel).getByLabelText("Model").tagName).toBe("SELECT");
+    expect(optionsOf(panel)).toEqual(["Default", "opus", "sonnet", "haiku"]);
+
+    fireEvent.change(within(panel).getByLabelText("Engine"), { target: { value: "codex" } });
+    expect(optionsOf(panel)).toEqual(["Default", "gpt-5-codex", "gpt-5"]);
+  });
+
+  it("sends Default as no model", async () => {
+    const onCreate = vi.fn((body: Record<string, unknown>) => ({ ...agent(), ...body }));
+    daemon.apiFetch.mockImplementation(agentsFetch([], { onCreate }));
+    await renderAgents();
+
+    const panel = await openCreate();
+    fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "analyst" } });
+    fireEvent.change(within(panel).getByLabelText("Speciality"), { target: { value: "reads sheets" } });
+    fireEvent.change(within(panel).getByLabelText("Model"), { target: { value: "opus" } });
+    fireEvent.change(within(panel).getByLabelText("Model"), { target: { value: "" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Add agent" }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalled());
+    expect(onCreate.mock.calls[0][0].model).toBeNull();
   });
 });
 

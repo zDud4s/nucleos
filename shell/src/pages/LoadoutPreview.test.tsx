@@ -35,7 +35,7 @@ beforeEach(() => {
 describe("LoadoutPreview", () => {
   it("asks for nothing until the owner previews", () => {
     renderWithQuery(<LoadoutPreview agentId="scout" />);
-    expect(screen.getByRole("region", { name: "Loadout preview" })).toBeDefined();
+    expect(screen.getByRole("region", { name: "Briefing preview" })).toBeDefined();
     expect(daemon.apiFetch).not.toHaveBeenCalled();
   });
 
@@ -96,5 +96,20 @@ describe("LoadoutPreview", () => {
     renderWithQuery(<LoadoutPreview agentId="scout" />);
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
     expect(await screen.findByRole("alert")).toBeDefined();
+  });
+
+  it("explains itself behind a tip and counts what the preview holds", async () => {
+    daemon.apiFetch.mockResolvedValue(ANSWER);
+    renderWithQuery(<LoadoutPreview agentId="scout" variant="section" />);
+
+    expect(screen.getByRole("region", { name: "Briefing preview" })).toBeDefined();
+    expect(screen.getByPlaceholderText("Sample task")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "About the briefing preview" }));
+    expect(await screen.findByText(/memory, tools and context this agent would receive/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    const tools = await screen.findByRole("region", { name: "Tools it would hold" });
+    expect(within(tools).getByRole("heading", { name: /Tools 2/ })).toBeDefined();
+    expect(within(screen.getByRole("region", { name: "Context it would be offered" })).getByRole("heading", { name: /Context 2/ })).toBeDefined();
   });
 });

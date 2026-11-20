@@ -85,3 +85,8 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* A compact Delete: the reduced-motion "Keep holding…" text must not set its width. */
+.agent-detail-delete .ui-confirm-keep {
+  display: none;
+}

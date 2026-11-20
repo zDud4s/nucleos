@@ -269,3 +269,34 @@ describe("droppedRoot - the folder a dropped file was resolved from", () => {
     ).toBe("/w/Docs");
   });
 });
+
+describe("ContextRefs - the compact row", () => {
+  it("is one line of name and note with icon-only actions named for the file", async () => {
+    holding([ref(), ref({ id: 2, path: "C:/files/docs/plain.md", note: null })]);
+    renderWithQuery(<ContextRefs ownerKind="agent" ownerId="copywriter" variant="section" />);
+    await screen.findByText("brief.md");
+
+    const edit = screen.getByRole("button", { name: "Edit note for brief.md" });
+    expect(edit.getAttribute("title")).toBe("Edit note for brief.md");
+    expect(edit.textContent).toBe("");
+    expect(screen.getByRole("button", { name: "Add note for plain.md" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Remove brief.md" }).querySelector("svg")).not.toBeNull();
+    expect(screen.getByText("brief.md").getAttribute("title")).toBe("C:/files/brief.md");
+
+    fireEvent.click(edit);
+    expect(screen.getByLabelText("Note for C:/files/brief.md")).toBeDefined();
+  });
+
+  it("removes only on the second press, announced with the whole path", async () => {
+    holding([ref()]);
+    renderWithQuery(<ContextRefs ownerKind="agent" ownerId="copywriter" variant="section" />);
+    await screen.findByText("brief.md");
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove brief.md" }));
+    expect(calls("DELETE")).toHaveLength(0);
+    await afterDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Remove C:/files/brief.md" }));
+
+    await waitFor(() => expect(calls("DELETE")).toHaveLength(1));
+  });
+});
