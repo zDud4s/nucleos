@@ -366,6 +366,13 @@ class Pure(unittest.TestCase):
         rec = {"weight": 2, "pred_cores": 10}
         self.assertEqual(c.held_pred_cores([(f, rec)], now=now), 2.5)
 
+    def test_held_pred_future_admitted_at_is_clamped(self) -> None:
+        c = self.load()
+        now = 1_000_000.0
+        # A clock stepped back: admitted_at in the future never reserves more than FACTOR*pred.
+        self.assertEqual(c.held_pred_cores([{"weight": 2, "pred_cores": 10,
+                                             "admitted_at": now + 60}], now=now), 5.0)
+
     def test_held_pred_ignores_weight_one(self) -> None:
         c = self.load()
         now = 1_000_000.0
@@ -462,6 +469,17 @@ class Pure(unittest.TestCase):
         # Same reason again after the interval.
         self.assertTrue(log.note("test", adm2, now=t0 + 6 + 31))
         self.assertEqual(len(read_jsonl(path)), 3)
+
+    def test_denial_log_fails_open(self) -> None:
+        spec = importlib.util.spec_from_file_location("heavy_denial_open_under_test", HEAVY)
+        heavy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heavy)
+        tmp = Path(tempfile.mkdtemp(prefix="heavy-denial-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        blocker = tmp / "file"
+        blocker.write_text("x")
+        log = heavy.DenialLog(blocker / "sub")  # parent is a regular file: the write raises
+        log.note("test", {"mode": "dynamic", "rule": "room", "why": ["idle"]}, now=1_000_000.0)
 
     # 9
     def test_dynamic_fit_idle_cores_and_none_busy(self) -> None:

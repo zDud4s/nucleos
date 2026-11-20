@@ -922,7 +922,7 @@ BATCH_MAX = 8
 
 
 def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int, dyn: bool,
-                     pr: dict | None, dk: dict | None) -> int:
+                     pr: dict | None, dk: dict | None, held_ents: list | None = None) -> int:
     """Called by the Mutex holder right after it admitted the head: admit the entries behind it,
     in queue order, for as long as they fit (static capacity, then dynamic_fit with the held
     count and probe updated for each grant, which also applies the disk rule). The first that does
@@ -935,6 +935,7 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
     limit = int(_env_float("NUCLEOS_HEAVY_BATCH_MAX", float(BATCH_MAX)))
     p = dict(pr) if isinstance(pr, dict) else pr
     n, w, granted = held_n, held_w, 0
+    reserve = list(held_ents or [])  # (Path, rec) of what is held, grown with each grant
     me = os.getpid()
     sample_ts = None
     if isinstance(p, dict) and not os.environ.get("NUCLEOS_HEAVY_FAKE_PROBE"):
@@ -957,7 +958,8 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
         adm = None
         if dyn:
             try:
-                ok, adm = hc.dynamic_fit(n, p, 0.0, hc.dynamic_max_jobs(p), True, disk=dk)
+                ok, adm = hc.dynamic_fit(n, p, 0.0, hc.dynamic_max_jobs(p), True, disk=dk,
+                                         held_pred_cores=hc.held_pred_cores(reserve))
             except Exception:
                 break
             if not ok:
@@ -996,6 +998,7 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
             break
         granted += 1
         n += 1
+        reserve.append((hpath, frec))
         w += wt
         if isinstance(p, dict):
             # The probe predates this grant: charge one job budget so a batch cannot admit
@@ -1204,7 +1207,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                             try:
                                 _grant_followers(
                                     hc, directory, order, len(held_recs) + 1,
-                                    held + int(rec["weight"]), dyn and probed, pr, dk)
+                                    held + int(rec["weight"]), dyn and probed, pr, dk,
+                                    list(held_ents) + [(held_dir / str(me), rec)])
                             except Exception:
                                 pass  # the head is admitted either way
                             mx.mark("batch")

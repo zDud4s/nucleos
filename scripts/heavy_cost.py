@@ -955,7 +955,7 @@ def held_pred_cores(held_recs, now: float | None = None) -> float:
                     age = 0.0
             else:
                 age = 0.0
-            total += factor * float(pred) * max(0.0, 1.0 - age / ramp)
+            total += factor * float(pred) * min(1.0, max(0.0, 1.0 - age / ramp))
         return total
     except Exception:
         return 0.0
