@@ -6,7 +6,7 @@ use super::*;
 /// Whether a turn should read the briefing: only a Claude turn that no kept process will serve. The
 /// block travels as a per-spawn system flag, so a process already standing would discard it.
 pub(in super::super) fn briefing_wanted(cli: &str, kept: bool) -> bool {
-    cli == "claude" && !kept
+    takes_system_prompt(cli) && !kept
 }
 
 /// Whether opening a chat should start its process ahead of the first message.

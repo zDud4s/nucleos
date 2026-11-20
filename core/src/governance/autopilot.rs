@@ -527,14 +527,26 @@ pub const HOOK_INTERPRETER: &str = if cfg!(windows) { "python" } else { "python3
 /// of its own payload to tell them apart (`core/hooks/ask_daemon.py`'s `main`). Nothing here needs
 /// to know which event it is being registered under.
 fn hook_entry() -> serde_json::Value {
-    serde_json::json!({
-        "matcher": "*",
-        "hooks": [{
-            "type": "command",
-            "command": format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\""),
-            "timeout": HOOK_TIMEOUT_SECONDS
-        }]
-    })
+    hook_entry_for("claude").unwrap_or_default()
+}
+
+/// The `PreToolUse` entry for `engine`, as that engine's adapter spells it (`wire_pretool`), with
+/// the timeout this daemon's gate wants. `None` when the engine has no settings-file hook: a
+/// refusal (Codex before 0.166.0) or a CLI-args wiring, neither of which is a settings entry.
+fn hook_entry_for(engine: &str) -> Option<serde_json::Value> {
+    use crate::engines::adapters::{HookWiring, execution_of};
+    let command =
+        format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"");
+    let HookWiring::SettingsEntry(mut entry) = execution_of(engine)?.wire_pretool(&command).ok()?
+    else {
+        return None;
+    };
+    entry
+        .get_mut("hooks")?
+        .get_mut(0)?
+        .as_object_mut()?
+        .insert("timeout".into(), serde_json::json!(HOOK_TIMEOUT_SECONDS));
+    Some(entry)
 }
 
 /// The events that are not about a tool call, wired beside the three that are so that a pinned
@@ -3193,6 +3205,26 @@ pub mod tests {
             written.contains("PreToolUse"),
             "the hook script was not written"
         );
+    }
+
+    /// The PreToolUse entry now comes from the adapter's `wire_pretool`; Claude's must be the entry
+    /// this file always wrote, and Codex (no settings-file hook before 0.166.0) must get none.
+    #[test]
+    fn hook_entry_comes_from_the_adapter_and_codex_gets_none() {
+        let command =
+            format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"");
+        let expected = serde_json::json!({
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "timeout": HOOK_TIMEOUT_SECONDS
+            }]
+        });
+        assert_eq!(hook_entry(), expected);
+        assert_eq!(hook_entry_for("claude"), Some(expected));
+        assert_eq!(hook_entry_for("codex"), None);
+        assert_eq!(hook_entry_for("local"), None);
     }
 
     /// The outcome half of the ledger is wired the moment `PreToolUse` is: without `PostToolUse`
