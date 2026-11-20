@@ -32,7 +32,12 @@ mod settings_row;
 use settings_row::{router_probe, settings_probe};
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Under test the budget is a hang guard, not a speed check: a loaded gate machine can take longer
+/// than 500 ms to answer the sqlite-backed channel rows, which turned them into `down: timeout`.
+#[cfg(not(test))]
 const SUBSYSTEM_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const SUBSYSTEM_TIMEOUT: Duration = Duration::from_secs(60);
 const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(1);
 const LOW_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DAEMON_TOKEN_KEY: &str = "daemon-token";
