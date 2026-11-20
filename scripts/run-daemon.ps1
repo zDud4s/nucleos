@@ -180,7 +180,7 @@ $out = Join-Path $TargetDir $BuildProfile
 if (-not $NoBuild) {
     Push-Location $RepoRoot
     try {
-        $cargoArgs = @('build', '-p', 'nucleos-daemon')
+        $cargoArgs = @('build', '-p', 'nucleos-daemon', '--target-dir', $TargetDir)
         if ($BuildProfile -eq 'release') { $cargoArgs += '--release' }
         & cargo @cargoArgs
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
