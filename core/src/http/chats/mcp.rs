@@ -156,6 +156,13 @@ fn engine_for(chat: &crate::chats::ChatSummary) -> ChatEngine {
     )
 }
 
+/// Whether the engine's CLI keeps loading the owner's own MCP servers under a restricted mode: a
+/// registered engine without `strict_mcp` (probe, not name). An unregistered engine has none.
+fn keeps_user_servers_on(engine: ChatEngine) -> bool {
+    crate::engines::adapters::capabilities_of(engine.as_str())
+        .is_some_and(|capabilities| !capabilities.strict_mcp)
+}
+
 /// `McpCardData`: what the panel and the `mcp` card show of this conversation.
 pub(super) async fn card_data(state: &AppState, chat_id: &str) -> Result<Value, SlashError> {
     let chat = summary(state, chat_id).await?;
@@ -183,7 +190,7 @@ pub(super) async fn card_data(state: &AppState, chat_id: &str) -> Result<Value, 
             let inactive_reason = (is_enabled && !is_active && supported)
                 .then(|| format!("mode {policy_name} only allows NucleOS tools"));
             let note = (!CODEX_CAN_DISABLE_USER_SERVERS
-                && engine == ChatEngine::Codex
+                && keeps_user_servers_on(engine)
                 && server.imported_from.as_deref() == Some(mcp_import::SOURCE_CODEX)
                 && !is_enabled)
                 .then_some(CODEX_NOTE);
@@ -416,6 +423,15 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use tower::ServiceExt;
+
+    #[test]
+    fn user_servers_note_probe_is_true_for_codex_alone() {
+        use crate::assistant::slash::capabilities::ChatEngine;
+        assert!(!super::keeps_user_servers_on(ChatEngine::Claude));
+        assert!(super::keeps_user_servers_on(ChatEngine::Codex));
+        assert!(!super::keeps_user_servers_on(ChatEngine::Local));
+        assert!(!super::keeps_user_servers_on(ChatEngine::OpenRouter));
+    }
 
     const SECRET: &str = "s3cret-value";
 
