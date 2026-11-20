@@ -70,10 +70,43 @@ func TestAPlacementNobodyDecidedIsNotAFence(t *testing.T) {
 	}
 }
 
-// TestTheLoopbackListStaysEmpty. Nothing the núcleo sends may open it: this machine's own services —
+// TestLocalOriginsFillLoopbackInBothPolicies: the person's listed loopback origins reach the fence
+// through Policy and EmbeddedPolicy alike, forbidden ports travel with them, and a non-loopback entry
+// is refused as a fence not attached.
+func TestLocalOriginsFillLoopbackInBothPolicies(t *testing.T) {
+	placement := browser.Placement{
+		Profile:        profile.Ref{Kind: profile.Project, ID: "acme"},
+		Origins:        []string{"https://jira.example.org"},
+		LocalOrigins:   []string{"http://localhost:5173"},
+		ForbiddenPorts: []int{8791},
+	}
+	for name, build := range map[string]func(browser.Placement) (fence.Policy, error){
+		"Policy": Policy, "EmbeddedPolicy": EmbeddedPolicy,
+	} {
+		policy, err := build(placement)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(policy.Loopback) != 1 || policy.Loopback[0] != "http://localhost:5173" {
+			t.Errorf("%s: loopback = %v", name, policy.Loopback)
+		}
+		if len(policy.ForbiddenPorts) != 1 || policy.ForbiddenPorts[0] != 8791 {
+			t.Errorf("%s: forbidden ports = %v", name, policy.ForbiddenPorts)
+		}
+		bad := placement
+		bad.LocalOrigins = []string{"https://example.org"}
+		if _, err := build(bad); !errors.Is(err, browser.ErrFenceNotAttached) {
+			t.Errorf("%s: non-loopback local origin = %v, want ErrFenceNotAttached", name, err)
+		}
+	}
+	if fingerprintOf(placement) == fingerprintOf(browser.Placement{Origins: placement.Origins}) {
+		t.Error("local origins and forbidden ports do not change the fingerprint")
+	}
+}
+
+// TestTheLoopbackListStaysEmpty. With no local_origins the list is empty: this machine's own services —
 // the núcleo's API, the other sidecars, and the browser's own debugging port, which asks for no token
-// at all — are reachable from a page unless the fence refuses them (spec §6.2). It is a seam, not a
-// setting, and a placement field that filled it would make it a setting.
+// at all — are reachable from a page unless the fence refuses them (spec §6.2).
 func TestTheLoopbackListStaysEmpty(t *testing.T) {
 	policy, err := Policy(browser.Placement{
 		Profile: profile.Ref{Kind: profile.Project, ID: "acme"},

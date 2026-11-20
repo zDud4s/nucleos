@@ -74,6 +74,15 @@ type Placement struct {
 	// Empty for an ephemeral profile, and it must be, for a reason narrower than Origins': a
 	// throwaway has no login in it, so there is nobody for a form to be submitted AS.
 	Writable []string `json:"writable,omitempty"`
+	// LocalOrigins are the loopback origins ("http://localhost:5173") this profile may reach on THIS
+	// machine, chosen by the person and sent by the núcleo. Empty means none, which is the normal
+	// case. They fill fence.Policy.Loopback in both Policy and EmbeddedPolicy; a non-loopback entry
+	// fails validation.
+	LocalOrigins []string `json:"local_origins,omitempty"`
+	// ForbiddenPorts are loopback ports no listing can open: the daemon's HTTP port, every sidecar's
+	// port and the shell's CDP ports. A request to one is refused as ConsequenceLoopback BEFORE
+	// LocalOrigins is consulted, even when the origin is listed.
+	ForbiddenPorts []int `json:"forbidden_ports,omitempty"`
 	// Visible runs the session's browser headful but still fenced (spec §4.1). The núcleo decides
 	// it, from the panel's choice; never the agent.
 	Visible bool `json:"visible,omitempty"`
@@ -458,6 +467,10 @@ const (
 type Refusal struct {
 	Consequence Consequence `json:"consequence"`
 	Detail      string      `json:"detail,omitempty"`
+	// Origin is the loopback origin a ConsequenceLoopback refusal stopped ("http://localhost:5173"),
+	// structured so the núcleo can open a decision for exactly that origin without parsing Detail.
+	// Empty for every other consequence.
+	Origin string `json:"origin,omitempty"`
 }
 
 // ActResult is the answer to an Act. Exactly one of the two states is meaningful, and Refusal is

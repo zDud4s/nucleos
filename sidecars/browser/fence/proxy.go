@@ -76,6 +76,8 @@ type ProxyRefusal struct {
 	Target      string
 	Consequence browser.Consequence
 	Detail      string
+	// Origin is the loopback origin of a ConsequenceLoopback refusal, "" otherwise.
+	Origin string
 }
 
 // proxyRefusalCap bounds the record. A page in a loop can generate refusals faster than anything
@@ -293,6 +295,7 @@ func (p *Proxy) refuse(w http.ResponseWriter, target string, verdict Verdict) {
 		Target:      target,
 		Consequence: verdict.Consequence,
 		Detail:      verdict.Detail,
+		Origin:      verdict.Origin,
 	})
 	// 403 rather than closing the connection: a closed connection is what a broken proxy looks like,
 	// and the difference between "refused" and "broken" is the difference between the agent learning

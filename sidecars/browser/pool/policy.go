@@ -57,11 +57,13 @@ func policyFor(placement browser.Placement, validate func(fence.Policy) error) (
 		Profile:  kind,
 		Origins:  placement.Origins,
 		Writable: placement.Writable,
-		// Loopback stays empty, which means the fence admits none of it. Spec §6.2's loopback rule
-		// exists because this machine's own services — the núcleo's API, the other sidecars — are
-		// reachable from a page unless something refuses them. (The browser has no debugging port
-		// to reach: it is driven over a pipe.) Nothing the núcleo can send opens that list today, and that is deliberate:
-		// there is no browsing reason to reach them, so the list is a seam and not a setting.
+		// Loopback is what the person admitted (local_origins), empty by default, which means the
+		// fence admits none of it. Spec §6.2's loopback rule exists because this machine's own
+		// services — the núcleo's API, the other sidecars — are reachable from a page unless
+		// something refuses them; ForbiddenPorts keeps those closed even if an entry names them.
+		// A non-loopback entry fails validation below.
+		Loopback:       placement.LocalOrigins,
+		ForbiddenPorts: placement.ForbiddenPorts,
 	}
 	if err := validate(policy); err != nil {
 		return fence.Policy{}, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
