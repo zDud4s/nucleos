@@ -43,6 +43,13 @@ pub fn automations(project_id: &str) -> Result<Automations, DocumentUnreadable> 
     read_from(&crate::settings::global().snapshot(), project_id)
 }
 
+/// The project's browser settings. Absent is empty: no loopback origin allowed.
+pub fn browser_project(
+    project_id: &str,
+) -> Result<crate::browser::local_origins::BrowserProject, DocumentUnreadable> {
+    read_from(&crate::settings::global().snapshot(), project_id)
+}
+
 /// The project's pins plus the stored version they were read at, from ONE snapshot.
 ///
 /// An absent document is `(Pins::default(), 0)`: `expected: Some(0)` on a `put` means "must not exist yet".

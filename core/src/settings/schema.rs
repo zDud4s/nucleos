@@ -146,6 +146,7 @@ mod tests {
         the_schema_of_autopilot_is_stable => "autopilot",
         the_schema_of_workflow_pins_is_stable => "workflow_pins",
         the_schema_of_automations_is_stable => "automations",
+        the_schema_of_browser_project_is_stable => "browser_project",
     }
 
     /// One snapshot per production channel (`channels__telegram.json`); the test-only `fake` channel shares the type.

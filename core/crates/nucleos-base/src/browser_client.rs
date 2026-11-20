@@ -62,9 +62,29 @@ pub struct Placement {
     /// login in it, so there is nobody for a form to be submitted AS.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writable: Vec<String>,
+    /// Loopback origins (`http://localhost:5173`) the owner allowed this project's agent to open.
+    /// Empty for no project. The sidecar's fence refuses the machine's own address otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_origins: Vec<String>,
+    /// Ports on this machine the agent may never reach, whatever `local_origins` says: the daemon's
+    /// HTTP port, every sidecar port and the shell's CDP ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_ports: Vec<u16>,
 }
 
 impl Placement {
+    /// The same placement, carrying the project's allowed loopback origins (set by the núcleo).
+    pub fn with_local_origins(mut self, local_origins: Vec<String>) -> Self {
+        self.local_origins = local_origins;
+        self
+    }
+
+    /// The same placement, carrying the ports that stay forbidden.
+    pub fn with_forbidden_ports(mut self, forbidden_ports: Vec<u16>) -> Self {
+        self.forbidden_ports = forbidden_ports;
+        self
+    }
+
     /// The placement for a project profile and the sites it admits, none of which it may write to.
     ///
     /// Read-only by default, and every caller that means otherwise says so with
@@ -79,6 +99,8 @@ impl Placement {
             },
             origins,
             writable: Vec::new(),
+            local_origins: Vec::new(),
+            forbidden_ports: Vec::new(),
         }
     }
 
@@ -99,6 +121,8 @@ impl Placement {
             },
             origins: Vec::new(),
             writable: Vec::new(),
+            local_origins: Vec::new(),
+            forbidden_ports: Vec::new(),
         }
     }
 }
@@ -979,6 +1003,19 @@ mod tests {
         assert_eq!(json["profile"]["kind"], "project");
         assert_eq!(json["profile"]["id"], "42");
         assert_eq!(json["origins"][0], "https://jira.example.org");
+    }
+
+    /// The two loopback fields use the names the sidecar reads, and are absent while empty.
+    #[test]
+    fn the_placement_carries_local_origins_and_forbidden_ports() {
+        let placement = Placement::project("42", vec![])
+            .with_local_origins(vec!["http://localhost:5173".into()])
+            .with_forbidden_ports(vec![7000, 9222]);
+        let json = serde_json::to_value(&placement).expect("serialisable");
+        assert_eq!(json["local_origins"][0], "http://localhost:5173");
+        assert_eq!(json["forbidden_ports"][1], 9222);
+        let bare = serde_json::to_value(Placement::ephemeral("r1")).expect("serialisable");
+        assert!(bare.get("local_origins").is_none() && bare.get("forbidden_ports").is_none());
     }
 
     /// An ephemeral placement carries no list at all — not an empty one, not a null. The sidecar's

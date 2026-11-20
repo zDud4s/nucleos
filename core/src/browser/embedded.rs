@@ -261,6 +261,10 @@ impl Registry {
 
     /// Records (or refreshes) a project's registration. Counts as a heartbeat for it.
     pub fn register(&self, project: &str, cdp_http: &str) {
+        // A port the shell once drove a browser on is never a dev server the owner can allow.
+        if let Some(port) = url_port(cdp_http) {
+            super::local_origins::note_cdp_port(port);
+        }
         let now = self.now();
         let mut inner = self.lock();
         // A different CDP address means the shell rebuilt its environment: the old tabs are gone.
@@ -729,6 +733,11 @@ fn is_loopback_http(address: &str) -> bool {
                 !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
             })
         })
+}
+
+/// The port of a registered `http://<loopback>:<port>` CDP address.
+fn url_port(address: &str) -> Option<u16> {
+    address.rsplit(':').next()?.parse().ok()
 }
 
 /// The nonce becomes part of a URL fragment and a CDP match, so it stays a plain token.

@@ -1655,13 +1655,16 @@ url: http://127.0.0.1:{port}
             .collect()
     }
 
-    #[tokio::test]
+    // The telegram tests run on a multi-thread runtime: `collect_readout` budgets the channel row at
+    // 500 ms, and on a current-thread runtime a blocking sibling probe can starve that timer into a
+    // spurious `down: timeout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_health_report_has_exactly_one_telegram_sidecar_row() {
         let state = crate::channels::testkit::state().await;
         assert_eq!(telegram_rows(state).await.len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_telegram_sidecar_row_comes_from_the_registry_manifest() {
         let state = crate::channels::testkit::state().await;
         state
@@ -1681,7 +1684,7 @@ url: http://127.0.0.1:{port}
         assert_ne!(rows[0].status, HealthState::Ok);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_telegram_sidecar_row_is_down_without_the_token() {
         // No token means no adapter to run: the row is not `ok`. It is `disabled`/`not_configured`
         // (a state, not a fault), exactly what the retired probe said for a missing token.

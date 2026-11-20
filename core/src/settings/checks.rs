@@ -105,6 +105,7 @@ mod tests {
         round_trip::<AutopilotRules>();
         round_trip::<Pins>();
         round_trip::<crate::automations::Automations>();
+        round_trip::<crate::browser::local_origins::BrowserProject>();
     }
 
     #[test]

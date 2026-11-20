@@ -557,6 +557,9 @@ pub async fn answer_widening(
         write_manifest(&mut tx, tree_id, manifest, &at).await?;
     }
     tx.commit().await?;
+    // "Allow <origin> in this project": the owner's yes is what adds the origin to the project's
+    // list. A refusal, or any other decision, does nothing here.
+    crate::browser::local_origins::on_answered(pool, decision_id, text).await;
     if decision.tree_id.is_some()
         && let Err(error) = crate::distill::enqueue_tree_parked_in(pool, decision_id).await
     {
