@@ -192,6 +192,41 @@ pub fn translate(engine: Engine, caps: &[Capability]) -> Result<EngineTools, Uns
     Ok(tools)
 }
 
+/// Whether the registry lists the runner's engine (agy and the local model are not in it).
+pub fn is_registered(kind: RunnerKind) -> bool {
+    crate::engines::adapters::entry_of(kind.as_str()).is_some()
+}
+
+/// Whether a launch pins `engine`'s coarse sandbox and its web-search switch: the CLI cannot grant
+/// file writes without a shell, so its wall is a sandbox mode and not a tool list. `false` for an
+/// engine outside the registry.
+pub fn pins_sandbox(engine: Engine) -> bool {
+    crate::engines::adapters::capabilities_of(engine.as_str())
+        .is_some_and(|caps| !caps.fs_write_without_shell)
+}
+
+/// Whether the CLI enforces a denied-tools list itself, so a loadout of its built-in tools means
+/// something. `false` for an engine outside the registry.
+pub fn enforces_denied_tools(engine: Engine) -> bool {
+    crate::engines::adapters::capabilities_of(engine.as_str()).is_some_and(|caps| caps.denied_tools)
+}
+
+/// Whether a session of `engine` can be continued with `--resume` by the launch path that serves
+/// resumed runs. `false` for an engine outside the registry.
+pub fn can_resume(engine: &str) -> bool {
+    crate::engines::adapters::capabilities_of(engine).is_some_and(|caps| caps.resume)
+}
+
+/// The engine an agent package is installed for: the first registered one whose CLI runs
+/// subagents. The local model when none does, which refuses every capability.
+pub fn subagent_engine() -> Engine {
+    crate::engines::adapters::registered_ids()
+        .into_iter()
+        .find(|id| crate::engines::adapters::capabilities_of(id).is_some_and(|caps| caps.subagents))
+        .and_then(|id| Engine::parse_in(crate::engines::TABLE, id))
+        .unwrap_or(Engine::Local)
+}
+
 /// The CLI runners that translate `caps` without error.
 pub fn translatable_runners(caps: &[Capability]) -> Vec<RunnerKind> {
     let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
@@ -210,8 +245,8 @@ pub fn translatable_runners_in(
         .into_iter()
         .filter_map(|id| RunnerKind::parse_in(table, id))
         // An empty capability list translates for agy, but agents never run on it: allow-list the
-        // engines that do, so a new engine is excluded until it is wired.
-        .filter(|&kind| kind == RunnerKind::Claude || kind == RunnerKind::Codex)
+        // engines that do (the registered ones), so a new engine is excluded until it is wired.
+        .filter(|&kind| is_registered(kind))
         .filter(|&kind| translate(kind.into(), caps).is_ok())
         .collect()
 }
@@ -225,6 +260,26 @@ mod tests {
         translate(Engine::Claude, caps)
             .unwrap()
             .claude_allowed_tools
+    }
+
+    /// The capability probes answer for Claude and Codex what the name checks used to, and refuse
+    /// every engine outside the registry.
+    #[test]
+    fn the_launch_probes_match_the_old_name_checks() {
+        assert!(!pins_sandbox(Engine::Claude));
+        assert!(pins_sandbox(Engine::Codex));
+        assert!(enforces_denied_tools(Engine::Claude));
+        assert!(!enforces_denied_tools(Engine::Codex));
+        assert!(can_resume("claude") && can_resume("codex"));
+        assert_eq!(subagent_engine(), Engine::Claude);
+        assert!(is_registered(RunnerKind::Claude) && is_registered(RunnerKind::Codex));
+        for outside in [Engine::Local, Engine::Agy, Engine::for_test("zed")] {
+            assert!(!pins_sandbox(outside), "{}", outside.as_str());
+            assert!(!enforces_denied_tools(outside), "{}", outside.as_str());
+            assert!(!can_resume(outside.as_str()), "{}", outside.as_str());
+        }
+        assert!(!is_registered(RunnerKind::Agy));
+        assert!(!is_registered(RunnerKind::for_test("zed")));
     }
 
     /// An engine with no arm refuses by name; it never falls through to Claude's tool set.

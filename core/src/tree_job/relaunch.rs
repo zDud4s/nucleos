@@ -316,11 +316,20 @@ async fn resumable_session(
     // which the default claude runner served), so it still resumes. The account is not compared: the
     // relaunch re-picks it at launch, after this decision, and a session id is looked up in whichever
     // account's config dir the new run lands in.
-    if runner.as_deref().is_some_and(|runner| runner != "claude") {
+    if !session_resumes_here(runner.as_deref()) {
         return None;
     }
     let limits = crate::node_scope::project_limits(&state.pool, launch.project_id.as_deref()).await;
     fits_for_resume(fill?, limits.leaf_budget).then_some(session)
+}
+
+/// Whether a session written by `runner` can be continued by the launch path that serves resumed
+/// tree runs: the engine must declare `resume`, and it must be the runner that path starts (the
+/// default one, which a run with no recorded runner also ran on). `codex` declares `resume` too, but
+/// `create_tree_node_run_resuming` starts the default runner, which cannot read its session ids.
+fn session_resumes_here(runner: Option<&str>) -> bool {
+    let engine = runner.unwrap_or(crate::engines::CLAUDE);
+    engine == crate::engines::CLAUDE && crate::agents::capabilities::can_resume(engine)
 }
 
 async fn cached_job<'a>(
@@ -1133,6 +1142,14 @@ mod tests {
         assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
         let stored = store::load(pool, JOB).await.unwrap().unwrap();
         assert_eq!(stored.manifest.branches["branch"].state, "parked");
+    }
+
+    #[test]
+    fn only_the_default_runners_sessions_resume_here() {
+        assert!(session_resumes_here(None));
+        assert!(session_resumes_here(Some("claude")));
+        assert!(!session_resumes_here(Some("codex")));
+        assert!(!session_resumes_here(Some("agy")));
     }
 
     #[test]

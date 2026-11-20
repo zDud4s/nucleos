@@ -89,7 +89,7 @@ impl DaemonRuns {
         Some(Sighting {
             key,
             parent: None,
-            harness_label: harness_label.to_owned(),
+            harness_label,
             model: row.model.clone(),
             role: role_of(&row),
             label: label_of(&row),
@@ -135,15 +135,18 @@ pub(crate) fn key_of(
     runner: Option<&str>,
     session_id: Option<&str>,
     run_id: i64,
-) -> (NodeKey, &'static str) {
-    let native = match runner {
-        Some("codex") => Some("codex-cli"),
-        Some("claude") | None => Some("claude-code"),
-        Some(_) => None,
-    };
+) -> (NodeKey, String) {
+    // A run with no recorded runner was served by the default one; any other id is read from the
+    // registry, and an engine outside it has no native harness to key by.
+    let native = crate::engines::adapters::entry_of(runner.unwrap_or(crate::engines::CLAUDE))
+        .and_then(|entry| entry.fleet_source)
+        .map(|source| source.replace('_', "-"));
     match (native, session_id.filter(|id| !id.is_empty())) {
-        (Some(harness), Some(session)) => (NodeKey::new(harness, session), harness),
-        _ => (NodeKey::new("daemon", &format!("run-{run_id}")), "daemon"),
+        (Some(harness), Some(session)) => (NodeKey::new(&harness, session), harness),
+        _ => (
+            NodeKey::new("daemon", &format!("run-{run_id}")),
+            "daemon".to_owned(),
+        ),
     }
 }
 
@@ -353,11 +356,11 @@ mod tests {
         let claude = |r, s| key_of(r, s, 9);
         assert_eq!(
             claude(Some("claude"), Some("s1")),
-            (NodeKey::new("claude-code", "s1"), "claude-code")
+            (NodeKey::new("claude-code", "s1"), "claude-code".to_owned())
         );
         assert_eq!(
             claude(Some("codex"), Some("s1")),
-            (NodeKey::new("codex-cli", "s1"), "codex-cli")
+            (NodeKey::new("codex-cli", "s1"), "codex-cli".to_owned())
         );
         assert_eq!(
             claude(None, Some("s1")).0,
@@ -365,7 +368,7 @@ mod tests {
         );
         assert_eq!(
             claude(Some("claude"), None),
-            (NodeKey::new("daemon", "run-9"), "daemon")
+            (NodeKey::new("daemon", "run-9"), "daemon".to_owned())
         );
         assert_eq!(
             claude(Some("claude"), Some("")).0,
