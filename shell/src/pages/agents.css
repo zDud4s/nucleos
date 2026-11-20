@@ -380,3 +380,75 @@
 .agents-changed {
   font-variant-numeric: tabular-nums;
 }
+
+/* The agent page's form (`AgentFields compact`): a column that fills its panel, the prompt taking what is left. */
+.agents-form.agents-form-page {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.agents-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 3fr);
+  align-items: start;
+  gap: var(--space-3);
+}
+
+.agents-form-page .agents-field {
+  grid-column: auto;
+  min-width: 0;
+}
+
+/* A field's label line: one height for all of them, so a Tip beside one does not push its control down. */
+.agents-field-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 1.25rem;
+}
+
+/* Wrapping chips: two to three to a row, in the case the capability is written in. */
+.agents-capabilities {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: var(--space-1) var(--space-3);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.agents-capabilities legend {
+  grid-column: 1 / -1;
+  padding: 0;
+  margin-bottom: var(--space-1);
+}
+
+.agents-capabilities .agents-capability {
+  margin-right: 0;
+  align-items: center;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.agents-field.agents-field-grow {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.agents-field-grow textarea {
+  flex: 1 1 auto;
+  min-height: 9rem;
+  resize: none;
+}
+
+@media (max-width: 40rem) {
+  .agents-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

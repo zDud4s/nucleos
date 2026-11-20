@@ -1,7 +1,7 @@
 import { useId, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { apiFetch } from "../data/client";
-import { Button, ErrorNote, Field, Quiet, Radio } from "../ui";
+import { Button, ErrorNote, Field, Quiet, Radio, SectionHead, Segmented } from "../ui";
 import "./loadout-preview.css";
 import { DAEMON_NAME } from "../copy";
 
@@ -41,7 +41,8 @@ const BOXES: { value: PreviewBox; label: string }[] = [
  * the effective tools with where each came from, and the context files.
  * Read-only — the núcleo resolves it the way a spawn does and records nothing.
  */
-export function LoadoutPreview({ agentId }: { agentId: string }) {
+export function LoadoutPreview({ agentId, variant }: { agentId: string; variant?: "section" }) {
+  const compact = variant === "section";
   const [task, setTask] = useState("");
   const [box, setBox] = useState<PreviewBox>("team");
   const boxName = useId();
@@ -52,6 +53,36 @@ export function LoadoutPreview({ agentId }: { agentId: string }) {
         body: JSON.stringify({ agent_id: agentId, box, task }),
       }),
   });
+
+  if (compact) {
+    return (
+      <section className="learned-group loadout-preview loadout-preview-section" aria-label="Loadout preview">
+        <SectionHead title="Loadout" />
+        <form
+          className="loadout-preview-line"
+          onSubmit={(event) => {
+            event.preventDefault();
+            preview.mutate();
+          }}
+        >
+          <Field label="Sample task" labelHidden>
+            <input
+              value={task}
+              placeholder="Sample task"
+              autoComplete="off"
+              onChange={(event) => setTask(event.target.value)}
+            />
+          </Field>
+          <Segmented label="Runs in" value={box} options={BOXES} onChange={setBox} />
+          <Button type="submit" disabled={preview.isPending}>
+            Preview
+          </Button>
+        </form>
+        {preview.isError && <ErrorNote>The {DAEMON_NAME} gave no reply to the preview.</ErrorNote>}
+        {preview.data !== undefined && <PreviewResult answer={preview.data} compact />}
+      </section>
+    );
+  }
 
   return (
     <section className="learned-group loadout-preview" aria-label="Loadout preview">
@@ -90,7 +121,7 @@ export function LoadoutPreview({ agentId }: { agentId: string }) {
   );
 }
 
-function PreviewResult({ answer }: { answer: LoadoutPreviewAnswer }) {
+function PreviewResult({ answer, compact = false }: { answer: LoadoutPreviewAnswer; compact?: boolean }) {
   const refs = (answer.refs ?? []).filter((ref) => ref.state !== "refused");
   const tools = answer.tools ?? [];
   return (
@@ -100,13 +131,13 @@ function PreviewResult({ answer }: { answer: LoadoutPreviewAnswer }) {
         {answer.memory ? (
           <pre className="loadout-preview-block">{answer.memory}</pre>
         ) : (
-          <Quiet says="No memory would be shown for this task." />
+          <Quiet compact={compact} says={compact ? "None" : "No memory would be shown for this task."} />
         )}
       </section>
       <section aria-label="Tools it would hold">
         <h4>Tools</h4>
         {tools.length === 0 ? (
-          <Quiet says="No tools: this agent would run without any." />
+          <Quiet compact={compact} says={compact ? "None" : "No tools: this agent would run without any."} />
         ) : (
           <ul className="loadout-preview-list">
             {tools.map((tool) => (
@@ -121,7 +152,7 @@ function PreviewResult({ answer }: { answer: LoadoutPreviewAnswer }) {
       <section aria-label="Context it would be offered">
         <h4>Context</h4>
         {refs.length === 0 ? (
-          <Quiet says="No context files would be offered." />
+          <Quiet compact={compact} says={compact ? "None" : "No context files would be offered."} />
         ) : (
           <ul className="loadout-preview-list">
             {refs.map((ref) => (

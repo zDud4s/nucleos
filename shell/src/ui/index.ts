@@ -83,6 +83,7 @@ export { chainLegs, partOfText, reasonLabel, type RunChain } from "./runChain";
  */
 export { Row, Rows, type RowProps, type RowsProps } from "./Rows";
 export { Section, type SectionProps } from "./Section";
+export { SectionHead, type SectionHeadProps } from "./SectionHead";
 export { SectionTitle, type SectionTitleProps } from "./SectionTitle";
 export { ShareBar, type ShareBarProps, type ShareItem } from "./ShareBar";
 export { SlotPips, type SlotPipsProps } from "./SlotPips";

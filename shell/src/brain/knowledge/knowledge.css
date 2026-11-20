@@ -298,3 +298,13 @@
     color-scheme: light;
   }
 }
+
+/* The compact variant: a section of a panel that stacks several, headed by `SectionHead`. */
+.learned-group.learned-section {
+  margin-top: 0;
+  gap: var(--space-1);
+}
+
+.learned-waiting {
+  font-size: var(--text-xs);
+}
