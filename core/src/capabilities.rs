@@ -422,7 +422,7 @@ pub enum ContextWindow {
 /// 3. neither -> `Err(MissingContextLength)`, never a vendor default. A turn ACCUMULATES — system
 ///    message, question, then every tool schema and every tool result again on every round — so a
 ///    window assumed from a guess is how a long conversation becomes a short one nobody was told
-///    about. That is `local_agent::TURN_NUM_CTX`'s guard restated on a wire with no `num_ctx` field
+///    about. That is `local_ctx::local_num_ctx`'s guard restated on a wire with no `num_ctx` field
 ///    to state it on.
 ///
 /// `required_tokens` is then checked against whichever number won, because a stated window that is
@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn triage_switches_off_completely_and_says_why() {
-        let error = context_too_small(2048, triage::LOCAL_NUM_CTX);
+        let error = context_too_small(2048, crate::models::local_ctx::MIN_LOCAL_NUM_CTX);
         let missing = vec![MissingCapability::ContextWindow(error.clone())];
 
         let posture = triage_posture(&missing);
@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn voice_switches_off_the_polish_and_dictation_carries_on_raw() {
-        let error = context_too_small(1024, voice::CLEANUP_NUM_CTX);
+        let error = context_too_small(1024, crate::models::local_ctx::MIN_LOCAL_NUM_CTX);
         let missing = vec![MissingCapability::ContextWindow(error)];
 
         let posture = voice_posture(&missing);
@@ -1551,7 +1551,7 @@ mod tests {
 
     #[test]
     fn the_local_conversation_falls_back_to_the_cli_instead_of_switching_off() {
-        let error = context_too_small(4096, local_agent::TURN_NUM_CTX);
+        let error = context_too_small(4096, crate::models::local_ctx::MIN_LOCAL_NUM_CTX);
         let missing = vec![MissingCapability::ContextWindow(error)];
 
         let posture = local_assistant_posture(&missing);
@@ -1597,29 +1597,29 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[test]
-    fn triage_requires_the_window_triage_rs_already_pinned() {
+    fn triage_requires_the_shared_floor() {
         assert_eq!(
             triage::CAPABILITY_REQUIREMENT.context_tokens,
-            triage::LOCAL_NUM_CTX,
-            "triage's requirement must mirror the constant triage.rs already fixed"
+            crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
+            "triage's requirement must be the shared local floor"
         );
     }
 
     #[test]
-    fn voice_requires_the_window_voice_rs_already_pinned() {
+    fn voice_requires_the_shared_floor() {
         assert_eq!(
             voice::CAPABILITY_REQUIREMENT.context_tokens,
-            voice::CLEANUP_NUM_CTX,
-            "voice's requirement must mirror the constant voice.rs already fixed"
+            crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
+            "voice's requirement must be the shared local floor"
         );
     }
 
     #[test]
-    fn the_local_conversation_requires_the_window_local_agent_rs_already_pinned() {
+    fn the_local_conversation_requires_the_shared_floor() {
         assert_eq!(
             local_agent::CAPABILITY_REQUIREMENT.context_tokens,
-            local_agent::TURN_NUM_CTX,
-            "the local assistant's requirement must mirror the constant local_agent.rs already fixed"
+            crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
+            "the local assistant's requirement must be the shared local floor"
         );
     }
 
@@ -1631,7 +1631,7 @@ mod tests {
         assert_eq!(
             triage::CAPABILITY_REQUIREMENT,
             Requirement {
-                context_tokens: triage::LOCAL_NUM_CTX,
+                context_tokens: crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
                 tools: false,
                 vision: false,
                 structured_output: false,
@@ -1640,7 +1640,7 @@ mod tests {
         assert_eq!(
             voice::CAPABILITY_REQUIREMENT,
             Requirement {
-                context_tokens: voice::CLEANUP_NUM_CTX,
+                context_tokens: crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
                 tools: false,
                 vision: false,
                 structured_output: false,
@@ -1649,7 +1649,7 @@ mod tests {
         assert_eq!(
             local_agent::CAPABILITY_REQUIREMENT,
             Requirement {
-                context_tokens: local_agent::TURN_NUM_CTX,
+                context_tokens: crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
                 tools: false,
                 vision: false,
                 structured_output: false,

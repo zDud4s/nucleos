@@ -509,7 +509,7 @@ pub(crate) async fn ask(
                 base_url,
                 model,
                 &prompt,
-                serde_json::json!({"num_ctx": 32_768, "temperature": 0}),
+                serde_json::json!({"num_ctx": crate::models::local_ctx::local_num_ctx(), "temperature": 0}),
                 Some(schema),
                 false,
             )
@@ -3792,5 +3792,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(again, rows, "a second tick neither duplicates nor recounts");
+    }
+}
+
+#[cfg(test)]
+mod shared_num_ctx_tests {
+    use super::*;
+
+    /// The loopback arm sends the one process-wide `num_ctx`, so Ollama never reloads the model
+    /// between this feature and the others.
+    #[tokio::test]
+    async fn the_loopback_arm_carries_the_shared_num_ctx() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let recorder = std::sync::Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": "{}"},
+                        "done": true
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+
+        ask(crate::map::intent::Extractor::Loopback { client: \&client, base_url: \&base_url, model: "qwen2" }, "prompt".to_string(), "standing", serde_json::json!({"type": "object"}))
+        .await
+        .expect("the fake answered");
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a chat request was posted");
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
+        );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
     }
 }

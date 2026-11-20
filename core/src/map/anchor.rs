@@ -281,7 +281,7 @@ pub fn catalogue(root: &Path) -> Vec<Spec> {
 /// **What it costs at the ceiling, because that is the number that has to fit.** Twenty windows at
 /// 600 bytes is 12 KB, plus at most [`MAX_DOC_BYTES`] of module comment, plus about 3.5 KB of
 /// document list — roughly 22 KB for the largest file in this repository and about 6 KB for the
-/// median one, which is inside `triage::LOCAL_NUM_CTX` with room to spare. Not the whole file, and
+/// median one, which is inside the shared `local_ctx::local_num_ctx()` with room to spare. Not the whole file, and
 /// this is the number that says why: `http.rs` is some 20 000 lines.
 pub const CITATION_RADIUS: usize = 300;
 
@@ -941,7 +941,7 @@ const ANCHOR_OUTPUT_CONTRACT: &str = "Answer with exactly one JSON object and no
 /// prompt it is handed, so a proposal sent through it comes back a triage array and parses to
 /// nothing.
 ///
-/// The local window is `triage::LOCAL_NUM_CTX`, which the startup probe establishes, and the
+/// The local window is `local_ctx::local_num_ctx()`, which the startup probe establishes, and the
 /// ceiling on this prompt is inside it by construction — see [`CITATION_RADIUS`] for the
 /// arithmetic. Unlike the extraction next door, this does not ask for four times the probed size,
 /// because unlike a 60 000-byte document it does not need it.
@@ -993,7 +993,7 @@ pub async fn ask(
                 // function's doc for what the other arm does instead, and for the three runs that
                 // measured the difference rather than assuming it away.
                 serde_json::json!({
-                    "num_ctx": crate::governance::triage::LOCAL_NUM_CTX,
+                    "num_ctx": crate::models::local_ctx::local_num_ctx(),
                     "temperature": 0
                 }),
                 Some(anchor_format()),
@@ -2828,6 +2828,57 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn the_loopback_anchor_question_carries_the_shared_num_ctx() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let recorder = std::sync::Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "message": {"role": "assistant", "content": "{}"},
+                        "done": true
+                    }))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+        let file = asked("core/src/gate.rs", "// the gate, and §7 governs it.\n");
+
+        ask(
+            crate::map::intent::Extractor::Loopback {
+                client: &client,
+                base_url: &base_url,
+                model: "qwen2",
+            },
+            &file,
+            &specs(),
+            &Neighbourhood::default(),
+        )
+        .await
+        .expect("the fake answered");
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a chat request was posted");
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
+        );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
     }
 
     #[tokio::test]

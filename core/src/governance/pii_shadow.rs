@@ -445,7 +445,7 @@ async fn observe_column(
             local.base_url,
             local.model,
             &prompt_for(column, &summary),
-            serde_json::json!({"num_ctx": crate::governance::triage::LOCAL_NUM_CTX}),
+            serde_json::json!({"num_ctx": crate::models::local_ctx::local_num_ctx()}),
             Some(answer_schema()),
             THINK,
         )
@@ -819,8 +819,9 @@ mod tests {
         // its own default window.
         assert_eq!(
             body["options"]["num_ctx"],
-            crate::governance::triage::LOCAL_NUM_CTX as i64
+            crate::models::local_ctx::local_num_ctx() as i64
         );
+        assert_eq!(body["options"]["num_ctx"], 8192);
         // The flag that decides whether this pass can see anything at all. With it false the same
         // model, prompt and grammar answered `[]` to a sentence beginning with a person's name, and
         // 59 fields in a row were recorded clean — a wrong value here costs a migration to undo and

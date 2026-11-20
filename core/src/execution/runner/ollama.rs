@@ -237,7 +237,7 @@ impl crate::models::local_agent::LocalChat for OllamaChat {
             messages,
             // No sampling grammar, unlike triage: an answer here is prose for a person, and a
             // grammar is also what would stop the model emitting a tool call at all.
-            serde_json::json!({"num_ctx": crate::models::local_agent::TURN_NUM_CTX}),
+            serde_json::json!({"num_ctx": crate::models::local_ctx::local_num_ctx()}),
             None,
             false,
             tools.map(serde_json::Value::from),
@@ -308,7 +308,7 @@ impl CommandRunner for OllamaRunner {
             &self.model,
             &request.prompt,
             serde_json::json!({
-                "num_ctx": crate::governance::triage::LOCAL_NUM_CTX,
+                "num_ctx": crate::models::local_ctx::local_num_ctx(),
                 "temperature": 0
             }),
             Some(format),

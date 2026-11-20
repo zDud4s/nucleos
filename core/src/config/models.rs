@@ -102,6 +102,9 @@ pub struct ModelsConfig {
     /// engines nothing can discover it: Ollama answers `/api/show`, and an OpenAI-compatible
     /// `/v1/models` states no window at all.
     ///
+    /// It ALSO sets the one `num_ctx` every local Ollama call sends (default 8192, clamped to the
+    /// probed model window); read once at startup.
+    ///
     /// Absent stays `None` and nothing invents a number. A guessed window is not a harmless default
     /// — it is a figure the daemon would then act on when deciding what fits in a turn — which is
     /// the argument `AssistantChoice::tools` makes for never marking `Some(false)` on a guess,

@@ -3905,8 +3905,9 @@ mod tests {
             .expect("run_prompt posted a chat request");
         assert_eq!(
             body["options"]["num_ctx"].as_u64(),
-            Some(crate::governance::triage::LOCAL_NUM_CTX as u64)
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
         );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
         assert_eq!(body["options"]["temperature"].as_u64(), Some(0));
         assert_eq!(body["think"].as_bool(), Some(false));
         assert_eq!(body["stream"].as_bool(), Some(false));
@@ -3915,6 +3916,36 @@ mod tests {
             body["format"]["items"]["required"],
             serde_json::json!(["id", "class", "summary"])
         );
+    }
+
+    /// The local agent turn shares the one process-wide `num_ctx` with every other Ollama call, so
+    /// Ollama never reloads the model between features.
+    #[tokio::test]
+    async fn ollama_chat_agent_turn_carries_the_shared_num_ctx() {
+        use crate::models::local_agent::LocalChat;
+
+        let (runner, seen) = ollama_runner_capturing("fine").await;
+        let chat = OllamaChat::with_client(
+            runner.client.clone(),
+            runner.base_url.clone(),
+            runner.model.clone(),
+        );
+
+        chat.exchange(vec![serde_json::json!({"role": "user", "content": "hi"})], None)
+            .await
+            .unwrap();
+
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("the agent turn posted a chat request");
+        assert_eq!(
+            body["options"]["num_ctx"].as_u64(),
+            Some(crate::models::local_ctx::local_num_ctx() as u64)
+        );
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(8192));
     }
 
     /// The batch-size half of the same contract, on a prompt that actually carries message markers.

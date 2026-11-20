@@ -25,26 +25,15 @@ use serde_json::Value;
 /// Eight is enough for "list the projects, then read the run" and several steps more.
 pub const MAX_TOOL_ROUNDS: usize = 8;
 
-/// The context window every request in a local turn states explicitly.
-///
-/// Stated on each request and never inherited from Ollama's factory default, which is the lesson
-/// `voice.rs` records at length: Ollama silently truncates a prompt that does not fit, so a default
-/// window turns a long conversation into a short one nobody was told about.
-///
-/// Larger than triage's 8192 because a turn ACCUMULATES. Triage sends one prompt; this sends the
-/// system message, the question, and then every tool schema and every tool result again on each
-/// round. The number is therefore coupled to `MAX_TOOL_ROUNDS` above: raising the ceiling without
-/// raising this trades a turn that gives up for a turn that quietly forgets its first lookup.
-pub const TURN_NUM_CTX: usize = 16_384;
-
 /// What a local assistant turn requires from a model, read by `capabilities::missing_capabilities`
-/// instead of a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window:
-/// a local turn checks nothing else today, and `capabilities`' own guard test
+/// instead of a fourth copy of the `/api/show` probe `main.rs` runs today. Only the context window,
+/// and only the floor: the shared `local_ctx::local_num_ctx()` is clamped to the probed window at
+/// startup. `capabilities`' own guard test
 /// (`none_of_the_three_roles_requires_more_than_the_window_today`) fails if this ever claims more without
 /// that being a deliberate change.
 pub const CAPABILITY_REQUIREMENT: crate::capabilities::Requirement =
     crate::capabilities::Requirement {
-        context_tokens: TURN_NUM_CTX,
+        context_tokens: crate::models::local_ctx::MIN_LOCAL_NUM_CTX,
         tools: false,
         vision: false,
         structured_output: false,
