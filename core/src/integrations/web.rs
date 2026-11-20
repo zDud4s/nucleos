@@ -856,7 +856,9 @@ mod tests {
     async fn quarantine_truncates_a_page_larger_than_the_local_window() {
         let page = "word ".repeat(100_000);
         let body = summarise_capturing(&page).await;
-        let prompt = body["messages"][0]["content"].as_str().expect("prompt text");
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
         assert!(prompt.contains("[truncated to fit"));
         assert!(prompt.len() < page.len());
     }
@@ -864,7 +866,9 @@ mod tests {
     #[tokio::test]
     async fn quarantine_sends_a_small_page_unchanged() {
         let body = summarise_capturing("a short page").await;
-        let prompt = body["messages"][0]["content"].as_str().expect("prompt text");
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
         assert!(prompt.contains("a short page"));
         assert!(!prompt.contains("[truncated to fit"));
     }

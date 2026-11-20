@@ -3931,9 +3931,12 @@ mod tests {
             runner.model.clone(),
         );
 
-        chat.exchange(vec![serde_json::json!({"role": "user", "content": "hi"})], None)
-            .await
-            .unwrap();
+        chat.exchange(
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+        )
+        .await
+        .unwrap();
 
         let body = seen
             .lock()

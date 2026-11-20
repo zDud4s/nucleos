@@ -327,12 +327,12 @@ pub fn local_ollama_models(config: &crate::config::ModelsConfig) -> Vec<(String,
     .into_iter()
     .map(|model| (model.to_owned(), default_url.to_owned()))
     .collect();
-    if let (Some(model), Ok(resolved)) = (&config.local_assistant_model, config.local_engine()) {
-        if resolved.engine == crate::config::LocalEngine::Ollama {
-            let pair = (model.clone(), resolved.base_url);
-            if !out.contains(&pair) {
-                out.push(pair);
-            }
+    if let (Some(model), Ok(resolved)) = (&config.local_assistant_model, config.local_engine())
+        && resolved.engine == crate::config::LocalEngine::Ollama
+    {
+        let pair = (model.clone(), resolved.base_url);
+        if !out.contains(&pair) {
+            out.push(pair);
         }
     }
     out
@@ -2788,7 +2788,10 @@ mod local_ollama_models_tests {
         c.local_assistant_model = Some("a".into());
         assert_eq!(local_ollama_models(&c).len(), 1);
         c.voice_cleanup_model = Some("b".into());
-        let names: Vec<String> = local_ollama_models(&c).into_iter().map(|(m, _)| m).collect();
+        let names: Vec<String> = local_ollama_models(&c)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(names, vec!["a", "b"]);
     }
 
@@ -2796,7 +2799,10 @@ mod local_ollama_models_tests {
     fn the_quarantine_model_is_listed_without_a_triage_model() {
         let mut c = config();
         c.voice_cleanup_model = Some("v".into());
-        let names: Vec<String> = local_ollama_models(&c).into_iter().map(|(m, _)| m).collect();
+        let names: Vec<String> = local_ollama_models(&c)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(names, vec!["v"]);
     }
 

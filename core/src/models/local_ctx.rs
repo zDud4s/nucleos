@@ -217,15 +217,20 @@ mod tests {
     #[test]
     fn fit_prompt_data_keeps_the_instructions_and_cuts_only_the_data() {
         let instructions = "INSTRUCTIONS: answer in JSON.";
-        let prompt = format!("{instructions}
+        let prompt = format!(
+            "{instructions}
 
 --- DATA ---
-{}", "x".repeat(100_000));
+{}",
+            "x".repeat(100_000)
+        );
         let fitted = fit_prompt_data(&prompt, instructions, 8192);
-        assert!(fitted.starts_with(&format!("{instructions}
+        assert!(fitted.starts_with(&format!(
+            "{instructions}
 
 --- DATA ---
-")));
+"
+        )));
         assert!(fitted.ends_with("[truncated to fit the local model's context]"));
         assert!(fitted.len() < 8192 * 3);
     }
@@ -253,12 +258,21 @@ small data";
     #[test]
     fn the_declared_window_sets_the_shared_value_only_for_the_ollama_engine() {
         assert_eq!(declared_ollama_num_ctx(None, Some(16384)), Some(16384));
-        assert_eq!(declared_ollama_num_ctx(Some("ollama"), Some(16384)), Some(16384));
-        assert_eq!(declared_ollama_num_ctx(Some("openai_compatible"), Some(16384)), None);
+        assert_eq!(
+            declared_ollama_num_ctx(Some("ollama"), Some(16384)),
+            Some(16384)
+        );
+        assert_eq!(
+            declared_ollama_num_ctx(Some("openai_compatible"), Some(16384)),
+            None
+        );
         assert_eq!(declared_ollama_num_ctx(Some("typo"), Some(16384)), None);
         assert_eq!(declared_ollama_num_ctx(None, None), None);
         assert_eq!(
-            resolve_local_num_ctx(declared_ollama_num_ctx(Some("openai_compatible"), Some(65536)), None),
+            resolve_local_num_ctx(
+                declared_ollama_num_ctx(Some("openai_compatible"), Some(65536)),
+                None
+            ),
             8192
         );
     }

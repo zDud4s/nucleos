@@ -1664,7 +1664,14 @@ mod shared_num_ctx_tests {
         let base_url = format!("http://{address}");
         let client = reqwest::Client::new();
 
-        ask_plain(&crate::map::intent::Extractor::Loopback { client: &client, base_url: &base_url, model: "qwen2" }, "prompt".to_string())
+        ask_plain(
+            &crate::map::intent::Extractor::Loopback {
+                client: &client,
+                base_url: &base_url,
+                model: "qwen2",
+            },
+            "prompt".to_string(),
+        )
         .await
         .expect("the fake answered");
 
@@ -1706,19 +1713,40 @@ mod shared_num_ctx_tests {
         let base_url = format!("http://{address}");
         let client = reqwest::Client::new();
         let standing: &str = SYNTHESIS_STANDING;
-        let huge = format!("{standing}
+        let huge = format!(
+            "{standing}
 
 --- DATA ---
-{}", "x".repeat(200_000));
+{}",
+            "x".repeat(200_000)
+        );
 
-        ask_plain(&crate::map::intent::Extractor::Loopback { client: &client, base_url: &base_url, model: "qwen2" }, huge)
+        ask_plain(
+            &crate::map::intent::Extractor::Loopback {
+                client: &client,
+                base_url: &base_url,
+                model: "qwen2",
+            },
+            huge,
+        )
         .await
         .expect("the fake answered");
 
-        let body = seen.lock().unwrap().first().cloned().expect("a chat request was posted");
+        let body = seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a chat request was posted");
         let sent = body["messages"].to_string();
-        assert!(sent.len() < 8192 * 3 + 2048, "the data part was cut to the window");
+        assert!(
+            sent.len() < 8192 * 3 + 2048,
+            "the data part was cut to the window"
+        );
         assert!(sent.contains("[truncated to fit the local model's context]"));
-        assert!(sent.contains(&standing[..40]), "the standing text is intact");
+        assert!(
+            sent.contains(&standing[..40]),
+            "the standing text is intact"
+        );
     }
 }

@@ -1162,7 +1162,9 @@ mod tests {
     async fn the_loopback_extraction_truncates_a_source_larger_than_the_local_window() {
         let source = format!("## §1\n{}", "word ".repeat(12_000));
         let body = extraction_body_for(&source).await;
-        let prompt = body["messages"][0]["content"].as_str().expect("prompt text");
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
         assert!(prompt.contains("[truncated to fit"));
         assert!(prompt.len() < source.len());
     }
@@ -1170,7 +1172,9 @@ mod tests {
     #[tokio::test]
     async fn the_loopback_extraction_sends_a_small_source_unchanged() {
         let body = extraction_body_for("## §1\nbody").await;
-        let prompt = body["messages"][0]["content"].as_str().expect("prompt text");
+        let prompt = body["messages"][0]["content"]
+            .as_str()
+            .expect("prompt text");
         assert!(prompt.contains("## §1\nbody"));
         assert!(!prompt.contains("[truncated to fit"));
     }
