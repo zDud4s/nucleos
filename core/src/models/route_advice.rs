@@ -34,6 +34,7 @@ use crate::speed::Speed;
 
 mod engines;
 mod item_context;
+mod probes;
 pub use engines::{Engines, RoutedRunner, allowed_models, front, front_with, installed_engines};
 use engines::{codex_runner, engines_without_headroom_now, resolve_pin};
 pub use item_context::{ItemContext, ItemRef, failed_label, item_context};
@@ -419,15 +420,18 @@ impl Router {
             return kinds;
         }
         for alternate in &self.alternates {
-            let fits = match alternate.kind {
-                RunnerKind::Claude => true,
-                RunnerKind::Codex => codex_can_take(shape),
-                // Agy is offered only while its gate is open and for a read-only run it can honour;
-                // `spawn.rs` drops it again for a run whose controls the runner refuses (job MCP,
-                // steering, a forked session).
-                RunnerKind::Agy => agy_can_take(shape) && crate::engines::agy::enabled(),
-                // An engine with no arm is never offered as an alternate.
-                _ => false,
+            let id = alternate.kind.as_str();
+            let fits = if crate::engines::adapters::capabilities_of(id).is_some() {
+                // An engine with an adapter is asked what it declares, never its name.
+                probes::shape_refusal(id, shape).is_none()
+            } else if alternate.kind == RunnerKind::Agy {
+                // Agy has no adapter yet. It is offered only while its gate is open and for a
+                // read-only run it can honour; `spawn.rs` drops it again for a run whose controls
+                // the runner refuses (job MCP, steering, a forked session).
+                agy_can_take(shape) && crate::engines::agy::enabled()
+            } else {
+                // An engine with neither is never offered as an alternate.
+                false
             };
             if fits && !kinds.contains(&alternate.kind) {
                 kinds.push(alternate.kind);
@@ -769,7 +773,7 @@ impl RouteQuery {
                 .into_iter()
                 .filter(|kind| *kind != RunnerKind::Agy)
                 .collect(),
-            None => vec![RunnerKind::Claude, RunnerKind::Codex],
+            None => probes::registered_kinds(),
         });
         self
     }
@@ -827,7 +831,7 @@ pub async fn braked_runners(pool: &SqlitePool) -> Vec<RunnerKind> {
     let Ok(providers) = crate::quota::stored(pool, now).await else {
         return Vec::new();
     };
-    [RunnerKind::Claude, RunnerKind::Codex]
+    probes::registered_kinds()
         .into_iter()
         .filter(|kind| {
             matches!(
@@ -1111,9 +1115,10 @@ pub fn narrowed_runners(
 }
 
 fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> String {
+    if let Some(model) = probes::model_of(models, kind.as_str()) {
+        return model.to_owned();
+    }
     match kind {
-        RunnerKind::Claude => models.claude_model.clone(),
-        RunnerKind::Codex => models.codex_model.clone(),
         // No model file names an agy default; the engine's own constant does.
         RunnerKind::Agy => crate::engines::agy::DEFAULT_MODEL.to_owned(),
         // An engine with no arm has no default model: the empty string names none, and never
