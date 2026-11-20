@@ -348,9 +348,19 @@ impl Contained {
     }
 
     /// Lets the child outlive this value: the tree is no longer killed on drop.
+    ///
+    /// This is the explicit opt-out from reaping: whatever is left in the tree is DELIBERATELY not
+    /// terminated. A caller that does not mean to leave a process behind wants [`Self::reap`].
     pub fn disarm(&mut self) {
         if let Some(killer) = self.killer.as_mut() {
-            killer.disarm();
+            killer.release();
+        }
+    }
+
+    /// The child has exited and its output is drained: terminates whatever is left in its tree.
+    pub fn reap(&mut self) {
+        if let Some(killer) = self.killer.as_mut() {
+            killer.reap();
         }
     }
 }

@@ -427,8 +427,11 @@ impl CommandRunner for AgyCliRunner {
                 None
             }
         };
+        // The supervisor is reaped and stdout has ended, so terminate whatever it left running rather
+        // than letting it outlive the run. Bytes already written to stderr stay readable in the pipe
+        // after its writers die, so the drain below loses none.
         if let Some(killer) = tree_killer.as_mut() {
-            killer.disarm();
+            killer.reap();
         }
 
         let mut stderr_str = stderr_task.await.unwrap_or_default();

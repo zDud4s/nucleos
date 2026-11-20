@@ -715,9 +715,12 @@ impl CommandRunner for CodexCliRunner {
                 None
             }
         };
-        // Reaped, so the process is gone and there is nothing left to kill.
+        // The CLI is reaped and stdout has ended, so terminate whatever it left running rather than
+        // letting it outlive the run. Bytes already written to stderr stay readable in the pipe after
+        // its writers die, so the drain below loses none (and a leftover holding stderr can no
+        // longer stall it).
         if let Some(killer) = tree_killer.as_mut() {
-            killer.disarm();
+            killer.reap();
         }
 
         let mut stderr_str = stderr_task.await.unwrap_or_default();
