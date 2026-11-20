@@ -9,8 +9,8 @@ use sqlx::SqlitePool;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
-    Available, EnginePinRoute, Resolved, Router, RouterConfig, RunShape, RunnerKind, codex_refusal,
-    default_model,
+    Available, EnginePinRoute, Resolved, Router, RouterConfig, RunShape, RunnerKind, default_model,
+    probes,
 };
 use crate::execution::runner::{CommandRunner, RunOutcome, RunRequest, TurnEvent};
 
@@ -54,9 +54,7 @@ pub(super) async fn resolve_pin(
             )),
         };
     };
-    if pin.runner == RunnerKind::Codex
-        && let Some(why) = codex_refusal(shape)
-    {
+    if let Some(why) = probes::shape_refusal(pin.runner.as_str(), shape) {
         return Resolved {
             runner,
             model: pin.model,
@@ -64,7 +62,8 @@ pub(super) async fn resolve_pin(
             decision_id: None,
             router: None,
             refused: Some(format!(
-                "this node is pinned to the codex engine, but {why}"
+                "this node is pinned to the {} engine, but {why}",
+                pin.runner.as_str()
             )),
         };
     }
@@ -275,7 +274,7 @@ pub fn allowed_models(
         .assistant_choices
         .iter()
         .filter(|choice| choice.brain == "cloud")
-        .filter(|choice| choice.runner.as_deref().unwrap_or("claude") == kind.as_str())
+        .filter(|choice| probes::choice_runner(choice) == kind.as_str())
         .map(|choice| choice.id.clone())
         .collect();
     if kind == RunnerKind::Agy {
