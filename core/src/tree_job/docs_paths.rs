@@ -24,6 +24,19 @@ pub fn owned_glob_matches(glob: &str, path: &str) -> bool {
     owned_glob_segments_match(&glob, &path)
 }
 
+/// True when `file` is inside what a declared path owns: a glob match, or, for a bare directory
+/// (`shell`, `shell/`, no `*`), anything below it. Traversal is never owned.
+pub fn owns(glob: &str, file: &str) -> bool {
+    let glob = glob.replace('\\', "/");
+    let file = file.replace('\\', "/");
+    let dir = glob.trim_end_matches('/');
+    owned_glob_matches(dir, &file)
+        || (!dir.is_empty()
+            && !dir.contains('*')
+            && file.starts_with(&format!("{dir}/"))
+            && owned_glob_matches(&format!("{dir}/**"), &file))
+}
+
 fn owned_glob_segments_match(glob: &[&str], path: &[&str]) -> bool {
     match glob {
         [] => path.is_empty(),

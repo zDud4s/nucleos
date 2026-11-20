@@ -5,7 +5,7 @@
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use super::docs_paths::owned_glob_matches;
+use super::docs_paths::owns;
 use super::driver::{Park, git, persist};
 use super::model::Branch;
 use super::store::TreeJob;
@@ -57,7 +57,7 @@ pub(super) fn check_leaf_diff(
         if paths.is_empty() || file == MODULE_MAP {
             continue;
         }
-        if !paths.iter().any(|glob| owned_glob_matches(glob, file)) {
+        if !paths.iter().any(|glob| owns(glob, file)) {
             outside.push(file);
         }
     }
@@ -265,7 +265,7 @@ fn outside_files(paths: &[String], changed: &[String]) -> Vec<String> {
         .filter(|file| {
             file.as_str() != MODULE_MAP
                 && !is_migration(file)
-                && !paths.iter().any(|glob| owned_glob_matches(glob, file))
+                && !paths.iter().any(|glob| owns(glob, file))
         })
         .cloned()
         .collect()
@@ -337,6 +337,22 @@ mod tests {
 
     fn owned() -> Vec<String> {
         s(&["core/src/execution/**", "core/tests/**", "core/AGENTS.md"])
+    }
+
+    #[test]
+    fn a_bare_directory_path_owns_everything_under_it() {
+        let paths = s(&["shell", "sidecars/browser/"]);
+        let changed = s(&[
+            "shell/src/project/LocalOrigins.tsx",
+            "sidecars/browser/chrome/fence.go",
+        ]);
+        assert_eq!(check_leaf_diff(&paths, &changed, &[]), Ok(()));
+        assert!(outside_files(&paths, &changed).is_empty());
+
+        let siblings = s(&["shell2/x.ts", "sidecars/browser2/y.go"]);
+        let reason = check_leaf_diff(&paths, &siblings, &[]).unwrap_err();
+        assert!(reason.contains("shell2/x.ts") && reason.contains("sidecars/browser2/y.go"));
+        assert_eq!(outside_files(&paths, &siblings), siblings);
     }
 
     #[test]

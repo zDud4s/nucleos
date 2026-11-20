@@ -266,7 +266,7 @@ pub(super) async fn docs_write_decision(
                     && docs_branch
                         .paths
                         .iter()
-                        .any(|glob| crate::tree_job::docs_paths::owned_glob_matches(glob, path))
+                        .any(|glob| crate::tree_job::docs_paths::owns(glob, path))
             })
         });
     if !allowed {
@@ -640,6 +640,18 @@ mod tests {
             ".ai/specs/README.md",
             relative,
         ));
+    }
+
+    #[test]
+    fn a_bare_directory_owned_path_allows_writes_below_it_only() {
+        use crate::tree_job::docs_paths::owns;
+        assert!(owns("shell", "shell/src/a.tsx"));
+        assert!(owns(
+            "sidecars/browser/",
+            "sidecars/browser/chrome/fence.go"
+        ));
+        assert!(!owns("shell", "shell2/x.ts"));
+        assert!(!owns("shell", "shell/../core/x.rs"));
     }
 
     /// The hook looks a node up by run id on every tool call; that lookup must be an index search.
