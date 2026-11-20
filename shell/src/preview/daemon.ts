@@ -3653,7 +3653,7 @@ const SIDECARS: SidecarState[] = [
   {
     name: "echo",
     state: "running",
-    started_at: "2026-09-13T06:00:00Z",
+    started_at: ago(26 * 3600_000),
     last_failure: null,
     last_failure_at: null,
     restarts: 0,
@@ -3663,17 +3663,17 @@ const SIDECARS: SidecarState[] = [
   {
     name: "email",
     state: "running",
-    started_at: "2026-09-13T06:00:00Z",
+    started_at: ago(26 * 3600_000),
     last_failure: null,
     last_failure_at: null,
     restarts: 1,
     last_line: "email: polled INBOX, 3 new",
-    last_line_at: "2026-09-13T08:55:00Z",
+    last_line_at: ago(5 * 60_000),
   },
   {
     name: "web",
     state: "running",
-    started_at: "2026-09-13T06:00:00Z",
+    started_at: ago(26 * 3600_000),
     last_failure: null,
     last_failure_at: null,
     restarts: 0,
@@ -3685,7 +3685,7 @@ const SIDECARS: SidecarState[] = [
     state: "down",
     started_at: null,
     last_failure: "could not start: The system cannot find the file specified. (os error 2)",
-    last_failure_at: "2026-09-13T08:58:00Z",
+    last_failure_at: ago(2 * 60_000),
     restarts: 14,
     last_line: null,
     last_line_at: null,
@@ -3942,6 +3942,8 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/jobs" || path.startsWith("/jobs?")) return [JOB];
   if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
   if (path === "/route/report" || path.startsWith("/route/report?")) return ROUTE_REPORT;
+  // The OS sandbox has no backend yet, which is what the real daemon answers today.
+  if (path === "/sandbox/status") return { state: "no_backend", banner: "sandbox por implementar" };
   if (/^\/runs\/\d+\/stop$/.test(path)) return RUN_STOP;
   if (/^\/runs\/2\/tail\?since=0$/.test(path)) {
     return { text: LIVE_TAIL_TEXT, next: LIVE_TAIL_TEXT.length, live: true } satisfies RunTailChunk;

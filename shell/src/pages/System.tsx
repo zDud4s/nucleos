@@ -3,6 +3,8 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { validateSystemSearch } from "./systemSearch";
 import { apiFetch, isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
+import { useSandboxStatus, type SandboxStatus } from "../data/sandbox";
+import { sandboxTone } from "../ui/sandbox-tone";
 import { registerPrefetcher } from "../lib/prefetch";
 import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
@@ -297,18 +299,51 @@ function HealthView({
   return (
     <>
       <HealthReadoutPanel health={health} />
-      <RouterReportPanel />
       <SidecarCardsPanel sidecars={sidecars} />
+      <RouterReportPanel />
     </>
   );
 }
 
-/** How a subsystem's detail reads in the strip tooltip and the drawer: the reason, then its tallies. */
+const SANDBOX_LABELS: Record<SandboxStatus["state"], string> = {
+  no_backend: "Not implemented",
+  off: "Off",
+  armed: "Armed",
+  refused: "Refused",
+};
+
+/** One small line in the Subsystems panel: the OS sandbox's state as a badge, with the explanation in a Tip. */
+function SandboxLine() {
+  const status = useSandboxStatus();
+  if (status.data === undefined) return null;
+  const tone = sandboxTone(status.data.state);
+  const label = SANDBOX_LABELS[status.data.state];
+  const refused = status.data.state === "refused";
+  return (
+    <div className="sy-sandbox">
+      <span>Sandbox</span>
+      <Badge tone={tone}>{label}</Badge>
+      {refused && status.data.banner !== null && <Tip name="Why it was refused" tip={<span>{status.data.banner}</span>} />}
+      <Tip
+        name="About the sandbox"
+        tip={<span>Runs are not contained by a sandbox yet. Only a refused sandbox blocks runs.</span>}
+      />
+    </div>
+  );
+}
+
+/** A daemon reason as a short phrase: `not-running` reads "Not running", `reason: low-disk-space` "Low disk space". */
+function humanizeReason(reason: string): string {
+  const words = reason.replace(/^reason:\s*/i, "").replace(/[-_]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** How a subsystem's detail reads in the attention rows and the drawer: the reason, then its tallies. */
 function subsystemDetail(row: SubsystemReadout): string {
   const tallies = subsystemCounts(row)
     .filter((count) => !count.instant)
     .map((count) => `${count.label} ${String(count.value)}`);
-  const parts = [row.reason === undefined ? null : `reason: ${row.reason}`, ...tallies];
+  const parts = [row.reason === undefined ? null : humanizeReason(row.reason), ...tallies];
   return parts.filter((part) => part !== null).join(" · ");
 }
 
@@ -323,6 +358,28 @@ function attentionNames<T>(items: readonly T[], shown: number): { head: T[]; mor
   return { head: items.slice(0, shown), more: Math.max(0, items.length - shown) };
 }
 
+interface KpiItem {
+  label: string;
+  value: string | number;
+  tone?: string;
+}
+
+/** Compact KPI tiles (the Limits tab's tile style) for a panel body. */
+function KpiTiles({ items }: { items: readonly KpiItem[] }) {
+  return (
+    <div className="sy-kpis sy-kpis-compact">
+      {items.map((item) => (
+        <div key={item.label} className="sy-kpi">
+          <dl>
+            <dt>{item.label}</dt>
+            <dd className={item.tone}>{item.value}</dd>
+          </dl>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function HealthReadoutPanel({
   health,
 }: {
@@ -335,20 +392,16 @@ function HealthReadoutPanel({
       ? [...health.data.subsystems].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
       : [];
   const count = (status: SubsystemReadout["status"]) => rows.filter((row) => row.status === status).length;
-  const attention = rows.filter((row) => row.status !== "ok").sort(bySubsystemHealth);
-  // Always three slots, so the card is as tall for none as for ten.
-  const slots: (SubsystemReadout | "ok" | "more" | "empty")[] =
-    attention.length === 0
-      ? ["ok", "empty", "empty"]
-      : attention.length > 3
-        ? [attention[0], attention[1], "more"]
-        : [...attention, ...Array<"empty">(3 - attention.length).fill("empty")];
-  const stats: { label: string; value: number; tone?: string }[] = [
-    { label: "Subsystems", value: rows.length },
+  // The sidecar pillars are reported by the Sidecars panel below; the tiles still count them.
+  const attention = rows
+    .filter((row) => row.status !== "ok" && !row.name.endsWith("_sidecar"))
+    .sort(bySubsystemHealth);
+  const shown = attention.length > 4 ? attention.slice(0, 3) : attention;
+  const stats: KpiItem[] = [
     { label: "Ok", value: count("ok") },
     { label: "Degraded", value: count("degraded"), tone: count("degraded") > 0 ? "sy-stat-warn" : undefined },
     { label: "Down", value: count("down"), tone: count("down") > 0 ? "sy-stat-danger" : undefined },
-    { label: "Disabled", value: count("disabled"), tone: count("disabled") > 0 ? "sy-stat-warn" : undefined },
+    { label: "Disabled", value: count("disabled") },
   ];
   const aside = ready ? (
     <Button variant="quiet" aria-expanded={open} onClick={() => { setOpen(true); }}>
@@ -357,61 +410,44 @@ function HealthReadoutPanel({
   ) : undefined;
   return (
     <Panel title="Subsystems" aside={aside}>
+      <SandboxLine />
       {health.data === undefined && !health.isError && (
-        <>
-          {/* The stat strip's five tracks, then the three fixed attention rows (2.5rem each). */}
-          <Skeleton label="Reading the subsystems" variant="cards" count={5} gridClassName="sy-stats-skeleton" height="2.75rem" />
-          <Skeleton label="Reading the subsystems" variant="row" count={3} height="2.5rem" />
-        </>
+        <Skeleton label="Reading the subsystems" variant="cards" count={4} gridClassName="sy-kpis-skeleton" height="3.75rem" />
       )}
       {health.isError && health.data === undefined && (
         <HealthError error={health.error} />
       )}
       {health.data !== undefined && isAggregateTimeout(health.data) && (
         <Notice tone="pending" role="status">
-          The readout timed out before it could measure anything below the aggregate, so no
-          subsystem was reached. That is not the same as all of them being down.
+          The readout timed out.
+          <Tip
+            name="About the timeout"
+            tip="It could not measure anything below the aggregate, so no subsystem was reached. That is not the same as all of them being down."
+          />
         </Notice>
       )}
       {ready && (
         <>
-          <dl className="sy-router-totals sy-stats">
-            {stats.map((stat) => (
-              <div key={stat.label} className="sy-router-total">
-                <dt>{stat.label}</dt>
-                <dd className={stat.tone}>{stat.value}</dd>
-              </div>
-            ))}
-          </dl>
-          <Rows label="Subsystems" className="sy-attn">
-            {slots.map((slot, index) =>
-              slot === "empty" ? (
-                <li key={`empty-${String(index)}`} className="ui-rows-row ui-rows-row-dense sy-attn-row" aria-hidden="true" />
-              ) : slot === "ok" ? (
-                <Row key="ok" dense className="sy-attn-row">
-                  <span className="sy-attn-ok">All subsystems ok</span>
-                </Row>
-              ) : slot === "more" ? (
-                <Row key="more" dense className="sy-attn-row">
-                  <span className="sy-attn-more">+{attention.length - 2} more</span>
-                  <span className="sy-attn-tools">
-                    <Button variant="quiet" onClick={() => { setOpen(true); }}>Details</Button>
-                  </span>
-                </Row>
-              ) : (
-                <Row key={slot.name} dense className="sy-attn-row">
-                  <span className="sy-sidecar-name" title={slot.name}>{slot.name}</span>
+          <KpiTiles items={stats} />
+          {attention.length === 0 && count("ok") === rows.length && <Quiet compact says="All ok" />}
+          {attention.length > 0 && (
+            <Rows label="Subsystems" className="sy-attn">
+              {shown.map((row) => (
+                <Row key={row.name} dense className="sy-attn-row">
+                  <span className="sy-sidecar-name" title={row.name}>{row.name}</span>
                   <span className="sy-sidecar-state">
-                    <StateBadge domain="pillar" state={slot.status} />
+                    <StateBadge domain="pillar" state={row.status} />
                   </span>
-                  <span className="sy-attn-detail" title={subsystemDetail(slot)}>{subsystemDetail(slot)}</span>
-                  <span className="sy-attn-tools">
-                    <Button variant="quiet" aria-label={`Details for ${slot.name}`} onClick={() => { setOpen(true); }}>Details</Button>
-                  </span>
+                  <span className="sy-attn-detail" title={subsystemDetail(row)}>{subsystemDetail(row)}</span>
                 </Row>
-              ),
-            )}
-          </Rows>
+              ))}
+              {shown.length < attention.length && (
+                <Row dense className="sy-attn-row">
+                  <span className="sy-attn-more">+{attention.length - shown.length} more</span>
+                </Row>
+              )}
+            </Rows>
+          )}
         </>
       )}
       {open && ready && (
@@ -458,9 +494,15 @@ function HealthReadoutPanel({
   );
 }
 
-/** One side of a pair as `runner · model · effort`, skipping what is unknown. */
-function pairLabel(runner: string | null, model: string | null, effort: string | null): string {
-  return routeTriple([runner, model, effort]) ?? "unknown";
+/** One side of a pair as `model · effort` (the runner is dropped when `dropRunner`), skipping what is unknown. */
+function pairLabel(
+  runner: string | null,
+  model: string | null,
+  effort: string | null,
+  dropRunner: boolean,
+): string {
+  const label = routeTriple([dropRunner ? null : runner, model, effort]) ?? "unknown";
+  return dropRunner ? label.charAt(0).toUpperCase() + label.slice(1) : label;
 }
 
 /**
@@ -473,67 +515,77 @@ function pairLabel(runner: string | null, model: string | null, effort: string |
  * surface, in `router.yaml` (`core/src/route_report.rs`)? That sits beside the
  * subsystems readout and its `llm_router` row, not above a list of runs.
  *
- * The words are the router's own and are spelt out because the Runs page has a
- * run *mode* called "shadow" too (plan mode, no relation): here shadow is "advice
- * only" and apply is "advice applied", with the raw word kept in parentheses so
- * it still matches the file being edited.
+ * The Runs page has a run *mode* called "shadow" too (plan mode, no relation), so the
+ * panel's tip spells the router's two words out.
  *
- * Nothing at all while loading, on any failure (a 404 from an older daemon is
- * one) or when no run was routed: an empty panel would claim a router that has
- * not spoken.
+ * Loading, a failure (a 404 from an older daemon is one) and an empty window all draw the
+ * same panel with one short line, so the page does not shift when the report arrives.
  */
 function RouterReportPanel() {
   const report = useRouteReport();
   const data = report.data;
-  // Said, not silent: "the router is not configured" and "the report failed" are different
-  // facts, and a page whose thesis is that the safety layer is visible cannot omit either.
-  if (report.isError) {
-    return <Section label="Router"><Quiet says="the router report is unavailable." /></Section>;
-  }
-  if (data === undefined) return null;
-  if (data.runs <= 0) {
-    return <Section label="Router"><Quiet says="No routed runs">Nothing was routed in the last 30 days.</Quiet></Section>;
+  if (data === undefined || data.runs <= 0) {
+    return (
+      <Panel title="Router">
+        {report.isError ? (
+          <Quiet compact says="Router report unavailable" />
+        ) : data === undefined ? (
+          <Skeleton label="Reading the router report" variant="cards" count={5} gridClassName="sy-kpis-skeleton" height="3.75rem" />
+        ) : (
+          <Quiet compact says="No routed runs in the last 30 days" />
+        )}
+      </Panel>
+    );
   }
   // Among shadow runs with advice only: an apply run launched its advice and cannot disagree.
   const shadowAdvised = data.shadow_advised;
   const rate = shadowAdvised > 0 ? percentText(data.matched / shadowAdvised) : "n/a";
   const pairs: RoutePair[] = data.pairs.slice(0, 5);
-  const totals: readonly { label: string; value: string }[] = [
+  const totals: readonly KpiItem[] = [
     { label: "Routed runs", value: String(data.runs) },
-    { label: "Advice only (shadow)", value: String(data.shadow) },
-    { label: "Advice applied (apply)", value: String(data.apply) },
+    { label: "Shadow", value: String(data.shadow) },
+    { label: "Applied", value: String(data.apply) },
     { label: "With advice", value: String(data.advised) },
     { label: "Match rate", value: rate },
   ];
   return (
-    <Panel title={`Router (last ${String(data.days)} days)`}>
-      <dl className="sy-router-totals">
-        {totals.map((total) => (
-          <div key={total.label} className="sy-router-total">
-            <dt>{total.label}</dt>
-            <dd>{total.value}</dd>
-          </div>
-        ))}
-      </dl>
+    <Panel
+      title="Router"
+      aside={
+        <>
+          <span className="sy-panel-quiet">{String(data.days)} days</span>
+          <Tip
+            name="About the router"
+            tip="Shadow: the router advised and the run kept its own choice. Applied: the run launched the advice. Not the Runs page's shadow mode. Each row counts runs that ran on one model while the router advised another, and how many passed."
+          />
+        </>
+      }
+    >
+      <KpiTiles items={totals} />
       {pairs.length > 0 && (
-        <Table caption="Ran → advised">
+        <Table label="Runs by model and advice">
           <thead>
             <tr>
-              <Th>Pair</Th>
+              <Th>Ran on</Th>
+              <Th>Advised</Th>
               <Th num>Runs</Th>
               <Th num>Passed</Th>
               <Th num>Failed</Th>
             </tr>
           </thead>
           <tbody>
-            {pairs.map((pair, index) => (
-              <tr key={index}>
-                <Td>{`${pairLabel(pair.runner, pair.model, pair.effort)} → ${pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort)}`}</Td>
-                <Td num>{pair.runs}</Td>
-                <Td num>{pair.passed}</Td>
-                <Td num>{pair.failed}</Td>
-              </tr>
-            ))}
+            {pairs.map((pair, index) => {
+              const sameRunner = pair.runner === pair.advised_runner;
+              return (
+                <tr key={index}>
+                  <Td>{pairLabel(pair.runner, pair.model, pair.effort, sameRunner)}</Td>
+                  <Td>{pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort, sameRunner)}</Td>
+                  <Td num>{pair.runs}</Td>
+                  <Td num>{pair.passed}</Td>
+                  <Td num>{pair.failed}</Td>
+                </tr>
+              );
+            })}
           </tbody>
         </Table>
       )}
@@ -544,10 +596,7 @@ function RouterReportPanel() {
 function HealthError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
-    <ErrorNote>
-      the {DAEMON_NAME} is not responding: nothing is known about the machine&apos;s
-      health
-    </ErrorNote>
+    <ErrorNote>Daemon not responding</ErrorNote>
   );
 }
 
@@ -566,12 +615,18 @@ function SidecarCardsPanel({
         <Skeleton label="Reading the sidecars" variant="row" count={3} />
       )}
       {sidecars.isError && sidecars.data === undefined && (
-        <ErrorNote>
-          the {DAEMON_NAME} is not responding: nothing is known about the sidecars
-        </ErrorNote>
+        <ErrorNote>Daemon not responding</ErrorNote>
       )}
       {sidecars.data !== undefined && sidecars.data.length > 0 && (
         <Rows label="Sidecars">
+          <Row dense className="sy-sidecar-row sy-sidecar-head">
+            <span>Name</span>
+            <span>State</span>
+            <span>Started</span>
+            <span>Restarts</span>
+            <span>Last output</span>
+            <span />
+          </Row>
           {sidecars.data.map((row) => (
             <SidecarCard key={row.name} sidecar={row} />
           ))}
@@ -593,22 +648,10 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
       <span className="sy-sidecar-state">
         <StateBadge domain="sidecar" state={sidecar.state} />
       </span>
-      <dl className="sy-sidecar-facts">
-        <div className="sy-fact">
-          {sidecar.started_at !== null && (
-            <>
-              <dt>started</dt>
-              <dd>
-                <RelativeTime at={sidecar.started_at} />
-              </dd>
-            </>
-          )}
-        </div>
-        <div className="sy-fact">
-          <dt>restarts</dt>
-          <dd>{sidecar.restarts}</dd>
-        </div>
-      </dl>
+      <span className="sy-sidecar-fact">
+        {sidecar.started_at !== null && <RelativeTime at={sidecar.started_at} />}
+      </span>
+      <span className="sy-sidecar-fact">{sidecar.restarts}</span>
       {/* What the sidecar last said, and the failure above it when there is one — each one
           clipped line, the whole text in the tooltip. */}
       <div className={wide ? "sy-sidecar-out sy-sidecar-out-wide" : "sy-sidecar-out"}>
@@ -624,7 +667,7 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
           </p>
         )}
         {sidecar.last_line !== null && (
-          <p className="sy-sidecar-line">
+          <p className="sy-sidecar-line" title={sidecar.last_line}>
             <code>{sidecar.last_line}</code>
             {sidecar.last_line_at !== null && (
               <span className="sy-sidecar-when">
@@ -1906,7 +1949,7 @@ function EmailConfigDetail() {
           title: "Account",
           fields: ["host", "username", "mailbox", "sent_mailbox"],
           // The password is not part of the document: it is one more row of this card.
-          extra: own.map((secret) => <SecretControl key={secret.key} secret={secret} />),
+          extra: own.map((secret) => <SecretControl key={secret.key} secret={secret} compact />),
         },
         {
           title: "Behaviour",
