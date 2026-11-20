@@ -67,3 +67,26 @@
   white-space: pre-wrap;
   font-size: var(--text-sm);
 }
+
+/* The compact variant: the task, the box and Preview on one row. */
+.loadout-preview.loadout-preview-section {
+  margin-top: 0;
+  gap: var(--space-1);
+}
+
+.loadout-preview-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.loadout-preview-line .ui-field {
+  flex: 1 1 9rem;
+  min-width: 9rem;
+}
+
+.loadout-preview-line .ui-field input {
+  width: 100%;
+  min-width: 0;
+}

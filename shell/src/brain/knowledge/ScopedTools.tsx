@@ -6,12 +6,15 @@ import {
   useRevokeLoadoutTool,
   type LoadoutTool,
 } from "../../data/loadout-tools";
-import { ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime, Row, Rows, Skeleton } from "../../ui";
+import { ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime, Row, Rows, SectionHead, Skeleton } from "../../ui";
+import { WaitingLink } from "./ScopedMemory";
 import "./knowledge.css";
 
 export interface ScopedToolsProps {
   ownerKind: "agent" | "team";
   ownerId: string;
+  /** `section`: the compact header row of a panel that holds several sections (the agent page). */
+  variant?: "section";
 }
 
 /**
@@ -19,13 +22,16 @@ export interface ScopedToolsProps {
  * rows of exactly that owner, with where each came from and a way to take it
  * back. Waiting requests are only counted — deciding them is the Brain's job.
  */
-export function ScopedTools({ ownerKind, ownerId }: ScopedToolsProps) {
+export function ScopedTools({ ownerKind, ownerId, variant }: ScopedToolsProps) {
+  const compact = variant === "section";
   const owner = { kind: ownerKind, id: ownerId };
   const active = useLoadoutTools("active", owner);
   const waiting = useLoadoutTools("proposed", owner);
   const revoke = useRevokeLoadoutTool();
 
   let body: ReactNode;
+  let count: ReactNode;
+  let waitingTotal = 0;
   if (active.isError) {
     body = (
       <ErrorNote onRetry={() => void active.refetch()}>the {DAEMON_NAME} is not responding: these tools are unknown</ErrorNote>
@@ -35,12 +41,18 @@ export function ScopedTools({ ownerKind, ownerId }: ScopedToolsProps) {
   } else {
     const rows = active.data.filter((row) => row.owner_kind === ownerKind && row.owner_id === ownerId);
     const waitingCount = (waiting.data ?? []).length;
+    waitingTotal = waitingCount;
+    count = rows.length === 0 ? undefined : rows.length;
     body = (
       <>
         {rows.length === 0 ? (
-          <Quiet says="No extra tools">
-            <p>No tool beyond the base has been approved here yet.</p>
-          </Quiet>
+          compact ? (
+            <Quiet compact says="None" />
+          ) : (
+            <Quiet says="No extra tools">
+              <p>No tool beyond the base has been approved here yet.</p>
+            </Quiet>
+          )
         ) : (
           <Rows label={`Tools of ${ownerKind} ${ownerId}`}>
             {rows.map((row) => (
@@ -54,10 +66,23 @@ export function ScopedTools({ ownerKind, ownerId }: ScopedToolsProps) {
           </Rows>
         )}
         {revoke.isError && <ToolRefusal error={revoke.error} />}
-        {waitingCount > 0 && (
+        {waitingCount > 0 && !compact && (
           <p className="learned-lede">{waitingCount} more waiting for you in the Brain</p>
         )}
       </>
+    );
+  }
+
+  if (compact) {
+    return (
+      <section className="learned-group learned-section" aria-label="Tools">
+        <SectionHead
+          title="Tools"
+          count={count}
+          aside={waitingTotal > 0 ? <WaitingLink count={waitingTotal} /> : undefined}
+        />
+        {body}
+      </section>
     );
   }
 

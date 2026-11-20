@@ -626,9 +626,93 @@ export function requestFromDraft(draft: AgentDraft): AgentRequest {
  * time, and a caller that needs to tell two apart scopes the query with
  * `within(...)`.
  */
-export function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: Partial<AgentDraft>) => void }) {
+export function AgentFields({
+  draft,
+  onChange,
+  compact = false,
+}: {
+  draft: AgentDraft;
+  onChange: (next: Partial<AgentDraft>) => void;
+  /** The agent page's layout: paired rows, a capability grid and a prompt that takes the height left. */
+  compact?: boolean;
+}) {
   const modelRequired = draft.engine === "local";
   const fieldId = useId();
+
+  if (compact) {
+    const capabilities = (
+      <fieldset className="agents-field agents-field-wide agents-capabilities">
+        <legend>Capabilities</legend>
+        {AGENT_CAPABILITIES.map((capability) => (
+          <label key={capability} className="agents-capability">
+            <Checkbox
+              checked={draft.capabilities.includes(capability)}
+              onChange={(event) =>
+                onChange({
+                  capabilities: event.target.checked
+                    ? [...draft.capabilities, capability]
+                    : draft.capabilities.filter((held) => held !== capability),
+                })
+              }
+            />
+            <span>{capability}</span>
+          </label>
+        ))}
+      </fieldset>
+    );
+    return (
+      <>
+        <div className="agents-pair">
+          <label className="agents-field">
+            <span className="agents-field-head">Name</span>
+            <input value={draft.name} onChange={(event) => onChange({ name: event.target.value })} />
+          </label>
+          <label className="agents-field">
+            <span className="agents-field-head">Speciality</span>
+            <input value={draft.speciality} onChange={(event) => onChange({ speciality: event.target.value })} />
+          </label>
+        </div>
+        <div className="agents-pair">
+          <label className="agents-field">
+            <span className="agents-field-head">Engine</span>
+            <Select
+              block
+              value={draft.engine}
+              onChange={(event) => onChange({ engine: event.target.value as AgentEngine })}
+            >
+              <option value="claude">claude</option>
+              <option value="codex">codex</option>
+              <option value="local">local</option>
+            </Select>
+          </label>
+          <div className="agents-field">
+            <span className="agents-field-head">
+              <label htmlFor={`${fieldId}-model`}>Model</label>
+              <Tip
+                name="About model"
+                tip={<span>{modelRequired ? "Required for a local engine." : "Blank uses the engine's default."}</span>}
+              />
+            </span>
+            <input
+              id={`${fieldId}-model`}
+              aria-required={modelRequired}
+              value={draft.model}
+              onChange={(event) => onChange({ model: event.target.value })}
+            />
+          </div>
+        </div>
+        {capabilities}
+        <label className="agents-field agents-field-grow">
+          <span className="agents-field-head">Prompt</span>
+          <textarea
+            rows={6}
+            value={draft.prompt}
+            onChange={(event) => onChange({ prompt: event.target.value })}
+          />
+        </label>
+      </>
+    );
+  }
 
   return (
     <>

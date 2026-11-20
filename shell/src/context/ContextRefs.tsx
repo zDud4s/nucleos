@@ -23,6 +23,7 @@ import {
   RefusalNote,
   Row,
   Rows,
+  SectionHead,
   Skeleton,
   Tip,
 } from "../ui";
@@ -31,6 +32,14 @@ import "./context.css";
 export interface ContextRefsProps {
   ownerKind: ContextOwnerKind;
   ownerId: string;
+  /** `section`: the compact header row of a panel that holds several sections (the agent page). */
+  variant?: "section";
+}
+
+/** The last segment of a path, for a row that keeps the whole path in its `title`. */
+function basename(path: string): string {
+  const parts = path.split(/[\\/]/).filter((part) => part !== "");
+  return parts.length === 0 ? path : parts[parts.length - 1];
 }
 
 /**
@@ -57,7 +66,9 @@ export function droppedRoot(file: DroppedFile): string {
  * A path is typed or dropped on the window; there is no native picker, because the dialog plugin is
  * not part of this shell and a browser file input would hand over a name, never a path.
  */
-export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
+export function ContextRefs({ ownerKind, ownerId, variant }: ContextRefsProps) {
+  const compact = variant === "section";
+  const [adding, setAdding] = useState(false);
   const refs = useContextRefs(ownerKind, ownerId);
   const add = useAddContextRef(ownerKind, ownerId);
   const [path, setPath] = useState("");
@@ -117,20 +128,57 @@ export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
   } else if (refs.data === undefined) {
     body = <Skeleton label="Loading context files…" lines={2} />;
   } else if (refs.data.length === 0) {
-    body = <Quiet says="No context files yet." />;
+    body = <Quiet compact={compact} says={compact ? "None" : "No context files yet."} />;
   } else {
     body = (
       <Rows label={`Context of ${ownerKind} ${ownerId}`}>
         {refs.data.map((row) => (
-          <RefRow key={row.id} row={row} ownerKind={ownerKind} ownerId={ownerId} />
+          <RefRow key={row.id} row={row} ownerKind={ownerKind} ownerId={ownerId} compact={compact} />
         ))}
       </Rows>
     );
   }
 
+  const tip = (
+    <Tip
+      name="About context"
+      tip={
+        <>
+          Files and folders this {ownerKind}&rsquo;s runs may read. Type an absolute path
+          {browserDropsApply() ? " on the main machine." : ", or drop a file or folder on the window."}
+        </>
+      }
+    />
+  );
+
+  const addForm = (
+    <form className="context-add" onSubmit={submit}>
+      <Field label="Path">
+        <input
+          value={path}
+          onChange={(event) => setPath(event.target.value)}
+          placeholder="C:ilesrief.md"
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </Field>
+      <Field label="Note">
+        <input
+          value={note}
+          onChange={(event) => setNote(event.target.value)}
+          placeholder="what it is for (optional)"
+          autoComplete="off"
+        />
+      </Field>
+      <Button type="submit" variant="approve" disabled={path.trim() === "" || add.isPending}>
+        Add
+      </Button>
+    </form>
+  );
+
   return (
     <section
-      className="context-refs"
+      className={compact ? "context-refs context-refs-section" : "context-refs"}
       aria-label="Context"
       onDragOver={(event) => {
         if (browserDropsApply()) event.preventDefault();
@@ -143,42 +191,28 @@ export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
         setDropNote(BROWSER_DROP_SENTENCE);
       }}
     >
-      <h3>
-        Context
-        <Tip
-          name="About context"
-          tip={
+      {compact ? (
+        <SectionHead
+          title="Context"
+          count={refs.data === undefined || refs.data.length === 0 ? undefined : refs.data.length}
+          aside={
             <>
-              Files and folders this {ownerKind}&rsquo;s runs may read. Type an absolute path
-              {browserDropsApply() ? " on the main machine." : ", or drop a file or folder on the window."}
+              {tip}
+              <Button variant="quiet" aria-expanded={adding} onClick={() => setAdding((open) => !open)}>
+                {adding ? "Close" : "+ Add"}
+              </Button>
             </>
           }
         />
-      </h3>
+      ) : (
+        <h3>
+          Context
+          {tip}
+        </h3>
+      )}
       {dropNote !== "" && <ErrorNote>{dropNote}</ErrorNote>}
       {body}
-      <form className="context-add" onSubmit={submit}>
-        <Field label="Path">
-          <input
-            value={path}
-            onChange={(event) => setPath(event.target.value)}
-            placeholder="C:\files\brief.md"
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </Field>
-        <Field label="Note">
-          <input
-            value={note}
-            onChange={(event) => setNote(event.target.value)}
-            placeholder="what it is for (optional)"
-            autoComplete="off"
-          />
-        </Field>
-        <Button type="submit" variant="approve" disabled={path.trim() === "" || add.isPending}>
-          Add
-        </Button>
-      </form>
+      {compact ? adding && addForm : addForm}
       {add.isError && <WriteRefusal error={add.error} />}
     </section>
   );
@@ -188,10 +222,12 @@ function RefRow({
   row,
   ownerKind,
   ownerId,
+  compact,
 }: {
   row: ContextRef;
   ownerKind: ContextOwnerKind;
   ownerId: string;
+  compact: boolean;
 }) {
   const edit = useEditContextNote(ownerKind, ownerId);
   const remove = useRemoveContextRef(ownerKind, ownerId);
@@ -203,6 +239,57 @@ function RefRow({
     edit.mutate(
       { refId: row.id, note: text === "" ? null : text },
       { onSuccess: () => setDraft(null) },
+    );
+  }
+
+  if (compact) {
+    return (
+      <Row layout="stack">
+        {draft === null ? (
+          <div className="context-line">
+            <code className="context-path" title={row.path}>
+              {basename(row.path)}
+            </code>
+            {row.state === "missing" && (
+              <span className="context-missing" title="nothing exists at this path any more">
+                missing
+              </span>
+            )}
+            {row.note !== null && <span className="context-note-inline">{row.note}</span>}
+            <span className="context-line-actions">
+              <Button variant="quiet" onClick={() => setDraft(row.note ?? "")}>
+                {row.note === null ? "Add note" : "Edit note"}
+              </Button>
+              <ConfirmButton
+                label="Remove"
+                confirmLabel={`Remove ${row.path}`}
+                variant="quiet"
+                disabled={remove.isPending}
+                onConfirm={() => remove.mutate(row.id)}
+              />
+            </span>
+          </div>
+        ) : (
+          <form className="context-note" onSubmit={save}>
+            <Field label={`Note for ${row.path}`} labelHidden>
+              <input
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                autoComplete="off"
+                autoFocus
+              />
+            </Field>
+            <Button type="submit" variant="approve" disabled={edit.isPending}>
+              Save note
+            </Button>
+            <Button variant="ghost" onClick={() => setDraft(null)}>
+              Cancel
+            </Button>
+          </form>
+        )}
+        {edit.isError && <WriteRefusal error={edit.error} />}
+        {remove.isError && <WriteRefusal error={remove.error} />}
+      </Row>
     );
   }
 

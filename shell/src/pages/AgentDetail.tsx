@@ -26,9 +26,9 @@ import "./agent-detail.css";
 /**
  * One agent, on a page of its own at `/agents/$agentId`.
  *
- * It replaced a modal with four tabs. The definition sits on the left and what
- * hangs off the agent (memory, context, tools, loadout) is stacked on the right,
- * so nothing is behind a tab and the two columns end at the same height.
+ * It replaced a modal with four tabs. The definition sits on the left in one panel and what
+ * hangs off the agent (memory, tools, context, loadout) is four compact sections of one panel on
+ * the right. The columns end at the same height and the left one spends the extra on its prompt.
  */
 export function AgentDetail() {
   const params = useParams({ strict: false }) as { agentId?: string };
@@ -79,58 +79,13 @@ function AgentPage({ agent }: { agent: Agent }) {
   const del = useDeleteAgent();
   const employment = employmentOf(agent.id, teams.data ?? []);
 
-  return (
-    <>
-      <DetailHeader
-        title={agent.name}
-        actions={
-          <>
-            <Tip name="What stands on this agent" tip={holdSentence(agent, employment, teams.data !== undefined)} />
-            <ConfirmButton
-              label="Delete"
-              confirmLabel={`Delete ${agent.name}`}
-              variant="danger"
-              intent="stop"
-              disabled={del.isPending}
-              onConfirm={() => del.mutate(agent.id, { onSuccess: () => void navigate({ to: "/agents" }) })}
-            />
-          </>
-        }
-      />
-      {del.isError && <DeleteRefusal error={del.error} />}
-
-      <div className="agent-detail-grid">
-        <div className="agent-detail-col">
-          <Panel title="Definition">
-            <DefinitionForm agent={agent} />
-          </Panel>
-        </div>
-        <div className="agent-detail-col">
-          <Panel>
-            <ScopedMemory scopeKind="agent" scopeId={agent.id} />
-          </Panel>
-          <Panel>
-            <ContextRefs ownerKind="agent" ownerId={agent.id} />
-          </Panel>
-          <Panel>
-            <ScopedTools ownerKind="agent" ownerId={agent.id} />
-          </Panel>
-          <Panel>
-            <LoadoutPreview agentId={agent.id} />
-          </Panel>
-        </div>
-      </div>
-    </>
-  );
-}
-
-function DefinitionForm({ agent }: { agent: Agent }) {
   const [draft, setDraft] = useState<AgentDraft>(() => draftFromAgent(agent));
   const update = useUpdateAgent();
   const formId = useId();
   const valid = draftIsValid(draft);
   const saved = draftFromAgent(agent);
   const dirty = JSON.stringify(draft) !== JSON.stringify(saved);
+  const status = update.isPending ? "Saving…" : !valid ? invalidReason(draft) : dirty ? "Unsaved changes" : "";
 
   function patch(next: Partial<AgentDraft>) {
     setDraft((current) => ({ ...current, ...next }));
@@ -138,43 +93,76 @@ function DefinitionForm({ agent }: { agent: Agent }) {
 
   return (
     <>
-      <form
-        id={formId}
-        className="agents-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!valid || update.isPending) return;
-          // Reseeds from the daemon's answer: what shows next is what it stored (trimmed, a blank
-          // model back to the engine's default).
-          update.mutate(
-            { id: agent.id, request: requestFromDraft(draft) },
-            {
-              onSuccess: (savedAgent) => {
-                setDraft(draftFromAgent(savedAgent));
-                toastManager.add({ type: "success", title: "Agent saved", description: savedAgent.name });
-              },
-            },
-          );
-        }}
-      >
-        <AgentFields draft={draft} onChange={patch} />
-        <div className="agent-detail-actions">
-          <span className="agents-save-status" role="status">
-            {update.isPending ? "Saving…" : !valid ? invalidReason(draft) : dirty ? "Unsaved changes" : ""}
-          </span>
+      <header className="agent-detail-head">
+        <Link to="/agents" className="agent-detail-back">
+          ← Agents
+        </Link>
+        <h1 className="ui-page-title">{agent.name}</h1>
+        <div className="agent-detail-head-actions">
+          {status === "" ? null : (
+            <span className="agents-save-status" role="status">
+              {status}
+            </span>
+          )}
           <Button variant="ghost" disabled={!dirty || update.isPending} onClick={() => setDraft(saved)}>
             Revert
           </Button>
-          <Button type="submit" intent="go" disabled={!valid || update.isPending}>
+          <Button
+            type="submit"
+            form={formId}
+            disabled={!valid || update.isPending}
+            title="Saving reaches work that is already queued: an item reads its agent's prompt when it is dispatched, not when it was planned."
+          >
             {update.isPending ? "Saving…" : "Save changes"}
           </Button>
-          <Tip
-            name="About saving"
-            tip="Saving reaches work that is already queued: an item reads its agent's prompt when it is dispatched, not when it was planned."
-          />
+          <span className="agent-detail-delete">
+            <ConfirmButton
+              label="Delete"
+              confirmLabel={`Delete ${agent.name}`}
+              variant="danger"
+              disabled={del.isPending}
+              onConfirm={() => del.mutate(agent.id, { onSuccess: () => void navigate({ to: "/agents" }) })}
+            />
+            <Tip name="What stands on this agent" tip={holdSentence(agent, employment, teams.data !== undefined)} />
+          </span>
         </div>
-      </form>
+      </header>
+      {del.isError && <DeleteRefusal error={del.error} />}
       {update.isError && <SaveRefusal error={update.error} />}
+
+      <div className="agent-detail-grid">
+        <Panel>
+          <form
+            id={formId}
+            className="agents-form agents-form-page"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!valid || update.isPending) return;
+              // Reseeds from the daemon's answer: what shows next is what it stored (trimmed, a blank
+              // model back to the engine's default).
+              update.mutate(
+                { id: agent.id, request: requestFromDraft(draft) },
+                {
+                  onSuccess: (savedAgent) => {
+                    setDraft(draftFromAgent(savedAgent));
+                    toastManager.add({ type: "success", title: "Agent saved", description: savedAgent.name });
+                  },
+                },
+              );
+            }}
+          >
+            <AgentFields draft={draft} onChange={patch} compact />
+          </form>
+        </Panel>
+        <Panel>
+          <div className="agent-detail-sections">
+            <ScopedMemory scopeKind="agent" scopeId={agent.id} variant="section" />
+            <ScopedTools ownerKind="agent" ownerId={agent.id} variant="section" />
+            <ContextRefs ownerKind="agent" ownerId={agent.id} variant="section" />
+            <LoadoutPreview agentId={agent.id} variant="section" />
+          </div>
+        </Panel>
+      </div>
     </>
   );
 }

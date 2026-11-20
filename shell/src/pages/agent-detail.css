@@ -1,41 +1,83 @@
 /**
  * `/agents/$agentId`, `agent-detail-` throughout.
  *
- * Two columns that end at the same height: the grid stretches both, the left
- * Definition panel fills its column, and the right panels share what is left of
- * theirs with flex rather than one of them stretching into an empty box.
+ * One header row, then two panels that end at the same height: the grid stretches both, the
+ * left panel's form is a flex column whose prompt takes the height left over, and the right
+ * panel's sections stack at their natural size.
  */
 
+.agent-detail-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: 90rem;
+  margin-bottom: var(--space-3);
+}
+
+.agent-detail-head .ui-page-title {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .agent-detail-back {
-  align-self: flex-start;
+  flex: none;
   font-size: var(--text-sm);
+}
+
+.agent-detail-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+  flex: none;
+}
+
+.agent-detail-head-actions .agents-save-status {
+  margin-right: var(--space-1);
+}
+
+.agent-detail-delete {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
 }
 
 .agent-detail-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
   align-items: stretch;
   gap: var(--space-3);
+  max-width: 90rem;
 }
 
-.agent-detail-col {
+/* Each panel fills its cell; its body is a column so the form (or the sections) can fill it. */
+.agent-detail-grid > .ui-panel {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
   min-width: 0;
-}
-
-.agent-detail-col > .ui-panel {
-  flex: 1 1 auto;
   margin: 0;
 }
 
-/* Save, Revert and the status, on the form's last row. */
-.agent-detail-actions {
-  grid-column: 1 / -1;
+.agent-detail-grid > .ui-panel > .ui-panel-body {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: var(--space-4);
+}
+
+.agent-detail-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* A hairline between sections, so four headers read as four parts of one panel. */
+.agent-detail-sections > * + * {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
 }
 
 @media (max-width: 64rem) {

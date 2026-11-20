@@ -101,19 +101,28 @@ describe("AgentDetail - the definition", () => {
     expect(name.value).toBe("copywriter");
   });
 
-  it("keeps the saving consequence behind a tip", async () => {
+  it("keeps the saving consequence on the Save button's title", async () => {
     await openAgent([agent()], "/agents/copywriter");
 
-    fireEvent.click(await screen.findByRole("button", { name: "About saving" }));
-    expect(screen.getByText(/reaches work that is already queued/i)).toBeDefined();
+    const save = await screen.findByRole("button", { name: "Save changes" });
+    expect(save.getAttribute("title")).toMatch(/reaches work that is already queued/i);
   });
 
-  it("keeps the Model hint attached to the field", async () => {
+  it("keeps the Model hint behind a tip beside the label", async () => {
     await openAgent([agent()], "/agents/copywriter");
 
-    const model = await screen.findByLabelText("Model");
-    const hint = document.getElementById(model.getAttribute("aria-describedby") ?? "");
-    expect(hint?.textContent).toMatch(/engine's default/);
+    expect(await screen.findByLabelText("Model")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "About model" }));
+    expect(screen.getByText(/engine's default/)).toBeDefined();
+  });
+
+  it("shows the save status only when there is one", async () => {
+    await openAgent([agent()], "/agents/copywriter");
+
+    const name = (await screen.findByLabelText("Name")) as HTMLInputElement;
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    fireEvent.change(name, { target: { value: "copywriter 2" } });
+    expect(screen.getByText("Unsaved changes")).toBeDefined();
   });
 });
 
@@ -131,7 +140,7 @@ describe("AgentDetail - what hangs off the agent", () => {
     expect(within(memory).queryByText("Someone else's habit")).toBeNull();
     expect(await screen.findByRole("region", { name: "Tools" })).toBeDefined();
     expect(await screen.findByRole("region", { name: "Loadout preview" })).toBeDefined();
-    expect(screen.getByRole("heading", { level: 2, name: "Definition" })).toBeDefined();
+    expect(screen.queryByRole("heading", { level: 2, name: "Definition" })).toBeNull();
     expect(screen.queryByRole("tab")).toBeNull();
   });
 });

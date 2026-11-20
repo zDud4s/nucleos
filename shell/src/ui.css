@@ -1090,6 +1090,28 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
   color: var(--text-faint);
 }
 
+/* The header row of a compact section: title, count, and an action at the right. */
+.ui-section-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 1.75rem;
+}
+
+.ui-section-head-count {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-section-head-aside {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+  font-size: var(--text-sm);
+}
+
 /* ----------------------------------------------------------------- quiet -- */
 
 /**
