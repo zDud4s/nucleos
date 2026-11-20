@@ -3942,6 +3942,8 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/jobs" || path.startsWith("/jobs?")) return [JOB];
   if (/^\/jobs\/\d+$/.test(path)) return JOB_VIEW;
   if (path === "/route/report" || path.startsWith("/route/report?")) return ROUTE_REPORT;
+  // The OS sandbox has no backend yet, which is what the real daemon answers today.
+  if (path === "/sandbox/status") return { state: "no_backend", banner: "sandbox por implementar" };
   if (/^\/runs\/\d+\/stop$/.test(path)) return RUN_STOP;
   if (/^\/runs\/2\/tail\?since=0$/.test(path)) {
     return { text: LIVE_TAIL_TEXT, next: LIVE_TAIL_TEXT.length, live: true } satisfies RunTailChunk;

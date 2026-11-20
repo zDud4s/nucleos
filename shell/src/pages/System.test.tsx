@@ -466,6 +466,20 @@ describe("System - health readout", () => {
     expect((await screen.findByText("1 down, 1 degraded")).className).toContain("ui-wrong");
   });
 
+  it("shows the sandbox state as a badge in the Subsystems panel", async () => {
+    const base = systemFetch(systemWorld());
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/sandbox/status"
+        ? Promise.resolve({ state: "no_backend", banner: "sandbox por implementar" })
+        : base(path, init),
+    );
+
+    await renderSystem();
+
+    expect(await screen.findByText("Not implemented")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "About the sandbox" })).toBeTruthy();
+  });
+
   it("leaves a healthy headline untoned", async () => {
     daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
 

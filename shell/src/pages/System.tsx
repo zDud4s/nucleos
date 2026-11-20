@@ -3,6 +3,8 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { validateSystemSearch } from "./systemSearch";
 import { apiFetch, isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
+import { useSandboxStatus, type SandboxStatus } from "../data/sandbox";
+import { sandboxTone } from "../ui/sandbox-tone";
 import { registerPrefetcher } from "../lib/prefetch";
 import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
@@ -303,6 +305,33 @@ function HealthView({
   );
 }
 
+const SANDBOX_LABELS: Record<SandboxStatus["state"], string> = {
+  no_backend: "Not implemented",
+  off: "Off",
+  armed: "Armed",
+  refused: "Refused",
+};
+
+/** One small line in the Subsystems panel: the OS sandbox's state as a badge, with the explanation in a Tip. */
+function SandboxLine() {
+  const status = useSandboxStatus();
+  if (status.data === undefined) return null;
+  const tone = sandboxTone(status.data.state);
+  const label = SANDBOX_LABELS[status.data.state];
+  const refused = status.data.state === "refused";
+  return (
+    <div className="sy-sandbox">
+      <span>Sandbox</span>
+      <Badge tone={tone}>{label}</Badge>
+      {refused && status.data.banner !== null && <Tip name="Why it was refused" tip={<span>{status.data.banner}</span>} />}
+      <Tip
+        name="About the sandbox"
+        tip={<span>Runs are not contained by a sandbox yet. Only a refused sandbox blocks runs.</span>}
+      />
+    </div>
+  );
+}
+
 /** A daemon reason as a short phrase: `not-running` reads "Not running", `reason: low-disk-space` "Low disk space". */
 function humanizeReason(reason: string): string {
   const words = reason.replace(/^reason:\s*/i, "").replace(/[-_]+/g, " ").trim();
@@ -381,6 +410,7 @@ function HealthReadoutPanel({
   ) : undefined;
   return (
     <Panel title="Subsystems" aside={aside}>
+      <SandboxLine />
       {health.data === undefined && !health.isError && (
         <Skeleton label="Reading the subsystems" variant="cards" count={4} gridClassName="sy-kpis-skeleton" height="3.75rem" />
       )}
