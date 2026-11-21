@@ -237,8 +237,13 @@ pub mod tests {
     /// A fresh operation budget. The functions under test take a deadline rather than a duration —
     /// the budget is for the whole operation, not for each git command inside it.
     fn deadline() -> std::time::Instant {
-        std::time::Instant::now() + OPERATION_TIMEOUT
+        std::time::Instant::now() + LOADED_MACHINE_BUDGET
     }
+
+    /// The whole-operation budget the hook tests give the executor: a hang guard, not a speed check.
+    /// `OPERATION_TIMEOUT` (300s) is the production default, and a gate run that stalls the machine
+    /// has used it up before the final `merge --ff-only` ("timed out after 14s", test ran 321s).
+    const LOADED_MACHINE_BUDGET: Duration = Duration::from_secs(1800);
 
     #[tokio::test]
     async fn a_git_command_reports_what_it_printed_and_how_it_exited() {
@@ -1006,21 +1011,24 @@ gate_command: git rev-parse --verify nao-existe
         // Reads the project's rules from the settings snapshot: hold the shared side of the rules gate
         // (a no-op when the test already published and so holds the exclusive side).
         crate::project::rules::testing::hold_shared();
-        GitExecutor::default()
-            .execute(&crate::execution::vcs::ClaimedRequest {
-                id: 1,
-                op: crate::execution::vcs::Op::Merge {
-                    source: "feat/x".into(),
-                    target: "master".into(),
-                },
-                project_id: "alpha".to_owned(),
-                project_root: repo.to_string_lossy().into_owned(),
-                from_resolution: false,
-                run_id: None,
-                approved_map_blob: None,
-                integration_branch: None,
-            })
-            .await
+        GitExecutor {
+            timeout: LOADED_MACHINE_BUDGET,
+            ..GitExecutor::default()
+        }
+        .execute(&crate::execution::vcs::ClaimedRequest {
+            id: 1,
+            op: crate::execution::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: None,
+            integration_branch: None,
+        })
+        .await
     }
 
     // ---- Integration steps wired into the executor (plan 2026-11-09, P4) -----------------------
@@ -2331,21 +2339,24 @@ integration_steps:
     /// The same, carrying the map blob the owner approved (if any).
     async fn revert_approved(repo: &Path, merge_sha: &str, approved: Option<&str>) -> Outcome {
         use crate::execution::vcs::VcsExecutor;
-        GitExecutor::default()
-            .execute(&crate::execution::vcs::ClaimedRequest {
-                id: 1,
-                op: crate::execution::vcs::Op::Revert {
-                    merge_sha: merge_sha.into(),
-                    target: "master".into(),
-                },
-                project_id: "alpha".to_owned(),
-                project_root: repo.to_string_lossy().into_owned(),
-                from_resolution: false,
-                run_id: None,
-                approved_map_blob: approved.map(str::to_owned),
-                integration_branch: None,
-            })
-            .await
+        GitExecutor {
+            timeout: LOADED_MACHINE_BUDGET,
+            ..GitExecutor::default()
+        }
+        .execute(&crate::execution::vcs::ClaimedRequest {
+            id: 1,
+            op: crate::execution::vcs::Op::Revert {
+                merge_sha: merge_sha.into(),
+                target: "master".into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: approved.map(str::to_owned),
+            integration_branch: None,
+        })
+        .await
     }
 
     /// Lands `feat/x` plus a `nucleos.tests.yaml` committed on it into `master` with a real

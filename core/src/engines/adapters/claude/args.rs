@@ -313,7 +313,7 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
 
 /// Everything the Claude CLI is told to deny for this request: the policy's denials, the run's own
 /// `denied_tools` and its `schema_diet` hint, as `--disallowedTools` carries them.
-pub(super) fn flag_denials(request: &RunRequest) -> Vec<String> {
+pub(crate) fn flag_denials(request: &RunRequest) -> Vec<String> {
     let asked: Vec<String> = request
         .denied_tools
         .iter()
