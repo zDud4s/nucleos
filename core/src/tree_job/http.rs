@@ -2560,9 +2560,13 @@ mod tests {
     async fn post_tree_after_other_project_is_400() {
         let state = test_state().await;
         seed_predecessor(&state.pool, "pred", "feat/pred").await;
-        let mut pred = loaded(&state.pool, "pred").await;
-        pred.project_id = Some("project-9".to_owned());
-        store::update(&state.pool, &pred).await.unwrap();
+        // `store::update` writes only state and manifest, so the column goes in directly.
+        sqlx::query("UPDATE tree_jobs SET project_id = ? WHERE id = ?")
+            .bind("project-9")
+            .bind("pred")
+            .execute(&state.pool)
+            .await
+            .unwrap();
 
         let response = post(&app(&state), "/trees", after_body(JOB, "pred")).await;
 
