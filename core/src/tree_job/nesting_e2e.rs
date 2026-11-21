@@ -179,7 +179,9 @@ impl Tree {
     async fn round(&self, gate: &FakeGate) {
         // A hang guard, not a speed check: a round here runs tens of git processes, which under
         // a full gate on Windows can take longer than the driver tests' 30 s.
-        self.fx.tick_within(self.job, gate, Duration::from_secs(120)).await;
+        self.fx
+            .tick_within(self.job, gate, Duration::from_secs(120))
+            .await;
         // The gate task records its verdict on its own; give it the lock.
         tokio::time::sleep(Duration::from_millis(40)).await;
         while drain_once(&self.fx.state.pool, &self.fx.key, &GitExecutor::default()).await {}

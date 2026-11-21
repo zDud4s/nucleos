@@ -49,7 +49,9 @@ pub fn resolve_account(
 ) -> Option<String> {
     let path = parts(transcript);
     let mut best: Option<(usize, &str)> = None;
-    for account in accounts.iter().filter(|a| a.engine == "claude") {
+    // The transcripts scanned here are the Claude adapter's, so only its accounts can own one.
+    let engine = crate::accounts::adapters::claude::ENGINE;
+    for account in accounts.iter().filter(|a| a.engine == engine) {
         let dir = match account.credential_locator.as_deref() {
             Some(locator) if !locator.trim().is_empty() => parts(locator),
             _ => parts(default_dir),
